@@ -1,6 +1,6 @@
 # Multi-stage build for modelrouter
 #
-# SQLite is bundled in the binary via sqlx's bundled feature.
+# SQLite is bundled in the binary via sqlx's sqlite feature (which enables bundled libsqlite3).
 # Config and database should be mounted as volumes at runtime, e.g.:
 #   -v /host/config:/config -v /host/data:/data
 #

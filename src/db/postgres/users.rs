@@ -39,16 +39,18 @@ impl From<UserRow> for User {
 #[async_trait]
 impl UserRepository for PostgresDb {
     async fn find_by_api_key(&self, key_hash: &str) -> anyhow::Result<Option<User>> {
+        let now = chrono::Utc::now().to_rfc3339();
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
                       group_name, enabled, created_at, metadata
                FROM users
                WHERE api_key = $1
-                  OR (api_key_old = $2 AND api_key_old_expires_at > now()::text)
+                  OR (api_key_old = $2 AND api_key_old_expires_at > $3)
                LIMIT 1"#,
         )
         .bind(key_hash)
         .bind(key_hash)
+        .bind(&now)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(User::from))
@@ -132,12 +134,14 @@ impl UserRepository for PostgresDb {
     }
 
     async fn expire_old_keys(&self) -> anyhow::Result<u64> {
+        let now = chrono::Utc::now().to_rfc3339();
         let result = sqlx::query(
             r#"UPDATE users
                SET api_key_old = NULL, api_key_old_expires_at = NULL
                WHERE api_key_old IS NOT NULL
-                 AND api_key_old_expires_at <= now()::text"#,
+                 AND api_key_old_expires_at <= $1"#,
         )
+        .bind(&now)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())

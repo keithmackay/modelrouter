@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE TABLE IF NOT EXISTS hook_metrics (
+    id          BIGSERIAL PRIMARY KEY,
     hook_name   TEXT NOT NULL,
     invoked_at  TEXT NOT NULL,
     duration_ms BIGINT NOT NULL,
@@ -117,3 +118,4 @@ CREATE INDEX IF NOT EXISTS idx_prompts_user_created ON prompts(user_id, created_
 CREATE INDEX IF NOT EXISTS idx_cost_ledger_user_created ON cost_ledger(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_hook_metrics_name_at ON hook_metrics(hook_name, invoked_at DESC);

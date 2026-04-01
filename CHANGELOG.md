@@ -17,4 +17,7 @@
 - CLI reporting: cost, usage, prompts, audit log, hook latency (table/CSV/JSON)
 - Zero-downtime API key rotation with overlap window
 - SQLite default database with idempotent migrations
+- Postgres database support via `--features postgres`
+- `modelrouter install-service` / `uninstall-service` for macOS (launchd) and Linux (systemd)
+- Docker image with distroless runtime
 - Single static binary, no runtime dependencies

@@ -9,10 +9,24 @@ use crate::report::formatter::{print_rows, OutputFormat};
 
 // ── Service install/uninstall ─────────────────────────────────────────────────
 
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 const PLIST_CONTENT: &str = include_str!("../../contrib/dev.modelrouter.plist");
-#[allow(dead_code)]
+
+#[cfg(target_os = "linux")]
 const SYSTEMD_CONTENT: &str = include_str!("../../contrib/modelrouter.service");
+
+#[cfg(target_os = "macos")]
+fn launchctl_uid() -> String {
+    std::env::var("UID").unwrap_or_else(|_| {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "501".to_string())
+    })
+}
 
 #[cfg(target_os = "macos")]
 fn install_service() -> Result<()> {
@@ -22,13 +36,16 @@ fn install_service() -> Result<()> {
     let plist_path = agents_dir.join("dev.modelrouter.plist");
     std::fs::write(&plist_path, PLIST_CONTENT)?;
     println!("Installed plist to {}", plist_path.display());
+    let path_str = plist_path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Path contains non-UTF-8 characters: {}", plist_path.display()))?;
+    let domain_target = format!("gui/{}", launchctl_uid());
     let status = std::process::Command::new("launchctl")
-        .args(["load", plist_path.to_str().unwrap_or_default()])
+        .args(["bootstrap", &domain_target, path_str])
         .status()?;
     if status.success() {
-        println!("Service loaded via launchctl.");
+        println!("Service bootstrapped via launchctl.");
     } else {
-        anyhow::bail!("launchctl load failed (exit code: {})", status);
+        anyhow::bail!("launchctl bootstrap failed (exit code: {})", status);
     }
     Ok(())
 }
@@ -38,11 +55,14 @@ fn uninstall_service() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let plist_path = home.join("Library").join("LaunchAgents").join("dev.modelrouter.plist");
     if plist_path.exists() {
+        let path_str = plist_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Path contains non-UTF-8 characters: {}", plist_path.display()))?;
+        let domain_target = format!("gui/{}", launchctl_uid());
         let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist_path.to_str().unwrap_or_default()])
+            .args(["bootout", &domain_target, path_str])
             .status();
         std::fs::remove_file(&plist_path)?;
-        println!("Service unloaded and plist removed.");
+        println!("Service booted out and plist removed.");
     } else {
         println!("No plist found at {}; nothing to do.", plist_path.display());
     }
