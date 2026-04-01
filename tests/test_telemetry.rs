@@ -172,3 +172,39 @@ fn metrics_policy_denied_increments_with_reason() {
         .find(|m| m.name == "modelrouter.policy.denied");
     assert!(denied.is_some(), "policy.denied metric not found");
 }
+
+// ── Init / shutdown (spec 9.3) ─────────────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn telemetry_init_and_shutdown_does_not_panic() {
+    use modelrouter::config::schema::TelemetryConfig;
+    use modelrouter::telemetry::init_telemetry;
+
+    let config = TelemetryConfig {
+        enabled: true,
+        endpoint: "http://127.0.0.1:4317".to_string(), // nothing listening — should not block
+        service_name: "test".to_string(),
+        sample_ratio: 1.0,
+        slow_threshold_ms: 5000,
+        batch_queue_size: 4,
+        batch_scheduled_delay_ms: 100,
+        batch_max_export_size: 2,
+    };
+
+    // init_telemetry must not panic even when the collector endpoint is unreachable.
+    // Use a multi-thread runtime so the background batch processor tasks can run
+    // without deadlocking during shutdown (which is called on guard Drop).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let guard = rt.block_on(async { init_telemetry(&config) });
+    assert!(guard.is_ok(), "init_telemetry returned error: {:?}", guard.err());
+
+    // Drop the guard (flushes pipelines) inside the runtime so spawned tasks can run.
+    drop(guard);
+    // Give background tasks a moment to complete (connection refused is fast)
+    rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await });
+}
