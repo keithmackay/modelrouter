@@ -26,6 +26,18 @@ pub async fn chat_completions(
         .to_string();
     let stream = body["stream"].as_bool().unwrap_or(false);
 
+    // Fire on_request_received lifecycle hooks
+    for hook in &state.settings.hooks.lifecycle {
+        if hook.event == "on_request_received" {
+            let payload = crate::hooks::lifecycle::request_received_payload(
+                &user.name,
+                &model,
+                body["messages"].as_array().map(|m| m.len()).unwrap_or(0),
+            );
+            crate::hooks::lifecycle::fire(hook, payload).await;
+        }
+    }
+
     // Policy check
     match state
         .policy
@@ -35,9 +47,34 @@ pub async fn chat_completions(
     {
         PolicyDecision::Allow => {}
         PolicyDecision::Deny { reason, status } => {
+            // Fire on_budget_exceeded hook if this was a budget denial (status 429)
+            if status == 429 {
+                for hook in &state.settings.hooks.lifecycle {
+                    if hook.event == "on_budget_exceeded" {
+                        crate::hooks::lifecycle::fire(
+                            hook,
+                            serde_json::json!({
+                                "event": "on_budget_exceeded",
+                                "user_name": user.name,
+                                "model": model,
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
             return Err(ApiError::PolicyDenied { reason, status });
         }
     }
+
+    // Run pre_request pipeline hooks (may mutate body)
+    let body = crate::hooks::pipeline::run_pre_request(
+        &state.settings.hooks.pipeline,
+        &state.db,
+        body,
+    )
+    .await
+    .map_err(|_| ApiError::Internal)?;
 
     let (provider_name, canonical_model) = state.router.resolve(&model);
 
@@ -67,6 +104,7 @@ pub async fn chat_completions(
             StreamLogCtx {
                 state: state.clone(),
                 user_id: user.id,
+                user_name: user.name.clone(),
                 model: model.clone(),
                 canonical_model: canonical_model.clone(),
                 provider: provider_name.clone(),
@@ -101,6 +139,7 @@ pub async fn chat_completions(
     let response_clone = result.content.clone();
     let finish_clone = result.finish_reason.clone();
     let user_id = user.id;
+    let user_name_clone = user.name.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
 
@@ -108,7 +147,7 @@ pub async fn chat_completions(
         let prompt = NewPrompt {
             user_id,
             session_id: None,
-            request_model: model_clone,
+            request_model: model_clone.clone(),
             routed_model: canonical_clone.clone(),
             provider: provider_clone.clone(),
             messages: messages_json,
@@ -126,7 +165,7 @@ pub async fn chat_completions(
                 let ledger = NewCostLedgerEntry {
                     user_id,
                     prompt_id: saved_prompt.id,
-                    model: canonical_clone,
+                    model: canonical_clone.clone(),
                     provider: provider_clone,
                     project: None,
                     tokens_in: prompt_tokens as i64,
@@ -139,6 +178,20 @@ pub async fn chat_completions(
             }
             Err(e) => tracing::error!("Failed to record prompt: {}", e),
         }
+
+        // Fire on_response_sent lifecycle hooks
+        for hook in &state_clone.settings.hooks.lifecycle {
+            if hook.event == "on_response_sent" {
+                let payload = crate::hooks::lifecycle::response_sent_payload(
+                    &user_name_clone,
+                    &model_clone,
+                    &canonical_clone,
+                    cost,
+                    latency_ms,
+                );
+                crate::hooks::lifecycle::fire(hook, payload).await;
+            }
+        }
     });
 
     Ok(Json(build_openai_response(request_id, &result)).into_response())
@@ -147,6 +200,7 @@ pub async fn chat_completions(
 struct StreamLogCtx {
     state: AppState,
     user_id: i64,
+    user_name: String,
     model: String,
     canonical_model: String,
     provider: String,
@@ -167,7 +221,9 @@ fn log_streaming_request(
 
     let cost_calc = ctx.state.cost_calc.clone();
     let db = ctx.state.db.clone();
+    let lifecycle_hooks = ctx.state.settings.hooks.lifecycle.clone();
     let user_id = ctx.user_id;
+    let user_name = ctx.user_name;
     let model = ctx.model;
     let canonical_model = ctx.canonical_model;
     let provider = ctx.provider;
@@ -202,12 +258,15 @@ fn log_streaming_request(
                 let canonical_c = canonical_model.clone();
                 let provider_c = provider.clone();
                 let messages_c = messages_json.clone();
+                let user_name_c = user_name.clone();
+                let lifecycle_hooks_c = lifecycle_hooks.clone();
 
                 tokio::spawn(async move {
                     use crate::db::repositories::{
                         costs::CostRepository, prompts::PromptRepository,
                     };
 
+                    let model_c_ref = model_c.clone();
                     let prompt = NewPrompt {
                         user_id,
                         session_id: None,
@@ -229,7 +288,7 @@ fn log_streaming_request(
                             let entry = NewCostLedgerEntry {
                                 user_id,
                                 prompt_id: saved.id,
-                                model: canonical_c,
+                                model: canonical_c.clone(),
                                 provider: provider_c,
                                 project: None,
                                 tokens_in: prompt_tokens as i64,
@@ -241,6 +300,20 @@ fn log_streaming_request(
                             }
                         }
                         Err(e) => tracing::error!("Failed to log streaming prompt: {}", e),
+                    }
+
+                    // Fire on_response_sent lifecycle hooks
+                    for hook in &lifecycle_hooks_c {
+                        if hook.event == "on_response_sent" {
+                            let payload = crate::hooks::lifecycle::response_sent_payload(
+                                &user_name_c,
+                                &model_c_ref,
+                                &canonical_c,
+                                cost,
+                                latency_ms,
+                            );
+                            crate::hooks::lifecycle::fire(hook, payload).await;
+                        }
                     }
                 });
             }

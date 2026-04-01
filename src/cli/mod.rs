@@ -32,6 +32,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::db::migrations::run_migrations(&db.pool).await?;
             let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
 
+            // Sync hook permissions from config into DB
+            crate::hooks::permissions::sync_hook_permissions(&db, &settings.hooks).await?;
+
             // Build app components
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
