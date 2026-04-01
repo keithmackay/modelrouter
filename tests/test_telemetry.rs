@@ -1,5 +1,7 @@
 #![cfg(feature = "otel")]
 
+mod common;
+
 use modelrouter::telemetry::sampler::SmartSampler;
 use opentelemetry::trace::TraceId;
 use opentelemetry_sdk::trace::ShouldSample;
@@ -207,4 +209,121 @@ fn telemetry_init_and_shutdown_does_not_panic() {
     drop(guard);
     // Give background tasks a moment to complete (connection refused is fast)
     rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await });
+}
+
+// ── Span attribute coverage (spec 9.4) ────────────────────────────────
+
+#[tokio::test]
+#[serial_test::serial]
+async fn completions_span_has_required_attributes() {
+    use axum_test::TestServer;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
+    use opentelemetry_sdk::trace::{SimpleSpanProcessor, TracerProvider};
+    use opentelemetry_sdk::Resource;
+    use opentelemetry::KeyValue;
+    use tracing_subscriber::prelude::*;
+    use std::sync::Arc;
+
+    // Set up an in-memory exporter
+    let exporter = InMemorySpanExporter::default();
+    let provider = TracerProvider::builder()
+        .with_resource(Resource::new(vec![
+            KeyValue::new("service.name", "test"),
+        ]))
+        .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    // Build a test tracer subscriber layer
+    let tracer = provider.tracer("test");
+    let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
+    let subscriber = tracing_subscriber::registry()
+        .with(otel_layer);
+    // Install for this test scope
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Build test AppState using the common test helpers
+    let db = common::in_memory_db().await;
+    use modelrouter::{
+        api::{app::{AppState, build_router}, auth::hash_token},
+        db::models::NewUser,
+        providers::registry::ProviderRegistry,
+        router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine},
+    };
+    use modelrouter::db::repositories::users::UserRepository;
+    use std::collections::HashMap;
+
+    let api_key = "test-span-key";
+    let hash = hash_token(api_key);
+    db.create(NewUser {
+        name: "span-test-user".to_string(),
+        api_key_hash: hash,
+        group_name: None,
+    }).await.unwrap();
+
+    let mut mock_providers = HashMap::new();
+    mock_providers.insert("mock".to_string(), modelrouter::config::schema::ProviderConfig {
+        api_key: "mock".to_string(),
+        api_base: Some("http://mock".to_string()),
+        timeout_secs: 10,
+    });
+    let settings = Arc::new(modelrouter::config::schema::Settings {
+        routing: modelrouter::config::schema::RoutingConfig {
+            default_provider: "mock".to_string(),
+            ..Default::default()
+        },
+        providers: mock_providers,
+        ..Default::default()
+    });
+
+    let db: Arc<dyn modelrouter::api::app::DatabaseProvider> = Arc::new(db);
+
+    // Use MockAdapter via registry — new_with_mock takes a single mock adapter arg
+    let registry = Arc::new(ProviderRegistry::new_with_mock(
+        common::MockAdapter { response: "hello".to_string() },
+    ));
+
+    let state = AppState {
+        settings: settings.clone(),
+        db: db.clone(),
+        pool: None,
+        router: Arc::new(RequestRouter::new(settings.clone())),
+        cost_calc: Arc::new(CostCalculator::new()),
+        provider_registry: registry,
+        policy: Arc::new(PolicyEngine::new(db.clone())),
+    };
+
+    let server = TestServer::new(build_router(state)).unwrap();
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {api_key}").parse().unwrap(),
+        )
+        .json(&serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    // Give the span time to be processed
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = provider.force_flush();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let completions_span = spans.iter().find(|s| s.name == "chat_completions");
+    assert!(completions_span.is_some(), "chat_completions span not found. Spans: {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>());
+
+    let span = completions_span.unwrap();
+    let attr_keys: Vec<&str> = span.attributes.iter()
+        .map(|kv| kv.key.as_str())
+        .collect();
+
+    assert!(attr_keys.contains(&"model"), "missing 'model' attribute");
+    assert!(attr_keys.contains(&"provider"), "missing 'provider' attribute");
+    assert!(attr_keys.contains(&"cost.usd"), "missing 'cost.usd' attribute");
+    assert!(attr_keys.contains(&"tokens.prompt"), "missing 'tokens.prompt' attribute");
 }
