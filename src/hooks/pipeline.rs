@@ -30,6 +30,9 @@ async fn run_pipeline_hooks(
         let duration_ms = start.elapsed().as_millis() as i64;
         let success = result.is_ok();
 
+        #[cfg(feature = "otel")]
+        crate::telemetry::metrics::record_hook_duration(&hook.name, "pipeline", duration_ms as f64);
+
         // Record metrics (fire-and-forget)
         let db_clone = db.clone();
         let hook_name = hook.name.clone();
@@ -64,11 +67,19 @@ async fn run_pipeline_hooks(
     Ok(payload)
 }
 
+#[tracing::instrument(skip_all, fields(
+    hook.name = %hook.name,
+    hook.type = "pipeline",
+    hook.success = tracing::field::Empty,
+    hook.duration_ms = tracing::field::Empty,
+))]
 async fn run_single_pipeline_hook(
     hook: &PipelineHookConfig,
     db: &Arc<dyn DatabaseProvider>,
     payload: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
+    let hook_start = std::time::Instant::now();
+
     let required_cap = match hook.event.as_str() {
         "pre_request" => "mutate_request",
         "post_response" => "mutate_response",
@@ -89,6 +100,10 @@ async fn run_single_pipeline_hook(
     if !can_run {
         // Hook claims a capability it doesn't have permission for — skip entirely
         tracing::debug!(hook = %hook.name, "pipeline hook skipped: missing DB permission for '{}'", required_cap);
+        let duration_ms = hook_start.elapsed().as_millis() as i64;
+        let span = tracing::Span::current();
+        span.record("hook.duration_ms", duration_ms);
+        span.record("hook.success", true);
         return Ok(payload);
     }
 
@@ -98,9 +113,10 @@ async fn run_single_pipeline_hook(
     )
     .await;
 
+    let duration_ms = hook_start.elapsed().as_millis() as i64;
     let can_mutate = claims_capability; // can only mutate if it both claimed AND has permission (already checked above)
 
-    match result {
+    let outcome = match result {
         Ok(Ok(output)) => {
             if can_mutate {
                 match serde_json::from_str::<serde_json::Value>(&output) {
@@ -141,7 +157,14 @@ async fn run_single_pipeline_hook(
                 Err(anyhow::anyhow!("pipeline hook '{}' timed out", hook.name))
             }
         }
-    }
+    };
+
+    let success = outcome.is_ok();
+    let span = tracing::Span::current();
+    span.record("hook.duration_ms", duration_ms);
+    span.record("hook.success", success);
+
+    outcome
 }
 
 async fn run_subprocess_bidirectional(
