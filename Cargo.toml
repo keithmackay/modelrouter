@@ -65,3 +65,4 @@ tracing-opentelemetry          = { version = "0.28", optional = true }
 axum-test = "14"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing", "experimental_metrics_periodic_reader_no_runtime"] }

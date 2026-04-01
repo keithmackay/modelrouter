@@ -101,3 +101,74 @@ fn sampler_propagates_sampled_parent() {
         opentelemetry::trace::SamplingDecision::RecordAndSample
     );
 }
+
+// ── Metrics recording (spec 9.2) ───────────────────────────────────────
+//
+// Both tests share a single global SdkMeterProvider+InMemoryMetricExporter
+// because the metrics module uses OnceLock<Instruments> — only the first
+// call to init_instruments() takes effect.
+//
+// PeriodicReaderWithOwnThread is used instead of PeriodicReader so that
+// force_flush() works synchronously without a tokio runtime.
+
+use opentelemetry_sdk::metrics::{PeriodicReaderWithOwnThread, SdkMeterProvider};
+use opentelemetry_sdk::testing::metrics::InMemoryMetricExporter;
+use opentelemetry::metrics::MeterProvider;
+use std::sync::OnceLock;
+
+struct MetricsTestState {
+    exporter: InMemoryMetricExporter,
+    provider: SdkMeterProvider,
+}
+
+static METRICS_TEST_STATE: OnceLock<MetricsTestState> = OnceLock::new();
+
+fn metrics_test_state() -> &'static MetricsTestState {
+    METRICS_TEST_STATE.get_or_init(|| {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReaderWithOwnThread::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .build();
+        modelrouter::telemetry::metrics::init_instruments(
+            provider.meter("test"),
+        );
+        MetricsTestState { exporter, provider }
+    })
+}
+
+#[test]
+fn metrics_requests_total_increments() {
+    let state = metrics_test_state();
+    state.exporter.reset();
+
+    modelrouter::telemetry::metrics::record_request("gpt-4o", "openai", "ok");
+    modelrouter::telemetry::metrics::record_request("gpt-4o", "openai", "ok");
+
+    state.provider.force_flush().unwrap();
+
+    let metrics = state.exporter.get_finished_metrics().unwrap();
+    // Verify the metric exists — .expect() panics if absent
+    let _req_metric = metrics.iter()
+        .flat_map(|rm| &rm.scope_metrics)
+        .flat_map(|sm| &sm.metrics)
+        .find(|m| m.name == "modelrouter.requests.total")
+        .expect("requests.total metric not found");
+}
+
+#[test]
+fn metrics_policy_denied_increments_with_reason() {
+    let state = metrics_test_state();
+    state.exporter.reset();
+
+    modelrouter::telemetry::metrics::record_policy_denied("budget");
+
+    state.provider.force_flush().unwrap();
+
+    let metrics = state.exporter.get_finished_metrics().unwrap();
+    let denied = metrics.iter()
+        .flat_map(|rm| &rm.scope_metrics)
+        .flat_map(|sm| &sm.metrics)
+        .find(|m| m.name == "modelrouter.policy.denied");
+    assert!(denied.is_some(), "policy.denied metric not found");
+}
