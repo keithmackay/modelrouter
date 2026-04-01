@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Users — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Users</h1>
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Group</th>
+            <th>Status</th>
+            <th>Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody id="users-tbody">
+        {% for user in users %}
+        <tr id="user-row-{{ user.id }}">
+            <td>{{ user.id }}</td>
+            <td>{{ user.name }}</td>
+            <td>{{ user.group_name | default("—") }}</td>
+            <td>
+                {% if user.enabled %}
+                <span class="tag tag-enabled">Enabled</span>
+                {% else %}
+                <span class="tag tag-disabled">Disabled</span>
+                {% endif %}
+            </td>
+            <td>{{ user.created_at }}</td>
+            <td>
+                {% if user.enabled %}
+                <button class="btn btn-danger" hx-post="/admin/users/{{ user.id }}/disable" hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML">Disable</button>
+                {% else %}
+                <button class="btn btn-success" hx-post="/admin/users/{{ user.id }}/enable" hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML">Enable</button>
+                {% endif %}
+                <button class="btn btn-secondary" hx-post="/admin/users/{{ user.id }}/rotate-key" hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML">Rotate Key</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Admin Accounts — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Admin Accounts</h1>
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th>Last Login</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for admin in admins %}
+        <tr id="admin-row-{{ admin.id }}">
+            <td>{{ admin.id }}</td>
+            <td>{{ admin.name }}</td>
+            <td><span class="tag {% if admin.role == 'superadmin' %}tag-enabled{% else %}tag-disabled{% endif %}">{{ admin.role }}</span></td>
+            <td>
+                {% if admin.enabled %}
+                <span class="tag tag-enabled">Enabled</span>
+                {% else %}
+                <span class="tag tag-disabled">Disabled</span>
+                {% endif %}
+            </td>
+            <td>{{ admin.last_login_at | default("Never") }}</td>
+            <td>
+                {% if admin.id != current_admin_id %}
+                <button class="btn btn-danger" hx-post="/admin/admins/{{ admin.id }}/delete" hx-target="#admin-row-{{ admin.id }}" hx-swap="outerHTML" hx-confirm="Delete admin {{ admin.name }}?">Delete</button>
+                {% else %}
+                <span style="color:#999; font-size:0.85rem;">(you)</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2 style="margin-top: 2rem; margin-bottom: 1rem; font-size: 1.1rem;">Create New Admin</h2>
+<form hx-post="/admin/admins" hx-target="#admins-form-result" hx-swap="innerHTML" style="display:flex; gap:1rem; flex-wrap:wrap; align-items:flex-end;">
+    <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Username</label>
+        <input type="text" name="name" required style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+    </div>
+    <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Password</label>
+        <input type="password" name="password" required style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+    </div>
+    <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Role</label>
+        <select name="role" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="viewer">Viewer</option>
+            <option value="superadmin">Superadmin</option>
+        </select>
+    </div>
+    <button type="submit" class="btn btn-primary">Create Admin</button>
+</form>
+<div id="admins-form-result" style="margin-top: 1rem;"></div>
+{% endblock %}

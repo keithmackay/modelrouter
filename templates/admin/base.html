@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}modelrouter Admin{% endblock %}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; }
+        nav { background: #1a1a2e; color: #fff; padding: 0.75rem 1.5rem; display: flex; align-items: center; gap: 1.5rem; }
+        nav a { color: #ccc; text-decoration: none; font-size: 0.9rem; }
+        nav a:hover, nav a.active { color: #fff; }
+        nav .brand { font-weight: bold; color: #fff; font-size: 1rem; margin-right: 1rem; }
+        .container { max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; }
+        h1 { margin-bottom: 1.5rem; font-size: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f0f0f0; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; }
+        tr:last-child td { border-bottom: none; }
+        .btn { display: inline-block; padding: 0.4rem 0.9rem; border-radius: 4px; font-size: 0.85rem; cursor: pointer; border: none; text-decoration: none; }
+        .btn-primary { background: #1a1a2e; color: #fff; }
+        .btn-danger { background: #c0392b; color: #fff; }
+        .btn-success { background: #27ae60; color: #fff; }
+        .btn-secondary { background: #7f8c8d; color: #fff; }
+        .alert { padding: 0.75rem 1rem; border-radius: 4px; margin-bottom: 1rem; }
+        .alert-warning { background: #fff3cd; border: 1px solid #ffc107; color: #856404; }
+        .alert-danger { background: #f8d7da; border: 1px solid #dc3545; color: #842029; }
+        .stat-card { background: #fff; border-radius: 6px; padding: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+        .stat-label { font-size: 0.8rem; text-transform: uppercase; color: #777; }
+        .stat-value { font-size: 1.8rem; font-weight: bold; margin-top: 0.25rem; }
+        form { display: inline; }
+        .tag { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.75rem; }
+        .tag-enabled { background: #d4edda; color: #155724; }
+        .tag-disabled { background: #f8d7da; color: #721c24; }
+        .pagination { margin-top: 1rem; display: flex; gap: 0.5rem; }
+        .pagination a { padding: 0.4rem 0.75rem; background: #fff; border: 1px solid #ddd; border-radius: 4px; text-decoration: none; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+<nav>
+    <span class="brand">modelrouter</span>
+    <a href="/admin">Overview</a>
+    <a href="/admin/users">Users</a>
+    <a href="/admin/prompts">Prompts</a>
+    <a href="/admin/cost">Cost</a>
+    <a href="/admin/hooks">Hooks</a>
+    <a href="/admin/audit">Audit Log</a>
+    <a href="/admin/admins">Admins</a>
+    <span style="flex:1"></span>
+    <form action="/admin/logout" method="POST">
+        <button class="btn btn-secondary" type="submit">Logout</button>
+    </form>
+</nav>
+<div class="container">
+    {% block content %}{% endblock %}
+</div>
+</body>
+</html>

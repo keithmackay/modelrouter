@@ -35,6 +35,7 @@ async fn test_app() -> TestServer {
     let state = AppState {
         settings,
         db,
+        pool: None,
         router,
         cost_calc,
         provider_registry,

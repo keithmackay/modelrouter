@@ -46,10 +46,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             let settings = Arc::new(settings);
 
             // Init DB
-            let db =
+            let sqlite_db =
                 crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
-            let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+            crate::db::migrations::run_migrations(&sqlite_db.pool).await?;
+            let pool = sqlite_db.pool.clone();
+            let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(sqlite_db);
 
             // Sync hook permissions from config into DB
             crate::hooks::permissions::sync_hook_permissions(&db, &settings.hooks).await?;
@@ -68,6 +69,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
                 db,
+                pool: Some(pool),
                 router,
                 cost_calc,
                 provider_registry,

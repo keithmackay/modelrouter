@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Audit Log — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Audit Log</h1>
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Actor</th>
+            <th>Action</th>
+            <th>Target</th>
+            <th>Created</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for entry in entries %}
+        <tr>
+            <td>{{ entry.id }}</td>
+            <td>{{ entry.actor_name }}</td>
+            <td><code>{{ entry.action }}</code></td>
+            <td>{{ entry.target | default("—") }}</td>
+            <td>{{ entry.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" style="text-align:center; color:#777; padding: 2rem;">No audit entries.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="/admin/audit?page={{ page - 1 }}">&laquo; Prev</a>
+    {% endif %}
+    <span style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">Page {{ page }}</span>
+    {% if has_next %}
+    <a href="/admin/audit?page={{ page + 1 }}">Next &raquo;</a>
+    {% endif %}
+</div>
+{% endblock %}

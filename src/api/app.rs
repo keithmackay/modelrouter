@@ -47,6 +47,7 @@ impl<T> DatabaseProvider for T where
 pub struct AppState {
     pub settings: Arc<Settings>,
     pub db: Arc<dyn DatabaseProvider>,
+    pub pool: Option<sqlx::SqlitePool>,
     pub router: Arc<RequestRouter>,
     pub cost_calc: Arc<CostCalculator>,
     pub provider_registry: Arc<ProviderRegistry>,
@@ -64,11 +65,21 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_stats, get_audit, get_prompts,
         list_admins, create_admin,
     };
+    use crate::api::admin::dashboard::{
+        get_login, post_login, post_logout,
+        get_overview, get_users, post_disable_user, post_enable_user, post_rotate_user_key,
+        get_prompts as dash_get_prompts, get_prompt_detail,
+        get_cost, get_hooks,
+        get_audit as dash_get_audit,
+        get_admins, post_create_admin, post_delete_admin,
+    };
 
     axum::Router::new()
+        // Health + API routes
         .route("/health", get(health_check))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))
         .route("/admin/api/users/:id", patch(update_user))
@@ -79,5 +90,21 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/audit", get(get_audit))
         .route("/admin/api/prompts", get(get_prompts))
         .route("/admin/api/admins", get(list_admins).post(create_admin))
+        // Admin Dashboard (public)
+        .route("/admin/login", get(get_login).post(post_login))
+        .route("/admin/logout", post(post_logout))
+        // Admin Dashboard (requires DashboardSession cookie)
+        .route("/admin", get(get_overview))
+        .route("/admin/users", get(get_users))
+        .route("/admin/users/:id/disable", post(post_disable_user))
+        .route("/admin/users/:id/enable", post(post_enable_user))
+        .route("/admin/users/:id/rotate-key", post(post_rotate_user_key))
+        .route("/admin/prompts", get(dash_get_prompts))
+        .route("/admin/prompts/:id", get(get_prompt_detail))
+        .route("/admin/cost", get(get_cost))
+        .route("/admin/hooks", get(get_hooks))
+        .route("/admin/audit", get(dash_get_audit))
+        .route("/admin/admins", get(get_admins).post(post_create_admin))
+        .route("/admin/admins/:id/delete", post(post_delete_admin))
         .with_state(state)
 }

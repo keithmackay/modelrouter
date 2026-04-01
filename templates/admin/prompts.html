@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Prompts — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Prompt Log</h1>
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>User</th>
+            <th>Model</th>
+            <th>Routed Model</th>
+            <th>Cost (USD)</th>
+            <th>Tokens In/Out</th>
+            <th>Created</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for p in prompts %}
+        <tr>
+            <td>{{ p.id }}</td>
+            <td>{{ p.user_name }}</td>
+            <td>{{ p.request_model }}</td>
+            <td>{{ p.routed_model }}</td>
+            <td>${{ p.cost_usd | round(precision=6) }}</td>
+            <td>{{ p.prompt_tokens }} / {{ p.completion_tokens }}</td>
+            <td>{{ p.created_at }}</td>
+            <td>
+                <button class="btn btn-secondary" hx-get="/admin/prompts/{{ p.id }}" hx-target="#prompt-detail-{{ p.id }}" hx-swap="innerHTML">Expand</button>
+                <div id="prompt-detail-{{ p.id }}"></div>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="/admin/prompts?page={{ page - 1 }}">&laquo; Prev</a>
+    {% endif %}
+    <span style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">Page {{ page }}</span>
+    {% if has_next %}
+    <a href="/admin/prompts?page={{ page + 1 }}">Next &raquo;</a>
+    {% endif %}
+</div>
+{% endblock %}
