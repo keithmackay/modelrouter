@@ -177,11 +177,136 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::Report(_) => {
-            println!("report — not yet implemented");
+        Commands::Report(report_args) => {
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            use crate::cli::commands::ReportCommands;
+            use crate::report::formatter::{print_rows, OutputFormat};
+
+            match report_args.command {
+                ReportCommands::Cost { user, window, format } => {
+                    let fmt = OutputFormat::parse(&format);
+                    let rows =
+                        crate::report::cost_by_user_window(&db.pool, &window, user.as_deref())
+                            .await?;
+                    print_rows(
+                        &rows,
+                        &["User", "Model", "Cost (USD)", "Tokens In", "Tokens Out", "Requests"],
+                        |r| {
+                            vec![
+                                r.user_name.clone(),
+                                r.model.clone(),
+                                format!("{:.6}", r.total_cost_usd),
+                                r.total_tokens_in.to_string(),
+                                r.total_tokens_out.to_string(),
+                                r.request_count.to_string(),
+                            ]
+                        },
+                        fmt,
+                    );
+                }
+                ReportCommands::Usage { model: _, since } => {
+                    let rows =
+                        crate::report::usage_by_model(&db.pool, since.as_deref()).await?;
+                    print_rows(
+                        &rows,
+                        &["Model", "Provider", "Requests", "Tokens In", "Tokens Out", "Cost (USD)"],
+                        |r| {
+                            vec![
+                                r.model.clone(),
+                                r.provider.clone(),
+                                r.request_count.to_string(),
+                                r.total_tokens_in.to_string(),
+                                r.total_tokens_out.to_string(),
+                                format!("{:.6}", r.total_cost_usd),
+                            ]
+                        },
+                        OutputFormat::Table,
+                    );
+                }
+                ReportCommands::Prompts { user, limit, since } => {
+                    let rows = crate::report::recent_prompts(
+                        &db.pool,
+                        user.as_deref(),
+                        limit,
+                        since.as_deref(),
+                    )
+                    .await?;
+                    print_rows(
+                        &rows,
+                        &["ID", "User", "Request Model", "Routed Model", "Cost", "Created At"],
+                        |r| {
+                            vec![
+                                r.id.to_string(),
+                                r.user_name.clone(),
+                                r.request_model.clone(),
+                                r.routed_model.clone(),
+                                format!("{:.6}", r.cost_usd),
+                                r.created_at.clone(),
+                            ]
+                        },
+                        OutputFormat::Table,
+                    );
+                }
+                ReportCommands::Audit { actor, tail } => {
+                    let rows =
+                        crate::report::recent_audit(&db.pool, actor.as_deref(), tail).await?;
+                    print_rows(
+                        &rows,
+                        &["ID", "Actor", "Action", "Target", "Created At"],
+                        |r| {
+                            vec![
+                                r.id.to_string(),
+                                r.actor_name.clone(),
+                                r.action.clone(),
+                                r.target.clone().unwrap_or_default(),
+                                r.created_at.clone(),
+                            ]
+                        },
+                        OutputFormat::Table,
+                    );
+                }
+                ReportCommands::Hooks => {
+                    let rows = crate::report::hook_latency_stats(&db.pool).await?;
+                    print_rows(
+                        &rows,
+                        &["Hook", "Invocations", "Success %", "Avg ms", "p50 ms", "p95 ms"],
+                        |r| {
+                            vec![
+                                r.hook_name.clone(),
+                                r.invocation_count.to_string(),
+                                format!("{:.1}%", r.success_rate * 100.0),
+                                format!("{:.1}", r.avg_duration_ms),
+                                r.p50_duration_ms.to_string(),
+                                r.p95_duration_ms.to_string(),
+                            ]
+                        },
+                        OutputFormat::Table,
+                    );
+                }
+            }
         }
-        Commands::Audit { .. } => {
-            println!("audit — not yet implemented");
+        Commands::Audit { tail } => {
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+            let rows = crate::report::recent_audit(&db.pool, None, tail).await?;
+            crate::report::formatter::print_rows(
+                &rows,
+                &["ID", "Actor", "Action", "Target", "Created At"],
+                |r| {
+                    vec![
+                        r.id.to_string(),
+                        r.actor_name.clone(),
+                        r.action.clone(),
+                        r.target.clone().unwrap_or_default(),
+                        r.created_at.clone(),
+                    ]
+                },
+                crate::report::formatter::OutputFormat::Table,
+            );
         }
         Commands::InstallService => {
             println!("install-service — not yet implemented");

@@ -4,4 +4,5 @@ pub mod config;
 pub mod db;
 pub mod hooks;
 pub mod providers;
+pub mod report;
 pub mod router;

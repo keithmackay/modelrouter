@@ -119,6 +119,8 @@ pub enum ReportCommands {
         user: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Audit log report
     Audit {
