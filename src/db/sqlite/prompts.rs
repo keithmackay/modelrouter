@@ -46,6 +46,19 @@ impl PromptRepository for SqliteDb {
         Ok(row)
     }
 
+    async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<Prompt>> {
+        let row = sqlx::query_as::<_, Prompt>(
+            r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
+                      messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cost_usd, latency_ms, tags, project, created_at
+               FROM prompts WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn list_by_user(&self, user_id: i64, limit: i64) -> anyhow::Result<Vec<Prompt>> {
         let rows = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,

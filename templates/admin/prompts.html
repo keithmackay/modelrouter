@@ -6,7 +6,7 @@
     <thead>
         <tr>
             <th>ID</th>
-            <th>User</th>
+            <th>User ID</th>
             <th>Model</th>
             <th>Routed Model</th>
             <th>Cost (USD)</th>
@@ -19,7 +19,7 @@
         {% for p in prompts %}
         <tr>
             <td>{{ p.id }}</td>
-            <td>{{ p.user_name }}</td>
+            <td>{{ p.user_id }}</td>
             <td>{{ p.request_model }}</td>
             <td>{{ p.routed_model }}</td>
             <td>${{ p.cost_usd | round(precision=6) }}</td>

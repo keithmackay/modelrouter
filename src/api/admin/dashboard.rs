@@ -5,23 +5,15 @@ use axum::{
     Form,
 };
 use serde::Deserialize;
-use std::sync::OnceLock;
 
 use super::auth::{issue_jwt, verify_jwt, AdminClaims};
 use super::audit::audit;
-use super::templates::build_env;
 use crate::api::app::AppState;
 
 // ── Template environment ──────────────────────────────────────────────────────
 
-static ENV: OnceLock<minijinja::Environment<'static>> = OnceLock::new();
-
-fn env() -> &'static minijinja::Environment<'static> {
-    ENV.get_or_init(build_env)
-}
-
 fn render(template: &str, ctx: minijinja::Value) -> Result<Html<String>, DashboardError> {
-    let tmpl = env()
+    let tmpl = super::templates::env()
         .get_template(template)
         .map_err(|e| DashboardError::Template(e.to_string()))?;
     let rendered = tmpl
@@ -283,12 +275,9 @@ pub async fn get_overview(
 
     // Total request count from prompts (using PromptRepository)
     use crate::db::repositories::prompts::PromptRepository;
-    for user in &users {
-        let prompts = PromptRepository::list_by_user(&*state.db, user.id, 10000i64)
-            .await
-            .unwrap_or_default();
-        request_count += prompts.len() as i64;
-    }
+    request_count = PromptRepository::count(&*state.db)
+        .await
+        .unwrap_or(0);
 
     // Budget warnings: users > 80% of monthly limit
     let mut budget_warnings: Vec<minijinja::Value> = Vec::new();
@@ -557,18 +546,12 @@ pub async fn get_prompt_detail(
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::prompts::PromptRepository;
-    use crate::db::repositories::users::UserRepository;
 
-    let users = UserRepository::list(&*state.db)
+    match PromptRepository::find_by_id(&*state.db, id)
         .await
-        .map_err(|_| DashboardError::Internal)?;
-
-    // Find the prompt across all users
-    for user in &users {
-        let prompts = PromptRepository::list_by_user(&*state.db, user.id, 10000i64)
-            .await
-            .unwrap_or_default();
-        if let Some(p) = prompts.into_iter().find(|p| p.id == id) {
+        .map_err(|_| DashboardError::Internal)?
+    {
+        Some(p) => {
             let html = format!(
                 r#"<div style="padding:0.75rem; background:#f9f9f9; border:1px solid #eee; border-radius:4px; margin-top:0.5rem;">
                     <strong>Messages:</strong><pre style="white-space:pre-wrap; font-size:0.8rem;">{}</pre>
@@ -580,11 +563,10 @@ pub async fn get_prompt_detail(
                 html_escape(p.finish_reason.as_deref().unwrap_or("—")),
                 p.latency_ms.unwrap_or(0),
             );
-            return Ok(Html(html));
+            Ok(Html(html))
         }
+        None => Ok(Html(format!("<div>Prompt {} not found.</div>", id))),
     }
-
-    Ok(Html(format!("<div>Prompt {} not found.</div>", id)))
 }
 
 fn html_escape(s: &str) -> String {

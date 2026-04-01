@@ -1,4 +1,11 @@
 use minijinja::Environment;
+use std::sync::OnceLock;
+
+static ENV: OnceLock<Environment<'static>> = OnceLock::new();
+
+pub fn env() -> &'static Environment<'static> {
+    ENV.get_or_init(build_env)
+}
 
 pub fn build_env() -> Environment<'static> {
     let mut env = Environment::new();
