@@ -1,0 +1,27 @@
+# docker-compose.yml — modelrouter example deployment
+#
+# Usage:
+#   1. Copy config.example.toml to ./config/config.toml and add your provider API keys
+#   2. Run: docker-compose up -d
+#   3. The proxy will be available at http://localhost:8080
+#
+# The ./config directory is mounted read-only at /config inside the container.
+# The ./data directory is mounted at /data and holds the SQLite database file.
+# On first run, modelrouter will create router.db automatically in /data.
+
+services:
+  modelrouter:
+    image: modelrouter:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    environment:
+      MODELROUTER_CONFIG: /config/config.toml
+      MODELROUTER_DATABASE__PATH: /data/router.db
+    restart: unless-stopped
+    command: ["serve", "--host", "0.0.0.0"]

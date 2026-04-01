@@ -7,6 +7,98 @@ use commands::{Cli, Commands, UserCommands, BudgetCommands};
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
+// ── Service install/uninstall ─────────────────────────────────────────────────
+
+#[allow(dead_code)]
+const PLIST_CONTENT: &str = include_str!("../../contrib/dev.modelrouter.plist");
+#[allow(dead_code)]
+const SYSTEMD_CONTENT: &str = include_str!("../../contrib/modelrouter.service");
+
+#[cfg(target_os = "macos")]
+fn install_service() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let agents_dir = home.join("Library").join("LaunchAgents");
+    std::fs::create_dir_all(&agents_dir)?;
+    let plist_path = agents_dir.join("dev.modelrouter.plist");
+    std::fs::write(&plist_path, PLIST_CONTENT)?;
+    println!("Installed plist to {}", plist_path.display());
+    let status = std::process::Command::new("launchctl")
+        .args(["load", plist_path.to_str().unwrap_or_default()])
+        .status()?;
+    if status.success() {
+        println!("Service loaded via launchctl.");
+    } else {
+        anyhow::bail!("launchctl load failed (exit code: {})", status);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_service() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let plist_path = home.join("Library").join("LaunchAgents").join("dev.modelrouter.plist");
+    if plist_path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", plist_path.to_str().unwrap_or_default()])
+            .status();
+        std::fs::remove_file(&plist_path)?;
+        println!("Service unloaded and plist removed.");
+    } else {
+        println!("No plist found at {}; nothing to do.", plist_path.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_service() -> Result<()> {
+    let service_path = std::path::Path::new("/etc/systemd/system/modelrouter.service");
+    std::fs::write(service_path, SYSTEMD_CONTENT)?;
+    println!("Installed unit file to {}", service_path.display());
+    let reload = std::process::Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()?;
+    if !reload.success() {
+        anyhow::bail!("systemctl daemon-reload failed");
+    }
+    let enable = std::process::Command::new("systemctl")
+        .args(["enable", "modelrouter"])
+        .status()?;
+    if enable.success() {
+        println!("Service enabled. Run 'systemctl start modelrouter' to start it.");
+    } else {
+        anyhow::bail!("systemctl enable modelrouter failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_service() -> Result<()> {
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "--now", "modelrouter"])
+        .status();
+    let service_path = std::path::Path::new("/etc/systemd/system/modelrouter.service");
+    if service_path.exists() {
+        std::fs::remove_file(service_path)?;
+        let _ = std::process::Command::new("systemctl")
+            .arg("daemon-reload")
+            .status();
+        println!("Service disabled and unit file removed.");
+    } else {
+        println!("No unit file found; nothing to do.");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn install_service() -> Result<()> {
+    anyhow::bail!("install-service is only supported on macOS and Linux");
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn uninstall_service() -> Result<()> {
+    anyhow::bail!("uninstall-service is only supported on macOS and Linux");
+}
+
 fn print_audit_rows(rows: Vec<AuditRow>, fmt: OutputFormat) {
     print_rows(
         &rows,
@@ -29,17 +121,39 @@ const CONFIG_TEMPLATE: &str = include_str!("../../config.example.toml");
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => {
+            println!("modelrouter v{}", env!("CARGO_PKG_VERSION"));
+            println!();
             let config_dir = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".modelrouter");
             tokio::fs::create_dir_all(&config_dir).await?;
             let config_path = config_dir.join("config.toml");
             if config_path.exists() {
-                println!("Config already exists at {}", config_path.display());
+                print!(
+                    "Config already exists at {}. Overwrite? [y/N] ",
+                    config_path.display()
+                );
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if input.trim().eq_ignore_ascii_case("y") {
+                    tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;
+                    println!("Overwrote config at {}", config_path.display());
+                } else {
+                    println!("Aborted.");
+                    return Ok(());
+                }
             } else {
                 tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;
                 println!("Created config at {}", config_path.display());
             }
+            println!();
+            println!("Next steps:");
+            println!("  1. Edit {} to add your provider API keys", config_path.display());
+            println!("  2. Run: modelrouter migrate");
+            println!("  3. Run: modelrouter serve");
+            println!("  4. Test: curl http://localhost:8080/health");
         }
         Commands::Serve { host, port } => {
             let settings = crate::config::load(cli.config)?;
@@ -303,10 +417,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_audit_rows(rows, format);
         }
         Commands::InstallService => {
-            println!("install-service — not yet implemented");
+            install_service()?;
         }
         Commands::UninstallService => {
-            println!("uninstall-service — not yet implemented");
+            uninstall_service()?;
         }
     }
     Ok(())
