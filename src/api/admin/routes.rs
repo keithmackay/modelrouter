@@ -218,25 +218,10 @@ pub async fn list_budgets(
     _session: AdminSession,
 ) -> Result<impl IntoResponse, ApiError> {
     use crate::db::repositories::budgets::BudgetRepository;
-    // List all budgets — we'll query for user_id = None (group-wide) and by user
-    // For a simple list endpoint, we fetch all rules
-    let db = &*state.db;
-    // Get all rules by passing a sentinel — but BudgetRepository doesn't have list_all.
-    // We use a direct pool query via the sqlite layer.
-    // As a pragmatic approach: list budgets for all users by fetching user list first.
-    let users = crate::db::repositories::users::UserRepository::list(db)
+    let budgets = BudgetRepository::list_all(&*state.db)
         .await
         .map_err(|_| ApiError::Internal)?;
-
-    let mut all_rules = Vec::new();
-    for user in &users {
-        let rules = BudgetRepository::list_for_user(db, user.id)
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        all_rules.extend(rules);
-    }
-
-    Ok(Json(all_rules))
+    Ok(Json(budgets))
 }
 
 #[derive(Deserialize)]

@@ -83,9 +83,9 @@ async fn hook_metrics_recorded_after_execution() {
     // The test mainly validates that the code path doesn't panic
 }
 
-// Test 4: sync_hook_permissions creates DB entries from config
+// Test 4: sync_hook_permissions logs a warning but does NOT auto-grant capabilities
 #[tokio::test]
-async fn sync_hook_permissions_adds_config_capabilities() {
+async fn sync_hook_permissions_does_not_auto_grant_capabilities() {
     use modelrouter::config::schema::{HooksConfig, PipelineHookConfig};
     use modelrouter::db::repositories::hooks::HookRepository;
     use modelrouter::hooks::permissions::sync_hook_permissions;
@@ -106,13 +106,18 @@ async fn sync_hook_permissions_adds_config_capabilities() {
         }],
     };
 
+    // sync_hook_permissions should complete without error
     sync_hook_permissions(&db_arc, &hooks_config).await.unwrap();
 
+    // Capability must NOT be auto-granted — operators must explicitly grant it
     let has_perm = db
         .has_permission("test-injector", "mutate_request")
         .await
         .unwrap();
-    assert!(has_perm, "sync should have created permission entry");
+    assert!(
+        !has_perm,
+        "sync should NOT auto-grant permissions; operators must grant explicitly"
+    );
 }
 
 // Test 5: fail_open=true returns original on hook error

@@ -181,9 +181,52 @@ impl ProviderAdapter for AnthropicAdapter {
         let stream = resp
             .bytes_stream()
             .map_err(|e| anyhow::anyhow!("Stream error: {}", e))
-            .map_ok(Bytes::from);
+            .map_ok(|chunk| {
+                // Translate Anthropic SSE lines to OpenAI-compatible format
+                let text = String::from_utf8_lossy(&chunk);
+                let mut out = String::new();
+                for line in text.lines() {
+                    if let Some(translated) = translate_anthropic_sse(line) {
+                        out.push_str(&String::from_utf8_lossy(&translated));
+                    }
+                }
+                Bytes::from(out)
+            });
 
         Ok(Box::pin(stream))
+    }
+}
+
+fn translate_anthropic_sse(line: &str) -> Option<Bytes> {
+    if !line.starts_with("data: ") {
+        return None;
+    }
+    let json_str = &line["data: ".len()..];
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    match v["type"].as_str()? {
+        "content_block_delta" => {
+            if v["delta"]["type"] == "text_delta" {
+                let text = v["delta"]["text"].as_str()?;
+                let chunk = serde_json::json!({
+                    "id": "chatcmpl-stream",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                });
+                Some(Bytes::from(format!("data: {}\n\n", chunk)))
+            } else {
+                None
+            }
+        }
+        "message_delta" => {
+            let chunk = serde_json::json!({
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            });
+            let done = "data: [DONE]\n\n";
+            Some(Bytes::from(format!("data: {}\n\n{}", chunk, done)))
+        }
+        _ => None,
     }
 }
 

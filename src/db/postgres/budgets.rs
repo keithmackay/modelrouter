@@ -32,6 +32,17 @@ impl BudgetRepository for PostgresDb {
         Ok(rows)
     }
 
+    async fn list_all(&self) -> anyhow::Result<Vec<BudgetRule>> {
+        let rows = sqlx::query_as::<_, BudgetRule>(
+            r#"SELECT id, user_id, group_name, window, limit_usd, limit_tokens,
+                      model_allow, model_deny, rate_rpm, created_at, updated_at
+               FROM budget_rules ORDER BY id"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn create(&self, rule: NewBudgetRule) -> anyhow::Result<BudgetRule> {
         let now = now_utc();
         let model_allow_json = serde_json::to_string(&rule.model_allow).unwrap_or_else(|_| "[]".to_string());

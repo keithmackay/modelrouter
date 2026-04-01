@@ -400,7 +400,7 @@ pub async fn get_users(
 
 pub async fn post_disable_user(
     State(state): State<AppState>,
-    _session: DashboardSession,
+    _session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::users::UserRepository;
@@ -425,7 +425,7 @@ pub async fn post_disable_user(
 
 pub async fn post_enable_user(
     State(state): State<AppState>,
-    _session: DashboardSession,
+    _session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::users::UserRepository;

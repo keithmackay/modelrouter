@@ -7,17 +7,14 @@ pub fn hash_token(token: &str) -> String {
 }
 
 pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
-    // Run migrations SQL directly to avoid compile-time DATABASE_URL requirement
-    sqlx::query(include_str!("../../migrations/001_initial.sql"))
-        .execute(pool)
-        .await?;
+    sqlx::migrate!("./migrations").run(pool).await?;
     warn_if_dev_key_active(pool).await?;
     Ok(())
 }
 
 pub async fn run_dev_seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     if std::env::var("MODELROUTER_DEV_SEED").as_deref() == Ok("true") {
-        sqlx::query(include_str!("../../migrations/dev_seed.sql"))
+        sqlx::query(include_str!("dev_seed.sql"))
             .execute(pool)
             .await?;
     }

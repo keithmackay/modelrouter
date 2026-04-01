@@ -11,8 +11,8 @@ pub async fn check_permission(
 }
 
 /// Sync hook capabilities from config into the DB at startup.
-/// Adds permissions declared in config if they don't already exist.
-/// DOES NOT remove permissions — removal is operator-controlled via API.
+/// Logs a warning for any declared capability that has no operator grant in hook_permissions.
+/// Does NOT auto-insert grants — operators must explicitly add rows with can_run=true.
 pub async fn sync_hook_permissions(
     db: &Arc<dyn DatabaseProvider>,
     hooks: &crate::config::schema::HooksConfig,
@@ -20,7 +20,13 @@ pub async fn sync_hook_permissions(
     for hook in &hooks.pipeline {
         for cap in &hook.capabilities {
             if !db.has_permission(&hook.name, cap).await? {
-                db.grant_permission(&hook.name, cap, None).await?;
+                tracing::warn!(
+                    hook = %hook.name,
+                    capability = %cap,
+                    "Hook declares capability '{}' but no operator grant exists in hook_permissions \
+                     table. Capability is inactive until an operator inserts a row with can_run=true.",
+                    cap
+                );
             }
         }
     }
