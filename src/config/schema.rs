@@ -16,6 +16,9 @@ pub struct Settings {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[cfg(feature = "otel")]
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -150,3 +153,55 @@ impl Default for AuthConfig {
 fn default_jwt_secret() -> String { "change-me-jwt-secret".to_string() }
 fn default_jwt_expiry_mins() -> i64 { 60 }
 fn default_rotation_overlap_mins() -> i64 { 15 }
+
+#[cfg(feature = "otel")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_otel_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    #[serde(default = "default_slow_threshold_ms")]
+    pub slow_threshold_ms: u64,
+    #[serde(default = "default_batch_queue_size")]
+    pub batch_queue_size: usize,
+    #[serde(default = "default_batch_delay_ms")]
+    pub batch_scheduled_delay_ms: u64,
+    #[serde(default = "default_batch_export_size")]
+    pub batch_max_export_size: usize,
+}
+
+#[cfg(feature = "otel")]
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_otel_endpoint(),
+            service_name: default_service_name(),
+            sample_ratio: default_sample_ratio(),
+            slow_threshold_ms: default_slow_threshold_ms(),
+            batch_queue_size: default_batch_queue_size(),
+            batch_scheduled_delay_ms: default_batch_delay_ms(),
+            batch_max_export_size: default_batch_export_size(),
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+fn default_otel_endpoint() -> String { "http://localhost:4317".to_string() }
+#[cfg(feature = "otel")]
+fn default_service_name() -> String { "modelrouter".to_string() }
+#[cfg(feature = "otel")]
+fn default_sample_ratio() -> f64 { 0.1 }
+#[cfg(feature = "otel")]
+fn default_slow_threshold_ms() -> u64 { 2000 }
+#[cfg(feature = "otel")]
+fn default_batch_queue_size() -> usize { 2048 }
+#[cfg(feature = "otel")]
+fn default_batch_delay_ms() -> u64 { 5000 }
+#[cfg(feature = "otel")]
+fn default_batch_export_size() -> usize { 512 }

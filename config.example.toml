@@ -102,3 +102,14 @@ exec         = "/usr/local/bin/log-usage"
 capabilities = []
 timeout_secs = 2
 fail_open    = true
+
+# ── Telemetry (requires --features otel) ──────────────────────────────
+# [telemetry]
+# enabled = false
+# endpoint = "http://localhost:4317"   # OTLP gRPC endpoint (collector)
+# service_name = "modelrouter"
+# sample_ratio = 0.1                   # 0.0–1.0 fraction of normal requests to trace
+# slow_threshold_ms = 2000             # always export spans slower than this
+# batch_queue_size = 2048
+# batch_scheduled_delay_ms = 5000
+# batch_max_export_size = 512
