@@ -5,10 +5,10 @@ use crate::{
     db::repositories::{
         admin_users::AdminUserRepository, audit::AuditRepository, budgets::BudgetRepository,
         costs::CostRepository, hooks::HookRepository, prompts::PromptRepository,
-        sessions::SessionRepository, users::UserRepository,
+        rate_limits::RateLimitRepository, sessions::SessionRepository, users::UserRepository,
     },
     providers::registry::ProviderRegistry,
-    router::{cost::CostCalculator, engine::RequestRouter},
+    router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine},
 };
 
 /// Aggregated DB trait — SqliteDb implements this via blanket impl
@@ -21,6 +21,7 @@ pub trait DatabaseProvider:
     + BudgetRepository
     + AuditRepository
     + HookRepository
+    + RateLimitRepository
     + Send
     + Sync
 {
@@ -36,6 +37,7 @@ impl<T> DatabaseProvider for T where
         + BudgetRepository
         + AuditRepository
         + HookRepository
+        + RateLimitRepository
         + Send
         + Sync
 {
@@ -48,17 +50,34 @@ pub struct AppState {
     pub router: Arc<RequestRouter>,
     pub cost_calc: Arc<CostCalculator>,
     pub provider_registry: Arc<ProviderRegistry>,
+    pub policy: Arc<PolicyEngine>,
 }
 
 pub fn build_router(state: AppState) -> axum::Router {
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         completions::chat_completions, health::health_check, models::list_models,
+    };
+    use crate::api::admin::routes::{
+        admin_login, list_users, create_user, update_user, rotate_user_key,
+        list_budgets, create_budget, delete_budget,
+        get_stats, get_audit, get_prompts,
+        list_admins, create_admin,
     };
 
     axum::Router::new()
         .route("/health", get(health_check))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/admin/api/login", post(admin_login))
+        .route("/admin/api/users", get(list_users).post(create_user))
+        .route("/admin/api/users/:id", patch(update_user))
+        .route("/admin/api/users/:id/rotate-key", post(rotate_user_key))
+        .route("/admin/api/budgets", get(list_budgets).post(create_budget))
+        .route("/admin/api/budgets/:id", delete(delete_budget))
+        .route("/admin/api/stats", get(get_stats))
+        .route("/admin/api/audit", get(get_audit))
+        .route("/admin/api/prompts", get(get_prompts))
+        .route("/admin/api/admins", get(list_admins).post(create_admin))
         .with_state(state)
 }

@@ -1,0 +1,436 @@
+use axum::{
+    extract::{Path, State},
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+
+use crate::api::{app::AppState, error::ApiError};
+use super::auth::{AdminSession, AdminClaims, SuperAdminSession, issue_jwt};
+use super::audit::audit;
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub name: String,
+    pub password: String,
+}
+
+pub async fn admin_login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::admin_users::AdminUserRepository;
+
+    let admin = AdminUserRepository::find_by_name(&*state.db, &body.name)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+
+    if !admin.enabled {
+        return Err(ApiError::Unauthorized);
+    }
+
+    let valid = bcrypt::verify(&body.password, &admin.password_hash)
+        .map_err(|_| ApiError::Internal)?;
+    if !valid {
+        return Err(ApiError::Unauthorized);
+    }
+
+    let exp = (chrono::Utc::now()
+        + chrono::Duration::minutes(state.settings.auth.jwt_expiry_mins))
+    .timestamp() as usize;
+    let claims = AdminClaims {
+        sub: admin.id,
+        name: admin.name.clone(),
+        role: admin.role.clone(),
+        exp,
+    };
+    let token = issue_jwt(&claims, &state.settings.auth.jwt_secret)
+        .map_err(|_| ApiError::Internal)?;
+
+    // Update last_login_at (fire-and-forget)
+    AdminUserRepository::update_last_login(&*state.db, admin.id)
+        .await
+        .ok();
+
+    Ok(Json(serde_json::json!({ "token": token })))
+}
+
+// ── User management ───────────────────────────────────────────────────────────
+
+pub async fn list_users(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::users::UserRepository;
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(Json(users))
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserRequest {
+    pub name: String,
+    pub group: Option<String>,
+}
+
+pub async fn create_user(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::{models::NewUser, repositories::users::UserRepository};
+    use crate::api::auth::hash_token;
+
+    let raw_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let hash = hash_token(&raw_token);
+    let user = UserRepository::create(
+        &*state.db,
+        NewUser {
+            name: body.name.clone(),
+            api_key_hash: hash,
+            group_name: body.group.clone(),
+        },
+    )
+    .await
+    .map_err(|_| ApiError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "user.create",
+        Some(format!("user:{}", user.id)),
+        None,
+        Some(serde_json::to_string(&user).unwrap_or_default()),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "user": user,
+        "api_key": raw_token,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRequest {
+    pub enabled: Option<bool>,
+}
+
+pub async fn update_user(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::users::UserRepository;
+
+    if let Some(enabled) = body.enabled {
+        UserRepository::set_enabled(&*state.db, id, enabled)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let action = if enabled { "user.enable" } else { "user.disable" };
+        audit(
+            &state.db,
+            Some(session.0.sub),
+            &session.0.name,
+            action,
+            Some(format!("user:{}", id)),
+            None,
+            None,
+        )
+        .await;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn rotate_user_key(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::users::UserRepository;
+    use crate::api::auth::hash_token;
+
+    let new_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let new_hash = hash_token(&new_token);
+    let overlap_expires_at = (chrono::Utc::now()
+        + chrono::Duration::minutes(state.settings.auth.rotation_overlap_mins))
+    .to_rfc3339();
+
+    UserRepository::rotate_key(&*state.db, id, &new_hash, &overlap_expires_at)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "user.rotate_key",
+        Some(format!("user:{}", id)),
+        None,
+        None,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "api_key": new_token,
+        "old_key_valid_until": overlap_expires_at,
+    })))
+}
+
+// ── Budget management ─────────────────────────────────────────────────────────
+
+pub async fn list_budgets(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::budgets::BudgetRepository;
+    // List all budgets — we'll query for user_id = None (group-wide) and by user
+    // For a simple list endpoint, we fetch all rules
+    let db = &*state.db;
+    // Get all rules by passing a sentinel — but BudgetRepository doesn't have list_all.
+    // We use a direct pool query via the sqlite layer.
+    // As a pragmatic approach: list budgets for all users by fetching user list first.
+    let users = crate::db::repositories::users::UserRepository::list(db)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let mut all_rules = Vec::new();
+    for user in &users {
+        let rules = BudgetRepository::list_for_user(db, user.id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        all_rules.extend(rules);
+    }
+
+    Ok(Json(all_rules))
+}
+
+#[derive(Deserialize)]
+pub struct CreateBudgetRequest {
+    pub user_id: Option<i64>,
+    pub group_name: Option<String>,
+    pub window: String,
+    pub limit_usd: Option<f64>,
+    pub limit_tokens: Option<i64>,
+    pub rate_rpm: Option<i64>,
+    #[serde(default)]
+    pub model_allow: Vec<String>,
+    #[serde(default)]
+    pub model_deny: Vec<String>,
+}
+
+pub async fn create_budget(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Json(body): Json<CreateBudgetRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::{models::NewBudgetRule, repositories::budgets::BudgetRepository};
+
+    let rule = BudgetRepository::create(
+        &*state.db,
+        NewBudgetRule {
+            user_id: body.user_id,
+            group_name: body.group_name,
+            window: body.window,
+            limit_usd: body.limit_usd,
+            limit_tokens: body.limit_tokens,
+            rate_rpm: body.rate_rpm,
+            model_allow: body.model_allow,
+            model_deny: body.model_deny,
+        },
+    )
+    .await
+    .map_err(|_| ApiError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "budget.create",
+        Some(format!("budget:{}", rule.id)),
+        None,
+        Some(serde_json::to_string(&rule).unwrap_or_default()),
+    )
+    .await;
+
+    Ok(Json(rule))
+}
+
+pub async fn delete_budget(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::budgets::BudgetRepository;
+
+    BudgetRepository::delete(&*state.db, id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "budget.delete",
+        Some(format!("budget:{}", id)),
+        None,
+        None,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+pub async fn get_stats(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::users::UserRepository;
+
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    // Aggregate cost for each user for all-time (since epoch)
+    let since = "1970-01-01T00:00:00+00:00";
+    let mut stats = Vec::new();
+    for user in &users {
+        let total_cost = crate::db::repositories::costs::CostRepository::sum_for_user_since(
+            &*state.db,
+            user.id,
+            since,
+        )
+        .await
+        .unwrap_or(0.0);
+        stats.push(serde_json::json!({
+            "user_id": user.id,
+            "name": user.name,
+            "total_cost_usd": total_cost,
+        }));
+    }
+
+    Ok(Json(stats))
+}
+
+// ── Audit ─────────────────────────────────────────────────────────────────────
+
+pub async fn get_audit(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::audit::AuditRepository;
+    let entries = AuditRepository::list(&*state.db, 100)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(Json(entries))
+}
+
+// ── Prompts ───────────────────────────────────────────────────────────────────
+
+pub async fn get_prompts(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::{prompts::PromptRepository, users::UserRepository};
+
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let mut all_prompts = Vec::new();
+    for user in &users {
+        let prompts = PromptRepository::list_by_user(&*state.db, user.id, 20)
+            .await
+            .unwrap_or_default();
+        all_prompts.extend(prompts);
+    }
+
+    Ok(Json(all_prompts))
+}
+
+// ── Admin user management ─────────────────────────────────────────────────────
+
+pub async fn list_admins(
+    State(state): State<AppState>,
+    _session: SuperAdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::admin_users::AdminUserRepository;
+    let admins = AdminUserRepository::list(&*state.db)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    // Redact password hashes
+    let safe: Vec<serde_json::Value> = admins
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "name": a.name,
+                "role": a.role,
+                "enabled": a.enabled,
+                "created_at": a.created_at,
+                "last_login_at": a.last_login_at,
+            })
+        })
+        .collect();
+    Ok(Json(safe))
+}
+
+#[derive(Deserialize)]
+pub struct CreateAdminRequest {
+    pub name: String,
+    pub password: String,
+    pub role: Option<String>,
+}
+
+pub async fn create_admin(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Json(body): Json<CreateAdminRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::{models::NewAdminUser, repositories::admin_users::AdminUserRepository};
+
+    let password_hash = bcrypt::hash(&body.password, bcrypt::DEFAULT_COST)
+        .map_err(|_| ApiError::Internal)?;
+
+    let admin = AdminUserRepository::create(
+        &*state.db,
+        NewAdminUser {
+            name: body.name.clone(),
+            password_hash,
+            role: body.role.clone().unwrap_or_else(|| "viewer".to_string()),
+        },
+    )
+    .await
+    .map_err(|_| ApiError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "admin.create",
+        Some(format!("admin:{}", admin.id)),
+        None,
+        Some(serde_json::json!({
+            "id": admin.id,
+            "name": admin.name,
+            "role": admin.role,
+        }).to_string()),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "id": admin.id,
+        "name": admin.name,
+        "role": admin.role,
+        "created_at": admin.created_at,
+    })))
+}

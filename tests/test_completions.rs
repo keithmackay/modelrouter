@@ -7,7 +7,7 @@ use modelrouter::config::Settings;
 use modelrouter::db::models::NewUser;
 use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::providers::registry::ProviderRegistry;
-use modelrouter::router::{cost::CostCalculator, engine::RequestRouter};
+use modelrouter::router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine};
 use std::sync::Arc;
 
 async fn test_app() -> TestServer {
@@ -30,12 +30,15 @@ async fn test_app() -> TestServer {
         response: "Hello!".to_string(),
     }));
 
+    let policy = Arc::new(PolicyEngine::new(db.clone()));
+
     let state = AppState {
         settings,
         db,
         router,
         cost_calc,
         provider_registry,
+        policy,
     };
     TestServer::new(build_router(state)).unwrap()
 }

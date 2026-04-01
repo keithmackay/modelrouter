@@ -4,6 +4,7 @@ pub mod budgets;
 pub mod costs;
 pub mod hooks;
 pub mod prompts;
+pub mod rate_limits;
 pub mod sessions;
 pub mod users;
 
@@ -13,5 +14,6 @@ pub use budgets::BudgetRepository;
 pub use costs::CostRepository;
 pub use hooks::HookRepository;
 pub use prompts::PromptRepository;
+pub use rate_limits::RateLimitRepository;
 pub use sessions::SessionRepository;
 pub use users::UserRepository;

@@ -9,6 +9,7 @@ use crate::{
     db::{
         models::{NewCostLedgerEntry, NewPrompt},
     },
+    router::policy::PolicyDecision,
 };
 
 pub async fn chat_completions(
@@ -24,6 +25,19 @@ pub async fn chat_completions(
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
     let stream = body["stream"].as_bool().unwrap_or(false);
+
+    // Policy check
+    match state
+        .policy
+        .check(&user, &model)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny { reason, status } => {
+            return Err(ApiError::PolicyDenied { reason, status });
+        }
+    }
 
     let (provider_name, canonical_model) = state.router.resolve(&model);
 

@@ -9,6 +9,8 @@ use serde_json::json;
 pub enum ApiError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
     #[error("provider error: {0}")]
     ProviderError(anyhow::Error),
     #[error("invalid request: {0}")]
@@ -26,6 +28,11 @@ impl IntoResponse for ApiError {
                 StatusCode::UNAUTHORIZED,
                 "unauthorized".to_string(),
                 "auth_error",
+            ),
+            ApiError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden".to_string(),
+                "forbidden",
             ),
             ApiError::ProviderError(e) => {
                 (StatusCode::BAD_GATEWAY, e.to_string(), "provider_error")

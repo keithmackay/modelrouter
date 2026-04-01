@@ -9,6 +9,7 @@ mod costs;
 mod budgets;
 mod audit;
 mod hooks;
+mod rate_limits;
 
 #[derive(Clone)]
 pub struct SqliteDb {
