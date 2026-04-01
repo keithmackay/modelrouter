@@ -127,7 +127,7 @@ async fn csv_format_has_correct_headers() {
         },
         OutputFormat::Csv,
         &mut output,
-    );
+    ).expect("write_rows should succeed");
 
     let text = String::from_utf8(output).expect("valid utf8");
     let lines: Vec<&str> = text.lines().collect();
@@ -193,4 +193,78 @@ async fn hook_latency_stats_computes_correct_percentiles() {
     assert_eq!(hook_b.p50_duration_ms, 5, "hook_b p50 should be 5");
     assert_eq!(hook_b.p95_duration_ms, 15, "hook_b p95 should be 15");
     assert_eq!(hook_b.p99_duration_ms, 15, "hook_b p99 should be 15");
+}
+
+#[tokio::test]
+async fn usage_by_model_filters_by_project() {
+    let db = common::in_memory_db().await;
+    let pool = &db.pool;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Insert a user
+    sqlx::query(
+        "INSERT INTO users (name, api_key, enabled, created_at, metadata) VALUES ('bob', 'hash-bob', 1, ?, '{}')",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    let user_id: (i64,) = sqlx::query_as("SELECT id FROM users WHERE name = 'bob'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+    // Insert two prompts (one per ledger row)
+    let prompt_a: (i64,) = sqlx::query_as(
+        "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, prompt_tokens, completion_tokens, cost_usd, created_at, tags) VALUES (?, 'model-a', 'model-a', 'openai', '[]', 10, 5, 0.001, ?, '[]') RETURNING id"
+    )
+    .bind(user_id.0)
+    .bind(&now)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let prompt_b: (i64,) = sqlx::query_as(
+        "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, prompt_tokens, completion_tokens, cost_usd, created_at, tags) VALUES (?, 'model-b', 'model-b', 'anthropic', '[]', 10, 5, 0.002, ?, '[]') RETURNING id"
+    )
+    .bind(user_id.0)
+    .bind(&now)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    // Insert cost_ledger row for proj-a
+    sqlx::query(
+        "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project, tokens_in, tokens_out, cost_usd, created_at) VALUES (?, ?, 'model-a', 'openai', 'proj-a', 10, 5, 0.001, ?)"
+    )
+    .bind(user_id.0)
+    .bind(prompt_a.0)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Insert cost_ledger row for proj-b
+    sqlx::query(
+        "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project, tokens_in, tokens_out, cost_usd, created_at) VALUES (?, ?, 'model-b', 'anthropic', 'proj-b', 10, 5, 0.002, ?)"
+    )
+    .bind(user_id.0)
+    .bind(prompt_b.0)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Filter by proj-a — should only return model-a
+    let rows = report::usage_by_model(pool, None, None, Some("proj-a"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "should return exactly one row for proj-a");
+    assert_eq!(rows[0].model, "model-a", "proj-a row should be model-a");
+
+    // Confirm proj-b row is excluded
+    assert!(
+        rows.iter().all(|r| r.model != "model-b"),
+        "proj-b rows should be excluded"
+    );
 }

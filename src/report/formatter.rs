@@ -1,21 +1,13 @@
 use comfy_table::{presets::UTF8_FULL, Table};
 use serde::Serialize;
-use std::io::Write;
+use std::io::{self, Write};
 
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
 pub enum OutputFormat {
+    #[default]
     Table,
     Csv,
     Json,
-}
-
-impl OutputFormat {
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "csv" => Self::Csv,
-            "json" => Self::Json,
-            _ => Self::Table,
-        }
-    }
 }
 
 pub fn print_rows<T: Serialize>(
@@ -24,7 +16,11 @@ pub fn print_rows<T: Serialize>(
     to_row: impl Fn(&T) -> Vec<String>,
     format: OutputFormat,
 ) {
-    write_rows(rows, headers, to_row, format, &mut std::io::stdout());
+    if let Err(e) = write_rows(rows, headers, to_row, format, &mut std::io::stdout()) {
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            eprintln!("Error writing output: {e}");
+        }
+    }
 }
 
 pub fn write_rows<T: Serialize>(
@@ -33,7 +29,7 @@ pub fn write_rows<T: Serialize>(
     to_row: impl Fn(&T) -> Vec<String>,
     format: OutputFormat,
     out: &mut impl Write,
-) {
+) -> io::Result<()> {
     match format {
         OutputFormat::Table => {
             let mut table = Table::new();
@@ -42,10 +38,10 @@ pub fn write_rows<T: Serialize>(
             for row in rows {
                 table.add_row(to_row(row));
             }
-            writeln!(out, "{}", table).unwrap();
+            writeln!(out, "{}", table)?;
         }
         OutputFormat::Csv => {
-            writeln!(out, "{}", headers.join(",")).unwrap();
+            writeln!(out, "{}", headers.join(","))?;
             for row in rows {
                 let fields = to_row(row);
                 let escaped: Vec<String> = fields
@@ -58,12 +54,13 @@ pub fn write_rows<T: Serialize>(
                         }
                     })
                     .collect();
-                writeln!(out, "{}", escaped.join(",")).unwrap();
+                writeln!(out, "{}", escaped.join(","))?;
             }
         }
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string());
-            writeln!(out, "{}", json).unwrap();
+            writeln!(out, "{}", json)?;
         }
     }
+    Ok(())
 }

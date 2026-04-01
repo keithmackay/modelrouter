@@ -61,7 +61,7 @@ pub async fn cost_by_user_window(
     window: &str,
     user_name: Option<&str>,
 ) -> Result<Vec<CostRow>> {
-    let window_start = window_start_str(window);
+    let window_start = window_start_str(window)?;
 
     if let Some(name) = user_name {
         let rows = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(
@@ -362,32 +362,36 @@ pub async fn hook_latency_stats(pool: &sqlx::SqlitePool) -> Result<Vec<HookStats
     Ok(result)
 }
 
-fn window_start_str(window: &str) -> String {
+pub fn window_start_str(window: &str) -> Result<String> {
     use chrono::Datelike;
     let now = chrono::Utc::now();
     match window {
-        "daily" => now
+        "daily" => Ok(now
             .date_naive()
             .and_hms_opt(0, 0, 0)
             .unwrap()
             .and_utc()
-            .to_rfc3339(),
+            .to_rfc3339()),
         "weekly" => {
             let days = now.weekday().num_days_from_monday() as i64;
-            (now - chrono::Duration::days(days))
+            Ok((now - chrono::Duration::days(days))
                 .date_naive()
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
                 .and_utc()
-                .to_rfc3339()
+                .to_rfc3339())
         }
-        _ => now
+        "monthly" => Ok(now
             .with_day(1)
             .unwrap()
             .date_naive()
             .and_hms_opt(0, 0, 0)
             .unwrap()
             .and_utc()
-            .to_rfc3339(),
+            .to_rfc3339()),
+        other => Err(anyhow::anyhow!(
+            "invalid window '{}': expected daily, weekly, or monthly",
+            other
+        )),
     }
 }

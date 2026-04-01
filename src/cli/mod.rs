@@ -205,7 +205,6 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             match report_args.command {
                 ReportCommands::Cost { user, window, format } => {
-                    let fmt = OutputFormat::parse(&format);
                     let rows =
                         crate::report::cost_by_user_window(&db.pool, &window, user.as_deref())
                             .await?;
@@ -222,11 +221,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.request_count.to_string(),
                             ]
                         },
-                        fmt,
+                        format,
                     );
                 }
                 ReportCommands::Usage { model, project, since, format } => {
-                    let fmt = OutputFormat::parse(&format);
                     let rows =
                         crate::report::usage_by_model(&db.pool, since.as_deref(), model.as_deref(), project.as_deref()).await?;
                     print_rows(
@@ -242,11 +240,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 format!("{:.6}", r.total_cost_usd),
                             ]
                         },
-                        fmt,
+                        format,
                     );
                 }
                 ReportCommands::Prompts { user, limit, since, format } => {
-                    let fmt = OutputFormat::parse(&format);
                     let rows = crate::report::recent_prompts(
                         &db.pool,
                         user.as_deref(),
@@ -267,16 +264,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.created_at.clone(),
                             ]
                         },
-                        fmt,
+                        format,
                     );
                 }
                 ReportCommands::Audit { actor, tail, format } => {
                     let rows =
                         crate::report::recent_audit(&db.pool, actor.as_deref(), tail).await?;
-                    print_audit_rows(rows, OutputFormat::parse(&format));
+                    print_audit_rows(rows, format);
                 }
                 ReportCommands::Hooks { format } => {
-                    let fmt = OutputFormat::parse(&format);
                     let rows = crate::report::hook_latency_stats(&db.pool).await?;
                     print_rows(
                         &rows,
@@ -292,7 +288,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.p99_duration_ms.to_string(),
                             ]
                         },
-                        fmt,
+                        format,
                     );
                 }
             }
@@ -302,7 +298,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
             crate::db::migrations::run_migrations(&db.pool).await?;
             let rows = crate::report::recent_audit(&db.pool, None, tail).await?;
-            print_audit_rows(rows, crate::report::formatter::OutputFormat::parse(&format));
+            print_audit_rows(rows, format);
         }
         Commands::InstallService => {
             println!("install-service — not yet implemented");

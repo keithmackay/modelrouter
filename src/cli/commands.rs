@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use crate::report::formatter::OutputFormat;
 
 #[derive(Parser)]
 #[command(name = "modelrouter", version, about = "Self-hosted LLM proxy with budget controls")]
@@ -35,7 +36,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 50)]
         tail: u32,
         #[arg(long, default_value = "table")]
-        format: String,
+        format: OutputFormat,
     },
     /// Install system service
     InstallService,
@@ -106,7 +107,7 @@ pub enum ReportCommands {
         #[arg(long, default_value = "monthly")]
         window: String,
         #[arg(long, default_value = "table")]
-        format: String,
+        format: OutputFormat,
     },
     /// Usage report
     Usage {
@@ -117,7 +118,7 @@ pub enum ReportCommands {
         #[arg(long)]
         since: Option<String>,
         #[arg(long, default_value = "table")]
-        format: String,
+        format: OutputFormat,
     },
     /// Prompts report
     Prompts {
@@ -128,7 +129,7 @@ pub enum ReportCommands {
         #[arg(long)]
         since: Option<String>,
         #[arg(long, default_value = "table")]
-        format: String,
+        format: OutputFormat,
     },
     /// Audit log report
     Audit {
@@ -137,11 +138,11 @@ pub enum ReportCommands {
         #[arg(long, default_value_t = 50)]
         tail: u32,
         #[arg(long, default_value = "table")]
-        format: String,
+        format: OutputFormat,
     },
     /// Hooks performance report
     Hooks {
         #[arg(long, default_value = "table")]
-        format: String,
+        format: OutputFormat,
     },
 }
