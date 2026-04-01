@@ -5,6 +5,7 @@ use crate::db::models::{User, NewUser};
 pub trait UserRepository: Send + Sync {
     async fn find_by_api_key(&self, key_hash: &str) -> anyhow::Result<Option<User>>;
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<User>>;
+    async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<User>>;
     async fn list(&self) -> anyhow::Result<Vec<User>>;
     async fn create(&self, user: NewUser) -> anyhow::Result<User>;
     async fn set_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()>;

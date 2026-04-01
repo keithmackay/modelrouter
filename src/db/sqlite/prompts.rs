@@ -59,4 +59,25 @@ impl PromptRepository for SqliteDb {
         .await?;
         Ok(rows)
     }
+
+    async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<Prompt>> {
+        let rows = sqlx::query_as::<_, Prompt>(
+            r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
+                      messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cost_usd, latency_ms, tags, project, created_at
+               FROM prompts ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn count(&self) -> anyhow::Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM prompts")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
 }

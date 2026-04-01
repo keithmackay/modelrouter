@@ -177,6 +177,8 @@ pub async fn post_login(
     match result {
         Ok(token) => {
             // Set HttpOnly cookie and redirect to /admin
+            // TODO: Add `; Secure` flag when TLS is configured (HTTPS deployments).
+            // Currently omitted because this dev tool may run on plain HTTP.
             let cookie = format!(
                 "mr_admin_session={}; Path=/; HttpOnly; SameSite=Lax",
                 token
@@ -204,6 +206,7 @@ pub async fn post_login(
 }
 
 pub async fn post_logout() -> Response {
+    // TODO: Add `; Secure` flag when TLS is configured (HTTPS deployments).
     let clear_cookie = "mr_admin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
     (
         StatusCode::SEE_OTHER,
@@ -416,7 +419,7 @@ pub async fn post_disable_user(
         .await
         .map_err(|_| DashboardError::Internal)?;
 
-    let user = UserRepository::find_by_name(&*state.db, "")
+    let user = UserRepository::find_by_id(&*state.db, id)
         .await
         .ok()
         .flatten();
@@ -441,7 +444,17 @@ pub async fn post_enable_user(
         .await
         .map_err(|_| DashboardError::Internal)?;
 
-    let html = user_row_html(id, &format!("user:{}", id), "—", true, "", None);
+    let user = UserRepository::find_by_id(&*state.db, id)
+        .await
+        .ok()
+        .flatten();
+    let (name, group_name, created_at) = if let Some(u) = user {
+        (u.name, u.group_name, u.created_at)
+    } else {
+        (format!("user:{}", id), None, String::new())
+    };
+
+    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, None);
     Ok(Html(html))
 }
 
@@ -474,7 +487,17 @@ pub async fn post_rotate_user_key(
     )
     .await;
 
-    let html = user_row_html(id, &format!("user:{}", id), "—", true, "", Some(&new_token));
+    let user = UserRepository::find_by_id(&*state.db, id)
+        .await
+        .ok()
+        .flatten();
+    let (name, group_name, created_at) = if let Some(u) = user {
+        (u.name, u.group_name, u.created_at)
+    } else {
+        (format!("user:{}", id), None, String::new())
+    };
+
+    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, Some(&new_token));
     Ok(Html(html))
 }
 
@@ -490,38 +513,24 @@ pub async fn get_prompts(
     _session: DashboardSession,
     Query(q): Query<PageQuery>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::{prompts::PromptRepository, users::UserRepository};
+    use crate::db::repositories::prompts::PromptRepository;
 
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = 50u32;
+    let page = q.page.unwrap_or(1).max(1) as i64;
+    let per_page: i64 = 50;
+    let offset = (page - 1) * per_page;
 
-    let users = UserRepository::list(&*state.db)
+    let prompts = PromptRepository::list(&*state.db, per_page, offset)
         .await
         .map_err(|_| DashboardError::Internal)?;
 
-    let mut all_prompts = Vec::new();
-    for user in &users {
-        let prompts = PromptRepository::list_by_user(&*state.db, user.id, 10000i64)
-            .await
-            .unwrap_or_default();
-        for p in prompts {
-            all_prompts.push((user.name.clone(), p));
-        }
-    }
+    let has_next = prompts.len() as i64 == per_page;
 
-    // Sort by created_at descending
-    all_prompts.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
-
-    let total = all_prompts.len() as u32;
-    let offset = ((page - 1) * per_page) as usize;
-    let page_items: Vec<minijinja::Value> = all_prompts
+    let page_items: Vec<minijinja::Value> = prompts
         .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
-        .map(|(user_name, p)| {
+        .map(|p| {
             minijinja::context! {
                 id => p.id,
-                user_name => user_name,
+                user_id => p.user_id,
                 request_model => p.request_model,
                 routed_model => p.routed_model,
                 cost_usd => p.cost_usd,
@@ -531,8 +540,6 @@ pub async fn get_prompts(
             }
         })
         .collect();
-
-    let has_next = (offset as u32 + per_page) < total;
 
     render(
         "prompts.html",
@@ -692,19 +699,18 @@ pub async fn get_audit(
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::audit::AuditRepository;
 
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = 100u32;
+    let page = q.page.unwrap_or(1).max(1) as i64;
+    let per_page: i64 = 100;
+    let offset = (page - 1) * per_page;
 
-    let entries = AuditRepository::list(&*state.db, (page * per_page) as i64)
+    let entries = AuditRepository::list(&*state.db, per_page, offset)
         .await
         .map_err(|_| DashboardError::Internal)?;
 
-    let total = entries.len();
-    let offset = ((page - 1) * per_page) as usize;
+    let has_next = entries.len() as i64 == per_page;
+
     let page_entries: Vec<minijinja::Value> = entries
         .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
         .map(|e| {
             minijinja::context! {
                 id => e.id,
@@ -715,8 +721,6 @@ pub async fn get_audit(
             }
         })
         .collect();
-
-    let has_next = (offset + per_page as usize) < total;
 
     render(
         "audit.html",
@@ -798,7 +802,7 @@ pub async fn post_create_admin(
         "admin.create",
         Some(format!("admin:{}", admin.id)),
         None,
-        Some(format!("{{\"id\":{},\"name\":\"{}\"}}", admin.id, admin.name)),
+        Some(serde_json::json!({"id": admin.id, "name": admin.name}).to_string()),
     )
     .await;
 
@@ -822,7 +826,7 @@ pub async fn post_delete_admin(
         return Ok(Html("<td colspan='6'>Cannot delete yourself.</td>".to_string()));
     }
 
-    AdminUserRepository::set_enabled(&*state.db, id, false)
+    AdminUserRepository::delete(&*state.db, id)
         .await
         .map_err(|_| DashboardError::Internal)?;
 

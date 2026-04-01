@@ -361,7 +361,7 @@ pub async fn get_audit(
     _session: AdminSession,
 ) -> Result<impl IntoResponse, ApiError> {
     use crate::db::repositories::audit::AuditRepository;
-    let entries = AuditRepository::list(&*state.db, 100)
+    let entries = AuditRepository::list(&*state.db, 100, 0)
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(Json(entries))

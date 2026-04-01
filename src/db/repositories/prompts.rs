@@ -5,4 +5,6 @@ use crate::db::models::{Prompt, NewPrompt};
 pub trait PromptRepository: Send + Sync {
     async fn create(&self, prompt: NewPrompt) -> anyhow::Result<Prompt>;
     async fn list_by_user(&self, user_id: i64, limit: i64) -> anyhow::Result<Vec<Prompt>>;
+    async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<Prompt>>;
+    async fn count(&self) -> anyhow::Result<i64>;
 }

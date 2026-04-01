@@ -64,6 +64,18 @@ impl UserRepository for SqliteDb {
         Ok(row.map(User::from))
     }
 
+    async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
+        let row = sqlx::query_as::<_, UserRow>(
+            r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
+                      group_name, enabled, created_at, metadata
+               FROM users WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(User::from))
+    }
+
     async fn list(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,

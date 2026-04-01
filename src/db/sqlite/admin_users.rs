@@ -96,6 +96,14 @@ impl AdminUserRepository for SqliteDb {
         Ok(())
     }
 
+    async fn delete(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM admin_users WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn update_last_login(&self, id: i64) -> anyhow::Result<()> {
         let now = now_utc();
         sqlx::query("UPDATE admin_users SET last_login_at = ? WHERE id = ?")

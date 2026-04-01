@@ -33,12 +33,13 @@ impl AuditRepository for SqliteDb {
         Ok(row)
     }
 
-    async fn list(&self, limit: i64) -> anyhow::Result<Vec<AuditLogEntry>> {
+    async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<AuditLogEntry>> {
         let rows = sqlx::query_as::<_, AuditLogEntry>(
             "SELECT id, actor_id, actor_name, action, target, before_json, after_json, created_at
-             FROM audit_log ORDER BY created_at DESC LIMIT ?",
+             FROM audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
