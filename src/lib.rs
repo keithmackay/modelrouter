@@ -6,3 +6,6 @@ pub mod hooks;
 pub mod providers;
 pub mod report;
 pub mod router;
+
+#[cfg(feature = "otel")]
+pub mod telemetry;

@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{extract::State, response::{IntoResponse, Response}, Json};
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
@@ -16,7 +17,26 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Json(body): Json<Value>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
+    let span = tracing::info_span!(
+        "chat_completions",
+        user_id = tracing::field::Empty,
+        model = tracing::field::Empty,
+        provider = tracing::field::Empty,
+        streaming = tracing::field::Empty,
+        "cost.usd" = tracing::field::Empty,
+        "tokens.prompt" = tracing::field::Empty,
+    );
+    chat_completions_inner(State(state), user, Json(body))
+        .instrument(span)
+        .await
+}
+
+async fn chat_completions_inner(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
@@ -39,12 +59,13 @@ pub async fn chat_completions(
     }
 
     // Policy check
-    match state
+    let policy_result = state
         .policy
         .check(&user, &model)
+        .instrument(tracing::info_span!("modelrouter.policy_check"))
         .await
-        .map_err(|_| ApiError::Internal)?
-    {
+        .map_err(|_| ApiError::Internal)?;
+    match policy_result {
         PolicyDecision::Allow => {}
         PolicyDecision::Deny {
             reason,
@@ -67,6 +88,18 @@ pub async fn chat_completions(
                     }
                 }
             }
+            #[cfg(feature = "otel")]
+            {
+                let metric_reason = match reason.as_str() {
+                    r if r.contains("budget") => "budget",
+                    r if r.contains("rate") => "rate_limit",
+                    _ => "model_denied",
+                };
+                crate::telemetry::metrics::record_request(
+                    &model, &state.router.resolve(&model).0, "policy_denied",
+                );
+                crate::telemetry::metrics::record_policy_denied(metric_reason);
+            }
             return Err(ApiError::PolicyDenied { reason, status });
         }
     }
@@ -81,6 +114,12 @@ pub async fn chat_completions(
     .map_err(|_| ApiError::Internal)?;
 
     let (provider_name, canonical_model) = state.router.resolve(&model);
+
+    let span = tracing::Span::current();
+    span.record("user_id", user.id);
+    span.record("model", canonical_model.as_str());
+    span.record("provider", provider_name.as_str());
+    span.record("streaming", stream);
 
     let norm_req = build_normalized_request(&body, canonical_model.clone());
 
@@ -124,12 +163,34 @@ pub async fn chat_completions(
 
     let result = adapter
         .complete(&norm_req)
+        .instrument(tracing::info_span!(
+            "modelrouter.provider_call",
+            "provider.name" = provider_name.as_str()
+        ))
         .await
         .map_err(ApiError::ProviderError)?;
     let latency_ms = start.elapsed().as_millis() as i64;
     let cost = state
         .cost_calc
         .calculate(&canonical_model, result.prompt_tokens, result.completion_tokens);
+
+    span.record("cost.usd", cost);
+    span.record("tokens.prompt", result.prompt_tokens as u64);
+
+    #[cfg(feature = "otel")]
+    {
+        crate::telemetry::metrics::record_request(&canonical_model, &provider_name, "ok");
+        crate::telemetry::metrics::record_tokens(
+            &canonical_model, &provider_name,
+            result.prompt_tokens, result.completion_tokens,
+        );
+        crate::telemetry::metrics::record_cost(
+            &canonical_model, &provider_name, user.id, cost,
+        );
+        crate::telemetry::metrics::record_duration(
+            &canonical_model, &provider_name, false, latency_ms as f64,
+        );
+    }
 
     // Fire-and-forget: log prompt + cost
     let state_clone = state.clone();

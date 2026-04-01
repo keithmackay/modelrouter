@@ -179,6 +179,34 @@ pub async fn run(cli: Cli) -> Result<()> {
             let settings = crate::config::load(cli.config)?;
             let settings = Arc::new(settings);
 
+            // Initialise tracing subscriber. The otel feature provides a richer layered
+            // subscriber; without it we install a basic fmt subscriber.
+            #[cfg(not(feature = "otel"))]
+            {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+                    .try_init()
+                    .ok();
+            }
+            #[cfg(feature = "otel")]
+            let _telemetry_guard = {
+                if settings.telemetry.enabled {
+                    Some(crate::telemetry::init_telemetry(&settings.telemetry)?)
+                } else {
+                    tracing_subscriber::fmt()
+                        .with_env_filter(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                        )
+                        .try_init()
+                        .ok();
+                    None
+                }
+            };
+
             // Init DB
             let sqlite_db =
                 crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;

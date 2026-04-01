@@ -17,3 +17,14 @@ fn env_var_overrides_config() {
     assert_eq!(s.server.port, 9090);
     std::env::remove_var("MODELROUTER_SERVER__PORT");
 }
+
+#[cfg(feature = "otel")]
+#[test]
+fn telemetry_config_has_defaults() {
+    let s = modelrouter::config::schema::TelemetryConfig::default();
+    assert_eq!(s.enabled, false);
+    assert_eq!(s.endpoint, "http://localhost:4317");
+    assert_eq!(s.service_name, "modelrouter");
+    assert!((s.sample_ratio - 0.1).abs() < f64::EPSILON);
+    assert_eq!(s.slow_threshold_ms, 2000);
+}

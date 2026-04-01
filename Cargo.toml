@@ -15,6 +15,13 @@ path = "src/lib.rs"
 [features]
 default = []
 postgres = ["sqlx/postgres"]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-appender-tracing",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
@@ -47,7 +54,15 @@ futures = "0.3"
 bytes = "1"
 dashmap = "6"
 
+# ── OpenTelemetry (--features otel) ────────────────────────────────────
+opentelemetry                  = { version = "0.27", features = ["logs"], optional = true }
+opentelemetry_sdk              = { version = "0.27", features = ["rt-tokio", "logs"], optional = true }
+opentelemetry-otlp             = { version = "0.27", features = ["grpc-tonic", "logs"], optional = true }
+opentelemetry-appender-tracing = { version = "0.27", optional = true }
+tracing-opentelemetry          = { version = "0.28", optional = true }
+
 [dev-dependencies]
 axum-test = "14"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing", "experimental_metrics_periodic_reader_no_runtime"] }

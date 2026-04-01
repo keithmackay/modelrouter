@@ -2,22 +2,37 @@ use std::time::Duration;
 use crate::config::schema::LifecycleHookConfig;
 
 pub fn fire(hook: &LifecycleHookConfig, payload: serde_json::Value) -> tokio::task::JoinHandle<()> {
+    use tracing::Instrument;
     let hook = hook.clone();
-    tokio::spawn(async move {
-        let result = tokio::time::timeout(
-            Duration::from_secs(hook.timeout_secs),
-            run_subprocess(&hook.exec, &payload),
-        )
-        .await;
-        match result {
-            Err(_timeout) => tracing::warn!(hook = %hook.name, "lifecycle hook timed out"),
-            Ok(Err(e)) => tracing::error!(hook = %hook.name, error = %e, "lifecycle hook failed"),
-            Ok(Ok(status)) if !status.success() => {
-                tracing::warn!(hook = %hook.name, "lifecycle hook exited non-zero")
+    let span = tracing::info_span!(
+        "modelrouter.lifecycle_hook",
+        "hook.name" = %hook.name,
+        "hook.type" = "lifecycle",
+    );
+    tokio::spawn(
+        async move {
+            let hook_start = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(hook.timeout_secs),
+                run_subprocess(&hook.exec, &payload),
+            )
+            .await;
+            let duration_ms = hook_start.elapsed().as_millis() as i64;
+
+            #[cfg(feature = "otel")]
+            crate::telemetry::metrics::record_hook_duration(&hook.name, "lifecycle", duration_ms as f64);
+
+            match result {
+                Err(_timeout) => tracing::warn!(hook = %hook.name, "lifecycle hook timed out"),
+                Ok(Err(e)) => tracing::error!(hook = %hook.name, error = %e, "lifecycle hook failed"),
+                Ok(Ok(status)) if !status.success() => {
+                    tracing::warn!(hook = %hook.name, "lifecycle hook exited non-zero")
+                }
+                Ok(Ok(_)) => tracing::debug!(hook = %hook.name, "lifecycle hook completed"),
             }
-            Ok(Ok(_)) => tracing::debug!(hook = %hook.name, "lifecycle hook completed"),
         }
-    })
+        .instrument(span),
+    )
 }
 
 async fn run_subprocess(

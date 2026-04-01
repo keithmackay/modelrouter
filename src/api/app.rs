@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tower_http::trace::TraceLayer;
+
 use crate::{
     config::Settings,
     db::repositories::{
@@ -107,4 +109,5 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/admins", get(get_admins).post(post_create_admin))
         .route("/admin/admins/:id/delete", post(post_delete_admin))
         .with_state(state)
+        .layer(TraceLayer::new_for_http())
 }
