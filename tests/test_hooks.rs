@@ -15,7 +15,7 @@ async fn lifecycle_hook_timeout_does_not_affect_caller() {
     };
 
     let start = Instant::now();
-    lifecycle::fire(&hook, serde_json::json!({"test": true})).await;
+    lifecycle::fire(&hook, serde_json::json!({"test": true}));
     // fire() must return immediately — it's fire-and-forget
     assert!(
         start.elapsed().as_millis() < 100,

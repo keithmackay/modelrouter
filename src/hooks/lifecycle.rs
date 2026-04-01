@@ -1,7 +1,7 @@
 use std::time::Duration;
 use crate::config::schema::LifecycleHookConfig;
 
-pub async fn fire(hook: &LifecycleHookConfig, payload: serde_json::Value) {
+pub fn fire(hook: &LifecycleHookConfig, payload: serde_json::Value) -> tokio::task::JoinHandle<()> {
     let hook = hook.clone();
     tokio::spawn(async move {
         let result = tokio::time::timeout(
@@ -17,7 +17,7 @@ pub async fn fire(hook: &LifecycleHookConfig, payload: serde_json::Value) {
             }
             Ok(Ok(_)) => tracing::debug!(hook = %hook.name, "lifecycle hook completed"),
         }
-    });
+    })
 }
 
 async fn run_subprocess(
@@ -37,8 +37,17 @@ async fn run_subprocess(
         stdin
             .write_all(serde_json::to_string(payload)?.as_bytes())
             .await?;
+        // stdin dropped here, sends EOF
     }
-    Ok(child.wait().await?)
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            tracing::debug!("lifecycle hook stderr: {}", stderr);
+        }
+    }
+    Ok(output.status)
 }
 
 pub fn request_received_payload(

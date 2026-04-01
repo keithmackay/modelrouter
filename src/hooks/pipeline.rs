@@ -69,18 +69,28 @@ async fn run_single_pipeline_hook(
     db: &Arc<dyn DatabaseProvider>,
     payload: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    // Check if hook has permission for the capability it claims
     let required_cap = match hook.event.as_str() {
         "pre_request" => "mutate_request",
         "post_response" => "mutate_response",
         _ => return Ok(payload),
     };
 
-    let can_mutate = if hook.capabilities.contains(&required_cap.to_string()) {
+    // Check if hook claims this capability
+    let claims_capability = hook.capabilities.contains(&required_cap.to_string());
+
+    // If the hook claims a capability, check DB permission.
+    // If the hook claims no capabilities, it can still run (read-only observer).
+    let can_run = if claims_capability {
         db.has_permission(&hook.name, required_cap).await?
     } else {
-        false
+        true // No capabilities claimed — always allow to run (read-only)
     };
+
+    if !can_run {
+        // Hook claims a capability it doesn't have permission for — skip entirely
+        tracing::debug!(hook = %hook.name, "pipeline hook skipped: missing DB permission for '{}'", required_cap);
+        return Ok(payload);
+    }
 
     let result = tokio::time::timeout(
         Duration::from_secs(hook.timeout_secs),
@@ -88,10 +98,11 @@ async fn run_single_pipeline_hook(
     )
     .await;
 
+    let can_mutate = claims_capability; // can only mutate if it both claimed AND has permission (already checked above)
+
     match result {
         Ok(Ok(output)) => {
             if can_mutate {
-                // Try to parse the output as JSON; if it fails, apply fail_open logic
                 match serde_json::from_str::<serde_json::Value>(&output) {
                     Ok(new_payload) => Ok(new_payload),
                     Err(e) => {
@@ -111,11 +122,17 @@ async fn run_single_pipeline_hook(
                     }
                 }
             } else {
-                // Hook ran but has no mutate permission — discard output, return original
+                // Read-only hook ran, discard output
                 Ok(payload)
             }
         }
-        Ok(Err(e)) => Err(e),
+        Ok(Err(e)) => {
+            if hook.fail_open {
+                Ok(payload)
+            } else {
+                Err(e)
+            }
+        }
         Err(_timeout) => {
             if hook.fail_open {
                 tracing::warn!(hook = %hook.name, "pipeline hook timed out (fail_open)");

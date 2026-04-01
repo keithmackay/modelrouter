@@ -34,7 +34,7 @@ pub async fn chat_completions(
                 &model,
                 body["messages"].as_array().map(|m| m.len()).unwrap_or(0),
             );
-            crate::hooks::lifecycle::fire(hook, payload).await;
+            crate::hooks::lifecycle::fire(hook, payload);
         }
     }
 
@@ -51,8 +51,8 @@ pub async fn chat_completions(
             status,
             budget_context,
         } => {
-            // Fire on_budget_exceeded hook if this was a budget denial (status 429)
-            if status == 429 {
+            // Only fire on_budget_exceeded if this is actually a budget denial (has budget context)
+            if budget_context.is_some() {
                 for hook in &state.settings.hooks.lifecycle {
                     if hook.event == "on_budget_exceeded" {
                         let ctx = budget_context.as_ref();
@@ -63,7 +63,7 @@ pub async fn chat_completions(
                             ctx.map(|c| c.spent_usd).unwrap_or(0.0),
                             ctx.map(|c| c.window.as_str()).unwrap_or("unknown"),
                         );
-                        crate::hooks::lifecycle::fire(hook, payload).await;
+                        crate::hooks::lifecycle::fire(hook, payload);
                     }
                 }
             }
@@ -193,7 +193,7 @@ pub async fn chat_completions(
                     cost,
                     latency_ms,
                 );
-                crate::hooks::lifecycle::fire(hook, payload).await;
+                crate::hooks::lifecycle::fire(hook, payload);
             }
         }
     });
@@ -316,7 +316,7 @@ fn log_streaming_request(
                                 cost,
                                 latency_ms,
                             );
-                            crate::hooks::lifecycle::fire(hook, payload).await;
+                            crate::hooks::lifecycle::fire(hook, payload);
                         }
                     }
                 });
