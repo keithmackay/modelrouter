@@ -48,22 +48,18 @@ impl PolicyEngine {
                 });
             }
 
-            // 3. Check rate limit (rate_rpm)
+            // 3. Check rate limit (rate_rpm) — atomic increment+check to avoid TOCTOU race
             if let Some(rate_rpm) = rule.rate_rpm {
                 let window_key = format!("rpm:{}", current_minute_bucket());
-                let count =
-                    RateLimitRepository::get_request_count(&*self.db, user.id, &window_key)
+                let new_count =
+                    RateLimitRepository::increment_and_get_count(&*self.db, user.id, &window_key)
                         .await?;
-                if count >= rate_rpm {
+                if new_count > rate_rpm {
                     return Ok(PolicyDecision::Deny {
                         reason: "rate limit exceeded".to_string(),
                         status: 429,
                     });
                 }
-                // Increment the counter (fire-and-forget)
-                RateLimitRepository::increment_request_count(&*self.db, user.id, &window_key)
-                    .await
-                    .ok();
             }
 
             // 4. Check budget

@@ -9,6 +9,31 @@ use crate::api::{app::AppState, error::ApiError};
 use super::auth::{AdminSession, AdminClaims, SuperAdminSession, issue_jwt};
 use super::audit::audit;
 
+// ── Safe response types (no key hashes) ───────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct UserResponse {
+    id: i64,
+    name: String,
+    group_name: Option<String>,
+    enabled: bool,
+    created_at: String,
+    metadata: String,
+}
+
+impl From<crate::db::models::User> for UserResponse {
+    fn from(u: crate::db::models::User) -> Self {
+        UserResponse {
+            id: u.id,
+            name: u.name,
+            group_name: u.group_name,
+            enabled: u.enabled,
+            created_at: u.created_at,
+            metadata: u.metadata,
+        }
+    }
+}
+
 // ── Login ─────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -68,7 +93,8 @@ pub async fn list_users(
     let users = UserRepository::list(&*state.db)
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(Json(users))
+    let safe: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();
+    Ok(Json(safe))
 }
 
 #[derive(Deserialize)]
@@ -98,19 +124,20 @@ pub async fn create_user(
     .await
     .map_err(|_| ApiError::Internal)?;
 
+    let safe_user = UserResponse::from(user);
     audit(
         &state.db,
         Some(session.0.sub),
         &session.0.name,
         "user.create",
-        Some(format!("user:{}", user.id)),
+        Some(format!("user:{}", safe_user.id)),
         None,
-        Some(serde_json::to_string(&user).unwrap_or_default()),
+        Some(serde_json::to_string(&safe_user).unwrap_or_default()),
     )
     .await;
 
     Ok(Json(serde_json::json!({
-        "user": user,
+        "user": safe_user,
         "api_key": raw_token,
     })))
 }
@@ -232,6 +259,12 @@ pub async fn create_budget(
     Json(body): Json<CreateBudgetRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     use crate::db::{models::NewBudgetRule, repositories::budgets::BudgetRepository};
+
+    if !["daily", "weekly", "monthly"].contains(&body.window.as_str()) {
+        return Err(ApiError::InvalidRequest(
+            "window must be 'daily', 'weekly', or 'monthly'".to_string(),
+        ));
+    }
 
     let rule = BudgetRepository::create(
         &*state.db,
@@ -398,6 +431,13 @@ pub async fn create_admin(
 ) -> Result<impl IntoResponse, ApiError> {
     use crate::db::{models::NewAdminUser, repositories::admin_users::AdminUserRepository};
 
+    let role = body.role.clone().unwrap_or_else(|| "viewer".to_string());
+    if !["superadmin", "viewer"].contains(&role.as_str()) {
+        return Err(ApiError::InvalidRequest(
+            "role must be 'superadmin' or 'viewer'".to_string(),
+        ));
+    }
+
     let password_hash = bcrypt::hash(&body.password, bcrypt::DEFAULT_COST)
         .map_err(|_| ApiError::Internal)?;
 
@@ -406,7 +446,7 @@ pub async fn create_admin(
         NewAdminUser {
             name: body.name.clone(),
             password_hash,
-            role: body.role.clone().unwrap_or_else(|| "viewer".to_string()),
+            role,
         },
     )
     .await
