@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub server: ServerConfig,
@@ -16,19 +16,6 @@ pub struct Settings {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub auth: AuthConfig,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            database: DatabaseConfig::default(),
-            routing: RoutingConfig::default(),
-            providers: HashMap::new(),
-            hooks: HooksConfig::default(),
-            auth: AuthConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
