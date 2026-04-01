@@ -25,6 +25,10 @@ impl PolicyEngine {
         Self { db }
     }
 
+    #[tracing::instrument(skip(self), fields(
+        policy.result = tracing::field::Empty,
+        policy.reason = tracing::field::Empty,
+    ))]
     pub async fn check(&self, user: &User, model: &str) -> anyhow::Result<PolicyDecision> {
         use crate::db::repositories::budgets::BudgetRepository;
         use crate::db::repositories::costs::CostRepository;
@@ -37,13 +41,18 @@ impl PolicyEngine {
             rules.extend(group_rules);
         }
 
+        let span = tracing::Span::current();
+
         for rule in &rules {
             // 1. Check model_allow (JSON array)
             let model_allow: Vec<String> =
                 serde_json::from_str(&rule.model_allow).unwrap_or_default();
             if !model_allow.is_empty() && !model_allow.contains(&model.to_string()) {
+                let reason = format!("model '{}' not in allow list", model);
+                span.record("policy.result", "deny");
+                span.record("policy.reason", reason.as_str());
                 return Ok(PolicyDecision::Deny {
-                    reason: format!("model '{}' not in allow list", model),
+                    reason,
                     status: 403,
                     budget_context: None,
                 });
@@ -53,8 +62,11 @@ impl PolicyEngine {
             let model_deny: Vec<String> =
                 serde_json::from_str(&rule.model_deny).unwrap_or_default();
             if model_deny.contains(&model.to_string()) {
+                let reason = format!("model '{}' is denied", model);
+                span.record("policy.result", "deny");
+                span.record("policy.reason", reason.as_str());
                 return Ok(PolicyDecision::Deny {
-                    reason: format!("model '{}' is denied", model),
+                    reason,
                     status: 403,
                     budget_context: None,
                 });
@@ -67,8 +79,11 @@ impl PolicyEngine {
                     RateLimitRepository::increment_and_get_count(&*self.db, user.id, &window_key)
                         .await?;
                 if new_count > rate_rpm {
+                    let reason = "rate limit exceeded".to_string();
+                    span.record("policy.result", "deny");
+                    span.record("policy.reason", reason.as_str());
                     return Ok(PolicyDecision::Deny {
-                        reason: "rate limit exceeded".to_string(),
+                        reason,
                         status: 429,
                         budget_context: None,
                     });
@@ -81,11 +96,14 @@ impl PolicyEngine {
                 let spent =
                     CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?;
                 if spent >= limit_usd {
+                    let reason = format!(
+                        "budget exceeded: ${:.4} of ${:.2} {} limit",
+                        spent, limit_usd, rule.window
+                    );
+                    span.record("policy.result", "deny");
+                    span.record("policy.reason", reason.as_str());
                     return Ok(PolicyDecision::Deny {
-                        reason: format!(
-                            "budget exceeded: ${:.4} of ${:.2} {} limit",
-                            spent, limit_usd, rule.window
-                        ),
+                        reason,
                         status: 429,
                         budget_context: Some(BudgetContext {
                             limit_usd,
@@ -97,6 +115,7 @@ impl PolicyEngine {
             }
         }
 
+        span.record("policy.result", "allow");
         Ok(PolicyDecision::Allow)
     }
 }
