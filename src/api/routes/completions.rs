@@ -46,20 +46,24 @@ pub async fn chat_completions(
         .map_err(|_| ApiError::Internal)?
     {
         PolicyDecision::Allow => {}
-        PolicyDecision::Deny { reason, status } => {
+        PolicyDecision::Deny {
+            reason,
+            status,
+            budget_context,
+        } => {
             // Fire on_budget_exceeded hook if this was a budget denial (status 429)
             if status == 429 {
                 for hook in &state.settings.hooks.lifecycle {
                     if hook.event == "on_budget_exceeded" {
-                        crate::hooks::lifecycle::fire(
-                            hook,
-                            serde_json::json!({
-                                "event": "on_budget_exceeded",
-                                "user_name": user.name,
-                                "model": model,
-                            }),
-                        )
-                        .await;
+                        let ctx = budget_context.as_ref();
+                        let payload = crate::hooks::lifecycle::budget_exceeded_payload(
+                            &user.name,
+                            &model,
+                            ctx.map(|c| c.limit_usd).unwrap_or(0.0),
+                            ctx.map(|c| c.spent_usd).unwrap_or(0.0),
+                            ctx.map(|c| c.window.as_str()).unwrap_or("unknown"),
+                        );
+                        crate::hooks::lifecycle::fire(hook, payload).await;
                     }
                 }
             }

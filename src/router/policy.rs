@@ -5,9 +5,19 @@ pub struct PolicyEngine {
     pub db: Arc<dyn DatabaseProvider>,
 }
 
+pub struct BudgetContext {
+    pub limit_usd: f64,
+    pub spent_usd: f64,
+    pub window: String,
+}
+
 pub enum PolicyDecision {
     Allow,
-    Deny { reason: String, status: u16 },
+    Deny {
+        reason: String,
+        status: u16,
+        budget_context: Option<BudgetContext>,
+    },
 }
 
 impl PolicyEngine {
@@ -35,6 +45,7 @@ impl PolicyEngine {
                 return Ok(PolicyDecision::Deny {
                     reason: format!("model '{}' not in allow list", model),
                     status: 403,
+                    budget_context: None,
                 });
             }
 
@@ -45,6 +56,7 @@ impl PolicyEngine {
                 return Ok(PolicyDecision::Deny {
                     reason: format!("model '{}' is denied", model),
                     status: 403,
+                    budget_context: None,
                 });
             }
 
@@ -58,6 +70,7 @@ impl PolicyEngine {
                     return Ok(PolicyDecision::Deny {
                         reason: "rate limit exceeded".to_string(),
                         status: 429,
+                        budget_context: None,
                     });
                 }
             }
@@ -74,6 +87,11 @@ impl PolicyEngine {
                             spent, limit_usd, rule.window
                         ),
                         status: 429,
+                        budget_context: Some(BudgetContext {
+                            limit_usd,
+                            spent_usd: spent,
+                            window: rule.window.clone(),
+                        }),
                     });
                 }
             }
