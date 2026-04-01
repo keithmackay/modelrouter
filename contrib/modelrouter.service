@@ -1,0 +1,17 @@
+[Unit]
+Description=modelrouter LLM proxy
+After=network.target
+
+[Service]
+Type=simple
+User=modelrouter
+ExecStart=/usr/local/bin/modelrouter serve
+Environment=MODELROUTER_CONFIG=/etc/modelrouter/config.toml
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=modelrouter
+
+[Install]
+WantedBy=multi-user.target

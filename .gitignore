@@ -1,1 +1,7 @@
 .worktrees/
+
+
+# Added by cargo
+
+/target
+session_stats.md

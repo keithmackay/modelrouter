@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Overview — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Overview</h1>
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="stat-label">Spend Today</div>
+        <div class="stat-value">${{ spend_today | round(precision=4) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Spend This Week</div>
+        <div class="stat-value">${{ spend_week | round(precision=4) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Spend This Month</div>
+        <div class="stat-value">${{ spend_month | round(precision=4) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Total Requests</div>
+        <div class="stat-value">{{ request_count }}</div>
+    </div>
+</div>
+
+{% if budget_warnings %}
+<h2 style="margin-bottom: 0.75rem; font-size: 1.1rem;">Budget Warnings</h2>
+{% for w in budget_warnings %}
+<div class="alert alert-warning">
+    <strong>{{ w.user_name }}</strong> has spent ${{ w.spend | round(precision=4) }} of ${{ w.limit | round(precision=4) }} ({{ (w.spend / w.limit * 100) | int }}% of {{ w.window }} budget)
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

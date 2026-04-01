@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Hooks — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Hook Latency</h1>
+<table>
+    <thead>
+        <tr>
+            <th>Hook Name</th>
+            <th>Invocations</th>
+            <th>Success Rate</th>
+            <th>Avg (ms)</th>
+            <th>p50 (ms)</th>
+            <th>p95 (ms)</th>
+            <th>p99 (ms)</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for h in hooks %}
+        <tr>
+            <td>{{ h.hook_name }}</td>
+            <td>{{ h.invocation_count }}</td>
+            <td>{{ (h.success_rate * 100) | round(precision=1) }}%</td>
+            <td>{{ h.avg_duration_ms | round(precision=1) }}</td>
+            <td>{{ h.p50_duration_ms }}</td>
+            <td>{{ h.p95_duration_ms }}</td>
+            <td>{{ h.p99_duration_ms }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" style="text-align:center; color:#777; padding: 2rem;">No hook data available.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

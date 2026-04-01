@@ -1,34 +1,40 @@
-# modelrouter — Project Instructions
+# modelrouter — Rust Implementation
 
 ## Quick Start
-
 ```bash
-# Install dependencies
-cd ~/Projects/modelrouter
-uv sync
-
-# Run DB migrations (creates ~/.modelrouter/router.db)
-uv run modelrouter migrate
-
-# Start the server
-uv run modelrouter serve
-
-# Or with a custom config
-MODELROUTER_CONFIG=./config.yaml uv run modelrouter serve
+cargo build --release
 ```
 
-## Entry Points
+## Development
+```bash
+cargo run -- init      # Create config
+cargo run -- migrate   # Run migrations
+cargo run -- serve     # Start server
+```
 
-- CLI: `modelrouter` (entry point → `modelrouter.cli.commands:app`)
-- Server: `modelrouter serve` — starts uvicorn on port 8080
-- Migrations: `modelrouter migrate` — idempotent, safe to re-run
-- User management: `modelrouter user create --name alice`, `modelrouter user list`
+## Testing
+```bash
+cargo test
+cargo build --features postgres  # Verify postgres feature
+```
+
+## CLI Commands
+```
+modelrouter init
+modelrouter migrate
+modelrouter serve [--config <path>]
+modelrouter user create --name alice
+modelrouter user list
+modelrouter budget set --user alice --limit 10.0 --window monthly
+modelrouter report cost [--user] [--window] [--format table|csv|json]
+modelrouter install-service  (macOS/Linux)
+```
 
 ## Key Paths
 
-- Config: `~/.modelrouter/config.yaml` (or `MODELROUTER_CONFIG` env var)
+- Config: `~/.modelrouter/config.toml` (or `MODELROUTER_CONFIG` env var)
 - Database: `~/.modelrouter/router.db` (configurable)
-- Logs: stdout via loguru
+- Logs: stdout via tracing/tracing-subscriber
 
 ## API Endpoints
 
@@ -37,17 +43,18 @@ MODELROUTER_CONFIG=./config.yaml uv run modelrouter serve
 | `GET /health` | Liveness check |
 | `GET /v1/models` | List available models |
 | `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible) |
-| `GET /admin/users` | List users (admin token required) |
-| `POST /admin/users` | Create user (admin token required) |
-| `GET /admin/stats` | Usage stats (admin token required) |
+| `GET /admin/users` | List users (admin JWT required) |
+| `POST /admin/users` | Create user (superadmin JWT required) |
+| `GET /admin/stats` | Usage stats (admin JWT required) |
+| `GET /admin/budgets` | List budget rules (admin JWT required) |
+| `GET /admin/audit` | Audit log (admin JWT required) |
 
 ## Authentication
 
 All `/v1/*` endpoints require `Authorization: Bearer <api-key>`.
 
-Dev key (seeded on first migration): `mr-dev-key`
-
-Admin endpoints require the `admin_token` from config (default: `change-me-admin-token`).
+Admin REST endpoints require a JWT obtained from `POST /admin/login`.
+Dashboard (web UI) at `/admin` uses cookie-based sessions.
 
 ## Model Routing
 
@@ -58,8 +65,9 @@ Models are resolved in this order:
 
 ## Dev Conventions
 
-- Use `uv run` for all Python commands (not `python3` directly)
-- Logging via `loguru` (not stdlib `logging`)
-- All DB operations async via `aiosqlite`
-- Never import `litellm`
+- Use `cargo` for all Rust commands
+- Logging via `tracing` / `tracing-subscriber`
+- All DB operations async via `sqlx` + `aiosqlite`
+- Migrations tracked via `sqlx::migrate!("./migrations")`
 - API keys stored as SHA-256 hex digest only
+- Hook capabilities are NOT auto-granted — operators must INSERT rows into `hook_permissions`
