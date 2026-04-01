@@ -1,0 +1,104 @@
+# modelrouter — example configuration
+# Copy to ~/.modelrouter/config.toml and edit as needed.
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+[server]
+# Address to bind. Use 0.0.0.0 to accept connections from all interfaces.
+host = "127.0.0.1"
+port = 8080
+# Maximum request body size in megabytes.
+request_body_limit_mb = 10
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+[database]
+# Path to the SQLite database file. ~ is expanded automatically.
+path = "~/.modelrouter/router.db"
+# Uncomment to use PostgreSQL instead of SQLite (requires --features postgres).
+# postgres_url = "postgres://user:pass@localhost:5432/modelrouter"
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+[routing]
+# Provider used when no prefix is present in the model name.
+default_provider = "openai"
+# Model used when the client does not specify one.
+default_model = "gpt-4o"
+
+# Aliases map a short name → full provider/model string.
+[routing.model_aliases]
+"fast"    = "openai/gpt-4o-mini"
+"smart"   = "anthropic/claude-opus-4-5"
+"local"   = "ollama/llama3"
+
+# Fallback chains: if a provider fails, try the next one.
+[routing.fallback_chains]
+"openai/gpt-4o" = ["anthropic/claude-opus-4-5", "ollama/llama3"]
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+[providers.openai]
+api_key  = ""          # or set MODELROUTER__PROVIDERS__OPENAI__API_KEY
+# api_base = "https://api.openai.com/v1"
+timeout_secs = 60
+
+[providers.anthropic]
+api_key  = ""          # or set MODELROUTER__PROVIDERS__ANTHROPIC__API_KEY
+# api_base = "https://api.anthropic.com"
+timeout_secs = 60
+
+[providers.gemini]
+api_key  = ""          # or set MODELROUTER__PROVIDERS__GEMINI__API_KEY
+# api_base = "https://generativelanguage.googleapis.com/v1beta/openai"
+timeout_secs = 60
+
+[providers.ollama]
+api_key  = "ollama"    # Ollama doesn't require a real key
+api_base = "http://localhost:11434/v1"
+timeout_secs = 120
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+[auth]
+# Secret used to sign JWT tokens for key rotation. Change before deploying!
+jwt_secret            = "change-me-jwt-secret"
+# How long a JWT token is valid (minutes).
+jwt_expiry_mins       = 60
+# Grace period during key rotation where both old and new keys are accepted.
+rotation_overlap_mins = 15
+
+# ---------------------------------------------------------------------------
+# Hooks — lifecycle
+# Lifecycle hooks run at server startup/shutdown.
+# ---------------------------------------------------------------------------
+[[hooks.lifecycle]]
+name        = "notify-start"
+event       = "server.start"
+exec        = "/usr/local/bin/my-notify.sh"
+timeout_secs = 5
+
+# ---------------------------------------------------------------------------
+# Hooks — pipeline
+# Pipeline hooks intercept every request/response.
+# ---------------------------------------------------------------------------
+[[hooks.pipeline]]
+name         = "pii-scrubber"
+event        = "request.pre"
+exec         = "/usr/local/bin/pii-scrub"
+capabilities = ["mutate_request"]
+timeout_secs = 3
+fail_open    = false   # If true, proxy continues even if the hook fails.
+
+[[hooks.pipeline]]
+name         = "usage-logger"
+event        = "response.post"
+exec         = "/usr/local/bin/log-usage"
+capabilities = []
+timeout_secs = 2
+fail_open    = true
