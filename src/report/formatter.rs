@@ -1,5 +1,6 @@
 use comfy_table::{presets::UTF8_FULL, Table};
 use serde::Serialize;
+use std::io::Write;
 
 pub enum OutputFormat {
     Table,
@@ -23,6 +24,16 @@ pub fn print_rows<T: Serialize>(
     to_row: impl Fn(&T) -> Vec<String>,
     format: OutputFormat,
 ) {
+    write_rows(rows, headers, to_row, format, &mut std::io::stdout());
+}
+
+pub fn write_rows<T: Serialize>(
+    rows: &[T],
+    headers: &[&str],
+    to_row: impl Fn(&T) -> Vec<String>,
+    format: OutputFormat,
+    out: &mut impl Write,
+) {
     match format {
         OutputFormat::Table => {
             let mut table = Table::new();
@@ -31,10 +42,10 @@ pub fn print_rows<T: Serialize>(
             for row in rows {
                 table.add_row(to_row(row));
             }
-            println!("{}", table);
+            writeln!(out, "{}", table).unwrap();
         }
         OutputFormat::Csv => {
-            println!("{}", headers.join(","));
+            writeln!(out, "{}", headers.join(",")).unwrap();
             for row in rows {
                 let fields = to_row(row);
                 let escaped: Vec<String> = fields
@@ -47,12 +58,12 @@ pub fn print_rows<T: Serialize>(
                         }
                     })
                     .collect();
-                println!("{}", escaped.join(","));
+                writeln!(out, "{}", escaped.join(",")).unwrap();
             }
         }
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string());
-            println!("{}", json);
+            writeln!(out, "{}", json).unwrap();
         }
     }
 }

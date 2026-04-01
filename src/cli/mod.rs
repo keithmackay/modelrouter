@@ -4,6 +4,25 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use commands::{Cli, Commands, UserCommands, BudgetCommands};
+use crate::report::AuditRow;
+use crate::report::formatter::{print_rows, OutputFormat};
+
+fn print_audit_rows(rows: Vec<AuditRow>, fmt: OutputFormat) {
+    print_rows(
+        &rows,
+        &["ID", "Actor", "Action", "Target", "Created At"],
+        |r| {
+            vec![
+                r.id.to_string(),
+                r.actor_name.clone(),
+                r.action.clone(),
+                r.target.clone().unwrap_or_default(),
+                r.created_at.clone(),
+            ]
+        },
+        fmt,
+    );
+}
 
 const CONFIG_TEMPLATE: &str = include_str!("../../config.example.toml");
 
@@ -183,7 +202,6 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::db::migrations::run_migrations(&db.pool).await?;
 
             use crate::cli::commands::ReportCommands;
-            use crate::report::formatter::{print_rows, OutputFormat};
 
             match report_args.command {
                 ReportCommands::Cost { user, window, format } => {
@@ -207,9 +225,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                         fmt,
                     );
                 }
-                ReportCommands::Usage { model: _, since } => {
+                ReportCommands::Usage { model, project, since, format } => {
+                    let fmt = OutputFormat::parse(&format);
                     let rows =
-                        crate::report::usage_by_model(&db.pool, since.as_deref()).await?;
+                        crate::report::usage_by_model(&db.pool, since.as_deref(), model.as_deref(), project.as_deref()).await?;
                     print_rows(
                         &rows,
                         &["Model", "Provider", "Requests", "Tokens In", "Tokens Out", "Cost (USD)"],
@@ -223,10 +242,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 format!("{:.6}", r.total_cost_usd),
                             ]
                         },
-                        OutputFormat::Table,
+                        fmt,
                     );
                 }
-                ReportCommands::Prompts { user, limit, since } => {
+                ReportCommands::Prompts { user, limit, since, format } => {
+                    let fmt = OutputFormat::parse(&format);
                     let rows = crate::report::recent_prompts(
                         &db.pool,
                         user.as_deref(),
@@ -247,32 +267,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.created_at.clone(),
                             ]
                         },
-                        OutputFormat::Table,
+                        fmt,
                     );
                 }
-                ReportCommands::Audit { actor, tail } => {
+                ReportCommands::Audit { actor, tail, format } => {
                     let rows =
                         crate::report::recent_audit(&db.pool, actor.as_deref(), tail).await?;
-                    print_rows(
-                        &rows,
-                        &["ID", "Actor", "Action", "Target", "Created At"],
-                        |r| {
-                            vec![
-                                r.id.to_string(),
-                                r.actor_name.clone(),
-                                r.action.clone(),
-                                r.target.clone().unwrap_or_default(),
-                                r.created_at.clone(),
-                            ]
-                        },
-                        OutputFormat::Table,
-                    );
+                    print_audit_rows(rows, OutputFormat::parse(&format));
                 }
-                ReportCommands::Hooks => {
+                ReportCommands::Hooks { format } => {
+                    let fmt = OutputFormat::parse(&format);
                     let rows = crate::report::hook_latency_stats(&db.pool).await?;
                     print_rows(
                         &rows,
-                        &["Hook", "Invocations", "Success %", "Avg ms", "p50 ms", "p95 ms"],
+                        &["Hook", "Invocations", "Success %", "Avg ms", "p50 ms", "p95 ms", "p99 ms"],
                         |r| {
                             vec![
                                 r.hook_name.clone(),
@@ -281,32 +289,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 format!("{:.1}", r.avg_duration_ms),
                                 r.p50_duration_ms.to_string(),
                                 r.p95_duration_ms.to_string(),
+                                r.p99_duration_ms.to_string(),
                             ]
                         },
-                        OutputFormat::Table,
+                        fmt,
                     );
                 }
             }
         }
-        Commands::Audit { tail } => {
+        Commands::Audit { tail, format } => {
             let settings = crate::config::load(cli.config)?;
             let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
             crate::db::migrations::run_migrations(&db.pool).await?;
             let rows = crate::report::recent_audit(&db.pool, None, tail).await?;
-            crate::report::formatter::print_rows(
-                &rows,
-                &["ID", "Actor", "Action", "Target", "Created At"],
-                |r| {
-                    vec![
-                        r.id.to_string(),
-                        r.actor_name.clone(),
-                        r.action.clone(),
-                        r.target.clone().unwrap_or_default(),
-                        r.created_at.clone(),
-                    ]
-                },
-                crate::report::formatter::OutputFormat::Table,
-            );
+            print_audit_rows(rows, crate::report::formatter::OutputFormat::parse(&format));
         }
         Commands::InstallService => {
             println!("install-service — not yet implemented");

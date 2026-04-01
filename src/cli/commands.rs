@@ -34,6 +34,8 @@ pub enum Commands {
     Audit {
         #[arg(long, default_value_t = 50)]
         tail: u32,
+        #[arg(long, default_value = "table")]
+        format: String,
     },
     /// Install system service
     InstallService,
@@ -111,7 +113,11 @@ pub enum ReportCommands {
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
         since: Option<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
     },
     /// Prompts report
     Prompts {
@@ -121,6 +127,8 @@ pub enum ReportCommands {
         limit: u32,
         #[arg(long)]
         since: Option<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
     },
     /// Audit log report
     Audit {
@@ -128,7 +136,12 @@ pub enum ReportCommands {
         actor: Option<String>,
         #[arg(long, default_value_t = 50)]
         tail: u32,
+        #[arg(long, default_value = "table")]
+        format: String,
     },
     /// Hooks performance report
-    Hooks,
+    Hooks {
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }

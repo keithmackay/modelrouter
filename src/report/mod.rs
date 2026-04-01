@@ -2,6 +2,7 @@ pub mod formatter;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CostRow {
@@ -52,6 +53,7 @@ pub struct HookStats {
     pub avg_duration_ms: f64,
     pub p50_duration_ms: i64,
     pub p95_duration_ms: i64,
+    pub p99_duration_ms: i64,
 }
 
 pub async fn cost_by_user_window(
@@ -130,22 +132,45 @@ pub async fn cost_by_user_window(
 pub async fn usage_by_model(
     pool: &sqlx::SqlitePool,
     since: Option<&str>,
+    model: Option<&str>,
+    project: Option<&str>,
 ) -> Result<Vec<UsageRow>> {
     let since = since.unwrap_or("1970-01-01T00:00:00Z");
-    let rows = sqlx::query_as::<_, (String, String, i64, i64, i64, f64)>(
+
+    // Build dynamic query based on optional filters
+    // cost_ledger has a `project` column directly, no join needed
+    let mut conditions = vec!["created_at >= ?"];
+    if model.is_some() {
+        conditions.push("model = ?");
+    }
+    if project.is_some() {
+        conditions.push("project = ?");
+    }
+    let where_clause = conditions.join(" AND ");
+
+    let base_query = format!(
         r#"SELECT model, provider,
                   COUNT(*) as request_count,
                   COALESCE(SUM(tokens_in), 0) as tokens_in,
                   COALESCE(SUM(tokens_out), 0) as tokens_out,
                   COALESCE(SUM(cost_usd), 0.0) as total_cost
            FROM cost_ledger
-           WHERE created_at >= ?
+           WHERE {}
            GROUP BY model, provider
            ORDER BY total_cost DESC"#,
-    )
-    .bind(since)
-    .fetch_all(pool)
-    .await?;
+        where_clause
+    );
+
+    let mut q = sqlx::query_as::<_, (String, String, i64, i64, i64, f64)>(&base_query);
+    q = q.bind(since);
+    if let Some(m) = model {
+        q = q.bind(m);
+    }
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+
+    let rows = q.fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .map(
@@ -280,37 +305,58 @@ pub async fn recent_audit(
 }
 
 pub async fn hook_latency_stats(pool: &sqlx::SqlitePool) -> Result<Vec<HookStats>> {
-    let stats = sqlx::query_as::<_, (String, i64, f64, f64)>(
-        r#"SELECT hook_name,
-                  COUNT(*) as invocation_count,
-                  AVG(CAST(success AS REAL)) as success_rate,
-                  AVG(CAST(duration_ms AS REAL)) as avg_duration_ms
+    // Single query: fetch all rows sorted by hook_name, duration_ms
+    // This avoids N+1 queries and lets us group in Rust.
+    let raw: Vec<(String, i64, i64)> = sqlx::query_as(
+        r#"SELECT hook_name, duration_ms, success
            FROM hook_metrics
-           GROUP BY hook_name"#,
+           ORDER BY hook_name, duration_ms"#,
     )
     .fetch_all(pool)
     .await?;
 
-    let mut result = Vec::new();
-    for (hook_name, invocation_count, success_rate, avg_duration_ms) in stats {
-        let all_durations: Vec<(i64,)> = sqlx::query_as(
-            "SELECT duration_ms FROM hook_metrics WHERE hook_name = ? ORDER BY duration_ms",
-        )
-        .bind(&hook_name)
-        .fetch_all(pool)
-        .await?;
+    // Group durations and aggregate per hook name
+    let mut durations_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    let mut success_counts: BTreeMap<String, (i64, i64)> = BTreeMap::new(); // (successes, total)
+    let mut sum_map: BTreeMap<String, i64> = BTreeMap::new();
 
-        let n = all_durations.len();
-        let p50 = if n > 0 { all_durations[n * 50 / 100].0 } else { 0 };
-        let p95 = if n > 0 { all_durations[(n * 95 / 100).min(n - 1)].0 } else { 0 };
+    for (hook_name, duration_ms, success) in &raw {
+        durations_map
+            .entry(hook_name.clone())
+            .or_default()
+            .push(*duration_ms);
+        let entry = success_counts.entry(hook_name.clone()).or_insert((0, 0));
+        entry.0 += *success;
+        entry.1 += 1;
+        *sum_map.entry(hook_name.clone()).or_insert(0) += duration_ms;
+    }
+
+    fn percentile(sorted: &[i64], pct: usize) -> i64 {
+        let n = sorted.len();
+        if n == 0 {
+            return 0;
+        }
+        // Use nearest-rank method: ceil(p/100 * n) - 1, clamped to [0, n-1]
+        let idx = ((pct * n + 99) / 100).saturating_sub(1).min(n - 1);
+        sorted[idx]
+    }
+
+    let mut result = Vec::new();
+    for (hook_name, durations) in &durations_map {
+        let n = durations.len() as i64;
+        let (successes, total) = success_counts[hook_name];
+        let sum = sum_map[hook_name];
+        let avg_duration_ms = if total > 0 { sum as f64 / total as f64 } else { 0.0 };
+        let success_rate = if total > 0 { successes as f64 / total as f64 } else { 0.0 };
 
         result.push(HookStats {
-            hook_name,
-            invocation_count,
+            hook_name: hook_name.clone(),
+            invocation_count: n,
             success_rate,
             avg_duration_ms,
-            p50_duration_ms: p50,
-            p95_duration_ms: p95,
+            p50_duration_ms: percentile(durations, 50),
+            p95_duration_ms: percentile(durations, 95),
+            p99_duration_ms: percentile(durations, 99),
         });
     }
     Ok(result)

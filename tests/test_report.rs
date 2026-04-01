@@ -77,7 +77,7 @@ async fn usage_report_groups_by_model() {
     let db = common::in_memory_db().await;
     setup_test_data(&db.pool).await;
 
-    let rows = report::usage_by_model(&db.pool, None).await.unwrap();
+    let rows = report::usage_by_model(&db.pool, None, None, None).await.unwrap();
     assert!(!rows.is_empty());
     let gpt4o = rows.iter().find(|r| r.model == "gpt-4o");
     assert!(gpt4o.is_some(), "gpt-4o should appear in usage report");
@@ -100,6 +100,7 @@ async fn json_format_is_valid_parseable_json() {
 #[tokio::test]
 async fn csv_format_has_correct_headers() {
     use modelrouter::report::CostRow;
+    use modelrouter::report::formatter::{write_rows, OutputFormat};
 
     let rows = vec![CostRow {
         user_name: "alice".to_string(),
@@ -110,23 +111,86 @@ async fn csv_format_has_correct_headers() {
         request_count: 3,
     }];
 
-    // Verify the headers array is correct
-    let headers = ["User", "Model", "Cost (USD)", "Tokens In", "Tokens Out", "Requests"];
-    assert_eq!(headers.len(), 6);
-    assert_eq!(headers[0], "User");
-    assert_eq!(headers[2], "Cost (USD)");
-    // Verify the row conversion matches the header count
-    let row_fields = vec![
-        rows[0].user_name.clone(),
-        rows[0].model.clone(),
-        format!("{:.6}", rows[0].total_cost_usd),
-        rows[0].total_tokens_in.to_string(),
-        rows[0].total_tokens_out.to_string(),
-        rows[0].request_count.to_string(),
-    ];
-    assert_eq!(
-        row_fields.len(),
-        headers.len(),
-        "row field count must match header count"
+    let mut output = Vec::new();
+    write_rows(
+        &rows,
+        &["User", "Model", "Cost (USD)", "Tokens In", "Tokens Out", "Requests"],
+        |r| {
+            vec![
+                r.user_name.clone(),
+                r.model.clone(),
+                format!("{:.6}", r.total_cost_usd),
+                r.total_tokens_in.to_string(),
+                r.total_tokens_out.to_string(),
+                r.request_count.to_string(),
+            ]
+        },
+        OutputFormat::Csv,
+        &mut output,
     );
+
+    let text = String::from_utf8(output).expect("valid utf8");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(!lines.is_empty(), "output should have lines");
+
+    let header_line = lines[0];
+    assert_eq!(header_line, "User,Model,Cost (USD),Tokens In,Tokens Out,Requests");
+
+    let data_line = lines[1];
+    assert!(data_line.starts_with("alice,gpt-4o,"));
+    assert!(data_line.contains("1000"), "tokens_in should appear in data row");
+}
+
+#[tokio::test]
+async fn hook_latency_stats_computes_correct_percentiles() {
+    let db = common::in_memory_db().await;
+    let pool = &db.pool;
+
+    // Insert hook_metrics rows for two hook names.
+    // hook_a durations: 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 (10 rows)
+    //   p50 = ceil(0.50*10) = 5th element (0-indexed: 4) = 50
+    //   p95 = ceil(0.95*10) = 10th element (0-indexed: 9) = 100
+    //   p99 = ceil(0.99*10) = 10th element (0-indexed: 9) = 100
+    // hook_b durations: 5, 15 (2 rows)
+    //   p50 = ceil(0.50*2) = 1st element (0-indexed: 0) = 5
+    //   p95 = ceil(0.95*2) = 2nd element (0-indexed: 1) = 15
+    //   p99 = ceil(0.99*2) = 2nd element (0-indexed: 1) = 15
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for duration in [10i64, 20, 30, 40, 50, 60, 70, 80, 90, 100] {
+        sqlx::query(
+            "INSERT INTO hook_metrics (hook_name, duration_ms, success, invoked_at) VALUES ('hook_a', ?, 1, ?)"
+        )
+        .bind(duration)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    for duration in [5i64, 15] {
+        sqlx::query(
+            "INSERT INTO hook_metrics (hook_name, duration_ms, success, invoked_at) VALUES ('hook_b', ?, 1, ?)"
+        )
+        .bind(duration)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let stats = report::hook_latency_stats(pool).await.unwrap();
+    assert_eq!(stats.len(), 2, "should have stats for two hooks");
+
+    let hook_a = stats.iter().find(|s| s.hook_name == "hook_a").expect("hook_a missing");
+    assert_eq!(hook_a.invocation_count, 10);
+    assert_eq!(hook_a.p50_duration_ms, 50, "hook_a p50 should be 50");
+    assert_eq!(hook_a.p95_duration_ms, 100, "hook_a p95 should be 100");
+    assert_eq!(hook_a.p99_duration_ms, 100, "hook_a p99 should be 100");
+    assert!((hook_a.avg_duration_ms - 55.0).abs() < 0.001, "hook_a avg should be 55");
+
+    let hook_b = stats.iter().find(|s| s.hook_name == "hook_b").expect("hook_b missing");
+    assert_eq!(hook_b.invocation_count, 2);
+    assert_eq!(hook_b.p50_duration_ms, 5, "hook_b p50 should be 5");
+    assert_eq!(hook_b.p95_duration_ms, 15, "hook_b p95 should be 15");
+    assert_eq!(hook_b.p99_duration_ms, 15, "hook_b p99 should be 15");
 }
