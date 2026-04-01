@@ -1,5 +1,7 @@
 pub mod commands;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use commands::{Cli, Commands};
 
@@ -21,7 +23,38 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Serve { host, port } => {
-            println!("serve {host}:{port} — not yet implemented");
+            let settings = crate::config::load(cli.config)?;
+            let settings = Arc::new(settings);
+
+            // Init DB
+            let db =
+                crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+            let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+
+            // Build app components
+            let router =
+                Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
+            let cost_calc = Arc::new(crate::router::cost::CostCalculator::new());
+            let provider_registry = Arc::new(
+                crate::providers::registry::ProviderRegistry::new(
+                    settings.providers.clone(),
+                ),
+            );
+
+            let state = crate::api::app::AppState {
+                settings: settings.clone(),
+                db,
+                router,
+                cost_calc,
+                provider_registry,
+            };
+            let app = crate::api::app::build_router(state);
+
+            let bind_addr = format!("{}:{}", host, port);
+            tracing::info!("Listening on {}", bind_addr);
+            let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+            axum::serve(listener, app).await?;
         }
         Commands::Migrate => {
             println!("migrate — not yet implemented");
