@@ -24,8 +24,8 @@ pub async fn chat_completions(
         model = tracing::field::Empty,
         provider = tracing::field::Empty,
         streaming = tracing::field::Empty,
-        cost_usd = tracing::field::Empty,
-        tokens_prompt = tracing::field::Empty,
+        "cost.usd" = tracing::field::Empty,
+        "tokens.prompt" = tracing::field::Empty,
     );
     chat_completions_inner(State(state), user, Json(body))
         .instrument(span)
@@ -174,8 +174,8 @@ async fn chat_completions_inner(
         .cost_calc
         .calculate(&canonical_model, result.prompt_tokens, result.completion_tokens);
 
-    span.record("cost_usd", cost);
-    span.record("tokens_prompt", result.prompt_tokens as u64);
+    span.record("cost.usd", cost);
+    span.record("tokens.prompt", result.prompt_tokens as u64);
 
     #[cfg(feature = "otel")]
     {
