@@ -142,6 +142,8 @@ pub struct NewBudgetRule {
     pub window: String,
     pub limit_usd: Option<f64>,
     pub limit_tokens: Option<i64>,
+    pub model_allow: Vec<String>,
+    pub model_deny: Vec<String>,
     pub rate_rpm: Option<i64>,
 }
 

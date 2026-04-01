@@ -81,7 +81,7 @@ impl HookRepository for SqliteDb {
         Ok(())
     }
 
-    async fn get_metrics_summary(&self, hook_name: &str) -> anyhow::Result<Vec<HookMetric>> {
+    async fn list_metrics(&self, hook_name: &str) -> anyhow::Result<Vec<HookMetric>> {
         let rows = sqlx::query_as::<_, HookMetricRow>(
             "SELECT hook_name, invoked_at, duration_ms, success
              FROM hook_metrics WHERE hook_name = ? ORDER BY invoked_at DESC",

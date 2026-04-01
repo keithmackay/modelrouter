@@ -32,16 +32,20 @@ impl BudgetRepository for SqliteDb {
 
     async fn create(&self, rule: NewBudgetRule) -> anyhow::Result<BudgetRule> {
         let now = now_utc();
+        let model_allow_json = serde_json::to_string(&rule.model_allow).unwrap_or_else(|_| "[]".to_string());
+        let model_deny_json = serde_json::to_string(&rule.model_deny).unwrap_or_else(|_| "[]".to_string());
         let result = sqlx::query(
             r#"INSERT INTO budget_rules (user_id, group_name, window, limit_usd, limit_tokens,
                                          model_allow, model_deny, rate_rpm, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?)"#,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(rule.user_id)
         .bind(&rule.group_name)
         .bind(&rule.window)
         .bind(rule.limit_usd)
         .bind(rule.limit_tokens)
+        .bind(&model_allow_json)
+        .bind(&model_deny_json)
         .bind(rule.rate_rpm)
         .bind(&now)
         .bind(&now)
