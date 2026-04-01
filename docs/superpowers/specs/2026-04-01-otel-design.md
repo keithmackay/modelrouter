@@ -89,7 +89,7 @@ In `src/cli/mod.rs` `Commands::Serve`, before `build_router()`:
 
 ### Layer 1 — HTTP boundary (`src/api/app.rs`)
 
-Wire up the already-present `tower-http` `TraceLayer` on the axum router. Produces a root span per HTTP request with: `http.method`, `http.route`, `http.status_code`, `http.user_agent`.
+Wire up the already-present `tower-http` `TraceLayer` on the axum router. This is done **unconditionally** (not cfg-gated) since `tower-http` is already an unconditional dependency — the layer is zero-overhead when no tracing subscriber is installed. Produces a root span per HTTP request with: `http.method`, `http.route`, `http.status_code`, `http.user_agent`.
 
 ### Layer 2 — Completions handler (`src/api/routes/completions.rs`)
 
@@ -104,7 +104,7 @@ Wire up the already-present `tower-http` `TraceLayer` on the axum router. Produc
 
 Short-lived child spans around the two highest-variance operations inside the completions handler:
 
-- `modelrouter.policy_check` — wraps `PolicyEngine::evaluate()`; attributes: `policy.result` (allow/deny), `policy.reason`
+- `modelrouter.policy_check` — wraps `PolicyEngine::check()`; attributes: `policy.result` (allow/deny), `policy.reason`
 - `modelrouter.provider_call` — wraps the provider adapter dispatch; attributes: `provider.name`, `http.status_code` from the upstream response
 
 ### Layer 4 — Hooks (`src/hooks/pipeline.rs`, `src/hooks/lifecycle.rs`)
@@ -117,7 +117,7 @@ Short-lived child spans around the two highest-variance operations inside the co
 
 ## Metrics Instruments
 
-Defined in `src/telemetry/metrics.rs`. All instruments are created once at startup as statics and accessed cheaply (single atomic operation per recording, no allocation on the hot path).
+Defined in `src/telemetry/metrics.rs`. All instruments are created once at startup and held in `OnceLock<T>` (or equivalent) — `Counter<T>` and `Histogram<T>` are not `Sync` in all SDK versions and cannot be `static` items directly. Recording a metric in the hot path is a single atomic operation with no allocation.
 
 | Instrument | Type | Labels |
 |---|---|---|
@@ -142,13 +142,12 @@ Defined in `src/telemetry/metrics.rs`. All instruments are created once at start
 
 ```
 is parent span already sampled?          → RECORD_AND_SAMPLE
-is span.status == Error?                 → RECORD_AND_SAMPLE
 does span have force_sample = true?      → RECORD_AND_SAMPLE
 random(0.0..1.0) < config.sample_ratio? → RECORD_AND_SAMPLE
                                          → DROP
 ```
 
-**Latency gate note:** OTel head-based sampling decides at span *start* before duration is known. The `slow_threshold_ms` gate is implemented as a best-effort post-hoc attribute: the completions handler sets `modelrouter.force_sample = true` if elapsed time exceeds the threshold before the span closes. This ensures slow requests are always exported.
+**Head-based sampling note:** `should_sample()` is called at span *start* before any status or duration is set. Span status (`Error`) and latency are therefore unavailable to the sampler. Both error detection and slow-request detection are handled via the `modelrouter.force_sample = true` attribute, which callers set *before the span closes* when they detect an error or when elapsed time exceeds `slow_threshold_ms`. The sampler checks only this attribute — it does not inspect span status directly.
 
 **Force-sample escape hatch:** Any code path can call `span.set_attribute("modelrouter.force_sample", true)` to guarantee the span is recorded, regardless of sample ratio. Used for budget-exceeded denials, authentication failures, and provider errors.
 
@@ -156,11 +155,11 @@ random(0.0..1.0) < config.sample_ratio? → RECORD_AND_SAMPLE
 
 ## Shutdown & Graceful Flush
 
-`TelemetryShutdownGuard` holds handles to all three pipeline processors. Its `Drop` implementation calls:
+`TelemetryShutdownGuard` holds explicit handles to all three pipeline processors (tracer provider, `SdkMeterProvider`, logger provider). Its `Drop` implementation calls:
 
 1. `opentelemetry::global::shutdown_tracer_provider()`
 2. `opentelemetry::global::shutdown_logger_provider()`
-3. Meter provider force-flush
+3. `sdk_meter_provider.force_flush()` then `sdk_meter_provider.shutdown()` — called on the held `SdkMeterProvider` handle directly, since there is no `global::shutdown_meter_provider()` API in opentelemetry 0.27
 
 This ensures in-flight telemetry is exported before the process exits — essential for short-lived invocations and `systemctl stop` / Ctrl-C scenarios.
 
@@ -182,7 +181,7 @@ otel = [
 opentelemetry           = { version = "0.27", optional = true }
 opentelemetry_sdk       = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp      = { version = "0.27", features = ["grpc-tonic"], optional = true }
-opentelemetry-appender-tracing = { version = "0.27", optional = true }
+opentelemetry-appender-tracing = { version = "0.28", optional = true }
 tracing-opentelemetry   = { version = "0.28", optional = true }
 ```
 
@@ -196,10 +195,10 @@ All in `tests/test_telemetry.rs`, gated `#[cfg(feature = "otel")]`:
 
 ### 9.1 Sampler unit tests
 Instantiate `SmartSampler` directly (no OTel infrastructure). Assert:
-- Error spans always sampled
 - `force_sample = true` always sampled
-- `sample_ratio = 0.0` always drops
+- `sample_ratio = 0.0` always drops (except force_sample)
 - `sample_ratio = 1.0` always records
+- Parent-sampled context propagates RECORD_AND_SAMPLE regardless of ratio
 
 ### 9.2 Metrics recording
 Use `opentelemetry_sdk::testing::metrics::InMemoryMetricReader` (no collector needed). Assert:
@@ -210,7 +209,7 @@ Use `opentelemetry_sdk::testing::metrics::InMemoryMetricReader` (no collector ne
 Assert `init_telemetry()` succeeds with a valid `TelemetryConfig`, and that `TelemetryShutdownGuard::drop()` completes without panicking. Verifies the startup path doesn't crash on a valid config.
 
 ### 9.4 Span attribute coverage
-Use `opentelemetry_sdk::testing::trace::InMemorySpanExporter`. Fire a mock completions request via `axum-test`. Assert the resulting span has `model`, `provider`, `cost.usd`, and `tokens.prompt` attributes set.
+Use `opentelemetry_sdk::testing::trace::InMemorySpanExporter`. Fire a mock completions request via `axum-test`, building the test `AppState` using the `in_memory_db()` helper already in `tests/common/mod.rs`. Assert the resulting span has `model`, `provider`, `cost.usd`, and `tokens.prompt` attributes set.
 
 ---
 
@@ -230,7 +229,7 @@ Use `opentelemetry_sdk::testing::trace::InMemorySpanExporter`. Fire a mock compl
 | `src/api/routes/completions.rs` | `#[instrument]`, span attributes, metrics recording |
 | `src/hooks/pipeline.rs` | `#[instrument]`, hook span attributes |
 | `src/hooks/lifecycle.rs` | `#[instrument]`, hook span attributes |
-| `src/router/policy.rs` | `#[instrument]` on `evaluate()` |
+| `src/router/policy.rs` | `#[instrument]` on `check()` |
 | `config.example.toml` | Add `[telemetry]` example section |
 | `tests/test_telemetry.rs` | New — 4 test groups (cfg-gated) |
 
