@@ -12,16 +12,32 @@ impl RequestRouter {
     }
 
     pub fn resolve(&self, requested_model: &str) -> (String, String) {
-        // 1. Alias lookup
-        if let Some(resolved) = self.settings.routing.model_aliases.get(requested_model) {
-            return self.resolve(resolved);
+        let mut current = requested_model.to_string();
+        let mut depth = 0;
+        const MAX_ALIAS_DEPTH: usize = 10;
+
+        while depth < MAX_ALIAS_DEPTH {
+            // 1. Alias lookup
+            if let Some(resolved) = self.settings.routing.model_aliases.get(&current) {
+                current = resolved.clone();
+                depth += 1;
+                continue;
+            }
+            // 2. Explicit provider prefix "provider/model"
+            if let Some(pos) = current.find('/') {
+                let provider = current[..pos].to_string();
+                let model = current[pos + 1..].to_string();
+                return (provider, model);
+            }
+            // Not an alias, not a prefix — break to fallback
+            break;
         }
-        // 2. Explicit provider prefix "provider/model"
-        if let Some(pos) = requested_model.find('/') {
-            let provider = requested_model[..pos].to_string();
-            let model = requested_model[pos + 1..].to_string();
-            return (provider, model);
+
+        // If we ended up with a "provider/model" form after alias resolution
+        if let Some(pos) = current.find('/') {
+            return (current[..pos].to_string(), current[pos + 1..].to_string());
         }
+
         // 3. Default provider + default model
         (
             self.settings.routing.default_provider.clone(),

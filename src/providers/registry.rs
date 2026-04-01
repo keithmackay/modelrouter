@@ -41,9 +41,12 @@ impl ProviderRegistry {
             Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(config))
         };
 
-        self.adapters
-            .insert(provider_name.to_string(), adapter.clone());
-        Ok(adapter)
+        // Use entry API to prevent duplicate creation under concurrency — only first caller wins
+        let entry = self
+            .adapters
+            .entry(provider_name.to_string())
+            .or_insert(adapter);
+        Ok(entry.clone())
     }
 
     /// Test helper: create registry with a single mock adapter for any provider.
