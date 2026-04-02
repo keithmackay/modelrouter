@@ -1,0 +1,43 @@
+name: Feature Request
+description: Suggest an improvement or new capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that modelrouter doesn't support today?
+      placeholder: "When I have multiple teams sharing one instance, I can't…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you've thought about or tried.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Routing / providers
+        - Budget / policy enforcement
+        - Authentication / users
+        - Hook system
+        - Admin dashboard
+        - CLI
+        - Observability (OTel)
+        - Docker / deployment
+        - Other
+    validations:
+      required: true
