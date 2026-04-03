@@ -90,23 +90,7 @@ impl PolicyEngine {
                 }
             }
 
-            // 4. Check token budget
-            if let Some(limit_tokens) = rule.limit_tokens {
-                let window_start = window_start_for(&rule.window);
-                let used_tokens =
-                    CostRepository::sum_tokens_for_user_since(&*self.db, user.id, &window_start).await?;
-                if used_tokens >= limit_tokens {
-                    let reason = format!(
-                        "token budget exceeded: {} of {} {} tokens used",
-                        used_tokens, limit_tokens, rule.window
-                    );
-                    span.record("policy.result", "deny");
-                    span.record("policy.reason", reason.as_str());
-                    return Ok(PolicyDecision::Deny { reason, status: 429, budget_context: None });
-                }
-            }
-
-            // 5. Check USD budget
+            // 4. Check USD budget
             if let Some(limit_usd) = rule.limit_usd {
                 let window_start = window_start_for(&rule.window);
                 let spent =
@@ -127,6 +111,22 @@ impl PolicyEngine {
                             window: rule.window.clone(),
                         }),
                     });
+                }
+            }
+
+            // 5. Check token budget
+            if let Some(limit_tokens) = rule.limit_tokens {
+                let window_start = window_start_for(&rule.window);
+                let used_tokens =
+                    CostRepository::sum_tokens_for_user_since(&*self.db, user.id, &window_start).await?;
+                if used_tokens >= limit_tokens {
+                    let reason = format!(
+                        "token budget exceeded: {} of {} {} tokens used",
+                        used_tokens, limit_tokens, rule.window
+                    );
+                    span.record("policy.result", "deny");
+                    span.record("policy.reason", reason.as_str());
+                    return Ok(PolicyDecision::Deny { reason, status: 429, budget_context: None });
                 }
             }
         }
