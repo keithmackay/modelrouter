@@ -8,6 +8,71 @@ use crate::{
     router::policy::PolicyDecision,
 };
 
+async fn log_messages_cost(
+    state: &AppState,
+    user_id: i64,
+    user_name: &str,
+    model: &str,
+    canonical_model: &str,
+    provider: &str,
+    messages_json: &str,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cost: f64,
+    latency_ms: i64,
+) {
+    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+
+    let prompt = NewPrompt {
+        user_id,
+        session_id: None,
+        request_model: model.to_string(),
+        routed_model: canonical_model.to_string(),
+        provider: provider.to_string(),
+        messages: messages_json.to_string(),
+        response: None,
+        finish_reason: None,
+        prompt_tokens: prompt_tokens as i64,
+        completion_tokens: completion_tokens as i64,
+        cost_usd: cost,
+        latency_ms: Some(latency_ms),
+        tags: "[]".to_string(),
+        project: None,
+    };
+    match PromptRepository::create(&*state.db, prompt).await {
+        Ok(saved_prompt) => {
+            let ledger = NewCostLedgerEntry {
+                user_id,
+                prompt_id: saved_prompt.id,
+                model: canonical_model.to_string(),
+                provider: provider.to_string(),
+                project: None,
+                tokens_in: prompt_tokens as i64,
+                tokens_out: completion_tokens as i64,
+                cost_usd: cost,
+            };
+            if let Err(e) = CostRepository::create(&*state.db, ledger).await {
+                tracing::error!("Failed to record cost: {}", e);
+            }
+        }
+        Err(e) => tracing::error!("Failed to record prompt: {}", e),
+    }
+
+    // Fire on_response_sent lifecycle hooks
+    for hook in &state.settings.hooks.lifecycle {
+        if hook.event == "on_response_sent" {
+            let payload = crate::hooks::lifecycle::response_sent_payload(
+                user_name,
+                model,
+                canonical_model,
+                cost,
+                latency_ms,
+            );
+            crate::hooks::lifecycle::fire(hook, payload);
+        }
+    }
+}
+
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -29,7 +94,6 @@ async fn anthropic_messages_inner(
     user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
     use std::time::Instant;
 
     let user = user.0;
@@ -39,7 +103,7 @@ async fn anthropic_messages_inner(
         .to_string();
     let stream = body["stream"].as_bool().unwrap_or(false);
 
-    let (provider_name, canonical_model) = state.router.resolve(&model);
+    let (_provider_name, canonical_model) = state.router.resolve(&model);
 
     // Policy check
     let policy_result = state
@@ -79,22 +143,19 @@ async fn anthropic_messages_inner(
     span.record("model", model.as_str());
     span.record("streaming", stream);
 
-    // Get the provider config using resolved provider name
-    let provider_config = state
-        .settings
-        .providers
-        .get(&provider_name)
-        .ok_or_else(|| ApiError::InvalidRequest(format!("No '{}' provider configured", provider_name)))?
+    // Fix 2: Always use the "anthropic" provider config for the Messages API
+    let anthropic_config = state.settings.providers.get("anthropic")
+        .ok_or_else(|| ApiError::ProviderError(anyhow::anyhow!("No 'anthropic' provider configured")))?
         .clone();
 
-    let api_base = provider_config
+    let api_base = anthropic_config
         .api_base
         .as_deref()
         .unwrap_or("https://api.anthropic.com")
         .trim_end_matches('/')
         .to_string();
-    let api_key = provider_config.api_key.clone();
-    let timeout_secs = provider_config.timeout_secs;
+    let api_key = anthropic_config.api_key.clone();
+    let timeout_secs = anthropic_config.timeout_secs;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
@@ -140,6 +201,26 @@ async fn anthropic_messages_inner(
         let byte_stream = upstream_resp
             .bytes_stream()
             .map_err(|e| std::io::Error::other(e.to_string()));
+
+        // Fix 3: Fire-and-forget approximate cost for streaming
+        let state_c = state.clone();
+        let user_id = user.id;
+        let user_name_s = user.name.clone();
+        let model_s = model.clone();
+        let canonical_s = canonical_model.clone();
+        let provider_s = "anthropic".to_string();
+        let messages_json_s = serde_json::to_string(
+            &body["messages"].as_array().cloned().unwrap_or_default()
+        ).unwrap_or_default();
+        let start_s = start;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let stream initiate
+            let prompt_tokens = (messages_json_s.chars().count() / 4) as u32;
+            let cost = state_c.cost_calc.calculate(&canonical_s, prompt_tokens, 0);
+            let latency_ms = start_s.elapsed().as_millis() as i64;
+            log_messages_cost(&state_c, user_id, &user_name_s, &model_s, &canonical_s, &provider_s,
+                               &messages_json_s, prompt_tokens, 0, cost, latency_ms).await;
+        });
 
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -199,12 +280,11 @@ async fn anthropic_messages_inner(
         .cost_calc
         .calculate(&canonical_model, prompt_tokens, completion_tokens);
 
-    // Fire-and-forget: log prompt + cost
+    // Fix 1 & Fix 4: Capture user_name before spawn; use model_clone consistently (no model_c)
     let state_clone = state.clone();
     let model_clone = model.clone();
     let canonical_c = canonical_model.clone();
-    let provider_clone = provider_name.clone();
-    let model_c = model.clone();
+    let user_name_c = user.name.clone();
     let messages_json = serde_json::to_string(
         &body["messages"].as_array().cloned().unwrap_or_default(),
     )
@@ -213,13 +293,15 @@ async fn anthropic_messages_inner(
     let user_id = user.id;
 
     tokio::spawn(async move {
+        use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+
         let prompt = NewPrompt {
             user_id,
             session_id: None,
             request_model: model_clone.clone(),
             routed_model: canonical_c.clone(),
-            provider: provider_clone.clone(),
-            messages: messages_json,
+            provider: "anthropic".to_string(),
+            messages: messages_json.clone(),
             response: Some(response_content),
             finish_reason: Some(stop_reason),
             prompt_tokens: prompt_tokens as i64,
@@ -235,7 +317,7 @@ async fn anthropic_messages_inner(
                     user_id,
                     prompt_id: saved_prompt.id,
                     model: canonical_c.clone(),
-                    provider: provider_clone.clone(),
+                    provider: "anthropic".to_string(),
                     project: None,
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
@@ -248,12 +330,12 @@ async fn anthropic_messages_inner(
             Err(e) => tracing::error!("Failed to record prompt: {}", e),
         }
 
-        // Fire on_response_sent lifecycle hooks
+        // Fix 1: Fire on_response_sent lifecycle hooks with correct user_name
         for hook in &state_clone.settings.hooks.lifecycle {
             if hook.event == "on_response_sent" {
                 let payload = crate::hooks::lifecycle::response_sent_payload(
-                    &provider_clone,
-                    &model_c,
+                    &user_name_c,
+                    &model_clone,
                     &canonical_c,
                     cost,
                     latency_ms,
