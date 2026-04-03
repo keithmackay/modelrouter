@@ -218,3 +218,169 @@ async fn budget_exceeded_returns_deny() {
         "should deny over-budget user"
     );
 }
+
+#[tokio::test]
+async fn test_policy_token_limit_under_budget() {
+    let db = common::in_memory_db().await;
+    use modelrouter::db::repositories::{
+        budgets::BudgetRepository, costs::CostRepository, prompts::PromptRepository,
+    };
+    use modelrouter::db::models::{NewBudgetRule, NewCostLedgerEntry, NewPrompt};
+    use modelrouter::api::auth::hash_token;
+
+    let user = UserRepository::create(
+        &db,
+        NewUser {
+            name: format!("token-under-{}", uuid::Uuid::new_v4()),
+            api_key_hash: hash_token(&uuid::Uuid::new_v4().to_string()),
+            group_name: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    BudgetRepository::create(
+        &db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: Some(100),
+            rate_rpm: None,
+            model_allow: vec![],
+            model_deny: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let prompt = PromptRepository::create(
+        &db,
+        NewPrompt {
+            user_id: user.id,
+            session_id: None,
+            request_model: "gpt-4o".to_string(),
+            routed_model: "gpt-4o".to_string(),
+            provider: "openai".to_string(),
+            messages: "[]".to_string(),
+            response: None,
+            finish_reason: None,
+            prompt_tokens: 60,
+            completion_tokens: 35,
+            cost_usd: 0.001,
+            latency_ms: None,
+            tags: "[]".to_string(),
+            project: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Insert 60 + 35 = 95 tokens — under the 100 token limit
+    CostRepository::create(
+        &db,
+        NewCostLedgerEntry {
+            user_id: user.id,
+            prompt_id: prompt.id,
+            model: "gpt-4o".to_string(),
+            provider: "openai".to_string(),
+            project: None,
+            tokens_in: 60,
+            tokens_out: 35,
+            cost_usd: 0.001,
+        },
+    )
+    .await
+    .unwrap();
+
+    let engine = PolicyEngine::new(Arc::new(db));
+    let decision = engine.check(&user, "gpt-4o").await.unwrap();
+    assert!(
+        matches!(decision, PolicyDecision::Allow),
+        "95 tokens used with 100 token limit should allow"
+    );
+}
+
+#[tokio::test]
+async fn test_policy_token_limit_blocks_when_exceeded() {
+    let db = common::in_memory_db().await;
+    use modelrouter::db::repositories::{
+        budgets::BudgetRepository, costs::CostRepository, prompts::PromptRepository,
+    };
+    use modelrouter::db::models::{NewBudgetRule, NewCostLedgerEntry, NewPrompt};
+    use modelrouter::api::auth::hash_token;
+
+    let user = UserRepository::create(
+        &db,
+        NewUser {
+            name: format!("token-exceeded-{}", uuid::Uuid::new_v4()),
+            api_key_hash: hash_token(&uuid::Uuid::new_v4().to_string()),
+            group_name: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    BudgetRepository::create(
+        &db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: Some(50),
+            rate_rpm: None,
+            model_allow: vec![],
+            model_deny: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let prompt = PromptRepository::create(
+        &db,
+        NewPrompt {
+            user_id: user.id,
+            session_id: None,
+            request_model: "gpt-4o".to_string(),
+            routed_model: "gpt-4o".to_string(),
+            provider: "openai".to_string(),
+            messages: "[]".to_string(),
+            response: None,
+            finish_reason: None,
+            prompt_tokens: 40,
+            completion_tokens: 20,
+            cost_usd: 0.001,
+            latency_ms: None,
+            tags: "[]".to_string(),
+            project: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Insert 40 + 20 = 60 tokens — over the 50 token limit
+    CostRepository::create(
+        &db,
+        NewCostLedgerEntry {
+            user_id: user.id,
+            prompt_id: prompt.id,
+            model: "gpt-4o".to_string(),
+            provider: "openai".to_string(),
+            project: None,
+            tokens_in: 40,
+            tokens_out: 20,
+            cost_usd: 0.001,
+        },
+    )
+    .await
+    .unwrap();
+
+    let engine = PolicyEngine::new(Arc::new(db));
+    let decision = engine.check(&user, "gpt-4o").await.unwrap();
+    assert!(
+        matches!(decision, PolicyDecision::Deny { status: 429, .. }),
+        "60 tokens used with 50 token limit should deny"
+    );
+}

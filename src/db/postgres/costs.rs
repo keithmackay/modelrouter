@@ -42,4 +42,16 @@ impl CostRepository for PostgresDb {
         .await?;
         Ok(row.0)
     }
+
+    async fn sum_tokens_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM cost_ledger
+             WHERE user_id = $1 AND created_at >= $2",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
 }
