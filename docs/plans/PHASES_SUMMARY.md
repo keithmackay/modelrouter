@@ -200,6 +200,148 @@ _Written: 2026-03-31_
 
 ---
 
+### Phase 9 — OpenTelemetry Integration ✅ Complete
+**Goal:** Full OTel observability (traces, metrics, logs) via OTLP/gRPC, behind `--features otel`.
+
+| # | Task |
+|---|---|
+| 9.1 | `otel` feature flag + 5 optional OTel crate dependencies in `Cargo.toml` |
+| 9.2 | `TelemetryConfig` schema (cfg-gated); `[telemetry]` section in `config.example.toml` |
+| 9.3 | `SmartSampler` — parent propagation, `force_sample` attribute, ratio-based sampling |
+| 9.4 | Metrics instruments — 7 instruments in `OnceLock<Instruments>` (requests, tokens, cost, latency, policy denials, hook duration) |
+| 9.5 | `init_telemetry()` — three OTLP gRPC pipelines (BatchSpanProcessor, PeriodicReader 15s, BatchLogProcessor); layered tracing subscriber |
+| 9.6 | `TelemetryShutdownGuard` — flushes all three pipelines on Drop |
+| 9.7 | `TraceLayer` wired unconditionally on axum router |
+| 9.8 | `chat_completions` span attributes (`user.id`, `model`, `provider`, `cost.usd`, `tokens.prompt`, child spans for policy check and provider call) |
+| 9.9 | Hook spans (`#[instrument]` on pipeline and lifecycle hooks) |
+| 9.10 | Policy span (`#[instrument]` on `PolicyEngine::check()`) |
+| 9.11 | Tests — sampler unit tests, metrics recording, init/shutdown, span attribute coverage |
+
+**Deliverable:** `cargo build --features otel` + a running OTLP collector (e.g. Arize Phoenix) produces traces, metrics, and logs. Default binary unchanged.
+
+---
+
+### Phase 10 — Quick Wins: Critical and High-Impact Low-Effort Features
+**Goal:** Five high-value features each achievable in a day or less, no new subsystems required.
+_Source: LiteLLM gap analysis items 1–5. See `docs/2026-04-02-litellm-feature-gap.md`._
+
+| # | Task |
+|---|---|
+| 10.1 | `POST /v1/messages` — Anthropic Messages API passthrough; unblocks Claude Code as a native client |
+| 10.2 | Enforce TPM/RPM token limits in `PolicyEngine` — `limit_tokens` column already in schema |
+| 10.3 | Config-driven pricing table — replace hardcoded map in `router/cost.rs` with `[[pricing]]` TOML config |
+| 10.4 | Fallback chain retry loop — `FallbackChain::try_in_order()` over already-parsed config |
+| 10.5 | `GET /metrics` Prometheus endpoint — thin wrapper over existing OTel metric instruments |
+| 10.6 | Tests for all five features |
+
+**Key decision:** The `/v1/messages` route reuses the existing `AuthenticatedUser` extractor and cost logging pipeline; the only new code is format translation between Anthropic Messages API shape and `NormalizedRequest`.
+
+**Deliverable:** Claude Code can point `ANTHROPIC_BASE_URL` at modelrouter with no adapter. Token limits enforced. Provider pricing customisable. Prometheus scrape target live.
+
+---
+
+### Phase 11 — Core Expansion: High-Impact Medium-Effort Features
+**Goal:** Caching, embeddings, per-key budgets, cloud provider adapters, and real load balancing.
+_Source: LiteLLM gap analysis items 6–12._
+
+| # | Task |
+|---|---|
+| 11.1 | Complexity router — cheap-model routing for simple prompts via heuristic token-count threshold |
+| 11.2 | Exact-match response cache — Redis or in-memory LRU, keyed on (model, messages hash, params) |
+| 11.3 | Semantic cache — optional Qdrant integration for similarity-based cache hits |
+| 11.4 | `POST /v1/embeddings` — new route + provider adapters for OpenAI, Anthropic, and Bedrock Titan |
+| 11.5 | Per-key budget entity — `api_keys` table, multiple keys per user, each with own `budget_rules` FK |
+| 11.6 | Azure OpenAI provider adapter — model deployments, API version negotiation |
+| 11.7 | AWS Bedrock adapter — SigV4 auth, Claude Converse API, Titan embeddings |
+| 11.8 | Load balancer — round-robin, weighted, and latency-based strategies across a deployment pool |
+| 11.9 | Tests for all features |
+
+**Key decision:** Introduce a `Deployment` type (pool member) separate from `Provider`. A provider is a credential; a deployment is a routeable endpoint with health state and latency history.
+
+**Deliverable:** Response caching reduces provider spend on repetitive workloads. Embeddings proxied. Azure and Bedrock unblocked. Load balanced across multiple API keys.
+
+---
+
+### Phase 12 — Provider Expansion and Polish: Medium-Impact Low-Effort Features
+**Goal:** Extend provider coverage and add nine targeted quality-of-life improvements.
+_Source: LiteLLM gap analysis items 13–21._
+
+| # | Task |
+|---|---|
+| 12.1 | Provider adapters — Groq, Mistral, DeepSeek, OpenRouter (all OpenAI-compat; reuse existing adapter) |
+| 12.2 | Circuit breaker — per-deployment failure state, cooldown window, auto-recovery |
+| 12.3 | IP-based rate limiting — add source IP as an additional rate limit key dimension |
+| 12.4 | Concurrent request limit — `max_parallel_requests` per user via per-user semaphore in `AppState` |
+| 12.5 | Spend reset API — `POST /admin/api/spend/reset` zeros counters for a user or window |
+| 12.6 | Per-tag budget rules — `tags` JSONB column on `api_keys`; budget rules can match by tag |
+| 12.7 | Spend log cold storage — background job archives `cost_ledger` rows older than 90 days to S3 |
+| 12.8 | Anthropic prompt caching — inject `cache_control` on long system prompts before upstream send |
+| 12.9 | Key TTL and auto-rotation — `expires_at` on keys; background job rotates keys on schedule |
+| 12.10 | Tests for all features |
+
+**Deliverable:** Four new provider families available. Nine quality improvements shipped. No new subsystems introduced.
+
+---
+
+### Phase 13 — Enterprise Readiness: Medium-Impact Medium-Effort Features
+**Goal:** Hot-reload, guardrails, LLM observability callbacks, session limits, K8s packaging.
+_Source: LiteLLM gap analysis items 22–26 and 29._
+
+| # | Task |
+|---|---|
+| 13.1 | Config hot-reload — background task polls DB every 10 s for new model deployments; applies without restart |
+| 13.2 | Guardrail framework — `GuardrailHook` trait (pre/post call); first integration: Presidio PII detection |
+| 13.3 | LangFuse callback — async span export via LangFuse SDK on request completion |
+| 13.4 | LangSmith callback — same interface, LangSmith target |
+| 13.5 | Session-based rate limits — `session_tpm_limit` / `session_rpm_limit` propagated via `X-Session-Id` header |
+| 13.6 | `POST /v1/responses` — OpenAI Responses API passthrough |
+| 13.7 | Kubernetes Helm chart — Deployment, Service, ConfigMap, HPA, liveness/readiness probes, PVC |
+| 13.8 | Tests for all features |
+
+**Deliverable:** modelrouter deployable on Kubernetes via Helm. LLM-specific observability platforms supported. PII protection available via guardrail config. Hot-reload eliminates restarts for model additions.
+
+---
+
+### Phase 14 — Advanced Platform: Medium/Low-Impact Higher-Effort Features
+**Goal:** MCP support, declarative policy engine, batch API, queueing, and additional modalities.
+_Source: LiteLLM gap analysis items 27–28 and 30–33._
+
+| # | Task |
+|---|---|
+| 14.1 | MCP server registry — CRUD endpoints for MCP server definitions, per-key access groups |
+| 14.2 | MCP tool calling — passthrough and routing for MCP tool invocations |
+| 14.3 | Semantic MCP tool filtering — embedding-based top-K tool selection before context assembly |
+| 14.4 | Declarative policy engine — condition-based rules with org→team→project→key cascade |
+| 14.5 | Policy CRUD endpoints — `POST /admin/api/policies`, `GET`, `PUT`, `DELETE` |
+| 14.6 | Batch API — `POST /v1/batches`, async job runner, result polling, post-completion cost tracking |
+| 14.7 | Request queue — per-user async queue so rate-limited requests wait rather than immediately 429 |
+| 14.8 | Image generation — `POST /v1/images/generations` with DALL-E and Stable Diffusion adapters |
+| 14.9 | Audio — `POST /v1/audio/transcriptions` (Whisper) and `POST /v1/audio/speech` (TTS) |
+| 14.10 | Tests for all features |
+
+**Deliverable:** Claude Code MCP tool calls route through modelrouter with budget tracking and semantic filtering. Batch processing proxied. Image and audio modalities covered.
+
+---
+
+### Phase 15 — Enterprise Integrations: Low-Impact High-Effort Features
+**Goal:** SSO, SCIM, billing hooks, shadow traffic, agent execution, vector stores, and realtime.
+_Source: LiteLLM gap analysis items 34–40._
+
+| # | Task |
+|---|---|
+| 15.1 | SSO / OIDC — admin dashboard login via Okta, Azure AD, or Auth0; PKCE flow |
+| 15.2 | SCIM provisioning — sync users and groups from identity provider automatically |
+| 15.3 | Shadow traffic routing — mirror a configurable fraction of requests to an alternate deployment |
+| 15.4 | Billing integrations — push usage events to Stripe (metered billing) and Lago |
+| 15.5 | Agent endpoints — `POST /agents`, `POST /agents/{id}/execute` with session memory and per-session budget |
+| 15.6 | Vector store and RAG — `POST /v1/vector_stores`, file management, retrieval pipeline |
+| 15.7 | Realtime WebSocket API — `GET /v1/realtime` WebSocket proxy for OpenAI Realtime API |
+| 15.8 | Tests for all features |
+
+**Deliverable:** Enterprise identity management automated. Billing systems connected. Full LiteLLM feature parity for all modalities and integration categories.
+
+---
+
 ## Success Criteria
 
 The implementation is complete when:
@@ -229,12 +371,20 @@ The implementation is complete when:
 
 ---
 
-## Future Enhancements (Post-Launch)
+## Roadmap
 
-See the **Next Steps** section of `implementation-plan.md` for the full list with rationale. Top candidates:
+Phases 10–15 are the structured improvement roadmap, derived from the LiteLLM feature gap analysis at `docs/2026-04-02-litellm-feature-gap.md`. Each phase is a self-contained sprint targeting one priority band from that analysis.
 
-1. **OIDC/SSO for admin auth** — `SessionProvider` trait is already designed for this [Keith's idea]
-2. **Prometheus metrics endpoint** — `/metrics` for Grafana/alerting [Claude's idea]
-3. **Budget alerts via webhook** — native Slack/webhook config without shell scripts [Keith's idea]
-4. **Homebrew tap** — `brew install keithmackay/tap/modelrouter` [Keith's idea]
-5. **Fallback chain execution** — retry on provider failure/timeout [Claude's idea]
+| Phase | Band | Items | Theme |
+|-------|------|-------|-------|
+| 10 | Critical + High / Low effort | 1–5 | Quick wins — maximum impact per hour |
+| 11 | High / Medium effort | 6–12 | Core expansion — caching, embeddings, cloud providers, load balancing |
+| 12 | Medium / Low effort | 13–21 | Provider breadth and polish |
+| 13 | Medium / Medium effort | 22–26, 29 | Enterprise readiness — guardrails, K8s, hot-reload |
+| 14 | Medium–Low / High effort | 27–28, 30–33 | Advanced platform — MCP, policy engine, new modalities |
+| 15 | Low / High effort | 34–40 | Enterprise integrations — SSO, SCIM, billing, realtime |
+
+Additional items not in the gap analysis:
+- **Homebrew tap** — `brew install keithmackay/tap/modelrouter` [Keith]
+- **WebAssembly plugin hooks** — replace shell subprocess hooks with `.wasm` modules via `wasmtime` [Claude]
+- **Prompt advisor** — meta-LLM background worker that annotates stored prompts with improvement suggestions [Keith]
