@@ -39,6 +39,8 @@ async fn anthropic_messages_inner(
         .to_string();
     let stream = body["stream"].as_bool().unwrap_or(false);
 
+    let (provider_name, canonical_model) = state.router.resolve(&model);
+
     // Policy check
     let policy_result = state
         .policy
@@ -48,7 +50,26 @@ async fn anthropic_messages_inner(
         .map_err(|_| ApiError::Internal)?;
     match policy_result {
         PolicyDecision::Allow => {}
-        PolicyDecision::Deny { reason, status, .. } => {
+        PolicyDecision::Deny {
+            reason,
+            status,
+            budget_context,
+        } => {
+            if budget_context.is_some() {
+                for hook in &state.settings.hooks.lifecycle {
+                    if hook.event == "on_budget_exceeded" {
+                        let ctx = budget_context.as_ref();
+                        let payload = crate::hooks::lifecycle::budget_exceeded_payload(
+                            &user.name,
+                            &model,
+                            ctx.map(|c| c.limit_usd).unwrap_or(0.0),
+                            ctx.map(|c| c.spent_usd).unwrap_or(0.0),
+                            ctx.map(|c| c.window.as_str()).unwrap_or("unknown"),
+                        );
+                        crate::hooks::lifecycle::fire(hook, payload);
+                    }
+                }
+            }
             return Err(ApiError::PolicyDenied { reason, status });
         }
     }
@@ -58,12 +79,12 @@ async fn anthropic_messages_inner(
     span.record("model", model.as_str());
     span.record("streaming", stream);
 
-    // Get the anthropic provider config
+    // Get the provider config using resolved provider name
     let provider_config = state
         .settings
         .providers
-        .get("anthropic")
-        .ok_or_else(|| ApiError::InvalidRequest("No 'anthropic' provider configured".to_string()))?
+        .get(&provider_name)
+        .ok_or_else(|| ApiError::InvalidRequest(format!("No '{}' provider configured", provider_name)))?
         .clone();
 
     let api_base = provider_config
@@ -83,6 +104,10 @@ async fn anthropic_messages_inner(
     let upstream_url = format!("{}/v1/messages", api_base);
     let start = Instant::now();
 
+    // Build upstream body with canonical model name
+    let mut upstream_body = body.clone();
+    upstream_body["model"] = serde_json::Value::String(canonical_model.clone());
+
     if stream {
         // Streaming: proxy raw SSE bytes back to client
         let upstream_resp = client
@@ -90,7 +115,7 @@ async fn anthropic_messages_inner(
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&upstream_body)
             .send()
             .await
             .map_err(|e| ApiError::ProviderError(e.into()))?;
@@ -133,7 +158,7 @@ async fn anthropic_messages_inner(
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&body)
+        .json(&upstream_body)
         .send()
         .await
         .map_err(|e| ApiError::ProviderError(e.into()))?;
@@ -172,11 +197,14 @@ async fn anthropic_messages_inner(
 
     let cost = state
         .cost_calc
-        .calculate(&model, prompt_tokens, completion_tokens);
+        .calculate(&canonical_model, prompt_tokens, completion_tokens);
 
     // Fire-and-forget: log prompt + cost
     let state_clone = state.clone();
     let model_clone = model.clone();
+    let canonical_c = canonical_model.clone();
+    let provider_clone = provider_name.clone();
+    let model_c = model.clone();
     let messages_json = serde_json::to_string(
         &body["messages"].as_array().cloned().unwrap_or_default(),
     )
@@ -189,8 +217,8 @@ async fn anthropic_messages_inner(
             user_id,
             session_id: None,
             request_model: model_clone.clone(),
-            routed_model: model_clone.clone(),
-            provider: "anthropic".to_string(),
+            routed_model: canonical_c.clone(),
+            provider: provider_clone.clone(),
             messages: messages_json,
             response: Some(response_content),
             finish_reason: Some(stop_reason),
@@ -206,8 +234,8 @@ async fn anthropic_messages_inner(
                 let ledger = NewCostLedgerEntry {
                     user_id,
                     prompt_id: saved_prompt.id,
-                    model: model_clone.clone(),
-                    provider: "anthropic".to_string(),
+                    model: canonical_c.clone(),
+                    provider: provider_clone.clone(),
                     project: None,
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
@@ -218,6 +246,20 @@ async fn anthropic_messages_inner(
                 }
             }
             Err(e) => tracing::error!("Failed to record prompt: {}", e),
+        }
+
+        // Fire on_response_sent lifecycle hooks
+        for hook in &state_clone.settings.hooks.lifecycle {
+            if hook.event == "on_response_sent" {
+                let payload = crate::hooks::lifecycle::response_sent_payload(
+                    &provider_clone,
+                    &model_c,
+                    &canonical_c,
+                    cost,
+                    latency_ms,
+                );
+                crate::hooks::lifecycle::fire(hook, payload);
+            }
         }
     });
 
