@@ -59,7 +59,8 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
-        completions::chat_completions, health::health_check, models::list_models,
+        completions::chat_completions, health::health_check, messages::anthropic_messages,
+        models::list_models,
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user, rotate_user_key,
@@ -81,6 +82,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/health", get(health_check))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))
