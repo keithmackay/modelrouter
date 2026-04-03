@@ -1,0 +1,42 @@
+mod common;
+
+use axum_test::TestServer;
+use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
+use modelrouter::config::Settings;
+use modelrouter::providers::registry::ProviderRegistry;
+use modelrouter::router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+async fn test_app() -> TestServer {
+    let db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    let router = Arc::new(RequestRouter::new(settings.clone()));
+    let cost_calc = Arc::new(CostCalculator::new());
+    let provider_registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
+        response: "Hello!".to_string(),
+    }));
+    let policy = Arc::new(PolicyEngine::new(db.clone()));
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+
+    let state = AppState {
+        settings,
+        db,
+        pool: None,
+        router,
+        cost_calc,
+        provider_registry,
+        policy,
+        fallback,
+        app_metrics: None,
+    };
+    TestServer::new(build_router(state)).unwrap()
+}
+
+#[tokio::test]
+async fn test_metrics_returns_404_without_feature() {
+    let server = test_app().await;
+    let resp = server.get("/metrics").await;
+    assert_eq!(resp.status_code(), 404);
+}

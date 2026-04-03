@@ -44,6 +44,7 @@ async fn test_app() -> TestServer {
         provider_registry,
         policy,
         fallback,
+        app_metrics: None,
     };
     TestServer::new(build_router(state)).unwrap()
 }

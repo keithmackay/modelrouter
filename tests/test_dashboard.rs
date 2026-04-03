@@ -36,6 +36,7 @@ async fn build_test_server() -> TestServer {
         provider_registry: registry,
         policy,
         fallback,
+        app_metrics: None,
     };
 
     TestServer::new(build_router(state)).unwrap()
@@ -115,6 +116,7 @@ async fn login_success_sets_cookie() {
         provider_registry: registry,
         policy,
         fallback,
+        app_metrics: None,
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -157,6 +159,7 @@ async fn superadmin_only_admins_page() {
         provider_registry: registry,
         policy,
         fallback,
+        app_metrics: None,
     };
 
     let server = TestServer::new(build_router(state)).unwrap();

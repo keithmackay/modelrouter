@@ -231,6 +231,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 settings.routing.fallback_chains.clone(),
             ));
 
+            #[cfg(feature = "prometheus")]
+            let app_metrics = Some(Arc::new(
+                crate::metrics::AppMetrics::new().expect("Failed to init Prometheus metrics")
+            ));
+            #[cfg(not(feature = "prometheus"))]
+            let app_metrics: Option<std::convert::Infallible> = None;
+
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
                 db,
@@ -240,6 +247,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 provider_registry,
                 policy,
                 fallback,
+                app_metrics,
             };
             let app = crate::api::app::build_router(state);
 

@@ -55,13 +55,17 @@ pub struct AppState {
     pub provider_registry: Arc<ProviderRegistry>,
     pub policy: Arc<PolicyEngine>,
     pub fallback: Arc<FallbackChain>,
+    #[cfg(feature = "prometheus")]
+    pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
+    #[cfg(not(feature = "prometheus"))]
+    pub app_metrics: Option<std::convert::Infallible>,
 }
 
 pub fn build_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         completions::chat_completions, health::health_check, messages::anthropic_messages,
-        models::list_models,
+        models::list_models, prometheus::metrics_handler,
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user, rotate_user_key,
@@ -81,6 +85,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     axum::Router::new()
         // Health + API routes
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))

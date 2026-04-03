@@ -292,6 +292,8 @@ async fn completions_span_has_required_attributes() {
         cost_calc: Arc::new(CostCalculator::new()),
         provider_registry: registry,
         policy: Arc::new(PolicyEngine::new(db.clone())),
+        fallback: Arc::new(modelrouter::router::fallback::FallbackChain::new(std::collections::HashMap::new())),
+        app_metrics: None,
     };
 
     let server = TestServer::new(build_router(state)).unwrap();

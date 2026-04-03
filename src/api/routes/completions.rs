@@ -217,6 +217,13 @@ async fn chat_completions_inner(
         );
     }
 
+    #[cfg(feature = "prometheus")]
+    if let Some(ref metrics) = state.app_metrics {
+        metrics.record_request(&current_model, &current_provider, "ok");
+        metrics.record_tokens(&current_model, &current_provider, result.prompt_tokens, result.completion_tokens);
+        metrics.record_cost(&current_model, &current_provider, cost);
+    }
+
     // Fire-and-forget: log prompt + cost
     let state_clone = state.clone();
     let model_clone = model.clone();
