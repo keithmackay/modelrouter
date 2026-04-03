@@ -7,7 +7,8 @@ use modelrouter::config::Settings;
 use modelrouter::db::models::NewUser;
 use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::providers::registry::ProviderRegistry;
-use modelrouter::router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine};
+use modelrouter::router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 async fn test_app() -> TestServer {
@@ -32,6 +33,8 @@ async fn test_app() -> TestServer {
 
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+
     let state = AppState {
         settings,
         db,
@@ -40,6 +43,7 @@ async fn test_app() -> TestServer {
         cost_calc,
         provider_registry,
         policy,
+        fallback,
     };
     TestServer::new(build_router(state)).unwrap()
 }

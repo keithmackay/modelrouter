@@ -227,6 +227,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ),
             );
             let policy = Arc::new(crate::router::policy::PolicyEngine::new(db.clone()));
+            let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
+                settings.routing.fallback_chains.clone(),
+            ));
 
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
@@ -236,6 +239,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 cost_calc,
                 provider_registry,
                 policy,
+                fallback,
             };
             let app = crate::api::app::build_router(state);
 

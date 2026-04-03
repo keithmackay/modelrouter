@@ -123,15 +123,14 @@ async fn chat_completions_inner(
 
     let norm_req = build_normalized_request(&body, canonical_model.clone());
 
-    let adapter = state
-        .provider_registry
-        .get(&provider_name)
-        .map_err(ApiError::ProviderError)?;
-
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
 
     if stream {
+        let adapter = state
+            .provider_registry
+            .get(&provider_name)
+            .map_err(ApiError::ProviderError)?;
         let sse_stream = adapter
             .stream(&norm_req)
             .await
@@ -161,14 +160,40 @@ async fn chat_completions_inner(
         );
     }
 
-    let result = adapter
-        .complete(&norm_req)
-        .instrument(tracing::info_span!(
-            "modelrouter.provider_call",
-            "provider.name" = provider_name.as_str()
-        ))
-        .await
-        .map_err(ApiError::ProviderError)?;
+    let mut current_model = canonical_model.clone();
+    let mut current_provider = provider_name.clone();
+    let result = loop {
+        let adapter = state
+            .provider_registry
+            .get(&current_provider)
+            .map_err(ApiError::ProviderError)?;
+        match adapter
+            .complete(&build_normalized_request(&body, current_model.clone()))
+            .instrument(tracing::info_span!(
+                "modelrouter.provider_call",
+                "provider.name" = current_provider.as_str()
+            ))
+            .await
+        {
+            Ok(r) => break r,
+            Err(e) => {
+                tracing::warn!(
+                    model = current_model.as_str(),
+                    provider = current_provider.as_str(),
+                    error = %e,
+                    "Provider call failed, checking fallback chain"
+                );
+                if let Some(next_model) = state.fallback.next_after(&current_model) {
+                    let (next_provider, next_canonical) = state.router.resolve(next_model);
+                    current_model = next_canonical;
+                    current_provider = next_provider;
+                    tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
+                } else {
+                    return Err(ApiError::ProviderError(e));
+                }
+            }
+        }
+    };
     let latency_ms = start.elapsed().as_millis() as i64;
     let cost = state
         .cost_calc

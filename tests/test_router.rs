@@ -45,3 +45,31 @@ fn resolve_default() {
         ("openai".to_string(), "gpt-4o".to_string())
     );
 }
+
+#[test]
+fn test_fallback_chain_next_model() {
+    use modelrouter::router::fallback::FallbackChain;
+    use std::collections::HashMap;
+
+    let mut chains = HashMap::new();
+    chains.insert(
+        "gpt-4o".to_string(),
+        vec!["gpt-4o-mini".to_string(), "gpt-3.5-turbo".to_string()],
+    );
+
+    let chain = FallbackChain::new(chains);
+
+    assert_eq!(chain.next_after("gpt-4o"), Some("gpt-4o-mini"));
+    assert_eq!(chain.next_after("gpt-4o-mini"), Some("gpt-3.5-turbo"));
+    assert_eq!(chain.next_after("gpt-3.5-turbo"), None);
+    assert_eq!(chain.next_after("unknown-model"), None);
+}
+
+#[test]
+fn test_fallback_chain_empty() {
+    use modelrouter::router::fallback::FallbackChain;
+    use std::collections::HashMap;
+
+    let chain = FallbackChain::new(HashMap::new());
+    assert_eq!(chain.next_after("gpt-4o"), None);
+}

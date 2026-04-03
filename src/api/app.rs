@@ -10,7 +10,7 @@ use crate::{
         rate_limits::RateLimitRepository, sessions::SessionRepository, users::UserRepository,
     },
     providers::registry::ProviderRegistry,
-    router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine},
+    router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine},
 };
 
 /// Aggregated DB trait — SqliteDb implements this via blanket impl
@@ -54,6 +54,7 @@ pub struct AppState {
     pub cost_calc: Arc<CostCalculator>,
     pub provider_registry: Arc<ProviderRegistry>,
     pub policy: Arc<PolicyEngine>,
+    pub fallback: Arc<FallbackChain>,
 }
 
 pub fn build_router(state: AppState) -> axum::Router {

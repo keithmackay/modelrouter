@@ -7,9 +7,11 @@ use modelrouter::providers::registry::ProviderRegistry;
 use modelrouter::router::{
     cost::CostCalculator,
     engine::RequestRouter,
+    fallback::FallbackChain,
     policy::PolicyEngine,
 };
 use modelrouter::config::Settings;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 async fn build_test_server() -> TestServer {
@@ -23,6 +25,8 @@ async fn build_test_server() -> TestServer {
     let cost_calc = Arc::new(CostCalculator::new());
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+
     let state = AppState {
         settings,
         db,
@@ -31,6 +35,7 @@ async fn build_test_server() -> TestServer {
         cost_calc,
         provider_registry: registry,
         policy,
+        fallback,
     };
 
     TestServer::new(build_router(state)).unwrap()
@@ -99,6 +104,8 @@ async fn login_success_sets_cookie() {
     let cost_calc = Arc::new(CostCalculator::new());
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+
     let state = AppState {
         settings,
         db,
@@ -107,6 +114,7 @@ async fn login_success_sets_cookie() {
         cost_calc,
         provider_registry: registry,
         policy,
+        fallback,
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -138,6 +146,8 @@ async fn superadmin_only_admins_page() {
     let cost_calc = Arc::new(CostCalculator::new());
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+
     let state = AppState {
         settings,
         db,
@@ -146,6 +156,7 @@ async fn superadmin_only_admins_page() {
         cost_calc,
         provider_registry: registry,
         policy,
+        fallback,
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
