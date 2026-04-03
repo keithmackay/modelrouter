@@ -373,6 +373,8 @@ LiteLLM automatically translates requests to include Anthropic's `cache_control`
 
 Items are scored by **impact** (how broadly the absence blocks adoption or saves money) and **effort** relative to the existing Rust codebase.
 
+Sorted by impact (Critical → High → Medium → Low), then by effort (Low → Medium → High) within each band.
+
 | # | Feature | Impact | Effort | Notes |
 |---|---------|--------|--------|-------|
 | 1 | `/v1/messages` Anthropic passthrough | Critical | Low | One route + auth reuse; unblocks Claude Code natively |
@@ -393,28 +395,28 @@ Items are scored by **impact** (how broadly the absence blocks adoption or saves
 | 16 | Concurrent request limits | Medium | Low | Semaphore per user in AppState |
 | 17 | Spend reset API | Medium | Low | Single SQL update + admin endpoint |
 | 18 | Per-tag budgets | Medium | Low | Tag column on keys + budget rule extension |
-| 19 | Config hot-reload for deployments | Medium | Medium | Background job + DB-stored model list |
-| 20 | Guardrail framework | Medium | Medium | Pre/post call hook interface; providers pluggable |
-| 21 | LangFuse / LangSmith callback | Medium | Medium | Callback-style hook shim over existing OTel data |
-| 22 | Cold storage / log archival | Medium | Low | Background job + S3 writer |
-| 23 | Session-based rate limits | Medium | Medium | Session ID propagation + per-session counters |
-| 24 | Prompt caching (Anthropic cache_control) | Medium | Low | Request transform before upstream send |
-| 25 | Kubernetes / Helm charts | Medium | Medium | Ops work; no code changes to modelrouter |
-| 26 | Key expiration / auto-rotation | Medium | Low | TTL column + background expiry job |
+| 19 | Cold storage / log archival | Medium | Low | Background job + S3 writer |
+| 20 | Prompt caching (Anthropic cache_control) | Medium | Low | Request transform before upstream send |
+| 21 | Key expiration / auto-rotation | Medium | Low | TTL column + background expiry job |
+| 22 | Config hot-reload for deployments | Medium | Medium | Background job + DB-stored model list |
+| 23 | Guardrail framework | Medium | Medium | Pre/post call hook interface; providers pluggable |
+| 24 | LangFuse / LangSmith callback | Medium | Medium | Callback-style hook shim over existing OTel data |
+| 25 | Session-based rate limits | Medium | Medium | Session ID propagation + per-session counters |
+| 26 | Kubernetes / Helm charts | Medium | Medium | Ops work; no code changes to modelrouter |
 | 27 | MCP server registry | Medium | High | New subsystem; growing importance |
 | 28 | Policy engine (declarative cascading) | Medium | High | New abstraction layer over budget rules |
-| 29 | SSO / OIDC | Low | High | Third-party IdP integration |
-| 30 | SCIM provisioning | Low | High | IdP webhook + user sync |
-| 31 | Batch API (`/v1/batches`) | Low | Medium | New route + async job; background cost tracking |
-| 32 | Request queuing under rate limits | Low | Medium | Async queue per user |
-| 33 | Shadow traffic routing | Low | High | Parallel dispatch; response discarding |
-| 34 | Image generation endpoint | Low | Medium | New route + DALL-E adapter |
-| 35 | Audio (Whisper / TTS) | Low | Medium | New routes + provider adapters |
-| 36 | Billing integrations (Stripe, Lago) | Low | High | External billing API + usage event push |
-| 37 | Agent endpoints | Low | High | New execution model |
-| 38 | Vector stores / RAG endpoints | Low | High | New subsystem |
-| 39 | Realtime WebSocket API | Low | High | New connection model |
-| 40 | Responses API (`/v1/responses`) | Low | Low | Passthrough route; provider translates |
+| 29 | Responses API (`/v1/responses`) | Low | Low | Passthrough route; provider translates |
+| 30 | Batch API (`/v1/batches`) | Low | Medium | New route + async job; background cost tracking |
+| 31 | Request queuing under rate limits | Low | Medium | Async queue per user |
+| 32 | Image generation endpoint | Low | Medium | New route + DALL-E adapter |
+| 33 | Audio (Whisper / TTS) | Low | Medium | New routes + provider adapters |
+| 34 | SSO / OIDC | Low | High | Third-party IdP integration |
+| 35 | SCIM provisioning | Low | High | IdP webhook + user sync |
+| 36 | Shadow traffic routing | Low | High | Parallel dispatch; response discarding |
+| 37 | Billing integrations (Stripe, Lago) | Low | High | External billing API + usage event push |
+| 38 | Agent endpoints | Low | High | New execution model |
+| 39 | Vector stores / RAG endpoints | Low | High | New subsystem |
+| 40 | Realtime WebSocket API | Low | High | New connection model |
 
 ---
 
