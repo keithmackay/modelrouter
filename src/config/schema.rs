@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PricingEntry {
+    pub model: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub server: ServerConfig,
@@ -16,6 +23,8 @@ pub struct Settings {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub pricing: Vec<PricingEntry>,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,

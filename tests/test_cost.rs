@@ -27,3 +27,39 @@ fn cost_calculation_strips_provider_prefix() {
     assert_eq!(with_prefix, without_prefix);
     assert!(with_prefix > 0.0);
 }
+
+#[test]
+fn test_config_pricing_overrides_default() {
+    use modelrouter::config::schema::PricingEntry;
+    use modelrouter::router::cost::CostCalculator;
+
+    let custom = vec![PricingEntry {
+        model: "my-custom-model".to_string(),
+        input_per_million: 1.0,
+        output_per_million: 2.0,
+    }];
+
+    let calc = CostCalculator::new_with_config(&custom);
+
+    let cost = calc.calculate("my-custom-model", 1_000_000, 0);
+    assert!((cost - 1.0).abs() < 0.001, "Expected $1.00, got {cost}");
+
+    let cost2 = calc.calculate("gpt-4o", 1_000_000, 0);
+    assert!((cost2 - 2.50).abs() < 0.001, "Expected $2.50, got {cost2}");
+}
+
+#[test]
+fn test_config_pricing_overrides_default_price() {
+    use modelrouter::config::schema::PricingEntry;
+    use modelrouter::router::cost::CostCalculator;
+
+    let custom = vec![PricingEntry {
+        model: "gpt-4o".to_string(),
+        input_per_million: 99.0,
+        output_per_million: 99.0,
+    }];
+
+    let calc = CostCalculator::new_with_config(&custom);
+    let cost = calc.calculate("gpt-4o", 1_000_000, 0);
+    assert!((cost - 99.0).abs() < 0.001, "Config price should override default");
+}

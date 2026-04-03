@@ -220,7 +220,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Build app components
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
-            let cost_calc = Arc::new(crate::router::cost::CostCalculator::new());
+            let cost_calc = Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing));
             let provider_registry = Arc::new(
                 crate::providers::registry::ProviderRegistry::new(
                     settings.providers.clone(),

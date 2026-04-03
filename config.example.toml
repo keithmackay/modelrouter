@@ -113,3 +113,17 @@ fail_open    = true
 # batch_queue_size = 2048
 # batch_scheduled_delay_ms = 5000
 # batch_max_export_size = 512
+
+# ── Pricing overrides ────────────────────────────────────────────────────
+# Override per-model pricing (dollars per million tokens).
+# Any model not listed here falls back to built-in defaults.
+#
+# [[pricing]]
+# model = "gpt-4o"
+# input_per_million = 2.50
+# output_per_million = 10.0
+#
+# [[pricing]]
+# model = "my-private-llama"
+# input_per_million = 0.10
+# output_per_million = 0.30

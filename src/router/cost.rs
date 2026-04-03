@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 pub struct CostCalculator {
-    pricing: HashMap<&'static str, ModelPricing>,
+    pricing: HashMap<String, ModelPricing>,
 }
 
 struct ModelPricing {
@@ -14,61 +14,75 @@ impl CostCalculator {
         let mut pricing = HashMap::new();
         // Anthropic models (as of early 2025)
         pricing.insert(
-            "claude-opus-4-6",
+            "claude-opus-4-6".to_string(),
             ModelPricing { input_per_million: 15.0, output_per_million: 75.0 },
         );
         pricing.insert(
-            "claude-sonnet-4-6",
+            "claude-sonnet-4-6".to_string(),
             ModelPricing { input_per_million: 3.0, output_per_million: 15.0 },
         );
         pricing.insert(
-            "claude-haiku-4-5",
+            "claude-haiku-4-5".to_string(),
             ModelPricing { input_per_million: 0.80, output_per_million: 4.0 },
         );
         pricing.insert(
-            "claude-3-5-sonnet-20241022",
+            "claude-3-5-sonnet-20241022".to_string(),
             ModelPricing { input_per_million: 3.0, output_per_million: 15.0 },
         );
         pricing.insert(
-            "claude-3-5-haiku-20241022",
+            "claude-3-5-haiku-20241022".to_string(),
             ModelPricing { input_per_million: 0.80, output_per_million: 4.0 },
         );
         pricing.insert(
-            "claude-3-opus-20240229",
+            "claude-3-opus-20240229".to_string(),
             ModelPricing { input_per_million: 15.0, output_per_million: 75.0 },
         );
         // OpenAI models
         pricing.insert(
-            "gpt-4o",
+            "gpt-4o".to_string(),
             ModelPricing { input_per_million: 2.50, output_per_million: 10.0 },
         );
         pricing.insert(
-            "gpt-4o-mini",
+            "gpt-4o-mini".to_string(),
             ModelPricing { input_per_million: 0.15, output_per_million: 0.60 },
         );
         pricing.insert(
-            "gpt-4-turbo",
+            "gpt-4-turbo".to_string(),
             ModelPricing { input_per_million: 10.0, output_per_million: 30.0 },
         );
         pricing.insert(
-            "gpt-4",
+            "gpt-4".to_string(),
             ModelPricing { input_per_million: 30.0, output_per_million: 60.0 },
         );
         pricing.insert(
-            "gpt-3.5-turbo",
+            "gpt-3.5-turbo".to_string(),
             ModelPricing { input_per_million: 0.50, output_per_million: 1.50 },
         );
         // Gemini
         pricing.insert(
-            "gemini-1.5-pro",
+            "gemini-1.5-pro".to_string(),
             ModelPricing { input_per_million: 1.25, output_per_million: 5.0 },
         );
         pricing.insert(
-            "gemini-1.5-flash",
+            "gemini-1.5-flash".to_string(),
             ModelPricing { input_per_million: 0.075, output_per_million: 0.30 },
         );
         // Unknown models return 0 (Ollama etc)
         Self { pricing }
+    }
+
+    pub fn new_with_config(config_pricing: &[crate::config::schema::PricingEntry]) -> Self {
+        let mut calc = Self::new();
+        for entry in config_pricing {
+            calc.pricing.insert(
+                entry.model.to_lowercase(),
+                ModelPricing {
+                    input_per_million: entry.input_per_million,
+                    output_per_million: entry.output_per_million,
+                },
+            );
+        }
+        calc
     }
 
     pub fn calculate(&self, model: &str, prompt_tokens: u32, completion_tokens: u32) -> f64 {
@@ -79,7 +93,7 @@ impl CostCalculator {
             model
         };
         let model_lower = model_key.to_lowercase();
-        match self.pricing.get(model_lower.as_str()) {
+        match self.pricing.get(&model_lower) {
             Some(p) => {
                 (prompt_tokens as f64 / 1_000_000.0) * p.input_per_million
                     + (completion_tokens as f64 / 1_000_000.0) * p.output_per_million
