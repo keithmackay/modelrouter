@@ -11,6 +11,7 @@ use crate::{
 async fn log_messages_cost(
     state: &AppState,
     user_id: i64,
+    api_key_id: Option<i64>,
     user_name: &str,
     model: &str,
     canonical_model: &str,
@@ -50,6 +51,7 @@ async fn log_messages_cost(
                 tokens_in: prompt_tokens as i64,
                 tokens_out: completion_tokens as i64,
                 cost_usd: cost,
+                api_key_id,
             };
             if let Err(e) = CostRepository::create(&*state.db, ledger).await {
                 tracing::error!("Failed to record cost: {}", e);
@@ -207,6 +209,7 @@ async fn anthropic_messages_inner(
         // Fix 3: Fire-and-forget approximate cost for streaming
         let state_c = state.clone();
         let user_id = user.id;
+        let api_key_id_s = user.api_key_id;
         let user_name_s = user.name.clone();
         let model_s = model.clone();
         let canonical_s = canonical_model.clone();
@@ -220,7 +223,7 @@ async fn anthropic_messages_inner(
             let prompt_tokens = (messages_json_s.chars().count() / 4) as u32;
             let cost = state_c.cost_calc.calculate(&canonical_s, prompt_tokens, 0);
             let latency_ms = start_s.elapsed().as_millis() as i64;
-            log_messages_cost(&state_c, user_id, &user_name_s, &model_s, &canonical_s, &provider_s,
+            log_messages_cost(&state_c, user_id, api_key_id_s, &user_name_s, &model_s, &canonical_s, &provider_s,
                                &messages_json_s, prompt_tokens, 0, cost, latency_ms).await;
         });
 
@@ -287,6 +290,7 @@ async fn anthropic_messages_inner(
     let model_clone = model.clone();
     let canonical_c = canonical_model.clone();
     let user_name_c = user.name.clone();
+    let api_key_id_c = user.api_key_id;
     let messages_json = serde_json::to_string(
         &body["messages"].as_array().cloned().unwrap_or_default(),
     )
@@ -324,6 +328,7 @@ async fn anthropic_messages_inner(
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
                     cost_usd: cost,
+                    api_key_id: api_key_id_c,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);

@@ -34,7 +34,7 @@ impl BudgetRepository for SqliteDb {
         let rows = sqlx::query_as::<_, BudgetRule>(
             r#"SELECT id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, created_at, updated_at
-               FROM budget_rules WHERE api_key_id = ?"#,
+               FROM budget_rules WHERE api_key_id = ? ORDER BY id"#,
         )
         .bind(api_key_id)
         .fetch_all(&self.pool)

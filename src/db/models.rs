@@ -126,6 +126,8 @@ pub struct CostLedgerEntry {
     pub tokens_out: i64,
     pub cost_usd: f64,
     pub created_at: String,
+    #[sqlx(default)]
+    pub api_key_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -138,6 +140,7 @@ pub struct NewCostLedgerEntry {
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub cost_usd: f64,
+    pub api_key_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

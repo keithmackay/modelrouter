@@ -6,4 +6,6 @@ pub trait CostRepository: Send + Sync {
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry>;
     async fn sum_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<f64>;
     async fn sum_tokens_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<i64>;
+    async fn sum_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<f64>;
+    async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64>;
 }

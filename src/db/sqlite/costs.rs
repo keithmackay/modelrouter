@@ -10,8 +10,8 @@ impl CostRepository for SqliteDb {
         let now = now_utc();
         let result = sqlx::query(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
-                                        tokens_in, tokens_out, cost_usd, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        tokens_in, tokens_out, cost_usd, api_key_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -21,6 +21,7 @@ impl CostRepository for SqliteDb {
         .bind(entry.tokens_in)
         .bind(entry.tokens_out)
         .bind(entry.cost_usd)
+        .bind(entry.api_key_id)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -28,7 +29,7 @@ impl CostRepository for SqliteDb {
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, CostLedgerEntry>(
             "SELECT id, user_id, prompt_id, model, provider, project,
-                    tokens_in, tokens_out, cost_usd, created_at
+                    tokens_in, tokens_out, cost_usd, created_at, api_key_id
              FROM cost_ledger WHERE id = ?",
         )
         .bind(id)
@@ -55,6 +56,28 @@ impl CostRepository for SqliteDb {
              WHERE user_id = ? AND created_at >= ?",
         )
         .bind(user_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    async fn sum_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE api_key_id = ? AND created_at >= ?"
+        )
+        .bind(api_key_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM cost_ledger WHERE api_key_id = ? AND created_at >= ?"
+        )
+        .bind(api_key_id)
         .bind(since)
         .fetch_one(&self.pool)
         .await?;

@@ -210,6 +210,7 @@ async fn budget_exceeded_returns_deny() {
             tokens_in: 1000,
             tokens_out: 500,
             cost_usd: 1.0, // Way over the $0.01 limit
+            api_key_id: None,
         },
     )
     .await
@@ -294,6 +295,7 @@ async fn test_policy_token_limit_under_budget() {
             tokens_in: 60,
             tokens_out: 35,
             cost_usd: 0.001,
+            api_key_id: None,
         },
     )
     .await
@@ -378,6 +380,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             tokens_in: 40,
             tokens_out: 20,
             cost_usd: 0.001,
+            api_key_id: None,
         },
     )
     .await

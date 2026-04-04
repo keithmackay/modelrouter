@@ -148,6 +148,7 @@ async fn chat_completions_inner(
             StreamLogCtx {
                 state: state.clone(),
                 user_id: user.id,
+                api_key_id: user.api_key_id,
                 user_name: user.name.clone(),
                 model: model.clone(),
                 canonical_model: canonical_model.clone(),
@@ -238,6 +239,7 @@ async fn chat_completions_inner(
     let response_clone = result.content.clone();
     let finish_clone = result.finish_reason.clone();
     let user_id = user.id;
+    let api_key_id = user.api_key_id;
     let user_name_clone = user.name.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
@@ -270,6 +272,7 @@ async fn chat_completions_inner(
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
                     cost_usd: cost,
+                    api_key_id,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
@@ -299,6 +302,7 @@ async fn chat_completions_inner(
 struct StreamLogCtx {
     state: AppState,
     user_id: i64,
+    api_key_id: Option<i64>,
     user_name: String,
     model: String,
     canonical_model: String,
@@ -322,6 +326,7 @@ fn log_streaming_request(
     let db = ctx.state.db.clone();
     let lifecycle_hooks = ctx.state.settings.hooks.lifecycle.clone();
     let user_id = ctx.user_id;
+    let api_key_id = ctx.api_key_id;
     let user_name = ctx.user_name;
     let model = ctx.model;
     let canonical_model = ctx.canonical_model;
@@ -393,6 +398,7 @@ fn log_streaming_request(
                                 tokens_in: prompt_tokens as i64,
                                 tokens_out: completion_tokens as i64,
                                 cost_usd: cost,
+                                api_key_id,
                             };
                             if let Err(e) = CostRepository::create(&*db_c, entry).await {
                                 tracing::error!("Failed to log streaming cost: {}", e);

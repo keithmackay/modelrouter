@@ -12,6 +12,27 @@ use super::audit::audit;
 // ── Safe response types (no key hashes) ───────────────────────────────────────
 
 #[derive(serde::Serialize)]
+pub struct ApiKeyResponse {
+    pub id: i64,
+    pub user_id: i64,
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+impl From<crate::db::models::ApiKey> for ApiKeyResponse {
+    fn from(k: crate::db::models::ApiKey) -> Self {
+        Self {
+            id: k.id,
+            user_id: k.user_id,
+            label: k.label,
+            enabled: k.enabled,
+            created_at: k.created_at,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
 struct UserResponse {
     id: i64,
     name: String,
@@ -228,6 +249,7 @@ pub async fn list_budgets(
 pub struct CreateBudgetRequest {
     pub user_id: Option<i64>,
     pub group_name: Option<String>,
+    pub api_key_id: Option<i64>,
     pub window: String,
     pub limit_usd: Option<f64>,
     pub limit_tokens: Option<i64>,
@@ -256,7 +278,7 @@ pub async fn create_budget(
         NewBudgetRule {
             user_id: body.user_id,
             group_name: body.group_name,
-            api_key_id: None,
+            api_key_id: body.api_key_id,
             window: body.window,
             limit_usd: body.limit_usd,
             limit_tokens: body.limit_tokens,
@@ -468,12 +490,12 @@ pub async fn list_user_api_keys(
     State(state): State<AppState>,
     _admin: AdminSession,
     Path(user_id): Path<i64>,
-) -> Result<Json<Vec<crate::db::models::ApiKey>>, ApiError> {
+) -> Result<Json<Vec<ApiKeyResponse>>, ApiError> {
     use crate::db::repositories::api_keys::ApiKeyRepository;
     let keys = ApiKeyRepository::list_api_keys_for_user(&*state.db, user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(Json(keys))
+    Ok(Json(keys.into_iter().map(ApiKeyResponse::from).collect()))
 }
 
 // POST /admin/api/users/:id/keys — create API key for user
@@ -484,7 +506,7 @@ pub struct CreateApiKeyRequest {
 
 pub async fn create_user_api_key(
     State(state): State<AppState>,
-    _admin: SuperAdminSession,
+    admin: SuperAdminSession,
     Path(user_id): Path<i64>,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -502,6 +524,17 @@ pub async fn create_user_api_key(
     .await
     .map_err(|_| ApiError::Internal)?;
 
+    audit(
+        &state.db,
+        Some(admin.0.sub),
+        &admin.0.name,
+        "create_api_key",
+        Some(format!("user:{}", user_id)),
+        None,
+        Some(format!("label:{:?}", created.label)),
+    )
+    .await;
+
     // Return the raw key once — it cannot be recovered later
     Ok(Json(serde_json::json!({
         "id": created.id,
@@ -514,12 +547,24 @@ pub async fn create_user_api_key(
 // POST /admin/api/keys/:id/revoke — revoke API key
 pub async fn revoke_api_key_handler(
     State(state): State<AppState>,
-    _admin: SuperAdminSession,
+    admin: SuperAdminSession,
     Path(key_id): Path<i64>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     use crate::db::repositories::api_keys::ApiKeyRepository;
     ApiKeyRepository::revoke_api_key(&*state.db, key_id)
         .await
         .map_err(|_| ApiError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(admin.0.sub),
+        &admin.0.name,
+        "revoke_api_key",
+        Some(format!("key:{}", key_id)),
+        None,
+        None,
+    )
+    .await;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

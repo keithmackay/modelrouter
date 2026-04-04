@@ -98,8 +98,11 @@ impl PolicyEngine {
             // 4. Check USD budget
             if let Some(limit_usd) = rule.limit_usd {
                 let window_start = window_start_for(&rule.window);
-                let spent =
-                    CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?;
+                let spent = if let Some(key_id) = rule.api_key_id {
+                    CostRepository::sum_for_key_since(&*self.db, key_id, &window_start).await?
+                } else {
+                    CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?
+                };
                 if spent >= limit_usd {
                     let reason = format!(
                         "budget exceeded: ${:.4} of ${:.2} {} limit",
@@ -122,8 +125,11 @@ impl PolicyEngine {
             // 5. Check token budget
             if let Some(limit_tokens) = rule.limit_tokens {
                 let window_start = window_start_for(&rule.window);
-                let used_tokens =
-                    CostRepository::sum_tokens_for_user_since(&*self.db, user.id, &window_start).await?;
+                let used_tokens = if let Some(key_id) = rule.api_key_id {
+                    CostRepository::sum_tokens_for_key_since(&*self.db, key_id, &window_start).await?
+                } else {
+                    CostRepository::sum_tokens_for_user_since(&*self.db, user.id, &window_start).await?
+                };
                 if used_tokens >= limit_tokens {
                     let reason = format!(
                         "token budget exceeded: {} of {} {} tokens used",

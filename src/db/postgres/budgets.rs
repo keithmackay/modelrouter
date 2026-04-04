@@ -10,7 +10,7 @@ use super::{PostgresDb, now_utc};
 impl BudgetRepository for PostgresDb {
     async fn list_for_user(&self, user_id: i64) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, created_at, updated_at
                FROM budget_rules WHERE user_id = $1 ORDER BY id"#,
         )
@@ -22,7 +22,7 @@ impl BudgetRepository for PostgresDb {
 
     async fn list_for_group(&self, group_name: &str) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, created_at, updated_at
                FROM budget_rules WHERE group_name = $1 ORDER BY id"#,
         )
@@ -32,9 +32,21 @@ impl BudgetRepository for PostgresDb {
         Ok(rows)
     }
 
+    async fn list_for_key(&self, api_key_id: i64) -> anyhow::Result<Vec<BudgetRule>> {
+        let rows = sqlx::query_as::<_, BudgetRule>(
+            r#"SELECT id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
+                      model_allow, model_deny, rate_rpm, created_at, updated_at
+               FROM budget_rules WHERE api_key_id = $1 ORDER BY id"#,
+        )
+        .bind(api_key_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn list_all(&self) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, created_at, updated_at
                FROM budget_rules ORDER BY id"#,
         )
@@ -48,14 +60,15 @@ impl BudgetRepository for PostgresDb {
         let model_allow_json = serde_json::to_string(&rule.model_allow).unwrap_or_else(|_| "[]".to_string());
         let model_deny_json = serde_json::to_string(&rule.model_deny).unwrap_or_else(|_| "[]".to_string());
         let row = sqlx::query_as::<_, BudgetRule>(
-            r#"INSERT INTO budget_rules (user_id, group_name, window, limit_usd, limit_tokens,
+            r#"INSERT INTO budget_rules (user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                                          model_allow, model_deny, rate_rpm, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-               RETURNING id, user_id, group_name, window, limit_usd, limit_tokens,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               RETURNING id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                          model_allow, model_deny, rate_rpm, created_at, updated_at"#,
         )
         .bind(rule.user_id)
         .bind(&rule.group_name)
+        .bind(rule.api_key_id)
         .bind(&rule.window)
         .bind(rule.limit_usd)
         .bind(rule.limit_tokens)
