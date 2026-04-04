@@ -32,6 +32,7 @@ impl From<UserRow> for User {
             enabled: r.enabled,
             created_at: r.created_at,
             metadata: r.metadata,
+            api_key_id: None,
         }
     }
 }

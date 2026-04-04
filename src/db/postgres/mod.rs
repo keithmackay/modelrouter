@@ -9,6 +9,7 @@ mod budgets;
 mod audit;
 mod hooks;
 mod rate_limits;
+mod api_keys;
 
 use sqlx::PgPool;
 
