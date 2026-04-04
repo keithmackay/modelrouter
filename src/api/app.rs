@@ -10,7 +10,7 @@ use crate::{
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
         users::UserRepository,
     },
-    providers::registry::ProviderRegistry,
+    providers::{embed_registry::EmbeddingRegistry, registry::ProviderRegistry},
     router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine},
 };
 
@@ -60,6 +60,7 @@ pub struct AppState {
     pub fallback: Arc<FallbackChain>,
     pub complexity_router: Arc<crate::router::complexity::ComplexityRouter>,
     pub response_cache: Arc<crate::router::cache::ResponseCache>,
+    pub embedding_registry: Arc<EmbeddingRegistry>,
     #[cfg(feature = "prometheus")]
     pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
     #[cfg(not(feature = "prometheus"))]
@@ -69,8 +70,8 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
-        completions::chat_completions, health::health_check, messages::anthropic_messages,
-        models::list_models, prometheus::metrics_handler,
+        completions::chat_completions, embeddings::embeddings, health::health_check,
+        messages::anthropic_messages, models::list_models, prometheus::metrics_handler,
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user, rotate_user_key,
@@ -94,6 +95,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/messages", post(anthropic_messages))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))

@@ -30,6 +30,11 @@ async fn build_test_server() -> TestServer {
     let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
         &modelrouter::config::schema::CacheConfig::default()
     ));
+    let embedding_registry = Arc::new(
+        modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+            common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+        )
+    );
 
     let state = AppState {
         settings,
@@ -42,6 +47,7 @@ async fn build_test_server() -> TestServer {
         fallback,
         complexity_router,
         response_cache,
+        embedding_registry,
         app_metrics: None,
     };
 
@@ -116,6 +122,11 @@ async fn login_success_sets_cookie() {
     let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
         &modelrouter::config::schema::CacheConfig::default()
     ));
+    let embedding_registry = Arc::new(
+        modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+            common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+        )
+    );
 
     let state = AppState {
         settings,
@@ -128,6 +139,7 @@ async fn login_success_sets_cookie() {
         fallback,
         complexity_router,
         response_cache,
+        embedding_registry,
         app_metrics: None,
     };
 
@@ -165,6 +177,11 @@ async fn superadmin_only_admins_page() {
     let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
         &modelrouter::config::schema::CacheConfig::default()
     ));
+    let embedding_registry = Arc::new(
+        modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+            common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+        )
+    );
 
     let state = AppState {
         settings,
@@ -177,6 +194,7 @@ async fn superadmin_only_admins_page() {
         fallback,
         complexity_router,
         response_cache,
+        embedding_registry,
         app_metrics: None,
     };
 

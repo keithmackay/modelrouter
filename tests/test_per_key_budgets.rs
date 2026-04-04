@@ -39,6 +39,11 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
     let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
         &modelrouter::config::schema::CacheConfig::default()
     ));
+    let embedding_registry = Arc::new(
+        modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+            common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+        )
+    );
 
     let state = AppState {
         settings,
@@ -51,6 +56,7 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
         fallback,
         complexity_router,
         response_cache,
+        embedding_registry,
         app_metrics: None,
     };
     (TestServer::new(build_router(state)).unwrap(), db)

@@ -34,3 +34,20 @@ impl ProviderAdapter for MockAdapter {
         Ok(Box::pin(stream))
     }
 }
+
+pub struct MockEmbeddingAdapter {
+    pub embedding: Vec<f32>,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::embedding::EmbeddingAdapter for MockEmbeddingAdapter {
+    async fn embed(
+        &self,
+        req: &modelrouter::providers::embedding::EmbeddingRequest,
+    ) -> anyhow::Result<modelrouter::providers::embedding::EmbeddingResult> {
+        Ok(modelrouter::providers::embedding::EmbeddingResult {
+            embeddings: vec![self.embedding.clone(); req.input.len()],
+            prompt_tokens: req.input.iter().map(|s| s.len() as u32 / 4).sum(),
+        })
+    }
+}

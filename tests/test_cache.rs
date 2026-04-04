@@ -133,7 +133,11 @@ async fn test_app_with_cache() -> TestServer {
         max_entries: 10,
         ttl_seconds: 60,
     }));
-    // NOTE: AppState fields match current state — will gain embedding_registry in Task 2
+    let embedding_registry = Arc::new(
+        modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+            common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+        )
+    );
     let state = AppState {
         settings,
         db,
@@ -145,6 +149,7 @@ async fn test_app_with_cache() -> TestServer {
         fallback,
         complexity_router,
         response_cache,
+        embedding_registry,
         app_metrics: None,
     };
     TestServer::new(build_router(state)).unwrap()
