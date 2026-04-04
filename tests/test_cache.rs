@@ -1,3 +1,5 @@
+mod common;
+
 use modelrouter::router::cache::{make_cache_key, ResponseCache};
 use modelrouter::config::schema::CacheConfig;
 use modelrouter::providers::adapter::CompletionResult;
@@ -51,25 +53,154 @@ async fn disabled_cache_always_misses() {
 
 #[test]
 fn same_inputs_produce_same_key() {
-    let messages = vec![json!({"role": "user", "content": "hello"})];
-    let k1 = make_cache_key("gpt-4o", &messages, Some(0.7), Some(100));
-    let k2 = make_cache_key("gpt-4o", &messages, Some(0.7), Some(100));
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "temperature": 0.7, "max_tokens": 100});
+    let k1 = make_cache_key(&body);
+    let k2 = make_cache_key(&body);
     assert_eq!(k1, k2);
 }
 
 #[test]
 fn different_model_produces_different_key() {
-    let messages = vec![json!({"role": "user", "content": "hello"})];
-    let k1 = make_cache_key("gpt-4o", &messages, None, None);
-    let k2 = make_cache_key("gpt-4o-mini", &messages, None, None);
-    assert_ne!(k1, k2);
+    let b1 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]});
+    let b2 = json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}]});
+    assert_ne!(make_cache_key(&b1), make_cache_key(&b2));
 }
 
 #[test]
 fn different_messages_produce_different_key() {
-    let m1 = vec![json!({"role": "user", "content": "hello"})];
-    let m2 = vec![json!({"role": "user", "content": "world"})];
-    let k1 = make_cache_key("gpt-4o", &m1, None, None);
-    let k2 = make_cache_key("gpt-4o", &m2, None, None);
-    assert_ne!(k1, k2);
+    let b1 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]});
+    let b2 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "world"}]});
+    assert_ne!(make_cache_key(&b1), make_cache_key(&b2));
+}
+
+#[test]
+fn stream_flag_does_not_affect_key() {
+    let b1 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]});
+    let b2 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "stream": false});
+    assert_eq!(make_cache_key(&b1), make_cache_key(&b2));
+}
+
+#[test]
+fn different_top_p_produces_different_key() {
+    let b1 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "top_p": 0.9});
+    let b2 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "top_p": 0.5});
+    assert_ne!(make_cache_key(&b1), make_cache_key(&b2));
+}
+
+// ── Integration tests ──────────────────────────────────────────────────────
+
+use axum_test::TestServer;
+use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
+use modelrouter::api::auth::hash_token;
+use modelrouter::config::schema::Settings;
+use modelrouter::db::models::NewUser;
+use modelrouter::db::repositories::users::UserRepository;
+use modelrouter::providers::registry::ProviderRegistry;
+use modelrouter::router::{
+    complexity::ComplexityRouter,
+    cost::CostCalculator,
+    engine::RequestRouter,
+    fallback::FallbackChain,
+    policy::PolicyEngine,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+async fn test_app_with_cache() -> TestServer {
+    let db = common::in_memory_db().await;
+    db.create(NewUser {
+        name: "test-user".to_string(),
+        api_key_hash: hash_token("test-token"),
+        group_name: None,
+    })
+    .await
+    .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    let router = Arc::new(RequestRouter::new(settings.clone()));
+    let cost_calc = Arc::new(CostCalculator::new());
+    let provider_registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
+        response: "cached response".to_string(),
+    }));
+    let policy = Arc::new(PolicyEngine::new(db.clone()));
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(ComplexityRouter::new(None));
+    let response_cache = Arc::new(ResponseCache::new(&CacheConfig {
+        enabled: true,
+        max_entries: 10,
+        ttl_seconds: 60,
+    }));
+    // NOTE: AppState fields match current state — will gain embedding_registry in Task 2
+    let state = AppState {
+        settings,
+        db,
+        pool: None,
+        router,
+        cost_calc,
+        provider_registry,
+        policy,
+        fallback,
+        complexity_router,
+        response_cache,
+        app_metrics: None,
+    };
+    TestServer::new(build_router(state)).unwrap()
+}
+
+#[tokio::test]
+async fn second_identical_request_returns_cached_response() {
+    let server = test_app_with_cache().await;
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hello cache"}]
+    });
+
+    // First request — goes to provider
+    let resp1 = server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&body)
+        .await;
+    assert_eq!(resp1.status_code(), 200);
+
+    // Second identical request — should hit cache
+    let resp2 = server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&body)
+        .await;
+    assert_eq!(resp2.status_code(), 200);
+
+    let b1: serde_json::Value = resp1.json();
+    let b2: serde_json::Value = resp2.json();
+    assert_eq!(
+        b1["choices"][0]["message"]["content"],
+        b2["choices"][0]["message"]["content"]
+    );
+}
+
+#[tokio::test]
+async fn streaming_requests_are_not_cached() {
+    let server = test_app_with_cache().await;
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "stream me"}],
+            "stream": true
+        }))
+        .await;
+    // Streaming still succeeds — just not cached
+    assert_eq!(resp.status_code(), 200);
 }

@@ -50,13 +50,7 @@ async fn chat_completions_inner(
 
     // Build cache key for non-streaming requests only
     let cache_key = if !stream {
-        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-        Some(crate::router::cache::make_cache_key(
-            &model,
-            &msgs,
-            body["temperature"].as_f64(),
-            body["max_tokens"].as_u64().map(|v| v as u32),
-        ))
+        Some(crate::router::cache::make_cache_key(&body))
     } else {
         None
     };

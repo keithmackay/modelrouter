@@ -29,24 +29,19 @@ impl ResponseCache {
     }
 }
 
-/// Build a deterministic cache key from request parameters.
-/// Returns a hex-encoded SHA-256 of the canonicalized inputs.
-pub fn make_cache_key(
-    model: &str,
-    messages: &[Value],
-    temperature: Option<f64>,
-    max_tokens: Option<u32>,
-) -> String {
+/// Build a deterministic cache key from the full request body.
+/// Returns a hex-encoded SHA-256 of the body with the `stream` field removed
+/// (stream is not part of the cache identity).
+pub fn make_cache_key(body: &Value) -> String {
     use sha2::{Digest, Sha256};
-    let payload = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    });
+    // Clone and remove stream flag before hashing (stream is not part of the cache identity)
+    let mut canonical = body.clone();
+    if let Some(obj) = canonical.as_object_mut() {
+        obj.remove("stream");
+    }
     let mut hasher = Sha256::new();
     hasher.update(
-        serde_json::to_string(&payload)
+        serde_json::to_string(&canonical)
             .unwrap_or_default()
             .as_bytes(),
     );
