@@ -284,6 +284,10 @@ async fn completions_span_has_required_attributes() {
         common::MockAdapter { response: "hello".to_string() },
     ));
 
+    let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig::default()
+    ));
+
     let state = AppState {
         settings: settings.clone(),
         db: db.clone(),
@@ -294,6 +298,7 @@ async fn completions_span_has_required_attributes() {
         policy: Arc::new(PolicyEngine::new(db.clone())),
         fallback: Arc::new(modelrouter::router::fallback::FallbackChain::new(std::collections::HashMap::new())),
         complexity_router: Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None)),
+        response_cache,
         app_metrics: None,
     };
 
