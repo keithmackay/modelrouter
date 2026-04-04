@@ -267,6 +267,7 @@ async fn completions_span_has_required_attributes() {
         api_key: "mock".to_string(),
         api_base: Some("http://mock".to_string()),
         timeout_secs: 10,
+        api_version: None,
     });
     let settings = Arc::new(modelrouter::config::schema::Settings {
         routing: modelrouter::config::schema::RoutingConfig {

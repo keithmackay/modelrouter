@@ -37,6 +37,8 @@ impl ProviderRegistry {
 
         let adapter: Arc<dyn ProviderAdapter> = if provider_name == "anthropic" {
             Arc::new(crate::providers::anthropic::AnthropicAdapter::new(config))
+        } else if provider_name == "azure" {
+            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(config))
         } else {
             Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(config))
         };

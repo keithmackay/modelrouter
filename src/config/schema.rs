@@ -144,6 +144,8 @@ pub struct ProviderConfig {
     pub api_base: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
+    pub api_version: Option<String>,
 }
 
 fn default_timeout_secs() -> u64 { 60 }
