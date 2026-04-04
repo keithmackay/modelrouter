@@ -4,6 +4,8 @@ use futures::TryStreamExt;
 use crate::config::schema::ProviderConfig;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
 
+/// GA stable Azure OpenAI API version at time of writing.
+/// Operators should pin `api_version` in config for production deployments.
 const DEFAULT_API_VERSION: &str = "2024-02-01";
 
 pub struct AzureOpenAIAdapter {
@@ -47,8 +49,8 @@ impl AzureOpenAIAdapter {
     }
 
     fn build_body(req: &NormalizedRequest) -> serde_json::Value {
+        // Azure uses the deployment URL for model selection; the `model` field in the body is ignored.
         let mut body = serde_json::json!({
-            "model": req.model,
             "messages": req.messages,
             "stream": false,
         });

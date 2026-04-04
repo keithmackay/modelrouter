@@ -43,7 +43,9 @@ impl Pool {
         if self.expanded.is_empty() {
             return None;
         }
-        // Use fetch_add for lock-free round-robin under concurrency
+        // Relaxed ordering is sufficient — no cross-thread memory sync required.
+        // usize wraparound is safe (wraps to 0) but may break a cycle at the boundary;
+        // this is negligible at normal request rates (takes ~centuries on 64-bit).
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.expanded.len();
         let entry_idx = self.expanded[idx];
         self.entries.get(entry_idx).cloned()
