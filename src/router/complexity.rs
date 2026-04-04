@@ -20,6 +20,13 @@ impl ComplexityRouter {
 
         let estimated = estimate_tokens_from_messages(messages);
         if estimated > config.token_threshold as usize {
+            tracing::info!(
+                requested_model = requested_model,
+                downgraded_to = config.cheap_model.as_str(),
+                estimated_tokens = estimated,
+                threshold = config.token_threshold,
+                "complexity router: downgrading model"
+            );
             config.cheap_model.clone()
         } else {
             requested_model.to_string()

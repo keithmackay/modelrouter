@@ -1,7 +1,5 @@
-mod common;
-
 use modelrouter::router::complexity::ComplexityRouter;
-use modelrouter::config::schema::{ComplexityRoutingConfig, RoutingConfig};
+use modelrouter::config::schema::ComplexityRoutingConfig;
 use serde_json::json;
 
 fn config_with_threshold(threshold: u32, cheap_model: &str) -> ComplexityRoutingConfig {
@@ -72,4 +70,13 @@ fn estimate_tokens_counts_chars_over_four() {
         ),
         100
     );
+}
+
+#[test]
+fn exact_threshold_stays_on_requested_model() {
+    // threshold=10, content = 40 chars / 4 = exactly 10 tokens — NOT downgraded (strictly >)
+    let config = config_with_threshold(10, "gpt-4o-mini");
+    let router = ComplexityRouter::new(Some(config));
+    let messages = vec![json!({"role": "user", "content": "A".repeat(40)})];
+    assert_eq!(router.maybe_downgrade("gpt-4o", &messages), "gpt-4o");
 }
