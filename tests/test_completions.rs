@@ -35,6 +35,8 @@ async fn test_app() -> TestServer {
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
 
+    let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
+
     let state = AppState {
         settings,
         db,
@@ -44,6 +46,7 @@ async fn test_app() -> TestServer {
         provider_registry,
         policy,
         fallback,
+        complexity_router,
         app_metrics: None,
     };
     TestServer::new(build_router(state)).unwrap()

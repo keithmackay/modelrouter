@@ -15,6 +15,7 @@ fn router_with_aliases() -> RequestRouter {
         default_model: "gpt-4o".to_string(),
         model_aliases: aliases,
         fallback_chains: HashMap::new(),
+        complexity_routing: None,
     };
     RequestRouter::new(Arc::new(settings))
 }

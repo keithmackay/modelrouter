@@ -26,6 +26,7 @@ async fn build_test_server() -> TestServer {
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
 
     let state = AppState {
         settings,
@@ -36,6 +37,7 @@ async fn build_test_server() -> TestServer {
         provider_registry: registry,
         policy,
         fallback,
+        complexity_router,
         app_metrics: None,
     };
 
@@ -106,6 +108,7 @@ async fn login_success_sets_cookie() {
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
 
     let state = AppState {
         settings,
@@ -116,6 +119,7 @@ async fn login_success_sets_cookie() {
         provider_registry: registry,
         policy,
         fallback,
+        complexity_router,
         app_metrics: None,
     };
 
@@ -149,6 +153,7 @@ async fn superadmin_only_admins_page() {
     let policy = Arc::new(PolicyEngine::new(db.clone()));
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
 
     let state = AppState {
         settings,
@@ -159,6 +164,7 @@ async fn superadmin_only_admins_page() {
         provider_registry: registry,
         policy,
         fallback,
+        complexity_router,
         app_metrics: None,
     };
 

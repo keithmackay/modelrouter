@@ -40,10 +40,12 @@ async fn chat_completions_inner(
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
-    let model = body["model"]
+    let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
+    let messages_for_complexity = body["messages"].as_array().cloned().unwrap_or_default();
+    let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
     let stream = body["stream"].as_bool().unwrap_or(false);
 
     // Fire on_request_received lifecycle hooks

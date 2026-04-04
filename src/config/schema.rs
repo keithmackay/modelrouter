@@ -80,6 +80,8 @@ pub struct RoutingConfig {
     pub model_aliases: HashMap<String, String>,
     #[serde(default)]
     pub fallback_chains: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub complexity_routing: Option<ComplexityRoutingConfig>,
 }
 
 impl Default for RoutingConfig {
@@ -89,12 +91,26 @@ impl Default for RoutingConfig {
             default_model: default_model(),
             model_aliases: HashMap::new(),
             fallback_chains: HashMap::new(),
+            complexity_routing: None,
         }
     }
 }
 
 fn default_provider() -> String { "openai".to_string() }
 fn default_model() -> String { "gpt-4o".to_string() }
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ComplexityRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_complexity_threshold")]
+    pub token_threshold: u32,
+    #[serde(default = "default_cheap_model")]
+    pub cheap_model: String,
+}
+
+fn default_complexity_threshold() -> u32 { 500 }
+fn default_cheap_model() -> String { "gpt-4o-mini".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {

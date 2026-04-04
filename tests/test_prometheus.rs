@@ -19,6 +19,7 @@ async fn test_app() -> TestServer {
     }));
     let policy = Arc::new(PolicyEngine::new(db.clone()));
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
 
     let state = AppState {
         settings,
@@ -29,6 +30,7 @@ async fn test_app() -> TestServer {
         provider_registry,
         policy,
         fallback,
+        complexity_router,
         app_metrics: None,
     };
     TestServer::new(build_router(state)).unwrap()

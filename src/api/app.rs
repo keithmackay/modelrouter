@@ -55,6 +55,7 @@ pub struct AppState {
     pub provider_registry: Arc<ProviderRegistry>,
     pub policy: Arc<PolicyEngine>,
     pub fallback: Arc<FallbackChain>,
+    pub complexity_router: Arc<crate::router::complexity::ComplexityRouter>,
     #[cfg(feature = "prometheus")]
     pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
     #[cfg(not(feature = "prometheus"))]

@@ -230,6 +230,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
                 settings.routing.fallback_chains.clone(),
             ));
+            let complexity_router = Arc::new(crate::router::complexity::ComplexityRouter::new(
+                settings.routing.complexity_routing.clone(),
+            ));
 
             #[cfg(feature = "prometheus")]
             let app_metrics = Some(Arc::new(
@@ -247,6 +250,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 provider_registry,
                 policy,
                 fallback,
+                complexity_router,
                 app_metrics,
             };
             let app = crate::api::app::build_router(state);

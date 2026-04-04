@@ -293,6 +293,7 @@ async fn completions_span_has_required_attributes() {
         provider_registry: registry,
         policy: Arc::new(PolicyEngine::new(db.clone())),
         fallback: Arc::new(modelrouter::router::fallback::FallbackChain::new(std::collections::HashMap::new())),
+        complexity_router: Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None)),
         app_metrics: None,
     };
 
