@@ -107,7 +107,20 @@ async fn anthropic_messages_inner(
     let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
     let stream = body["stream"].as_bool().unwrap_or(false);
 
-    let (_provider_name, canonical_model) = state.router.resolve(&model);
+    // Check load balancer: if `model` is a named pool, override provider + model
+    let (_provider_name, canonical_model) = if let Some((lb_provider, lb_model)) =
+        state.load_balancer.resolve(&model)
+    {
+        tracing::info!(
+            pool = model.as_str(),
+            provider = lb_provider.as_str(),
+            routed_model = lb_model.as_str(),
+            "load balancer selected provider"
+        );
+        (lb_provider, lb_model)
+    } else {
+        state.router.resolve(&model)
+    };
 
     // Policy check
     let policy_result = state

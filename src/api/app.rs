@@ -61,6 +61,7 @@ pub struct AppState {
     pub complexity_router: Arc<crate::router::complexity::ComplexityRouter>,
     pub response_cache: Arc<crate::router::cache::ResponseCache>,
     pub embedding_registry: Arc<EmbeddingRegistry>,
+    pub load_balancer: Arc<crate::router::load_balancer::LoadBalancer>,
     #[cfg(feature = "prometheus")]
     pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
     #[cfg(not(feature = "prometheus"))]

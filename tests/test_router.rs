@@ -16,6 +16,7 @@ fn router_with_aliases() -> RequestRouter {
         model_aliases: aliases,
         fallback_chains: HashMap::new(),
         complexity_routing: None,
+        load_balancer: HashMap::new(),
     };
     RequestRouter::new(Arc::new(settings))
 }

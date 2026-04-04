@@ -48,6 +48,9 @@ async fn build_test_server() -> TestServer {
         complexity_router,
         response_cache,
         embedding_registry,
+        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+            std::collections::HashMap::new(),
+        )),
         app_metrics: None,
     };
 
@@ -140,6 +143,9 @@ async fn login_success_sets_cookie() {
         complexity_router,
         response_cache,
         embedding_registry,
+        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+            std::collections::HashMap::new(),
+        )),
         app_metrics: None,
     };
 
@@ -195,6 +201,9 @@ async fn superadmin_only_admins_page() {
         complexity_router,
         response_cache,
         embedding_registry,
+        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+            std::collections::HashMap::new(),
+        )),
         app_metrics: None,
     };
 

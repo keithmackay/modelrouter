@@ -107,6 +107,9 @@ pub struct RoutingConfig {
     pub fallback_chains: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub complexity_routing: Option<ComplexityRoutingConfig>,
+    /// Named load balancer pools. Key is the virtual pool name used as `model` in requests.
+    #[serde(default)]
+    pub load_balancer: HashMap<String, LoadBalancerConfig>,
 }
 
 impl Default for RoutingConfig {
@@ -117,6 +120,7 @@ impl Default for RoutingConfig {
             model_aliases: HashMap::new(),
             fallback_chains: HashMap::new(),
             complexity_routing: None,
+            load_balancer: HashMap::new(),
         }
     }
 }
@@ -136,6 +140,37 @@ pub struct ComplexityRoutingConfig {
 
 fn default_complexity_threshold() -> u32 { 500 }
 fn default_cheap_model() -> String { "gpt-4o-mini".to_string() }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LbStrategy {
+    RoundRobin,
+    Weighted,
+}
+
+impl Default for LbStrategy {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LbPoolEntry {
+    pub provider: String,
+    pub model: String,
+    #[serde(default = "default_lb_weight")]
+    pub weight: u32,
+}
+
+fn default_lb_weight() -> u32 { 1 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LoadBalancerConfig {
+    #[serde(default)]
+    pub strategy: LbStrategy,
+    #[serde(default)]
+    pub pool: Vec<LbPoolEntry>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {

@@ -44,6 +44,9 @@ async fn test_app() -> TestServer {
             common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
         )
     );
+    let load_balancer = Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+        std::collections::HashMap::new(),
+    ));
 
     let state = AppState {
         settings,
@@ -57,6 +60,7 @@ async fn test_app() -> TestServer {
         complexity_router,
         response_cache,
         embedding_registry,
+        load_balancer,
         app_metrics: None,
     };
     TestServer::new(build_router(state)).unwrap()

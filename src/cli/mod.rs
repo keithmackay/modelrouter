@@ -237,6 +237,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             let embedding_registry = Arc::new(crate::providers::embed_registry::EmbeddingRegistry::new(
                 settings.providers.clone(),
             ));
+            let load_balancer = Arc::new(crate::router::load_balancer::LoadBalancer::new(
+                settings.routing.load_balancer.clone(),
+            ));
 
             #[cfg(feature = "prometheus")]
             let app_metrics = Some(Arc::new(
@@ -257,6 +260,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 complexity_router,
                 response_cache,
                 embedding_registry,
+                load_balancer,
                 app_metrics,
             };
             let app = crate::api::app::build_router(state);

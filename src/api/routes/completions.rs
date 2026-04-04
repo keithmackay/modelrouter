@@ -132,7 +132,20 @@ async fn chat_completions_inner(
     .await
     .map_err(|_| ApiError::Internal)?;
 
-    let (provider_name, canonical_model) = state.router.resolve(&model);
+    // Check load balancer: if `model` is a named pool, override provider + model
+    let (provider_name, canonical_model) = if let Some((lb_provider, lb_model)) =
+        state.load_balancer.resolve(&model)
+    {
+        tracing::info!(
+            pool = model.as_str(),
+            provider = lb_provider.as_str(),
+            routed_model = lb_model.as_str(),
+            "load balancer selected provider"
+        );
+        (lb_provider, lb_model)
+    } else {
+        state.router.resolve(&model)
+    };
 
     let span = tracing::Span::current();
     span.record("model", canonical_model.as_str());
