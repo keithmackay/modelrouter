@@ -158,6 +158,9 @@ impl Default for LbStrategy {
 pub struct LbPoolEntry {
     pub provider: String,
     pub model: String,
+    /// Weight for weighted round-robin. Higher values increase selection frequency.
+    /// A weight of 0 silently excludes the entry from rotation.
+    /// Default: 1
     #[serde(default = "default_lb_weight")]
     pub weight: u32,
 }

@@ -107,21 +107,6 @@ async fn anthropic_messages_inner(
     let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
     let stream = body["stream"].as_bool().unwrap_or(false);
 
-    // Check load balancer: if `model` is a named pool, override provider + model
-    let (_provider_name, canonical_model) = if let Some((lb_provider, lb_model)) =
-        state.load_balancer.resolve(&model)
-    {
-        tracing::info!(
-            pool = model.as_str(),
-            provider = lb_provider.as_str(),
-            routed_model = lb_model.as_str(),
-            "load balancer selected provider"
-        );
-        (lb_provider, lb_model)
-    } else {
-        state.router.resolve(&model)
-    };
-
     // Policy check
     let policy_result = state
         .policy
@@ -154,6 +139,27 @@ async fn anthropic_messages_inner(
             return Err(ApiError::PolicyDenied { reason, status });
         }
     }
+
+    // Check load balancer: if `model` is a named pool, override provider + model
+    let (_lb_provider_unused, canonical_model) = if let Some((lb_provider, lb_model)) =
+        state.load_balancer.resolve(&model)
+    {
+        if lb_provider != "anthropic" {
+            tracing::warn!(
+                pool = model.as_str(),
+                lb_provider = lb_provider.as_str(),
+                "load balancer pool entry has non-anthropic provider; /v1/messages only supports Anthropic — provider field is ignored"
+            );
+        }
+        tracing::info!(
+            pool = model.as_str(),
+            routed_model = lb_model.as_str(),
+            "load balancer selected model for /v1/messages"
+        );
+        (lb_provider, lb_model)  // only lb_model is used by this handler
+    } else {
+        state.router.resolve(&model)
+    };
 
     let span = tracing::Span::current();
     span.record("user_id", user.id);
