@@ -1,9 +1,12 @@
+use std::time::Instant;
+
 use axum::{
     extract::State,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
@@ -13,6 +16,24 @@ use crate::{
 };
 
 pub async fn embeddings(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
+    let span = tracing::info_span!(
+        "embeddings",
+        user_id = tracing::field::Empty,
+        model = tracing::field::Empty,
+        provider = tracing::field::Empty,
+        "cost.usd" = tracing::field::Empty,
+        "tokens.prompt" = tracing::field::Empty,
+    );
+    embeddings_inner(State(state), user, Json(body))
+        .instrument(span)
+        .await
+}
+
+async fn embeddings_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Json(body): Json<Value>,
@@ -62,16 +83,48 @@ pub async fn embeddings(
         .get(&provider_name)
         .map_err(ApiError::ProviderError)?;
 
+    let span = tracing::Span::current();
+    span.record("user_id", user.id);
+    span.record("model", canonical_model.as_str());
+    span.record("provider", provider_name.as_str());
+
     let req = EmbeddingRequest {
         model: canonical_model.clone(),
         input,
     };
 
+    let start = Instant::now();
     let result = adapter.embed(&req).await.map_err(ApiError::ProviderError)?;
+    let latency_ms = start.elapsed().as_millis() as i64;
 
     let cost = state
         .cost_calc
         .calculate(&canonical_model, result.prompt_tokens, 0);
+
+    span.record("cost.usd", cost);
+    span.record("tokens.prompt", result.prompt_tokens as u64);
+
+    #[cfg(feature = "otel")]
+    {
+        crate::telemetry::metrics::record_request(&canonical_model, &provider_name, "ok");
+        crate::telemetry::metrics::record_tokens(
+            &canonical_model, &provider_name,
+            result.prompt_tokens, 0,
+        );
+        crate::telemetry::metrics::record_cost(
+            &canonical_model, &provider_name, user.id, cost,
+        );
+        crate::telemetry::metrics::record_duration(
+            &canonical_model, &provider_name, false, latency_ms as f64,
+        );
+    }
+
+    #[cfg(feature = "prometheus")]
+    if let Some(ref metrics) = state.app_metrics {
+        metrics.record_request(&canonical_model, &provider_name, "ok");
+        metrics.record_tokens(&canonical_model, &provider_name, result.prompt_tokens, 0);
+        metrics.record_cost(&canonical_model, &provider_name, cost);
+    }
 
     // Fire-and-forget cost recording
     let state_clone = state.clone();
@@ -95,7 +148,7 @@ pub async fn embeddings(
             prompt_tokens: prompt_tokens as i64,
             completion_tokens: 0,
             cost_usd: cost,
-            latency_ms: None,
+            latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
             project: None,
         };

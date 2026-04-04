@@ -38,6 +38,7 @@ impl EmbeddingRegistry {
             crate::providers::openai_embed::OpenAIEmbeddingAdapter::new(config),
         );
 
+        // Use entry API to prevent duplicate creation under concurrency — only first caller wins
         let entry = self
             .adapters
             .entry(provider_name.to_string())
