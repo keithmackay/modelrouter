@@ -22,13 +22,6 @@ impl EmbeddingRegistry {
             return Ok(adapter.clone());
         }
 
-        // Fall back to first available adapter (test-only path when configs is empty)
-        if self.configs.is_empty() {
-            if let Some(entry) = self.adapters.iter().next() {
-                return Ok(entry.value().clone());
-            }
-        }
-
         let config = self
             .configs
             .get(provider_name)
@@ -53,7 +46,7 @@ impl EmbeddingRegistry {
             configs: HashMap::new(),
         };
         let mock_arc: Arc<dyn EmbeddingAdapter> = Arc::new(mock);
-        registry.adapters.insert("__mock__".to_string(), mock_arc);
+        registry.adapters.insert("openai".to_string(), mock_arc);
         registry
     }
 }

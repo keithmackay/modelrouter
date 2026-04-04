@@ -40,6 +40,7 @@ async fn chat_completions_inner(
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
+    tracing::Span::current().record("user_id", user.id);
     let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
@@ -134,7 +135,6 @@ async fn chat_completions_inner(
     let (provider_name, canonical_model) = state.router.resolve(&model);
 
     let span = tracing::Span::current();
-    span.record("user_id", user.id);
     span.record("model", canonical_model.as_str());
     span.record("provider", provider_name.as_str());
     span.record("streaming", stream);
