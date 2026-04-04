@@ -27,6 +27,9 @@ async fn build_test_server() -> TestServer {
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
     let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
+    let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig::default()
+    ));
 
     let state = AppState {
         settings,
@@ -38,6 +41,7 @@ async fn build_test_server() -> TestServer {
         policy,
         fallback,
         complexity_router,
+        response_cache,
         app_metrics: None,
     };
 
@@ -109,6 +113,9 @@ async fn login_success_sets_cookie() {
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
     let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
+    let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig::default()
+    ));
 
     let state = AppState {
         settings,
@@ -120,6 +127,7 @@ async fn login_success_sets_cookie() {
         policy,
         fallback,
         complexity_router,
+        response_cache,
         app_metrics: None,
     };
 
@@ -154,6 +162,9 @@ async fn superadmin_only_admins_page() {
 
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
     let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
+    let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig::default()
+    ));
 
     let state = AppState {
         settings,
@@ -165,6 +176,7 @@ async fn superadmin_only_admins_page() {
         policy,
         fallback,
         complexity_router,
+        response_cache,
         app_metrics: None,
     };
 

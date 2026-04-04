@@ -54,6 +54,7 @@ async-trait = "0.1"
 futures = "0.3"
 bytes = "1"
 dashmap = "6"
+moka = { version = "0.12", features = ["future"] }
 
 # ── Prometheus (--features prometheus) ─────────────────────────────────
 prometheus = { version = "0.13", optional = true }

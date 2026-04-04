@@ -48,6 +48,28 @@ async fn chat_completions_inner(
     let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
     let stream = body["stream"].as_bool().unwrap_or(false);
 
+    // Build cache key for non-streaming requests only
+    let cache_key = if !stream {
+        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+        Some(crate::router::cache::make_cache_key(
+            &model,
+            &msgs,
+            body["temperature"].as_f64(),
+            body["max_tokens"].as_u64().map(|v| v as u32),
+        ))
+    } else {
+        None
+    };
+
+    // Check cache — hit returns immediately with no policy check or cost
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = state.response_cache.get(key).await {
+            tracing::info!(cache_key = key.as_str(), model = model.as_str(), "response cache hit");
+            let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
+            return Ok(Json(build_openai_response(request_id, &cached)).into_response());
+        }
+    }
+
     // Fire on_request_received lifecycle hooks
     for hook in &state.settings.hooks.lifecycle {
         if hook.event == "on_request_received" {
@@ -295,6 +317,11 @@ async fn chat_completions_inner(
             }
         }
     });
+
+    // Store result in cache for future requests
+    if let Some(key) = cache_key {
+        state.response_cache.insert(key, result.clone()).await;
+    }
 
     Ok(Json(build_openai_response(request_id, &result)).into_response())
 }

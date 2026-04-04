@@ -36,6 +36,9 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
     let policy = Arc::new(PolicyEngine::new(db.clone()));
     let fallback = Arc::new(FallbackChain::new(HashMap::new()));
     let complexity_router = Arc::new(ComplexityRouter::new(None));
+    let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig::default()
+    ));
 
     let state = AppState {
         settings,
@@ -47,6 +50,7 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
         policy,
         fallback,
         complexity_router,
+        response_cache,
         app_metrics: None,
     };
     (TestServer::new(build_router(state)).unwrap(), db)

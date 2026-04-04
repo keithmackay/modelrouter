@@ -9,6 +9,29 @@ pub struct PricingEntry {
     pub output_per_million: f64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: u64,
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_seconds: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: default_cache_max_entries(),
+            ttl_seconds: default_cache_ttl(),
+        }
+    }
+}
+
+fn default_cache_max_entries() -> u64 { 1000 }
+fn default_cache_ttl() -> u64 { 3600 }
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -25,6 +48,8 @@ pub struct Settings {
     pub auth: AuthConfig,
     #[serde(default)]
     pub pricing: Vec<PricingEntry>,
+    #[serde(default)]
+    pub cache: CacheConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
