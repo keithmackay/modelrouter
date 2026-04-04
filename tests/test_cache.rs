@@ -75,9 +75,11 @@ fn different_messages_produce_different_key() {
 
 #[test]
 fn stream_flag_does_not_affect_key() {
-    let b1 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]});
-    let b2 = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "stream": false});
-    assert_eq!(make_cache_key(&b1), make_cache_key(&b2));
+    let base = serde_json::json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]});
+    let with_stream_false = serde_json::json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "stream": false});
+    let with_stream_true = serde_json::json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "stream": true});
+    assert_eq!(make_cache_key(&base), make_cache_key(&with_stream_false));
+    assert_eq!(make_cache_key(&base), make_cache_key(&with_stream_true));
 }
 
 #[test]
@@ -189,7 +191,10 @@ async fn second_identical_request_returns_cached_response() {
 #[tokio::test]
 async fn streaming_requests_are_not_cached() {
     let server = test_app_with_cache().await;
-    let resp = server
+    let messages = serde_json::json!([{"role": "user", "content": "stream me"}]);
+
+    // Streaming request — should not be cached
+    let stream_resp = server
         .post("/v1/chat/completions")
         .add_header(
             axum::http::header::AUTHORIZATION,
@@ -197,10 +202,25 @@ async fn streaming_requests_are_not_cached() {
         )
         .json(&serde_json::json!({
             "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "stream me"}],
+            "messages": messages,
             "stream": true
         }))
         .await;
-    // Streaming still succeeds — just not cached
-    assert_eq!(resp.status_code(), 200);
+    assert_eq!(stream_resp.status_code(), 200);
+
+    // Non-streaming request with same messages — should succeed (not corrupted by streaming)
+    let non_stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": messages
+        }))
+        .await;
+    assert_eq!(non_stream_resp.status_code(), 200);
+    let body: serde_json::Value = non_stream_resp.json();
+    assert!(body["choices"][0]["message"]["content"].is_string());
 }
