@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 mod users;
 mod admin_users;
+mod api_keys;
 mod sessions;
 mod prompts;
 mod costs;

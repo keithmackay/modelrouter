@@ -256,6 +256,7 @@ pub async fn create_budget(
         NewBudgetRule {
             user_id: body.user_id,
             group_name: body.group_name,
+            api_key_id: None,
             window: body.window,
             limit_usd: body.limit_usd,
             limit_tokens: body.limit_tokens,
@@ -458,4 +459,67 @@ pub async fn create_admin(
         "role": admin.role,
         "created_at": admin.created_at,
     })))
+}
+
+// ── API key management ────────────────────────────────────────────────────────
+
+// GET /admin/api/users/:id/keys — list API keys for user
+pub async fn list_user_api_keys(
+    State(state): State<AppState>,
+    _admin: AdminSession,
+    Path(user_id): Path<i64>,
+) -> Result<Json<Vec<crate::db::models::ApiKey>>, ApiError> {
+    use crate::db::repositories::api_keys::ApiKeyRepository;
+    let keys = ApiKeyRepository::list_api_keys_for_user(&*state.db, user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(Json(keys))
+}
+
+// POST /admin/api/users/:id/keys — create API key for user
+#[derive(serde::Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub label: Option<String>,
+}
+
+pub async fn create_user_api_key(
+    State(state): State<AppState>,
+    _admin: SuperAdminSession,
+    Path(user_id): Path<i64>,
+    Json(body): Json<CreateApiKeyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::db::repositories::api_keys::ApiKeyRepository;
+    use crate::api::auth::hash_token;
+
+    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = hash_token(&raw_key);
+
+    let created = ApiKeyRepository::create_api_key(&*state.db, crate::db::models::NewApiKey {
+        user_id,
+        key_hash,
+        label: body.label,
+    })
+    .await
+    .map_err(|_| ApiError::Internal)?;
+
+    // Return the raw key once — it cannot be recovered later
+    Ok(Json(serde_json::json!({
+        "id": created.id,
+        "key": raw_key,
+        "label": created.label,
+        "created_at": created.created_at,
+    })))
+}
+
+// POST /admin/api/keys/:id/revoke — revoke API key
+pub async fn revoke_api_key_handler(
+    State(state): State<AppState>,
+    _admin: SuperAdminSession,
+    Path(key_id): Path<i64>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    use crate::db::repositories::api_keys::ApiKeyRepository;
+    ApiKeyRepository::revoke_api_key(&*state.db, key_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }

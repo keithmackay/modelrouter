@@ -346,6 +346,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let rule = BudgetRepository::create(&db, NewBudgetRule {
                         user_id: Some(found.id),
                         group_name: None,
+                        api_key_id: None,
                         window: window.clone(),
                         limit_usd,
                         limit_tokens: None,

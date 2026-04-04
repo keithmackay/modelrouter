@@ -26,6 +26,7 @@ async fn make_user_with_budget(
         NewBudgetRule {
             user_id: Some(user.id),
             group_name: None,
+            api_key_id: None,
             window: window.to_string(),
             limit_usd: Some(limit_usd),
             limit_tokens: None,
@@ -67,6 +68,7 @@ async fn model_in_deny_list_returns_403() {
         NewBudgetRule {
             user_id: Some(user.id),
             group_name: None,
+            api_key_id: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: None,
@@ -101,6 +103,7 @@ async fn model_not_in_allow_list_returns_403() {
         NewBudgetRule {
             user_id: Some(user.id),
             group_name: None,
+            api_key_id: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: None,
@@ -160,6 +163,7 @@ async fn budget_exceeded_returns_deny() {
         NewBudgetRule {
             user_id: Some(user.id),
             group_name: None,
+            api_key_id: None,
             window: "monthly".to_string(),
             limit_usd: Some(0.01),
             limit_tokens: None,
@@ -244,6 +248,7 @@ async fn test_policy_token_limit_under_budget() {
         NewBudgetRule {
             user_id: Some(user.id),
             group_name: None,
+            api_key_id: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: Some(100),
@@ -327,6 +332,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
         NewBudgetRule {
             user_id: Some(user.id),
             group_name: None,
+            api_key_id: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: Some(50),

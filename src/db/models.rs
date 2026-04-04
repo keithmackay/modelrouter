@@ -11,6 +11,26 @@ pub struct User {
     pub enabled: bool,
     pub created_at: String,
     pub metadata: String,
+    /// Set during authentication when matched via api_keys table; None for legacy key auth.
+    #[sqlx(default)]
+    pub api_key_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: i64,
+    pub user_id: i64,
+    pub key_hash: String,
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug)]
+pub struct NewApiKey {
+    pub user_id: i64,
+    pub key_hash: String,
+    pub label: Option<String>,
 }
 
 #[derive(Debug)]
@@ -125,6 +145,8 @@ pub struct BudgetRule {
     pub id: i64,
     pub user_id: Option<i64>,
     pub group_name: Option<String>,
+    #[sqlx(default)]
+    pub api_key_id: Option<i64>,
     pub window: String,
     pub limit_usd: Option<f64>,
     pub limit_tokens: Option<i64>,
@@ -139,6 +161,7 @@ pub struct BudgetRule {
 pub struct NewBudgetRule {
     pub user_id: Option<i64>,
     pub group_name: Option<String>,
+    pub api_key_id: Option<i64>,
     pub window: String,
     pub limit_usd: Option<f64>,
     pub limit_tokens: Option<i64>,

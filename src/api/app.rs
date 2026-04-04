@@ -5,9 +5,10 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::Settings,
     db::repositories::{
-        admin_users::AdminUserRepository, audit::AuditRepository, budgets::BudgetRepository,
-        costs::CostRepository, hooks::HookRepository, prompts::PromptRepository,
-        rate_limits::RateLimitRepository, sessions::SessionRepository, users::UserRepository,
+        admin_users::AdminUserRepository, api_keys::ApiKeyRepository, audit::AuditRepository,
+        budgets::BudgetRepository, costs::CostRepository, hooks::HookRepository,
+        prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
+        users::UserRepository,
     },
     providers::registry::ProviderRegistry,
     router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine},
@@ -24,6 +25,7 @@ pub trait DatabaseProvider:
     + AuditRepository
     + HookRepository
     + RateLimitRepository
+    + ApiKeyRepository
     + Send
     + Sync
 {
@@ -40,6 +42,7 @@ impl<T> DatabaseProvider for T where
         + AuditRepository
         + HookRepository
         + RateLimitRepository
+        + ApiKeyRepository
         + Send
         + Sync
 {
@@ -73,6 +76,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         list_budgets, create_budget, delete_budget,
         get_stats, get_audit, get_prompts,
         list_admins, create_admin,
+        list_user_api_keys, create_user_api_key, revoke_api_key_handler,
     };
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
@@ -101,6 +105,8 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/audit", get(get_audit))
         .route("/admin/api/prompts", get(get_prompts))
         .route("/admin/api/admins", get(list_admins).post(create_admin))
+        .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
+        .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
         // Admin Dashboard (public)
         .route("/admin/login", get(get_login).post(post_login))
         .route("/admin/logout", post(post_logout))

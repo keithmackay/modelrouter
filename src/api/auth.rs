@@ -26,7 +26,9 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Extract Bearer token
+        use crate::db::repositories::api_keys::ApiKeyRepository;
+        use crate::db::repositories::users::UserRepository;
+
         let auth_header = parts
             .headers
             .get("Authorization")
@@ -35,6 +37,25 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             .ok_or(ApiError::Unauthorized)?;
 
         let key_hash = hash_token(auth_header);
+
+        // 1. Try api_keys table first
+        if let Some(api_key) = ApiKeyRepository::find_api_key_by_hash(&*state.db, &key_hash)
+            .await
+            .map_err(|_| ApiError::Internal)?
+        {
+            let mut user = UserRepository::find_by_id(&*state.db, api_key.user_id)
+                .await
+                .map_err(|_| ApiError::Internal)?
+                .ok_or(ApiError::Unauthorized)?;
+
+            if !user.enabled {
+                return Err(ApiError::Unauthorized);
+            }
+            user.api_key_id = Some(api_key.id);
+            return Ok(AuthenticatedUser(user));
+        }
+
+        // 2. Fall back to legacy users.api_key
         let user = state
             .db
             .find_by_api_key(&key_hash)

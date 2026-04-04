@@ -1,4 +1,5 @@
 pub mod admin_users;
+pub mod api_keys;
 pub mod audit;
 pub mod budgets;
 pub mod costs;
@@ -9,6 +10,7 @@ pub mod sessions;
 pub mod users;
 
 pub use admin_users::AdminUserRepository;
+pub use api_keys::ApiKeyRepository;
 pub use audit::AuditRepository;
 pub use budgets::BudgetRepository;
 pub use costs::CostRepository;

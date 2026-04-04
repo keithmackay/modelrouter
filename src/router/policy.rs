@@ -40,6 +40,11 @@ impl PolicyEngine {
             let group_rules = BudgetRepository::list_for_group(&*self.db, group).await?;
             rules.extend(group_rules);
         }
+        // Per-key rules take precedence — check them first by prepending
+        if let Some(key_id) = user.api_key_id {
+            let key_rules = BudgetRepository::list_for_key(&*self.db, key_id).await?;
+            rules = key_rules.into_iter().chain(rules).collect();
+        }
 
         let span = tracing::Span::current();
 
