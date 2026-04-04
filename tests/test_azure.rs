@@ -29,14 +29,15 @@ fn azure_adapter_defaults_api_version() {
 }
 
 #[test]
-fn azure_adapter_uses_api_base_fallback() {
+fn azure_adapter_with_both_fields_set() {
     let config = ProviderConfig {
         api_key: "key".to_string(),
-        api_base: None,
-        api_version: None,
-        timeout_secs: 60,
+        api_base: Some("https://res.openai.azure.com/openai/deployments/gpt4o".to_string()),
+        api_version: Some("2025-01-01".to_string()),
+        timeout_secs: 30,
     };
     let adapter = AzureOpenAIAdapter::new(&config);
     let url = adapter.chat_url();
-    assert!(url.contains("api-version="));
+    assert!(url.starts_with("https://res.openai.azure.com"));
+    assert!(url.ends_with("api-version=2025-01-01"));
 }

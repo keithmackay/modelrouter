@@ -1,5 +1,4 @@
 use anyhow::Context;
-use bytes::Bytes;
 use futures::TryStreamExt;
 
 use crate::config::schema::ProviderConfig;
@@ -16,10 +15,13 @@ pub struct AzureOpenAIAdapter {
 
 impl AzureOpenAIAdapter {
     pub fn new(config: &ProviderConfig) -> Self {
-        let api_base = config
-            .api_base
-            .clone()
-            .unwrap_or_else(|| "https://missing-api-base.openai.azure.com".to_string());
+        let api_base = config.api_base.clone().unwrap_or_else(|| {
+            panic!(
+                "Azure OpenAI adapter requires `api_base` to be set. \
+                 Configure it as the full deployment endpoint, e.g.: \
+                 https://{{resource}}.openai.azure.com/openai/deployments/{{deployment-name}}"
+            )
+        });
         let api_version = config
             .api_version
             .clone()
@@ -94,7 +96,6 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             .client
             .post(self.chat_url())
             .header("api-key", &self.api_key)
-            .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await
@@ -133,7 +134,6 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             .client
             .post(self.chat_url())
             .header("api-key", &self.api_key)
-            .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await
@@ -147,8 +147,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
 
         let stream = resp
             .bytes_stream()
-            .map_err(|e| anyhow::anyhow!("Stream error: {}", e))
-            .map_ok(Bytes::from);
+            .map_err(|e| anyhow::anyhow!("Stream error: {}", e));
 
         Ok(Box::pin(stream))
     }
