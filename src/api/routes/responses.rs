@@ -2,11 +2,13 @@ use std::time::Instant;
 
 use axum::{extract::State, response::{IntoResponse, Response}, Json};
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     db::models::{NewCostLedgerEntry, NewPrompt},
     providers::adapter::NormalizedRequest,
+    router::policy::PolicyDecision,
 };
 
 pub async fn responses_handler(
@@ -14,54 +16,106 @@ pub async fn responses_handler(
     user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
+    let span = tracing::info_span!(
+        "responses_handler",
+        user_id = tracing::field::Empty,
+        model = tracing::field::Empty,
+    );
+    responses_inner(State(state), user, Json(body))
+        .instrument(span)
+        .await
+}
+
+async fn responses_inner(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
+    tracing::Span::current().record("user_id", user.id);
 
     let model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
 
+    tracing::Span::current().record("model", model.as_str());
+
     // Policy check
-    state
+    let policy_result = state
         .policy
         .check(&user, &model)
+        .instrument(tracing::info_span!("modelrouter.policy_check"))
         .await
         .map_err(|_| ApiError::Internal)?;
+    let _concurrency_permit = match policy_result {
+        PolicyDecision::Allow { max_concurrent } => {
+            if let Some(max) = max_concurrent {
+                match state.concurrency.try_acquire(user.id, max) {
+                    Some(permit) => Some(permit),
+                    None => return Err(ApiError::PolicyDenied {
+                        reason: "concurrent request limit exceeded".to_string(),
+                        status: 429,
+                    }),
+                }
+            } else {
+                None
+            }
+        }
+        PolicyDecision::Deny { reason, status, .. } => {
+            return Err(ApiError::PolicyDenied { reason, status });
+        }
+    };
 
     // Route the model
     let (provider_name, canonical_model) = state.router.resolve(&model);
 
     // Translate body: if messages absent and input is a string, synthesize messages
-    let mut translated_body = body.clone();
+    let mut body = body;
     let has_messages = body["messages"].is_array();
     if !has_messages {
         if let Some(input_str) = body["input"].as_str() {
             let messages = serde_json::json!([{"role": "user", "content": input_str}]);
-            translated_body["messages"] = messages;
+            body["messages"] = messages;
+        } else if body["input"].is_array() {
+            // Array-form input: pass through as messages directly
+            body["messages"] = body["input"].clone();
+            body.as_object_mut().map(|m| m.remove("input"));
         }
     }
     // Remove "input" key
-    if let Some(obj) = translated_body.as_object_mut() {
+    if let Some(obj) = body.as_object_mut() {
         obj.remove("input");
     }
 
     let norm_req = NormalizedRequest {
         model: canonical_model.clone(),
-        messages: translated_body["messages"].as_array().cloned().unwrap_or_default(),
+        messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: false,
-        temperature: translated_body["temperature"].as_f64(),
-        max_tokens: translated_body["max_tokens"].as_u64().map(|v| v as u32),
+        temperature: body["temperature"].as_f64(),
+        max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
         extra_params: serde_json::Value::Object(Default::default()),
     };
 
     let start = Instant::now();
+
+    // Check circuit breaker before calling provider
+    if state.circuit_breaker.is_open(&provider_name) {
+        return Err(ApiError::ProviderError(anyhow::anyhow!("{provider_name} is circuit-broken")));
+    }
+
     let adapter = state
         .provider_registry
         .get(&provider_name)
         .map_err(ApiError::ProviderError)?;
-    let result = adapter.complete(&norm_req).await.map_err(ApiError::ProviderError)?;
+    let result = adapter.complete(&norm_req).await.map_err(|e| {
+        state.circuit_breaker.record_failure(&provider_name);
+        ApiError::ProviderError(e)
+    })?;
+    state.circuit_breaker.record_success(&provider_name);
+
     let latency_ms = start.elapsed().as_millis() as i64;
 
     let cost = state
@@ -76,7 +130,7 @@ pub async fn responses_handler(
     let canonical_clone = canonical_model.clone();
     let provider_clone = provider_name.clone();
     let messages_json = serde_json::to_string(
-        &translated_body["messages"].as_array().cloned().unwrap_or_default(),
+        &body["messages"].as_array().cloned().unwrap_or_default(),
     )
     .unwrap_or_default();
     let response_clone = result.content.clone();
