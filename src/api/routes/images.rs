@@ -46,9 +46,18 @@ pub async fn image_generations(
             region: None,
         });
 
+    // Check circuit breaker before calling provider
+    if state.circuit_breaker.is_open(provider_name) {
+        return Err(ApiError::ProviderError(anyhow::anyhow!("{provider_name} is circuit-broken")));
+    }
+
     // Call image adapter
     let adapter = crate::providers::openai_images::OpenAIImageAdapter::new(&provider_config);
-    let result = adapter.generate_image(&body).await.map_err(ApiError::ProviderError)?;
+    let result = adapter.generate_image(&body).await.map_err(|e| {
+        state.circuit_breaker.record_failure(provider_name);
+        ApiError::ProviderError(e)
+    })?;
+    state.circuit_breaker.record_success(provider_name);
 
     // Calculate cost
     let pricing_key = format!("{}/{}", model, quality);
