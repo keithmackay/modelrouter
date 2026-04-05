@@ -30,8 +30,20 @@ pub fn translate_messages(
     let system_parts: Vec<String> = messages
         .iter()
         .filter_map(|m| {
-            if m["role"].as_str() == Some("system") {
-                m["content"].as_str().map(|s| s.to_string())
+            if m["role"].as_str() != Some("system") {
+                return None;
+            }
+            if let Some(s) = m["content"].as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(arr) = m["content"].as_array() {
+                let text = arr
+                    .iter()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() { Some(text) } else { None }
             } else {
                 None
             }
@@ -49,6 +61,7 @@ pub fn translate_messages(
         .filter(|m| {
             matches!(m["role"].as_str(), Some("user") | Some("assistant"))
         })
+        .filter(|m| m["content"].is_string() || m["content"].is_array())
         .cloned()
         .collect();
 
