@@ -1,5 +1,7 @@
 pub mod adapter;
 pub mod anthropic;
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
 pub mod azure_openai;
 pub mod embed_registry;
 pub mod embedding;
