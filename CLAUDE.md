@@ -16,6 +16,7 @@ cargo run -- serve     # Start server
 ```bash
 cargo test
 cargo build --features postgres  # Verify postgres feature
+cargo build --features bedrock  # Verify bedrock feature
 ```
 
 ## CLI Commands
