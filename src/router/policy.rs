@@ -99,7 +99,9 @@ impl PolicyEngine {
             if let Some(limit_usd) = rule.limit_usd {
                 let raw_window_start = window_start_for(&rule.window);
                 // Honor spend_reset_at: use whichever timestamp is later
-                // Both are RFC3339 UTC strings; lexicographic comparison is correct for UTC
+                // SAFETY: both strings are produced by chrono::to_rfc3339() with UTC offset +00:00
+                // (via now_utc()). Lexicographic ordering is correct when format is consistent.
+                // Do not mix with Z-suffix or fractional-second timestamps from external sources.
                 let window_start = match &user.spend_reset_at {
                     Some(reset_at) if reset_at.as_str() > raw_window_start.as_str() => reset_at.clone(),
                     _ => raw_window_start,
@@ -131,6 +133,9 @@ impl PolicyEngine {
             // 5. Check token budget
             if let Some(limit_tokens) = rule.limit_tokens {
                 let raw_window_start = window_start_for(&rule.window);
+                // SAFETY: both strings are produced by chrono::to_rfc3339() with UTC offset +00:00
+                // (via now_utc()). Lexicographic ordering is correct when format is consistent.
+                // Do not mix with Z-suffix or fractional-second timestamps from external sources.
                 let window_start = match &user.spend_reset_at {
                     Some(reset_at) if reset_at.as_str() > raw_window_start.as_str() => reset_at.clone(),
                     _ => raw_window_start,

@@ -547,7 +547,7 @@ pub async fn create_user_api_key(
 /// POST /admin/api/users/:id/reset-spend
 pub async fn reset_user_spend(
     State(state): State<AppState>,
-    _session: AdminSession,
+    _session: SuperAdminSession,
     Path(user_id): Path<i64>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
     use crate::db::repositories::users::UserRepository;
