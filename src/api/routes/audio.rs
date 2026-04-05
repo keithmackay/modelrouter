@@ -5,6 +5,7 @@ use axum::{
     Json,
 };
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
@@ -17,24 +18,54 @@ pub async fn speech(
     user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
+    let span = tracing::info_span!(
+        "speech",
+        user_id = tracing::field::Empty,
+        model = tracing::field::Empty,
+    );
+    speech_inner(State(state), user, Json(body))
+        .instrument(span)
+        .await
+}
+
+async fn speech_inner(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
+    tracing::Span::current().record("user_id", user.id);
 
     let model = body["model"].as_str().unwrap_or("tts-1").to_string();
+    tracing::Span::current().record("model", model.as_str());
 
     // Policy check
-    match state
+    let _concurrency_permit = match state
         .policy
         .check(&user, &model)
+        .instrument(tracing::info_span!("modelrouter.policy_check"))
         .await
         .map_err(|_| ApiError::Internal)?
     {
+        PolicyDecision::Allow { max_concurrent } => {
+            if let Some(max) = max_concurrent {
+                match state.concurrency.try_acquire(user.id, max) {
+                    Some(permit) => Some(permit),
+                    None => return Err(ApiError::PolicyDenied {
+                        reason: "concurrent request limit exceeded".to_string(),
+                        status: 429,
+                    }),
+                }
+            } else {
+                None
+            }
+        }
         PolicyDecision::Deny { reason, status, .. } => {
             return Err(ApiError::PolicyDenied { reason, status });
         }
-        PolicyDecision::Allow { .. } => {}
-    }
+    };
 
     // Get provider config
     let provider_name = &state.settings.routing.default_provider;
@@ -155,25 +186,56 @@ pub async fn speech(
 pub async fn transcriptions(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    multipart: Multipart,
+) -> Result<Response, ApiError> {
+    let span = tracing::info_span!(
+        "transcriptions",
+        user_id = tracing::field::Empty,
+        model = tracing::field::Empty,
+    );
+    transcriptions_inner(State(state), user, multipart)
+        .instrument(span)
+        .await
+}
+
+async fn transcriptions_inner(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
+    tracing::Span::current().record("user_id", user.id);
+
     let model = "whisper-1".to_string();
+    tracing::Span::current().record("model", model.as_str());
 
     // Policy check
-    match state
+    let _concurrency_permit = match state
         .policy
         .check(&user, &model)
+        .instrument(tracing::info_span!("modelrouter.policy_check"))
         .await
         .map_err(|_| ApiError::Internal)?
     {
+        PolicyDecision::Allow { max_concurrent } => {
+            if let Some(max) = max_concurrent {
+                match state.concurrency.try_acquire(user.id, max) {
+                    Some(permit) => Some(permit),
+                    None => return Err(ApiError::PolicyDenied {
+                        reason: "concurrent request limit exceeded".to_string(),
+                        status: 429,
+                    }),
+                }
+            } else {
+                None
+            }
+        }
         PolicyDecision::Deny { reason, status, .. } => {
             return Err(ApiError::PolicyDenied { reason, status });
         }
-        PolicyDecision::Allow { .. } => {}
-    }
+    };
 
     // Get provider config
     let provider_name = &state.settings.routing.default_provider;

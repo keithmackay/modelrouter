@@ -175,7 +175,10 @@ async fn responses_inner(
     });
 
     let response_body = serde_json::json!({
-        "id": format!("resp_{}", prompt_tokens),
+        "id": format!("resp_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()),
         "object": "response",
         "model": canonical_model,
         "choices": [{
