@@ -4,18 +4,22 @@ pub struct OpenAIModerationGuardrail {
     api_key: String,
     /// If true, HTTP/parse errors cause Allow. If false, they cause Block.
     fail_open: bool,
+    /// Shared HTTP client — reused across calls to benefit from connection pooling.
+    client: reqwest::Client,
 }
 
 impl OpenAIModerationGuardrail {
     pub fn new(api_key: String) -> Self {
-        Self { api_key, fail_open: true }
+        Self { api_key, fail_open: true, client: reqwest::Client::new() }
     }
 
     pub fn with_fail_open(api_key: String, fail_open: bool) -> Self {
-        Self { api_key, fail_open }
+        Self { api_key, fail_open, client: reqwest::Client::new() }
     }
 
     /// Extract plain text from a messages array for moderation.
+    /// Only string `content` fields are extracted; array-format content
+    /// (used by multimodal/vision requests) is intentionally skipped.
     fn messages_to_text(messages: &serde_json::Value) -> String {
         messages
             .as_array()
@@ -32,9 +36,8 @@ impl OpenAIModerationGuardrail {
         if self.api_key.is_empty() || text.is_empty() {
             return GuardrailDecision::Allow;
         }
-        let client = reqwest::Client::new();
         let body = serde_json::json!({ "input": text });
-        let resp = match client
+        let resp = match self.client
             .post("https://api.openai.com/v1/moderations")
             .bearer_auth(&self.api_key)
             .json(&body)

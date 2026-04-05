@@ -26,7 +26,13 @@ pub trait Guardrail: Send + Sync {
 }
 
 /// Ordered chain of guardrails. Each entry is `(guardrail, fail_open)`.
-/// `fail_open = true` means: if the guardrail errors internally, Allow.
+///
+/// The `fail_open` bool is passed through to each guardrail implementation via
+/// `with_fail_open` constructors. The chain runner itself does not enforce it —
+/// each guardrail is responsible for honouring the flag when handling internal
+/// errors (e.g. network failures). This design means guardrails that do not
+/// implement `fail_open` internally will not benefit from the flag.
+///
 /// The chain short-circuits on the first Block or Replace decision.
 pub struct GuardrailChain {
     guardrails: Vec<(Box<dyn Guardrail>, bool)>,
@@ -40,14 +46,11 @@ impl GuardrailChain {
     /// Run all guardrails against the request. Returns the first non-Allow decision,
     /// or Allow if all pass.
     pub async fn check_request(&self, ctx: &GuardrailContext) -> GuardrailDecision {
-        for (guardrail, fail_open) in &self.guardrails {
+        for (guardrail, _fail_open) in &self.guardrails {
             let decision = guardrail.check_request(ctx).await;
             match decision {
                 GuardrailDecision::Allow => continue,
-                other => {
-                    let _ = fail_open; // used by guardrail implementations, not the chain runner
-                    return other;
-                }
+                other => return other,
             }
         }
         GuardrailDecision::Allow
@@ -56,14 +59,11 @@ impl GuardrailChain {
     /// Run all guardrails against the response. Returns the first non-Allow decision,
     /// or Allow if all pass.
     pub async fn check_response(&self, ctx: &GuardrailContext, response: &str) -> GuardrailDecision {
-        for (guardrail, fail_open) in &self.guardrails {
+        for (guardrail, _fail_open) in &self.guardrails {
             let decision = guardrail.check_response(ctx, response).await;
             match decision {
                 GuardrailDecision::Allow => continue,
-                other => {
-                    let _ = fail_open;
-                    return other;
-                }
+                other => return other,
             }
         }
         GuardrailDecision::Allow
