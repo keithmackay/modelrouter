@@ -1,4 +1,5 @@
 pub mod completions;
+pub mod images;
 pub mod responses;
 pub mod embeddings;
 pub mod health;

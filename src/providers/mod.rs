@@ -7,4 +7,5 @@ pub mod embed_registry;
 pub mod embedding;
 pub mod openai_compat;
 pub mod openai_embed;
+pub mod openai_images;
 pub mod registry;
