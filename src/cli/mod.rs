@@ -263,6 +263,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 load_balancer,
                 concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::new()),
                 circuit_breaker: Arc::new(crate::router::circuit_breaker::CircuitBreaker::default()),
+                ip_rate_limiter: Arc::new(crate::api::middleware::ip_rate_limit::IpRateLimiter::new(
+                    settings.server.ip_rate_limit_rpm,
+                )),
                 app_metrics,
             };
             let app = crate::api::app::build_router(state);
@@ -270,7 +273,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             let bind_addr = format!("{}:{}", host, port);
             tracing::info!("Listening on {}", bind_addr);
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-            axum::serve(listener, app).await?;
+            use std::net::SocketAddr;
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
         }
         Commands::Migrate => {
             let settings = crate::config::load(cli.config)?;

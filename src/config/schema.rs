@@ -63,6 +63,9 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_request_body_limit_mb")]
     pub request_body_limit_mb: usize,
+    /// Max requests per minute per IP address. 0 = disabled (default).
+    #[serde(default)]
+    pub ip_rate_limit_rpm: u32,
 }
 
 impl Default for ServerConfig {
@@ -71,6 +74,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             request_body_limit_mb: default_request_body_limit_mb(),
+            ip_rate_limit_rpm: 0,
         }
     }
 }

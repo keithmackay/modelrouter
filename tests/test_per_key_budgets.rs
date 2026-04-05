@@ -63,6 +63,7 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
         load_balancer,
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
+        ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         app_metrics: None,
     };
     (TestServer::new(build_router(state)).unwrap(), db)

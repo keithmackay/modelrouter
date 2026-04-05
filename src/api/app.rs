@@ -64,6 +64,7 @@ pub struct AppState {
     pub load_balancer: Arc<crate::router::load_balancer::LoadBalancer>,
     pub concurrency: Arc<crate::router::concurrency::ConcurrencyLimiter>,
     pub circuit_breaker: Arc<crate::router::circuit_breaker::CircuitBreaker>,
+    pub ip_rate_limiter: Arc<crate::api::middleware::ip_rate_limit::IpRateLimiter>,
     #[cfg(feature = "prometheus")]
     pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
     #[cfg(not(feature = "prometheus"))]
@@ -131,6 +132,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/audit", get(dash_get_audit))
         .route("/admin/admins", get(get_admins).post(post_create_admin))
         .route("/admin/admins/:id/delete", post(post_delete_admin))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.ip_rate_limiter.clone(),
+            crate::api::middleware::ip_rate_limit::ip_rate_limit_middleware,
+        ))
 }
