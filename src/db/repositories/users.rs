@@ -11,4 +11,5 @@ pub trait UserRepository: Send + Sync {
     async fn set_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()>;
     async fn rotate_key(&self, id: i64, new_key_hash: &str, overlap_expires_at: &str) -> anyhow::Result<()>;
     async fn expire_old_keys(&self) -> anyhow::Result<u64>;
+    async fn reset_spend(&self, user_id: i64) -> anyhow::Result<()>;
 }

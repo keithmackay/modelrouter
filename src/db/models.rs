@@ -14,6 +14,9 @@ pub struct User {
     /// Set during authentication when matched via api_keys table; None for legacy key auth.
     #[sqlx(default)]
     pub api_key_id: Option<i64>,
+    /// If set, only costs recorded after this timestamp count toward budget limits.
+    #[sqlx(default)]
+    pub spend_reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

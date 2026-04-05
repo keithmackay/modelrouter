@@ -97,7 +97,13 @@ impl PolicyEngine {
 
             // 4. Check USD budget
             if let Some(limit_usd) = rule.limit_usd {
-                let window_start = window_start_for(&rule.window);
+                let raw_window_start = window_start_for(&rule.window);
+                // Honor spend_reset_at: use whichever timestamp is later
+                // Both are RFC3339 UTC strings; lexicographic comparison is correct for UTC
+                let window_start = match &user.spend_reset_at {
+                    Some(reset_at) if reset_at.as_str() > raw_window_start.as_str() => reset_at.clone(),
+                    _ => raw_window_start,
+                };
                 let spent = if let Some(key_id) = rule.api_key_id {
                     CostRepository::sum_for_key_since(&*self.db, key_id, &window_start).await?
                 } else {
@@ -124,7 +130,11 @@ impl PolicyEngine {
 
             // 5. Check token budget
             if let Some(limit_tokens) = rule.limit_tokens {
-                let window_start = window_start_for(&rule.window);
+                let raw_window_start = window_start_for(&rule.window);
+                let window_start = match &user.spend_reset_at {
+                    Some(reset_at) if reset_at.as_str() > raw_window_start.as_str() => reset_at.clone(),
+                    _ => raw_window_start,
+                };
                 let used_tokens = if let Some(key_id) = rule.api_key_id {
                     CostRepository::sum_tokens_for_key_since(&*self.db, key_id, &window_start).await?
                 } else {

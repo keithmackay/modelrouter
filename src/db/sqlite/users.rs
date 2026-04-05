@@ -16,6 +16,8 @@ struct UserRow {
     enabled: i64,
     created_at: String,
     metadata: String,
+    #[sqlx(default)]
+    spend_reset_at: Option<String>,
 }
 
 impl From<UserRow> for User {
@@ -31,6 +33,7 @@ impl From<UserRow> for User {
             created_at: r.created_at,
             metadata: r.metadata,
             api_key_id: None,
+            spend_reset_at: r.spend_reset_at,
         }
     }
 }
@@ -136,6 +139,16 @@ impl UserRepository for SqliteDb {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn reset_spend(&self, user_id: i64) -> anyhow::Result<()> {
+        let now = now_utc();
+        sqlx::query("UPDATE users SET spend_reset_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
