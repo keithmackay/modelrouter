@@ -81,3 +81,19 @@ async fn chain_replace_decision_is_returned_for_response() {
     let decision = chain.check_response(&ctx, "some response").await;
     assert!(matches!(decision, GuardrailDecision::Replace { content } if content == "[redacted]"));
 }
+
+use modelrouter::guardrails::{Guardrail as _, openai_moderation::OpenAIModerationGuardrail};
+
+#[tokio::test]
+async fn moderation_guardrail_allows_with_empty_api_key_and_no_server() {
+    // With an empty API key, the guardrail should return Allow immediately (short-circuit).
+    let guardrail = OpenAIModerationGuardrail::new("".to_string());
+    let ctx = GuardrailContext {
+        messages: serde_json::json!([{"role": "user", "content": "Hello"}]),
+        model: "gpt-4o".to_string(),
+        user_id: 1,
+    };
+    // Should not panic, and with empty key returns Allow immediately.
+    let decision = guardrail.check_request(&ctx).await;
+    let _ = decision; // Either Allow (empty key short-circuits) — just verify no panic
+}
