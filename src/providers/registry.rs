@@ -40,6 +40,19 @@ impl ProviderRegistry {
         } else if provider_name == "azure" {
             Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(config))
         } else {
+            #[cfg(feature = "bedrock")]
+            if provider_name == "bedrock" {
+                let bedrock = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(crate::providers::bedrock::BedrockAdapter::new(config))
+                });
+                // Use or_insert so concurrent callers don't create duplicate adapters
+                let entry = self
+                    .adapters
+                    .entry(provider_name.to_string())
+                    .or_insert(Arc::new(bedrock));
+                return Ok(entry.clone());
+            }
             Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(config))
         };
 
