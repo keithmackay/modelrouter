@@ -279,6 +279,7 @@ pub async fn create_budget(
             user_id: body.user_id,
             group_name: body.group_name,
             api_key_id: body.api_key_id,
+            tag: None,
             window: body.window,
             limit_usd: body.limit_usd,
             limit_tokens: body.limit_tokens,
@@ -522,6 +523,7 @@ pub async fn create_user_api_key(
         key_hash,
         label: body.label,
         expires_at: None,
+        tag: None,
     })
     .await
     .map_err(|_| ApiError::Internal)?;

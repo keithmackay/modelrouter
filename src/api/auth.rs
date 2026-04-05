@@ -52,6 +52,7 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
                 return Err(ApiError::Unauthorized);
             }
             user.api_key_id = Some(api_key.id);
+            user.api_key_tag = api_key.tag.clone();
             return Ok(AuthenticatedUser(user));
         }
 

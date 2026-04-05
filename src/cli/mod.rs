@@ -363,6 +363,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         user_id: Some(found.id),
                         group_name: None,
                         api_key_id: None,
+                        tag: None,
                         window: window.clone(),
                         limit_usd,
                         limit_tokens: None,

@@ -34,6 +34,7 @@ impl From<UserRow> for User {
             metadata: r.metadata,
             api_key_id: None,
             spend_reset_at: r.spend_reset_at,
+            api_key_tag: None,
         }
     }
 }

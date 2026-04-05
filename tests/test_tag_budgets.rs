@@ -1,0 +1,48 @@
+// tests/test_tag_budgets.rs
+
+#[test]
+fn api_key_tag_field_compiles() {
+    let _key = modelrouter::db::models::NewApiKey {
+        user_id: 1,
+        key_hash: "abc".to_string(),
+        label: None,
+        expires_at: None,
+        tag: Some("ci".to_string()),
+    };
+}
+
+#[test]
+fn budget_rule_tag_field_compiles() {
+    let _rule = modelrouter::db::models::NewBudgetRule {
+        user_id: None,
+        group_name: None,
+        api_key_id: None,
+        tag: Some("ci".to_string()),
+        window: "monthly".to_string(),
+        limit_usd: None,
+        limit_tokens: None,
+        model_allow: vec![],
+        model_deny: vec![],
+        rate_rpm: None,
+        max_concurrent: None,
+    };
+}
+
+#[test]
+fn user_has_api_key_tag_field() {
+    let user = modelrouter::db::models::User {
+        id: 1,
+        name: "test".to_string(),
+        api_key: "hash".to_string(),
+        api_key_old: None,
+        api_key_old_expires_at: None,
+        group_name: None,
+        enabled: true,
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        metadata: "{}".to_string(),
+        api_key_id: None,
+        spend_reset_at: None,
+        api_key_tag: None,
+    };
+    assert!(user.api_key_tag.is_none());
+}

@@ -49,6 +49,11 @@ impl PolicyEngine {
             let key_rules = BudgetRepository::list_for_key(&*self.db, key_id).await?;
             rules = key_rules.into_iter().chain(rules).collect();
         }
+        // Include budget rules targeting this key's tag (lowest priority — appended last)
+        if let Some(tag) = &user.api_key_tag {
+            let tag_rules = self.db.list_for_tag(tag).await.unwrap_or_default();
+            rules.extend(tag_rules);
+        }
 
         let span = tracing::Span::current();
         let mut min_concurrent: Option<u32> = None;

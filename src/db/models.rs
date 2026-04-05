@@ -17,6 +17,9 @@ pub struct User {
     /// If set, only costs recorded after this timestamp count toward budget limits.
     #[sqlx(default)]
     pub spend_reset_at: Option<String>,
+    /// Tag from the authenticating API key. Set in memory by auth extractor.
+    #[sqlx(default)]
+    pub api_key_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,8 @@ pub struct ApiKey {
     pub created_at: String,
     /// RFC3339 UTC expiry. None = never expires.
     pub expires_at: Option<String>,
+    /// Optional tag for per-tag budget matching (e.g., "ci", "project-x").
+    pub tag: Option<String>,
 }
 
 impl ApiKey {
@@ -51,6 +56,7 @@ pub struct NewApiKey {
     pub key_hash: String,
     pub label: Option<String>,
     pub expires_at: Option<String>,
+    pub tag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -170,6 +176,9 @@ pub struct BudgetRule {
     pub group_name: Option<String>,
     #[sqlx(default)]
     pub api_key_id: Option<i64>,
+    /// If set, this rule applies to API keys with a matching tag.
+    #[sqlx(default)]
+    pub tag: Option<String>,
     pub window: String,
     pub limit_usd: Option<f64>,
     pub limit_tokens: Option<i64>,
@@ -187,6 +196,7 @@ pub struct NewBudgetRule {
     pub user_id: Option<i64>,
     pub group_name: Option<String>,
     pub api_key_id: Option<i64>,
+    pub tag: Option<String>,
     pub window: String,
     pub limit_usd: Option<f64>,
     pub limit_tokens: Option<i64>,
