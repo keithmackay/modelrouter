@@ -1,6 +1,7 @@
 pub mod api;
 pub mod archival;
 pub mod callbacks;
+pub mod guardrails;
 pub mod cli;
 pub mod config;
 pub mod db;
