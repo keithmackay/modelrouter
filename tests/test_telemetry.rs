@@ -311,6 +311,7 @@ async fn completions_span_has_required_attributes() {
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),
+        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         app_metrics: None,
     };
 

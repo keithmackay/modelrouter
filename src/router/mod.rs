@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod concurrency;
 pub mod complexity;
 pub mod cost;
 pub mod engine;

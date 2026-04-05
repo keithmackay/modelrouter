@@ -114,8 +114,20 @@ async fn anthropic_messages_inner(
         .instrument(tracing::info_span!("modelrouter.policy_check"))
         .await
         .map_err(|_| ApiError::Internal)?;
-    match policy_result {
-        PolicyDecision::Allow => {}
+    let _concurrency_permit = match policy_result {
+        PolicyDecision::Allow { max_concurrent } => {
+            if let Some(max) = max_concurrent {
+                match state.concurrency.try_acquire(user.id, max) {
+                    Some(permit) => Some(permit),
+                    None => return Err(ApiError::PolicyDenied {
+                        reason: "concurrent request limit exceeded".to_string(),
+                        status: 429,
+                    }),
+                }
+            } else {
+                None
+            }
+        }
         PolicyDecision::Deny {
             reason,
             status,
@@ -138,7 +150,7 @@ async fn anthropic_messages_inner(
             }
             return Err(ApiError::PolicyDenied { reason, status });
         }
-    }
+    };
 
     // Check load balancer: if `model` is a named pool, override provider + model
     let (_lb_provider_unused, canonical_model) = if let Some((lb_provider, lb_model)) =

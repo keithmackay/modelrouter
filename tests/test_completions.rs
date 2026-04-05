@@ -61,6 +61,7 @@ async fn test_app() -> TestServer {
         response_cache,
         embedding_registry,
         load_balancer,
+        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         app_metrics: None,
     };
     TestServer::new(build_router(state)).unwrap()

@@ -12,7 +12,11 @@ pub struct BudgetContext {
 }
 
 pub enum PolicyDecision {
-    Allow,
+    Allow {
+        /// Most restrictive max_concurrent across all applicable budget rules.
+        /// None means unlimited.
+        max_concurrent: Option<u32>,
+    },
     Deny {
         reason: String,
         status: u16,
@@ -47,6 +51,7 @@ impl PolicyEngine {
         }
 
         let span = tracing::Span::current();
+        let mut min_concurrent: Option<u32> = None;
 
         for rule in &rules {
             // 1. Check model_allow (JSON array)
@@ -130,6 +135,12 @@ impl PolicyEngine {
                 }
             }
 
+            // 6. Track max_concurrent
+            if let Some(mc) = rule.max_concurrent {
+                let mc = mc.max(0) as u32;
+                min_concurrent = Some(min_concurrent.map_or(mc, |prev| prev.min(mc)));
+            }
+
             // 5. Check token budget
             if let Some(limit_tokens) = rule.limit_tokens {
                 let raw_window_start = window_start_for(&rule.window);
@@ -158,7 +169,7 @@ impl PolicyEngine {
         }
 
         span.record("policy.result", "allow");
-        Ok(PolicyDecision::Allow)
+        Ok(PolicyDecision::Allow { max_concurrent: min_concurrent })
     }
 }
 

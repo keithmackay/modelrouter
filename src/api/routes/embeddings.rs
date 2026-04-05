@@ -53,7 +53,7 @@ async fn embeddings_inner(
         .await
         .map_err(|_| ApiError::Internal)?;
     match policy_result {
-        PolicyDecision::Allow => {}
+        PolicyDecision::Allow { .. } => {}
         PolicyDecision::Deny { reason, status, .. } => {
             return Err(ApiError::PolicyDenied { reason, status });
         }

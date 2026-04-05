@@ -261,6 +261,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 response_cache,
                 embedding_registry,
                 load_balancer,
+                concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::new()),
                 app_metrics,
             };
             let app = crate::api::app::build_router(state);
@@ -361,6 +362,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         limit_usd,
                         limit_tokens: None,
                         rate_rpm: None,
+                        max_concurrent: None,
                         model_allow: vec![],
                         model_deny: vec![],
                     }).await?;

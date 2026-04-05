@@ -84,8 +84,20 @@ async fn chat_completions_inner(
         .instrument(tracing::info_span!("modelrouter.policy_check"))
         .await
         .map_err(|_| ApiError::Internal)?;
-    match policy_result {
-        PolicyDecision::Allow => {}
+    let _concurrency_permit = match policy_result {
+        PolicyDecision::Allow { max_concurrent } => {
+            if let Some(max) = max_concurrent {
+                match state.concurrency.try_acquire(user.id, max) {
+                    Some(permit) => Some(permit),
+                    None => return Err(ApiError::PolicyDenied {
+                        reason: "concurrent request limit exceeded".to_string(),
+                        status: 429,
+                    }),
+                }
+            } else {
+                None
+            }
+        }
         PolicyDecision::Deny {
             reason,
             status,
@@ -121,7 +133,7 @@ async fn chat_completions_inner(
             }
             return Err(ApiError::PolicyDenied { reason, status });
         }
-    }
+    };
 
     // Run pre_request pipeline hooks (may mutate body)
     let body = crate::hooks::pipeline::run_pre_request(

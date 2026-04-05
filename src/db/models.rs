@@ -176,6 +176,8 @@ pub struct BudgetRule {
     pub model_allow: String,
     pub model_deny: String,
     pub rate_rpm: Option<i64>,
+    #[sqlx(default)]
+    pub max_concurrent: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -191,6 +193,7 @@ pub struct NewBudgetRule {
     pub model_allow: Vec<String>,
     pub model_deny: Vec<String>,
     pub rate_rpm: Option<i64>,
+    pub max_concurrent: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

@@ -31,6 +31,7 @@ async fn make_user_with_budget(
             limit_usd: Some(limit_usd),
             limit_tokens: None,
             rate_rpm: None,
+            max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
         },
@@ -46,7 +47,7 @@ async fn under_budget_allows_request() {
     let user = make_user_with_budget(&db, 10.0, "monthly").await;
     let engine = PolicyEngine::new(Arc::new(db));
     let decision = engine.check(&user, "gpt-4o").await.unwrap();
-    assert!(matches!(decision, PolicyDecision::Allow));
+    assert!(matches!(decision, PolicyDecision::Allow { .. }));
 }
 
 #[tokio::test]
@@ -73,6 +74,7 @@ async fn model_in_deny_list_returns_403() {
             limit_usd: None,
             limit_tokens: None,
             rate_rpm: None,
+            max_concurrent: None,
             model_allow: vec![],
             model_deny: vec!["gpt-4".to_string()],
         },
@@ -108,6 +110,7 @@ async fn model_not_in_allow_list_returns_403() {
             limit_usd: None,
             limit_tokens: None,
             rate_rpm: None,
+            max_concurrent: None,
             model_allow: vec!["claude-haiku-4-5".to_string()],
             model_deny: vec![],
         },
@@ -135,7 +138,7 @@ async fn no_budget_rules_allows_request() {
     .unwrap();
     let engine = PolicyEngine::new(Arc::new(db));
     let decision = engine.check(&user, "gpt-4o").await.unwrap();
-    assert!(matches!(decision, PolicyDecision::Allow));
+    assert!(matches!(decision, PolicyDecision::Allow { .. }));
 }
 
 #[tokio::test]
@@ -168,6 +171,7 @@ async fn budget_exceeded_returns_deny() {
             limit_usd: Some(0.01),
             limit_tokens: None,
             rate_rpm: None,
+            max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
         },
@@ -254,6 +258,7 @@ async fn test_policy_token_limit_under_budget() {
             limit_usd: None,
             limit_tokens: Some(100),
             rate_rpm: None,
+            max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
         },
@@ -304,7 +309,7 @@ async fn test_policy_token_limit_under_budget() {
     let engine = PolicyEngine::new(Arc::new(db));
     let decision = engine.check(&user, "gpt-4o").await.unwrap();
     assert!(
-        matches!(decision, PolicyDecision::Allow),
+        matches!(decision, PolicyDecision::Allow { .. }),
         "95 tokens used with 100 token limit should allow"
     );
 }
@@ -339,6 +344,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             limit_usd: None,
             limit_tokens: Some(50),
             rate_rpm: None,
+            max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
         },
