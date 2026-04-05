@@ -76,6 +76,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::routes::{
         completions::chat_completions, embeddings::embeddings, health::health_check,
         messages::anthropic_messages, models::list_models, prometheus::metrics_handler,
+        responses::responses_handler,
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user, rotate_user_key,
@@ -102,6 +103,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/responses", post(responses_handler))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))

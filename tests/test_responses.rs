@@ -1,0 +1,99 @@
+mod common;
+
+use axum_test::TestServer;
+use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
+use modelrouter::api::auth::hash_token;
+use modelrouter::config::Settings;
+use modelrouter::db::models::NewUser;
+use modelrouter::db::repositories::users::UserRepository;
+use modelrouter::providers::registry::ProviderRegistry;
+use modelrouter::router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+async fn test_app() -> TestServer {
+    let db = common::in_memory_db().await;
+
+    db.create(NewUser {
+        name: "test-user".to_string(),
+        api_key_hash: hash_token("test-token"),
+        group_name: None,
+    })
+    .await
+    .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    let router = Arc::new(RequestRouter::new(settings.clone()));
+    let cost_calc = Arc::new(CostCalculator::new());
+    let provider_registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
+        response: "Hello!".to_string(),
+    }));
+
+    let policy = Arc::new(PolicyEngine::new(db.clone()));
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None));
+    let response_cache = Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig::default(),
+    ));
+    let embedding_registry = Arc::new(
+        modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+            common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+        ),
+    );
+    let load_balancer = Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+        std::collections::HashMap::new(),
+    ));
+
+    let state = AppState {
+        settings,
+        db,
+        pool: None,
+        router,
+        cost_calc,
+        provider_registry,
+        policy,
+        fallback,
+        complexity_router,
+        response_cache,
+        embedding_registry,
+        load_balancer,
+        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
+        ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
+        app_metrics: None,
+    };
+    TestServer::new(build_router(state)).unwrap()
+}
+
+#[tokio::test]
+async fn unauthenticated_responses_returns_401() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/responses")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 401);
+}
+
+#[tokio::test]
+async fn authenticated_responses_with_input_returns_200() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/responses")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
+}
