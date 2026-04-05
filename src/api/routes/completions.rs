@@ -170,6 +170,11 @@ async fn chat_completions_inner(
     let start = Instant::now();
 
     if stream {
+        if state.circuit_breaker.is_open(&provider_name) {
+            tracing::warn!(provider = provider_name.as_str(), "circuit breaker open, skipping provider");
+            let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", provider_name);
+            return Err(ApiError::ProviderError(pseudo_err));
+        }
         let adapter = state
             .provider_registry
             .get(&provider_name)
@@ -177,7 +182,11 @@ async fn chat_completions_inner(
         let sse_stream = adapter
             .stream(&norm_req)
             .await
-            .map_err(ApiError::ProviderError)?;
+            .map_err(|e| {
+                state.circuit_breaker.record_failure(&provider_name);
+                ApiError::ProviderError(e)
+            })?;
+        state.circuit_breaker.record_success(&provider_name);
 
         let messages_json = serde_json::to_string(
             &body["messages"].as_array().cloned().unwrap_or_default(),
@@ -207,6 +216,18 @@ async fn chat_completions_inner(
     let mut current_model = canonical_model.clone();
     let mut current_provider = provider_name.clone();
     let result = loop {
+        if state.circuit_breaker.is_open(&current_provider) {
+            tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
+            let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
+            if let Some(next_model) = state.fallback.next_after(&current_model) {
+                let (next_provider, next_canonical) = state.router.resolve(next_model);
+                current_model = next_canonical;
+                current_provider = next_provider;
+                continue;
+            } else {
+                return Err(ApiError::ProviderError(pseudo_err));
+            }
+        }
         let adapter = state
             .provider_registry
             .get(&current_provider)
@@ -219,8 +240,12 @@ async fn chat_completions_inner(
             ))
             .await
         {
-            Ok(r) => break r,
+            Ok(r) => {
+                state.circuit_breaker.record_success(&current_provider);
+                break r;
+            }
             Err(e) => {
+                state.circuit_breaker.record_failure(&current_provider);
                 tracing::warn!(
                     model = current_model.as_str(),
                     provider = current_provider.as_str(),

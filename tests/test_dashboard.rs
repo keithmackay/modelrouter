@@ -52,6 +52,7 @@ async fn build_test_server() -> TestServer {
             std::collections::HashMap::new(),
         )),
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         app_metrics: None,
     };
 
@@ -148,6 +149,7 @@ async fn login_success_sets_cookie() {
             std::collections::HashMap::new(),
         )),
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         app_metrics: None,
     };
 
@@ -207,6 +209,7 @@ async fn superadmin_only_admins_page() {
             std::collections::HashMap::new(),
         )),
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         app_metrics: None,
     };
 

@@ -312,6 +312,7 @@ async fn completions_span_has_required_attributes() {
             std::collections::HashMap::new(),
         )),
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         app_metrics: None,
     };
 

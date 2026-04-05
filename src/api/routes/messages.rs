@@ -205,6 +205,10 @@ async fn anthropic_messages_inner(
     upstream_body["model"] = serde_json::Value::String(canonical_model.clone());
 
     if stream {
+        if state.circuit_breaker.is_open("anthropic") {
+            tracing::warn!(provider = "anthropic", "circuit breaker open, skipping provider");
+            return Err(ApiError::ProviderError(anyhow::anyhow!("circuit breaker open for anthropic")));
+        }
         // Streaming: proxy raw SSE bytes back to client
         let upstream_resp = client
             .post(&upstream_url)
@@ -214,7 +218,10 @@ async fn anthropic_messages_inner(
             .json(&upstream_body)
             .send()
             .await
-            .map_err(|e| ApiError::ProviderError(e.into()))?;
+            .map_err(|e| {
+                state.circuit_breaker.record_failure("anthropic");
+                ApiError::ProviderError(e.into())
+            })?;
 
         if !upstream_resp.status().is_success() {
             let status = upstream_resp.status().as_u16();
@@ -222,12 +229,14 @@ async fn anthropic_messages_inner(
                 .text()
                 .await
                 .unwrap_or_else(|_| "upstream error".to_string());
+            state.circuit_breaker.record_failure("anthropic");
             return Err(ApiError::ProviderError(anyhow::anyhow!(
                 "Anthropic API error {}: {}",
                 status,
                 err_text
             )));
         }
+        state.circuit_breaker.record_success("anthropic");
 
         use axum::body::Body;
         use axum::http::{header, StatusCode};
@@ -270,6 +279,10 @@ async fn anthropic_messages_inner(
     }
 
     // Non-streaming: proxy and return raw Anthropic JSON
+    if state.circuit_breaker.is_open("anthropic") {
+        tracing::warn!(provider = "anthropic", "circuit breaker open, skipping provider");
+        return Err(ApiError::ProviderError(anyhow::anyhow!("circuit breaker open for anthropic")));
+    }
     let upstream_resp = client
         .post(&upstream_url)
         .header("x-api-key", &api_key)
@@ -278,7 +291,10 @@ async fn anthropic_messages_inner(
         .json(&upstream_body)
         .send()
         .await
-        .map_err(|e| ApiError::ProviderError(e.into()))?;
+        .map_err(|e| {
+            state.circuit_breaker.record_failure("anthropic");
+            ApiError::ProviderError(e.into())
+        })?;
 
     let latency_ms = start.elapsed().as_millis() as i64;
 
@@ -288,12 +304,14 @@ async fn anthropic_messages_inner(
             .text()
             .await
             .unwrap_or_else(|_| "upstream error".to_string());
+        state.circuit_breaker.record_failure("anthropic");
         return Err(ApiError::ProviderError(anyhow::anyhow!(
             "Anthropic API error {}: {}",
             status,
             err_text
         )));
     }
+    state.circuit_breaker.record_success("anthropic");
 
     let resp_json: Value = upstream_resp
         .json()

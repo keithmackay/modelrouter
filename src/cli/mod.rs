@@ -262,6 +262,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 embedding_registry,
                 load_balancer,
                 concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::new()),
+                circuit_breaker: Arc::new(crate::router::circuit_breaker::CircuitBreaker::default()),
                 app_metrics,
             };
             let app = crate::api::app::build_router(state);

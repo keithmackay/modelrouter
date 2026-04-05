@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod circuit_breaker;
 pub mod concurrency;
 pub mod complexity;
 pub mod cost;
