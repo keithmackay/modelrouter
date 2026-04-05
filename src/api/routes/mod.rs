@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod completions;
 pub mod images;
 pub mod responses;

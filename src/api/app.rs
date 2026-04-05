@@ -78,6 +78,7 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
+        audio::{speech, transcriptions},
         completions::chat_completions, embeddings::embeddings, health::health_check,
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler,
@@ -109,6 +110,8 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/images/generations", post(image_generations))
+        .route("/v1/audio/speech", post(speech))
+        .route("/v1/audio/transcriptions", post(transcriptions))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))

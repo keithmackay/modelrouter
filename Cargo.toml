@@ -26,10 +26,10 @@ otel = [
 ]
 
 [dependencies]
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "migrate", "macros", "chrono", "uuid"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
 config = "0.14"
 serde = { version = "1", features = ["derive"] }
