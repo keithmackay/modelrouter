@@ -286,6 +286,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     Arc::new(crate::callbacks::CallbackDispatcher::new(backends))
                 },
+                guardrails: {
+                    let mut chain: Vec<(Box<dyn crate::guardrails::Guardrail>, bool)> = vec![];
+                    for cfg in &settings.guardrails {
+                        match cfg.guardrail_type.as_str() {
+                            "openai_moderation" => {
+                                let api_key = cfg.api_key.clone()
+                                    .or_else(|| settings.providers.get("openai").map(|p| p.api_key.clone()))
+                                    .unwrap_or_default();
+                                chain.push((
+                                    Box::new(crate::guardrails::openai_moderation::OpenAIModerationGuardrail::with_fail_open(api_key, cfg.fail_open)),
+                                    cfg.fail_open,
+                                ));
+                            }
+                            other => tracing::warn!(guardrail_type = other, "Unknown guardrail type, skipping"),
+                        }
+                    }
+                    Arc::new(crate::guardrails::GuardrailChain::new(chain))
+                },
                 app_metrics,
             };
             #[cfg(feature = "s3-archival")]

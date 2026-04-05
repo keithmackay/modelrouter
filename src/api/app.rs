@@ -69,6 +69,7 @@ pub struct AppState {
     pub ip_rate_limiter: Arc<crate::api::middleware::ip_rate_limit::IpRateLimiter>,
     pub session_limiter: Arc<crate::router::session_limits::SessionLimiter>,
     pub callbacks: Arc<crate::callbacks::CallbackDispatcher>,
+    pub guardrails: Arc<crate::guardrails::GuardrailChain>,
     #[cfg(feature = "prometheus")]
     pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
     #[cfg(not(feature = "prometheus"))]

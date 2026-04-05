@@ -58,6 +58,7 @@ async fn build_test_server() -> TestServer {
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
     };
 
     TestServer::new(build_router(state)).unwrap()
@@ -159,6 +160,7 @@ async fn login_success_sets_cookie() {
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -223,6 +225,7 @@ async fn superadmin_only_admins_page() {
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();

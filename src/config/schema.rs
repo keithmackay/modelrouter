@@ -90,6 +90,8 @@ pub struct Settings {
     pub retry: RetryConfig,
     #[serde(default)]
     pub callbacks: CallbacksConfig,
+    #[serde(default)]
+    pub guardrails: Vec<GuardrailConfig>,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -360,6 +362,22 @@ pub struct LangSmithConfig {
     pub project: String,
 }
 fn default_langsmith_host() -> String { "https://api.smith.langchain.com".to_string() }
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GuardrailConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub guardrail_type: String,
+    /// If true, a guardrail error causes Allow rather than Block.
+    #[serde(default)]
+    pub fail_open: bool,
+    /// API key override (e.g. for openai_moderation). Falls back to providers.openai.api_key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// HTTP endpoint for external guardrails (e.g. Presidio).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
 
 #[cfg(feature = "otel")]
 #[derive(Debug, Clone, Deserialize, Serialize)]

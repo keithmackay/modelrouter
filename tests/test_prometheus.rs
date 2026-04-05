@@ -52,6 +52,7 @@ async fn test_app() -> TestServer {
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
     };
     TestServer::new(build_router(state)).unwrap()
 }
