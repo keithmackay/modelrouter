@@ -2,7 +2,7 @@
 name = "modelrouter"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 
 [[bin]]
 name = "modelrouter"
@@ -23,6 +23,7 @@ otel = [
     "dep:tracing-opentelemetry",
 ]
 prometheus = ["dep:prometheus"]
+bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
@@ -58,6 +59,10 @@ moka = { version = "0.12", features = ["future"] }
 
 # ── Prometheus (--features prometheus) ─────────────────────────────────
 prometheus = { version = "0.13", optional = true }
+
+# ── AWS Bedrock (--features bedrock) ───────────────────────────────────
+aws-sdk-bedrockruntime = { version = "1", optional = true }
+aws-config             = { version = "1", optional = true }
 
 # ── OpenTelemetry (--features otel) ────────────────────────────────────
 opentelemetry                  = { version = "0.27", features = ["logs"], optional = true }
