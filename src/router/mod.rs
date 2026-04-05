@@ -8,3 +8,4 @@ pub mod engine;
 pub mod fallback;
 pub mod load_balancer;
 pub mod policy;
+pub mod retry;

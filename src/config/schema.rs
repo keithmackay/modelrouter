@@ -32,6 +32,30 @@ impl Default for CacheConfig {
 fn default_cache_max_entries() -> u64 { 1000 }
 fn default_cache_ttl() -> u64 { 3600 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_retry_base_delay_ms")]
+    pub base_delay_ms: u64,
+    #[serde(default = "default_retry_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            base_delay_ms: default_retry_base_delay_ms(),
+            max_delay_ms: default_retry_max_delay_ms(),
+        }
+    }
+}
+
+fn default_max_retries() -> u32 { 3 }
+fn default_retry_base_delay_ms() -> u64 { 1000 }
+fn default_retry_max_delay_ms() -> u64 { 30000 }
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SessionLimitConfig {
     /// Max tokens per minute per session. 0 = disabled.
@@ -62,6 +86,8 @@ pub struct Settings {
     pub cache: CacheConfig,
     #[serde(default)]
     pub session_limits: SessionLimitConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,

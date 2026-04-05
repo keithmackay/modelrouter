@@ -57,6 +57,7 @@ bytes = "1"
 dashmap = "6"
 moka = { version = "0.12", features = ["future"] }
 arc-swap = "1"
+rand = "0.8"
 
 # ── Prometheus (--features prometheus) ─────────────────────────────────
 prometheus = { version = "0.13", optional = true }

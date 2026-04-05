@@ -229,6 +229,7 @@ async fn chat_completions_inner(
         );
     }
 
+    let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model.clone();
     let mut current_provider = provider_name.clone();
     let result = loop {
@@ -248,14 +249,38 @@ async fn chat_completions_inner(
             .provider_registry
             .get(&current_provider)
             .map_err(ApiError::ProviderError)?;
-        match adapter
-            .complete(&build_normalized_request(&body, current_model.clone()))
-            .instrument(tracing::info_span!(
-                "modelrouter.provider_call",
-                "provider.name" = current_provider.as_str()
-            ))
-            .await
-        {
+        let mut retry_attempt = 0u32;
+        let call_result = loop {
+            match adapter
+                .complete(&build_normalized_request(&body, current_model.clone()))
+                .instrument(tracing::info_span!(
+                    "modelrouter.provider_call",
+                    "provider.name" = current_provider.as_str()
+                ))
+                .await
+            {
+                Ok(r) => break Ok(r),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let retryable = crate::router::retry::RetryableError::classify(&err_str);
+                    if retry_policy.should_retry(retry_attempt, &retryable) {
+                        let delay = retry_policy.delay_ms(retry_attempt);
+                        tracing::warn!(
+                            attempt = retry_attempt,
+                            delay_ms = delay,
+                            provider = current_provider.as_str(),
+                            error = %err_str,
+                            "provider error, retrying with backoff"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                        retry_attempt += 1;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        };
+        match call_result {
             Ok(r) => {
                 state.circuit_breaker.record_success(&current_provider);
                 break r;
