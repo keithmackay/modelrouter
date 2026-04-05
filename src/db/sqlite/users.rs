@@ -43,7 +43,7 @@ impl UserRepository for SqliteDb {
     async fn find_by_api_key(&self, key_hash: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users
                WHERE api_key = ?
                   OR (api_key_old = ? AND api_key_old_expires_at > datetime('now'))
@@ -59,7 +59,7 @@ impl UserRepository for SqliteDb {
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE name = ?"#,
         )
         .bind(name)
@@ -71,7 +71,7 @@ impl UserRepository for SqliteDb {
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE id = ?"#,
         )
         .bind(id)
@@ -83,7 +83,7 @@ impl UserRepository for SqliteDb {
     async fn list(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users ORDER BY id"#,
         )
         .fetch_all(&self.pool)
@@ -107,7 +107,7 @@ impl UserRepository for SqliteDb {
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE id = ?"#,
         )
         .bind(id)
