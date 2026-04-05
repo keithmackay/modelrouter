@@ -62,7 +62,7 @@ impl BudgetRepository for PostgresDb {
         let row = sqlx::query_as::<_, BudgetRule>(
             r#"INSERT INTO budget_rules (user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                                          model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                RETURNING id, user_id, group_name, api_key_id, window, limit_usd, limit_tokens,
                          model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at"#,
         )
