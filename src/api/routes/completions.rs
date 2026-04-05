@@ -151,6 +151,22 @@ async fn chat_completions_inner(
         }
     }
 
+    // Pre-request guardrail check
+    let guardrail_ctx = crate::guardrails::GuardrailContext {
+        messages: body["messages"].clone(),
+        model: model.clone(),
+        user_id: user.id,
+    };
+    match state.guardrails.check_request(&guardrail_ctx).await {
+        crate::guardrails::GuardrailDecision::Allow => {}
+        crate::guardrails::GuardrailDecision::Block { reason } => {
+            return Err(ApiError::PolicyDenied { reason, status: 400 });
+        }
+        crate::guardrails::GuardrailDecision::Replace { .. } => {
+            // Replace on request is not supported; treat as Allow
+        }
+    }
+
     // Run pre_request pipeline hooks (may mutate body)
     let body = crate::hooks::pipeline::run_pre_request(
         &state.settings.hooks.pipeline,
@@ -304,6 +320,20 @@ async fn chat_completions_inner(
             }
         }
     };
+
+    // Post-response guardrail check (non-streaming only)
+    let result = match state.guardrails.check_response(&guardrail_ctx, &result.content).await {
+        crate::guardrails::GuardrailDecision::Allow => result,
+        crate::guardrails::GuardrailDecision::Block { reason } => {
+            return Err(ApiError::PolicyDenied { reason, status: 400 });
+        }
+        crate::guardrails::GuardrailDecision::Replace { content } => {
+            let mut r = result;
+            r.content = content;
+            r
+        }
+    };
+
     let latency_ms = start.elapsed().as_millis() as i64;
     let cost = state
         .cost_calc
