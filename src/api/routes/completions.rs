@@ -135,6 +135,22 @@ async fn chat_completions_inner(
         }
     };
 
+    // Session rate limit check
+    if let Some(session_id) = body["session_id"].as_str() {
+        let estimated_tokens = body["messages"]
+            .as_array()
+            .map(|m| m.iter().map(|msg| {
+                msg["content"].as_str().map(|s| (s.len() / 4) as u32).unwrap_or(50)
+            }).sum::<u32>())
+            .unwrap_or(100);
+        if !state.session_limiter.check_and_record(session_id, estimated_tokens) {
+            return Err(ApiError::PolicyDenied {
+                reason: "session rate limit exceeded".to_string(),
+                status: 429,
+            });
+        }
+    }
+
     // Run pre_request pipeline hooks (may mutate body)
     let body = crate::hooks::pipeline::run_pre_request(
         &state.settings.hooks.pipeline,

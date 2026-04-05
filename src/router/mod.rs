@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod session_limits;
 pub mod circuit_breaker;
 pub mod concurrency;
 pub mod complexity;

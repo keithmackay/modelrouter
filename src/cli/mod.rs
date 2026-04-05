@@ -272,6 +272,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ip_rate_limiter: Arc::new(crate::api::middleware::ip_rate_limit::IpRateLimiter::new(
                     settings.server.ip_rate_limit_rpm,
                 )),
+                session_limiter: Arc::new(crate::router::session_limits::SessionLimiter::new(
+                    settings.session_limits.tpm,
+                    settings.session_limits.rpm,
+                )),
                 app_metrics,
             };
             if let Some(ref cfg_path) = config_path {

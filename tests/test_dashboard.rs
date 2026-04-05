@@ -55,6 +55,7 @@ async fn build_test_server() -> TestServer {
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
+        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
     };
 
@@ -154,6 +155,7 @@ async fn login_success_sets_cookie() {
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
+        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
     };
 
@@ -216,6 +218,7 @@ async fn superadmin_only_admins_page() {
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
+        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
     };
 

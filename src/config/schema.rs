@@ -33,6 +33,16 @@ fn default_cache_max_entries() -> u64 { 1000 }
 fn default_cache_ttl() -> u64 { 3600 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SessionLimitConfig {
+    /// Max tokens per minute per session. 0 = disabled.
+    #[serde(default)]
+    pub tpm: u32,
+    /// Max requests per minute per session. 0 = disabled.
+    #[serde(default)]
+    pub rpm: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub server: ServerConfig,
@@ -50,6 +60,8 @@ pub struct Settings {
     pub pricing: Vec<PricingEntry>,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub session_limits: SessionLimitConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,

@@ -48,6 +48,7 @@ async fn test_app() -> TestServer {
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
+        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         app_metrics: None,
     };
