@@ -37,6 +37,7 @@ async fn build_test_server() -> TestServer {
     );
 
     let state = AppState {
+        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         settings,
         db,
         pool: None,
@@ -135,6 +136,7 @@ async fn login_success_sets_cookie() {
     );
 
     let state = AppState {
+        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         settings,
         db,
         pool: None,
@@ -196,6 +198,7 @@ async fn superadmin_only_admins_page() {
     );
 
     let state = AppState {
+        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         settings,
         db,
         pool: None,

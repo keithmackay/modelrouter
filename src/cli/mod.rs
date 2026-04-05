@@ -176,6 +176,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             println!("  4. Test: curl http://localhost:8080/health");
         }
         Commands::Serve { host, port } => {
+            let config_path: Option<String> = cli.config.as_ref()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .or_else(|| std::env::var("MODELROUTER_CONFIG").ok());
             let settings = crate::config::load(cli.config)?;
             let settings = Arc::new(settings);
 
@@ -248,8 +251,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             #[cfg(not(feature = "prometheus"))]
             let app_metrics: Option<std::convert::Infallible> = None;
 
+            let live_settings = Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone()));
+
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
+                live_settings: live_settings.clone(),
                 db,
                 pool: Some(pool),
                 router,
@@ -268,6 +274,23 @@ pub async fn run(cli: Cli) -> Result<()> {
                 )),
                 app_metrics,
             };
+            if let Some(ref cfg_path) = config_path {
+                let loader = crate::config::loader::SettingsLoader::new(cfg_path.clone());
+                let live = live_settings.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                        match loader.load() {
+                            Ok(new_settings) => {
+                                live.store(Arc::new(new_settings));
+                                tracing::info!("config hot-reloaded");
+                            }
+                            Err(e) => tracing::warn!("config reload failed: {e}"),
+                        }
+                    }
+                });
+            }
+
             let app = crate::api::app::build_router(state);
 
             let bind_addr = format!("{}:{}", host, port);

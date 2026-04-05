@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use tower_http::trace::TraceLayer;
 
 use crate::{
@@ -51,6 +52,7 @@ impl<T> DatabaseProvider for T where
 #[derive(Clone)]
 pub struct AppState {
     pub settings: Arc<Settings>,
+    pub live_settings: Arc<ArcSwap<Settings>>,
     pub db: Arc<dyn DatabaseProvider>,
     pub pool: Option<sqlx::SqlitePool>,
     pub router: Arc<RequestRouter>,

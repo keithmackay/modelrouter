@@ -610,6 +610,99 @@ git commit -m "docs: add bedrock feature to CLAUDE.md build reference"
 
 ---
 
+### Task 6: Follow-up fixes from final review
+
+**Files:**
+- Modify: `src/config/schema.rs`
+- Modify: `src/providers/bedrock.rs`
+
+Two issues flagged in the final review that are non-blocking but should be fixed.
+
+#### Fix 1: Add `#[serde(default)]` to optional `ProviderConfig` fields
+
+Without `#[serde(default)]`, TOML configs that omit `api_base`, `api_version`, or `region` will fail to deserialize with a "missing field" error rather than defaulting to `None`.
+
+- [ ] **Step 1: Verify the bug**
+
+```bash
+cat > /tmp/test_config.toml << 'EOF'
+[providers.bedrock]
+api_key = "test"
+EOF
+```
+
+In a test or scratch, try loading that config — the missing `region` should cause a parse error without `#[serde(default)]`. (Skip the actual test if it's inconvenient; the fix is obvious.)
+
+- [ ] **Step 2: Add `#[serde(default)]` to the three Option fields in `ProviderConfig`**
+
+In `src/config/schema.rs`, update `ProviderConfig`:
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// AWS region for Bedrock (e.g. "us-east-1"). Used only by the Bedrock adapter.
+    /// Defaults to the AWS standard chain (AWS_REGION env var / ~/.aws/config).
+    #[serde(default)]
+    pub region: Option<String>,
+}
+```
+
+- [ ] **Step 3: Run tests**
+
+```bash
+cargo test 2>&1 | tail -10
+cargo test --features otel 2>&1 | tail -10
+cargo test --features bedrock 2>&1 | tail -10
+```
+Expected: all pass
+
+#### Fix 2: Don't send `[DONE]` after a stream error in `BedrockAdapter::stream()`
+
+In `src/providers/bedrock.rs`, the `stream()` method appends `[DONE]` unconditionally after the event loop, even when the loop exited via an `Err`. Fix it to only append `[DONE]` on clean exit:
+
+- [ ] **Step 4: Fix the streaming error path**
+
+Change the end of `stream()` from:
+```rust
+        chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        Ok(Box::pin(stream::iter(chunks)))
+    }
+```
+To:
+```rust
+        // Only emit [DONE] on clean end-of-stream — not after an error event
+        let had_error = chunks.iter().any(|c| c.is_err());
+        if !had_error {
+            chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        }
+        Ok(Box::pin(stream::iter(chunks)))
+    }
+```
+
+- [ ] **Step 5: Run tests**
+
+```bash
+cargo test --features bedrock 2>&1 | tail -10
+```
+Expected: all pass
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/config/schema.rs src/providers/bedrock.rs
+git commit -m "fix: add serde(default) to ProviderConfig optional fields; fix bedrock stream error path"
+```
+
+---
+
 ## Common Pitfalls
 
 1. **`test_telemetry.rs` missing `region: None`** — this file is gated behind `#![cfg(feature = "otel")]` so `cargo test` passes but `cargo test --features otel` fails. Always run both after any `ProviderConfig` field change.

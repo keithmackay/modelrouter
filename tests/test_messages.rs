@@ -46,6 +46,7 @@ async fn test_app() -> TestServer {
     ));
 
     let state = AppState {
+        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         settings,
         db,
         pool: None,
