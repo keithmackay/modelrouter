@@ -276,6 +276,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                     settings.session_limits.tpm,
                     settings.session_limits.rpm,
                 )),
+                callbacks: {
+                    let mut backends: Vec<Box<dyn crate::callbacks::CallbackBackend>> = vec![];
+                    if let Some(cfg) = settings.callbacks.langfuse.clone() {
+                        backends.push(Box::new(crate::callbacks::langfuse::LangFuseBackend::new(cfg)));
+                    }
+                    if let Some(cfg) = settings.callbacks.langsmith.clone() {
+                        backends.push(Box::new(crate::callbacks::langsmith::LangSmithBackend::new(cfg)));
+                    }
+                    Arc::new(crate::callbacks::CallbackDispatcher::new(backends))
+                },
                 app_metrics,
             };
             if let Some(ref cfg_path) = config_path {

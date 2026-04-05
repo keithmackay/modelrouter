@@ -64,6 +64,7 @@ async fn test_app() -> TestServer {
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         app_metrics: None,
+        callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
     };
     TestServer::new(build_router(state)).unwrap()
 }

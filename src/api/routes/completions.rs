@@ -358,8 +358,8 @@ async fn chat_completions_inner(
             request_model: model_clone.clone(),
             routed_model: canonical_clone.clone(),
             provider: provider_clone.clone(),
-            messages: messages_json,
-            response: Some(response_clone),
+            messages: messages_json.clone(),
+            response: Some(response_clone.clone()),
             finish_reason: Some(finish_clone),
             prompt_tokens: prompt_tokens as i64,
             completion_tokens: completion_tokens as i64,
@@ -374,7 +374,7 @@ async fn chat_completions_inner(
                     user_id,
                     prompt_id: saved_prompt.id,
                     model: canonical_clone.clone(),
-                    provider: provider_clone,
+                    provider: provider_clone.clone(),
                     project: None,
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
@@ -384,6 +384,18 @@ async fn chat_completions_inner(
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
                 }
+                state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
+                    trace_id: format!("{}", saved_prompt.id),
+                    user_id,
+                    model: canonical_clone.clone(),
+                    provider: provider_clone.clone(),
+                    input: serde_json::from_str(&messages_json).unwrap_or(serde_json::Value::Null),
+                    output: response_clone.clone(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cost_usd: cost,
+                    latency_ms,
+                });
             }
             Err(e) => tracing::error!("Failed to record prompt: {}", e),
         }

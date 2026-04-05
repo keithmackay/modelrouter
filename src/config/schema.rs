@@ -88,6 +88,8 @@ pub struct Settings {
     pub session_limits: SessionLimitConfig,
     #[serde(default)]
     pub retry: RetryConfig,
+    #[serde(default)]
+    pub callbacks: CallbacksConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -291,6 +293,32 @@ impl Default for AuthConfig {
 fn default_jwt_secret() -> String { "change-me-jwt-secret".to_string() }
 fn default_jwt_expiry_mins() -> i64 { 60 }
 fn default_rotation_overlap_mins() -> i64 { 15 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CallbacksConfig {
+    #[serde(default)]
+    pub langfuse: Option<LangFuseConfig>,
+    #[serde(default)]
+    pub langsmith: Option<LangSmithConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LangFuseConfig {
+    pub public_key: String,
+    pub secret_key: String,
+    #[serde(default = "default_langfuse_host")]
+    pub host: String,
+}
+fn default_langfuse_host() -> String { "https://cloud.langfuse.com".to_string() }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LangSmithConfig {
+    pub api_key: String,
+    #[serde(default = "default_langsmith_host")]
+    pub host: String,
+    pub project: String,
+}
+fn default_langsmith_host() -> String { "https://api.smith.langchain.com".to_string() }
 
 #[cfg(feature = "otel")]
 #[derive(Debug, Clone, Deserialize, Serialize)]

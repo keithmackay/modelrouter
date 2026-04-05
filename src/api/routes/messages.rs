@@ -357,7 +357,7 @@ async fn anthropic_messages_inner(
             routed_model: canonical_c.clone(),
             provider: "anthropic".to_string(),
             messages: messages_json.clone(),
-            response: Some(response_content),
+            response: Some(response_content.clone()),
             finish_reason: Some(stop_reason),
             prompt_tokens: prompt_tokens as i64,
             completion_tokens: completion_tokens as i64,
@@ -382,6 +382,18 @@ async fn anthropic_messages_inner(
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
                 }
+                state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
+                    trace_id: format!("{}", saved_prompt.id),
+                    user_id,
+                    model: canonical_c.clone(),
+                    provider: "anthropic".to_string(),
+                    input: serde_json::from_str(&messages_json).unwrap_or(serde_json::Value::Null),
+                    output: response_content.clone(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cost_usd: cost,
+                    latency_ms,
+                });
             }
             Err(e) => tracing::error!("Failed to record prompt: {}", e),
         }

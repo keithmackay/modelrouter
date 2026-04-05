@@ -317,6 +317,7 @@ async fn completions_span_has_required_attributes() {
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         app_metrics: None,
+        callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
