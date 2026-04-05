@@ -2,7 +2,7 @@
 name = "modelrouter"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.91"
 
 [[bin]]
 name = "modelrouter"
@@ -15,6 +15,8 @@ path = "src/lib.rs"
 [features]
 default = []
 postgres = ["sqlx/postgres"]
+prometheus = ["dep:prometheus"]
+bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -22,8 +24,6 @@ otel = [
     "dep:opentelemetry-appender-tracing",
     "dep:tracing-opentelemetry",
 ]
-prometheus = ["dep:prometheus"]
-bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
