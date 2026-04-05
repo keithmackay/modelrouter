@@ -48,7 +48,7 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
                 .map_err(|_| ApiError::Internal)?
                 .ok_or(ApiError::Unauthorized)?;
 
-            if !user.enabled {
+            if !api_key.is_valid() || !user.enabled {
                 return Err(ApiError::Unauthorized);
             }
             user.api_key_id = Some(api_key.id);

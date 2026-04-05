@@ -27,6 +27,22 @@ pub struct ApiKey {
     pub label: Option<String>,
     pub enabled: bool,
     pub created_at: String,
+    /// RFC3339 UTC expiry. None = never expires.
+    pub expires_at: Option<String>,
+}
+
+impl ApiKey {
+    /// Returns true if the key is enabled and not past its expiry.
+    /// Both timestamps are RFC3339 UTC +00:00 strings; lexicographic comparison is correct.
+    pub fn is_valid(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match &self.expires_at {
+            None => true,
+            Some(exp) => exp.as_str() > chrono::Utc::now().to_rfc3339().as_str(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -34,6 +50,7 @@ pub struct NewApiKey {
     pub user_id: i64,
     pub key_hash: String,
     pub label: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug)]
