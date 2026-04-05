@@ -179,13 +179,16 @@ pub struct LoadBalancerConfig {
 pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
     pub api_base: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
+    #[serde(default)]
     pub api_version: Option<String>,
     /// AWS region for Bedrock (e.g. "us-east-1"). Used only by the Bedrock adapter.
     /// Defaults to the AWS standard chain (AWS_REGION env var / ~/.aws/config).
+    #[serde(default)]
     pub region: Option<String>,
 }
 

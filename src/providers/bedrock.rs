@@ -253,7 +253,11 @@ impl ProviderAdapter for BedrockAdapter {
             }
         }
 
-        chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        // Only emit [DONE] on clean end-of-stream — not after an error event
+        let had_error = chunks.iter().any(|c| c.is_err());
+        if !had_error {
+            chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        }
         Ok(Box::pin(stream::iter(chunks)))
     }
 }
