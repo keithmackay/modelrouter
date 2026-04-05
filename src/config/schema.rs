@@ -93,7 +93,48 @@ pub struct Settings {
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub archival: ArchivalConfig,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ArchivalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_archive_after_days")]
+    pub after_days: u32,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default = "default_archive_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub access_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+    #[serde(default = "default_archive_region")]
+    pub region: String,
+}
+
+impl Default for ArchivalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            after_days: default_archive_after_days(),
+            endpoint: String::new(),
+            bucket: String::new(),
+            prefix: default_archive_prefix(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: default_archive_region(),
+        }
+    }
+}
+
+fn default_archive_after_days() -> u32 { 90 }
+fn default_archive_prefix() -> String { "modelrouter/cost-logs".to_string() }
+fn default_archive_region() -> String { "us-east-1".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {

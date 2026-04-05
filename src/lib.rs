@@ -1,4 +1,5 @@
 pub mod api;
+pub mod archival;
 pub mod callbacks;
 pub mod cli;
 pub mod config;

@@ -288,6 +288,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
                 app_metrics,
             };
+            #[cfg(feature = "s3-archival")]
+            if settings.archival.enabled {
+                let job = crate::archival::ArchivalJob::new(
+                    settings.archival.clone(),
+                    state.db.clone(),
+                );
+                crate::archival::spawn_archival_task(job);
+            }
+
             if let Some(ref cfg_path) = config_path {
                 let loader = crate::config::loader::SettingsLoader::new(cfg_path.clone());
                 let live = live_settings.clone();

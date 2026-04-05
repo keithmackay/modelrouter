@@ -83,4 +83,27 @@ impl CostRepository for SqliteDb {
         .await?;
         Ok(row.0)
     }
+
+    async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
+        let rows = sqlx::query_as::<_, CostLedgerEntry>(
+            r#"SELECT id, user_id, prompt_id, model, provider, project,
+                      tokens_in, tokens_out, cost_usd, created_at, api_key_id
+               FROM cost_ledger WHERE created_at < ? ORDER BY created_at ASC LIMIT 10000"#,
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()> {
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM cost_ledger WHERE id IN ({})", placeholders);
+            let mut q = sqlx::query(&sql);
+            for id in chunk { q = q.bind(id); }
+            q.execute(&self.pool).await?;
+        }
+        Ok(())
+    }
 }

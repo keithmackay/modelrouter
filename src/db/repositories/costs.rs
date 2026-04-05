@@ -8,4 +8,6 @@ pub trait CostRepository: Send + Sync {
     async fn sum_tokens_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<i64>;
     async fn sum_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<f64>;
     async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64>;
+    async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<crate::db::models::CostLedgerEntry>>;
+    async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()>;
 }

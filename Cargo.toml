@@ -17,6 +17,7 @@ default = []
 postgres = ["sqlx/postgres"]
 prometheus = ["dep:prometheus"]
 bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]
+s3-archival = []
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",

@@ -77,4 +77,12 @@ impl CostRepository for PostgresDb {
         .await?;
         Ok(row.0)
     }
+
+    async fn list_cost_entries_before(&self, _cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
+        Ok(vec![])
+    }
+
+    async fn delete_cost_entries_by_ids(&self, _ids: &[i64]) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
