@@ -54,3 +54,19 @@ fn message_with_null_content_is_excluded() {
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0]["role"], "assistant");
 }
+
+#[test]
+fn multiple_text_blocks_in_system_array_are_joined_with_newline() {
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Block one."},
+                {"type": "text", "text": "Block two."}
+            ]
+        }),
+        json!({"role": "user", "content": "Hi"}),
+    ];
+    let (system, _) = translate_messages(&messages);
+    assert_eq!(system.as_deref(), Some("Block one.\nBlock two."));
+}

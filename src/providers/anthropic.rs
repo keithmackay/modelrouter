@@ -42,7 +42,7 @@ pub fn translate_messages(
                     .filter(|block| block["type"] == "text")
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
-                    .join("");
+                    .join("\n");
                 if !text.is_empty() { Some(text) } else { None }
             } else {
                 None
