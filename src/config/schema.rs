@@ -184,6 +184,9 @@ pub struct ProviderConfig {
     pub timeout_secs: u64,
     /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
     pub api_version: Option<String>,
+    /// AWS region for Bedrock (e.g. "us-east-1"). Used only by the Bedrock adapter.
+    /// Defaults to the AWS standard chain (AWS_REGION env var / ~/.aws/config).
+    pub region: Option<String>,
 }
 
 fn default_timeout_secs() -> u64 { 60 }
