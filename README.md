@@ -1,6 +1,6 @@
 # modelrouter
 
-![Release](https://img.shields.io/github/actions/workflow/status/keithmackay/tokenomics/release.yml?label=release)
+![Release](https://img.shields.io/github/actions/workflow/status/keithmackay/modelrouter/release.yml?label=release)
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
@@ -51,11 +51,31 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 ### Installation
 
-**From source:**
+**Docker (from GHCR):**
+
+| Image | Features |
+|---|---|
+| `ghcr.io/keithmackay/modelrouter:latest` | SQLite only |
+| `ghcr.io/keithmackay/modelrouter:latest-otel` | + OpenTelemetry |
+| `ghcr.io/keithmackay/modelrouter:latest-postgres` | + PostgreSQL |
+| `ghcr.io/keithmackay/modelrouter:latest-full` | All features (OTel + Postgres + Bedrock + Prometheus) |
 
 ```bash
-git clone https://github.com/keithmackay/tokenomics.git
-cd tokenomics
+docker pull ghcr.io/keithmackay/modelrouter:latest
+docker run \
+  -v /host/config:/config \
+  -v /host/data:/data \
+  -e MODELROUTER_CONFIG=/config/config.toml \
+  -p 8080:8080 \
+  ghcr.io/keithmackay/modelrouter:latest
+# -p 8080:8080 maps to server.port in config.toml (default: 8080)
+```
+
+**Build from source:**
+
+```bash
+git clone https://github.com/keithmackay/modelrouter.git
+cd modelrouter
 cargo build --release
 # Binary is at target/release/modelrouter
 ```
@@ -64,15 +84,6 @@ cargo build --release
 
 ```bash
 cargo build --release --features otel
-```
-
-**Docker:**
-
-```bash
-docker build -t modelrouter .
-docker run -v /host/config:/config -v /host/data:/data \
-  -e MODELROUTER_CONFIG=/config/config.toml \
-  -p 8080:8080 modelrouter serve
 ```
 
 **Initial setup:**
