@@ -49,23 +49,6 @@ impl PolicyEngine {
         use crate::db::repositories::costs::CostRepository;
         use crate::db::repositories::rate_limits::RateLimitRepository;
 
-        // Get budget rules for this user (user-specific first, then group)
-        let mut rules = BudgetRepository::list_for_user(&*self.db, user.id).await?;
-        if let Some(ref group) = user.group_name {
-            let group_rules = BudgetRepository::list_for_group(&*self.db, group).await?;
-            rules.extend(group_rules);
-        }
-        // Per-key rules take precedence — check them first by prepending
-        if let Some(key_id) = user.api_key_id {
-            let key_rules = BudgetRepository::list_for_key(&*self.db, key_id).await?;
-            rules = key_rules.into_iter().chain(rules).collect();
-        }
-        // Include budget rules targeting this key's tag (lowest priority — appended last)
-        if let Some(tag) = &user.api_key_tag {
-            let tag_rules = self.db.list_for_tag(tag).await.unwrap_or_default();
-            rules.extend(tag_rules);
-        }
-
         let span = tracing::Span::current();
 
         // ── Declarative policy rules (config-driven, highest priority) ──────
@@ -114,6 +97,23 @@ impl PolicyEngine {
             }
         }
         // ── Fallthrough: existing database-driven rules ──────────────────────
+
+        // Get budget rules for this user (user-specific first, then group)
+        let mut rules = BudgetRepository::list_for_user(&*self.db, user.id).await?;
+        if let Some(ref group) = user.group_name {
+            let group_rules = BudgetRepository::list_for_group(&*self.db, group).await?;
+            rules.extend(group_rules);
+        }
+        // Per-key rules take precedence — check them first by prepending
+        if let Some(key_id) = user.api_key_id {
+            let key_rules = BudgetRepository::list_for_key(&*self.db, key_id).await?;
+            rules = key_rules.into_iter().chain(rules).collect();
+        }
+        // Include budget rules targeting this key's tag (lowest priority — appended last)
+        if let Some(tag) = &user.api_key_tag {
+            let tag_rules = self.db.list_for_tag(tag).await.unwrap_or_default();
+            rules.extend(tag_rules);
+        }
 
         let mut min_concurrent: Option<u32> = None;
 
