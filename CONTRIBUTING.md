@@ -11,8 +11,8 @@ Open an issue using the **Feature Request** template. Describe the problem you'r
 ## Development setup
 
 ```bash
-git clone https://github.com/keithmackay/tokenomics.git
-cd tokenomics
+git clone https://github.com/keithmackay/modelrouter.git
+cd modelrouter
 
 # Build and run tests (SQLite only, no external dependencies)
 cargo build

@@ -771,7 +771,7 @@ Expected: Compiles successfully
 
 Run:
 ```bash
-cd /Users/Keith.MacKay/Projects/tokenomics
+cd /Users/Keith.MacKay/Projects/modelrouter
 cargo test policy_rule_full_parse 2>&1
 ```
 Expected: PASS — confirms the TOML round-trip works

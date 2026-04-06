@@ -21,7 +21,7 @@ This guide gets modelrouter running on your Mac alongside your existing Claude C
 ## Step 1: Build the binary
 
 ```bash
-cd /Users/Keith.MacKay/Projects/tokenomics
+cd /Users/Keith.MacKay/Projects/modelrouter
 
 # Default build (SQLite, no OTel)
 cargo build --release
@@ -34,7 +34,7 @@ The binary lands at `target/release/modelrouter`. Add it to your PATH for conven
 
 ```bash
 # Add to ~/.zshrc or ~/.bashrc
-export PATH="$PATH:/Users/Keith.MacKay/Projects/tokenomics/target/release"
+export PATH="$PATH:/Users/Keith.MacKay/Projects/modelrouter/target/release"
 ```
 
 Open a new shell or `source ~/.zshrc`.

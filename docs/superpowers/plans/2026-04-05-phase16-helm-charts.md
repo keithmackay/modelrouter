@@ -143,7 +143,7 @@ keywords:
   - llm
   - ai
   - proxy
-home: https://github.com/keithmackay/tokenomics
+home: https://github.com/keithmackay/modelrouter
 ```
 
 - [ ] **Step 3: Create `deploy/helm/modelrouter/values.yaml`**
