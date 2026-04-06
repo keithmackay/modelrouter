@@ -11,6 +11,7 @@ mod budgets;
 mod audit;
 mod hooks;
 mod rate_limits;
+mod mcp_servers;
 
 #[derive(Clone)]
 pub struct SqliteDb {
