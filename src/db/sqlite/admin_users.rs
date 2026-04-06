@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::db::models::{AdminUser, NewAdminUser};
+use crate::db::models::{AdminUser, NewAdminUser, NewAdminUserFromOidc};
 use crate::db::repositories::admin_users::AdminUserRepository;
 use super::{SqliteDb, now_utc};
 
@@ -13,6 +13,8 @@ struct AdminUserRow {
     enabled: i64,
     created_at: String,
     last_login_at: Option<String>,
+    oidc_subject: Option<String>,
+    email: Option<String>,
 }
 
 impl From<AdminUserRow> for AdminUser {
@@ -25,6 +27,8 @@ impl From<AdminUserRow> for AdminUser {
             enabled: r.enabled != 0,
             created_at: r.created_at,
             last_login_at: r.last_login_at,
+            oidc_subject: r.oidc_subject,
+            email: r.email,
         }
     }
 }
@@ -33,7 +37,7 @@ impl From<AdminUserRow> for AdminUser {
 impl AdminUserRepository for SqliteDb {
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<AdminUser>> {
         let row = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users WHERE name = ?",
         )
         .bind(name)
@@ -44,7 +48,7 @@ impl AdminUserRepository for SqliteDb {
 
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<AdminUser>> {
         let row = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users WHERE id = ?",
         )
         .bind(id)
@@ -55,7 +59,7 @@ impl AdminUserRepository for SqliteDb {
 
     async fn list(&self) -> anyhow::Result<Vec<AdminUser>> {
         let rows = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -78,7 +82,7 @@ impl AdminUserRepository for SqliteDb {
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users WHERE id = ?",
         )
         .bind(id)
@@ -112,5 +116,41 @@ impl AdminUserRepository for SqliteDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn find_by_oidc_subject(&self, subject: &str) -> anyhow::Result<Option<AdminUser>> {
+        let row = sqlx::query_as::<_, AdminUserRow>(
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
+             FROM admin_users WHERE oidc_subject = ?",
+        )
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(AdminUser::from))
+    }
+
+    async fn create_from_oidc(&self, user: NewAdminUserFromOidc) -> anyhow::Result<AdminUser> {
+        let now = now_utc();
+        let result = sqlx::query(
+            "INSERT INTO admin_users (name, password_hash, role, enabled, created_at, oidc_subject, email)
+             VALUES (?, '', ?, 1, ?, ?, ?)",
+        )
+        .bind(&user.name)
+        .bind(&user.role)
+        .bind(&now)
+        .bind(&user.oidc_subject)
+        .bind(&user.email)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid();
+        let row = sqlx::query_as::<_, AdminUserRow>(
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
+             FROM admin_users WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(AdminUser::from(row))
     }
 }

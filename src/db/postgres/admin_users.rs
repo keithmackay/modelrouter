@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use crate::db::models::{AdminUser, NewAdminUser};
+use crate::db::models::{AdminUser, NewAdminUser, NewAdminUserFromOidc};
 use crate::db::repositories::admin_users::AdminUserRepository;
 use super::{PostgresDb, now_utc};
 
@@ -15,6 +15,8 @@ struct AdminUserRow {
     enabled: bool,
     created_at: String,
     last_login_at: Option<String>,
+    oidc_subject: Option<String>,
+    email: Option<String>,
 }
 
 impl From<AdminUserRow> for AdminUser {
@@ -27,6 +29,8 @@ impl From<AdminUserRow> for AdminUser {
             enabled: r.enabled,
             created_at: r.created_at,
             last_login_at: r.last_login_at,
+            oidc_subject: r.oidc_subject,
+            email: r.email,
         }
     }
 }
@@ -35,7 +39,7 @@ impl From<AdminUserRow> for AdminUser {
 impl AdminUserRepository for PostgresDb {
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<AdminUser>> {
         let row = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users WHERE name = $1",
         )
         .bind(name)
@@ -46,7 +50,7 @@ impl AdminUserRepository for PostgresDb {
 
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<AdminUser>> {
         let row = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users WHERE id = $1",
         )
         .bind(id)
@@ -57,7 +61,7 @@ impl AdminUserRepository for PostgresDb {
 
     async fn list(&self) -> anyhow::Result<Vec<AdminUser>> {
         let rows = sqlx::query_as::<_, AdminUserRow>(
-            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
              FROM admin_users ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -70,7 +74,7 @@ impl AdminUserRepository for PostgresDb {
         let row = sqlx::query_as::<_, AdminUserRow>(
             r#"INSERT INTO admin_users (name, password_hash, role, enabled, created_at)
                VALUES ($1, $2, $3, true, $4)
-               RETURNING id, name, password_hash, role, enabled, created_at, last_login_at"#,
+               RETURNING id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email"#,
         )
         .bind(&user.name)
         .bind(&user.password_hash)
@@ -106,5 +110,33 @@ impl AdminUserRepository for PostgresDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn find_by_oidc_subject(&self, subject: &str) -> anyhow::Result<Option<AdminUser>> {
+        let row = sqlx::query_as::<_, AdminUserRow>(
+            "SELECT id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email
+             FROM admin_users WHERE oidc_subject = $1",
+        )
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(AdminUser::from))
+    }
+
+    async fn create_from_oidc(&self, user: NewAdminUserFromOidc) -> anyhow::Result<AdminUser> {
+        let now = now_utc();
+        let row = sqlx::query_as::<_, AdminUserRow>(
+            r#"INSERT INTO admin_users (name, password_hash, role, enabled, created_at, oidc_subject, email)
+               VALUES ($1, '', $2, true, $3, $4, $5)
+               RETURNING id, name, password_hash, role, enabled, created_at, last_login_at, oidc_subject, email"#,
+        )
+        .bind(&user.name)
+        .bind(&user.role)
+        .bind(&now)
+        .bind(&user.oidc_subject)
+        .bind(&user.email)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(AdminUser::from(row))
     }
 }

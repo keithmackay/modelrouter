@@ -75,12 +75,22 @@ pub struct AdminUser {
     pub enabled: bool,
     pub created_at: String,
     pub last_login_at: Option<String>,
+    pub oidc_subject: Option<String>,
+    pub email: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct NewAdminUser {
     pub name: String,
     pub password_hash: String,
+    pub role: String,
+}
+
+#[derive(Debug)]
+pub struct NewAdminUserFromOidc {
+    pub name: String,
+    pub email: String,
+    pub oidc_subject: String,
     pub role: String,
 }
 

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crate::db::models::{AdminUser, NewAdminUser};
+use crate::db::models::{AdminUser, NewAdminUser, NewAdminUserFromOidc};
 
 #[async_trait]
 pub trait AdminUserRepository: Send + Sync {
@@ -10,4 +10,6 @@ pub trait AdminUserRepository: Send + Sync {
     async fn set_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()>;
     async fn delete(&self, id: i64) -> anyhow::Result<()>;
     async fn update_last_login(&self, id: i64) -> anyhow::Result<()>;
+    async fn find_by_oidc_subject(&self, subject: &str) -> anyhow::Result<Option<AdminUser>>;
+    async fn create_from_oidc(&self, user: NewAdminUserFromOidc) -> anyhow::Result<AdminUser>;
 }
