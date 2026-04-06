@@ -29,11 +29,15 @@ impl OidcStateStore {
 
     /// Consume the state entry, returning the code_verifier if it exists and hasn't expired.
     pub fn take(&self, state: &str) -> Option<String> {
-        let entry = self.map.remove(state)?;
-        if entry.1.created_at.elapsed() > Duration::from_secs(300) {
+        // Check expiry before consuming the entry
+        let expired = self.map.get(state)
+            .map(|e| e.created_at.elapsed() > Duration::from_secs(300))
+            .unwrap_or(false);
+        if expired {
+            self.map.remove(state);
             return None;
         }
-        Some(entry.1.code_verifier)
+        self.map.remove(state).map(|e| e.1.code_verifier)
     }
 
     fn cleanup_expired(&self) {
@@ -163,6 +167,7 @@ pub async fn validate_id_token(
     id_token: &str,
     jwks_uri: &str,
     client_id: &str,
+    issuer_url: &str,
     client: &reqwest::Client,
 ) -> anyhow::Result<IdTokenClaims> {
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -193,6 +198,7 @@ pub async fn validate_id_token(
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&[client_id]);
+    validation.set_issuer(&[issuer_url]);
 
     let token_data = decode::<IdTokenClaims>(id_token, &decoding_key, &validation)?;
     Ok(token_data.claims)
