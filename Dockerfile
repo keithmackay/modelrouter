@@ -35,7 +35,7 @@ FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /build/target/release/modelrouter /modelrouter
 
+ENTRYPOINT ["/modelrouter"]
 # Default command: start the HTTP server.
 # Override with "migrate" to run database migrations.
 CMD ["serve"]
-ENTRYPOINT ["/modelrouter"]
