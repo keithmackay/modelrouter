@@ -244,3 +244,39 @@ pub struct HookMetric {
     pub duration_ms: i64,
     pub success: bool,
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpServer {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewMcpServer {
+    pub name: String,
+    pub url: String,
+    pub description: Option<String>,
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_server_roundtrip() {
+        let s = McpServer {
+            id: 1,
+            name: "my-server".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            description: Some("does stuff".to_string()),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(s.name, "my-server");
+        assert!(s.enabled);
+    }
+}
