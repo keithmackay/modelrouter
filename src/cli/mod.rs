@@ -257,6 +257,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .with_settings(live_settings.clone()),
             );
 
+            let oidc_state = Arc::new(crate::api::admin::oidc::OidcStateStore::new());
+
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
                 live_settings: live_settings.clone(),
@@ -309,6 +311,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     Arc::new(crate::guardrails::GuardrailChain::new(chain))
                 },
                 app_metrics,
+                oidc_state,
             };
             #[cfg(feature = "s3-archival")]
             if settings.archival.enabled {

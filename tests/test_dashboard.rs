@@ -59,6 +59,7 @@ async fn build_test_server() -> TestServer {
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
 
     TestServer::new(build_router(state)).unwrap()
@@ -161,6 +162,7 @@ async fn login_success_sets_cookie() {
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -226,6 +228,7 @@ async fn superadmin_only_admins_page() {
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();

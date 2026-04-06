@@ -69,6 +69,7 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
     (TestServer::new(build_router(state)).unwrap(), db)
 }

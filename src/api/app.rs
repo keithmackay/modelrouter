@@ -76,6 +76,7 @@ pub struct AppState {
     pub app_metrics: Option<Arc<crate::metrics::AppMetrics>>,
     #[cfg(not(feature = "prometheus"))]
     pub app_metrics: Option<std::convert::Infallible>,
+    pub oidc_state: Arc<crate::api::admin::oidc::OidcStateStore>,
 }
 
 pub fn build_router(state: AppState) -> axum::Router {
@@ -130,6 +131,9 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
         .route("/admin/api/users/:id/reset-spend", post(reset_user_spend))
+        // OIDC login flow
+        .route("/admin/auth/oidc/login", get(crate::api::admin::oidc::oidc_login))
+        .route("/admin/auth/oidc/callback", get(crate::api::admin::oidc::oidc_callback))
         // Admin Dashboard (public)
         .route("/admin/login", get(get_login).post(post_login))
         .route("/admin/logout", post(post_logout))

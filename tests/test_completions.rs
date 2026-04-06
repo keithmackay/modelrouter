@@ -70,6 +70,7 @@ async fn test_app() -> TestServer {
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
     TestServer::new(build_router(state)).unwrap()
 }
@@ -187,6 +188,7 @@ async fn test_app_with_blocking_guardrail() -> TestServer {
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails,
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
     TestServer::new(build_router(state)).unwrap()
 }
