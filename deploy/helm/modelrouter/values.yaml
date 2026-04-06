@@ -1,0 +1,68 @@
+# Number of replicas. Keep at 1 when using SQLite (single-writer constraint).
+replicaCount: 1
+
+image:
+  repository: ghcr.io/keithmackay/modelrouter
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8080
+
+# Resource requests and limits
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Persistent storage for SQLite database
+persistence:
+  enabled: true
+  storageClass: ""     # "" uses cluster default
+  size: 1Gi
+  accessMode: ReadWriteOnce
+
+# Horizontal Pod Autoscaler — disable when using SQLite (single-writer)
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# config.toml content rendered into a ConfigMap.
+# Sensitive values (api_key, jwt_secret) should be provided via `secrets` below
+# and will be injected as environment variables, not embedded in the config file.
+config: |
+  [server]
+  host = "0.0.0.0"
+  port = 8080
+
+  [database]
+  path = "/data/router.db"
+
+  [routing]
+  default_provider = "openai"
+  default_model = "gpt-4o"
+
+  [auth]
+  jwt_secret = ""  # overridden by MODELROUTER__AUTH__JWT_SECRET env var
+
+# Provider API keys and other secrets injected as environment variables.
+# These become env vars of the form MODELROUTER__PROVIDERS__<UPPER>__API_KEY.
+secrets:
+  jwtSecret: "change-me"
+  providers: {}
+  # providers:
+  #   openai: "sk-..."
+  #   anthropic: "sk-ant-..."
+
+# Node selector, tolerations, affinity
+nodeSelector: {}
+tolerations: []
+affinity: {}

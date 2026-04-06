@@ -1,0 +1,11 @@
+apiVersion: v2
+name: modelrouter
+description: LLM proxy with budget enforcement, routing, and guardrails
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - llm
+  - ai
+  - proxy
+home: https://github.com/keithmackay/tokenomics
