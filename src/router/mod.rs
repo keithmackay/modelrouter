@@ -7,5 +7,6 @@ pub mod cost;
 pub mod engine;
 pub mod fallback;
 pub mod load_balancer;
+pub mod declarative_policy;
 pub mod policy;
 pub mod retry;
