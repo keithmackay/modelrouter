@@ -2521,6 +2521,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "axum",
  "axum-test",
+ "base64 0.22.1",
  "bcrypt",
  "bytes",
  "chrono",
