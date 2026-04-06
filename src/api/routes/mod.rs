@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod completions;
+pub mod mcp;
 pub mod images;
 pub mod responses;
 pub mod embeddings;
