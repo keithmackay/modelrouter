@@ -68,7 +68,6 @@ impl PolicyEngine {
 
                     // 2. USD budget check
                     if let Some(limit_usd) = rule.budget_usd {
-                        use crate::db::repositories::costs::CostRepository;
                         let window_start = window_start_for(&rule.window);
                         let spent = CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?;
                         if spent >= limit_usd {
