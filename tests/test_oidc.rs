@@ -90,3 +90,65 @@ mod oidc_core_tests {
         assert!(is_email_allowed("anyone@anywhere.com", &[], &[]));
     }
 }
+
+mod oidc_integration_tests {
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+    use modelrouter::db::models::{NewAdminUserFromOidc, NewAdminUser};
+
+    #[tokio::test]
+    async fn test_create_from_oidc_and_find_by_subject() {
+        let db = crate::common::in_memory_db().await;
+
+        let created = db.create_from_oidc(NewAdminUserFromOidc {
+            name: "Alice OIDC".to_string(),
+            email: "alice@example.com".to_string(),
+            oidc_subject: "google|12345".to_string(),
+            role: "admin".to_string(),
+        }).await.unwrap();
+
+        assert_eq!(created.oidc_subject.as_deref(), Some("google|12345"));
+        assert_eq!(created.email.as_deref(), Some("alice@example.com"));
+        assert!(created.enabled);
+        assert_eq!(created.password_hash, "");
+
+        let found = db.find_by_oidc_subject("google|12345").await.unwrap().unwrap();
+        assert_eq!(found.id, created.id);
+        assert_eq!(found.name, "Alice OIDC");
+        assert_eq!(found.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(found.oidc_subject.as_deref(), Some("google|12345"));
+    }
+
+    #[tokio::test]
+    async fn test_oidc_subject_unique_constraint() {
+        let db = crate::common::in_memory_db().await;
+
+        db.create_from_oidc(NewAdminUserFromOidc {
+            name: "Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            oidc_subject: "provider|abc".to_string(),
+            role: "admin".to_string(),
+        }).await.unwrap();
+
+        // Second insert with same oidc_subject must fail
+        let result = db.create_from_oidc(NewAdminUserFromOidc {
+            name: "Alice Dup".to_string(),
+            email: "alice2@example.com".to_string(),
+            oidc_subject: "provider|abc".to_string(),
+            role: "admin".to_string(),
+        }).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_existing_admin_find_returns_oidc_subject_none() {
+        let db = crate::common::in_memory_db().await;
+        let created = db.create(NewAdminUser {
+            name: "bob".to_string(),
+            password_hash: "hash".to_string(),
+            role: "admin".to_string(),
+        }).await.unwrap();
+
+        assert!(created.oidc_subject.is_none());
+        assert!(created.email.is_none());
+    }
+}
