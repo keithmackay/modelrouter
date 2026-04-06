@@ -229,7 +229,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                     settings.providers.clone(),
                 ),
             );
-            let policy = Arc::new(crate::router::policy::PolicyEngine::new(db.clone()));
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
                 settings.routing.fallback_chains.clone(),
             ));
@@ -252,6 +251,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             let app_metrics: Option<std::convert::Infallible> = None;
 
             let live_settings = Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone()));
+
+            let policy = Arc::new(
+                crate::router::policy::PolicyEngine::new(db.clone())
+                    .with_settings(live_settings.clone()),
+            );
 
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
