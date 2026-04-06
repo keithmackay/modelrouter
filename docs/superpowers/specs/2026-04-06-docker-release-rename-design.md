@@ -23,7 +23,7 @@ Two sequential phases:
 | `keithmackay/modelrouter` (Python) | `keithmackay/modelrouter_py` |
 | `keithmackay/tokenomics` (Rust) | `keithmackay/modelrouter` |
 
-GitHub automatically redirects old URLs after a rename, so existing clones continue to work.
+GitHub automatically redirects old URLs after a rename, so existing clones continue to work. Note: GitHub secrets, environments, and any configured webhooks under the old repo name are **not** automatically remapped — review these after renaming.
 
 ### Local folder renames (done in shell after GitHub rename)
 
@@ -34,7 +34,7 @@ mv ~/Projects/tokenomics ~/Projects/modelrouter
 
 ### Internal reference updates (in this repo)
 
-Six files reference `tokenomics` and must be updated to `modelrouter`:
+Seven files reference `tokenomics` and must be updated to `modelrouter`:
 
 | File | Change |
 |---|---|
@@ -44,6 +44,7 @@ Six files reference `tokenomics` and must be updated to `modelrouter`:
 | `deploy/helm/modelrouter/Chart.yaml` | Source URL or annotation |
 | `docs/superpowers/plans/2026-04-05-phase18-declarative-policy-engine.md` | Repo reference |
 | `docs/superpowers/plans/2026-04-05-phase16-helm-charts.md` | Repo reference |
+| `session_stats.md` | Project name reference (tracking file, not source) |
 
 ### README.md additions (Docker section)
 
@@ -52,6 +53,7 @@ The existing Docker section shows only a local `docker build`. It will be expand
 - GHCR pull instructions for each variant
 - Variant table (default, otel, postgres, full) with feature descriptions
 - Volume mount and environment variable reference
+- Note that `-p 8080:8080` maps to `server.port` in `config.toml`
 
 ---
 
@@ -65,6 +67,8 @@ The existing Docker section shows only a local `docker build`. It will be expand
 | `-otel` | `otel` | + OpenTelemetry traces/metrics/logs |
 | `-postgres` | `postgres` | + PostgreSQL backend |
 | `-full` | `otel,postgres,bedrock,prometheus` | All optional features |
+
+`s3-archival` is intentionally excluded from `full` — it is an unimplemented stub with no dependencies and no runtime behavior.
 
 ### Tagging scheme (Convention A)
 
@@ -81,6 +85,8 @@ ghcr.io/keithmackay/modelrouter:latest-postgres
 ghcr.io/keithmackay/modelrouter:latest-full
 ```
 
+Tags are derived from `github.ref_name`, which is the short tag name (e.g. `v0.2.0`) on tag-push triggers. The workflow only fires on `v*` tags, so this is safe. If a `workflow_dispatch` trigger is ever added, tag generation must be revisited.
+
 ### Architecture
 
 Each image tag is a multi-arch manifest covering:
@@ -91,35 +97,50 @@ Built with `docker buildx` + QEMU emulation on GitHub-hosted runners.
 
 ### Dockerfile changes
 
-The existing `Dockerfile` is extended with a `FEATURES` build argument:
+`ARG FEATURES=""` is declared **inside the builder stage** (after `FROM rust:1.91-slim AS builder`) so it is in scope for the `RUN` commands. Both the stub pre-build step and the real build step pass `--features`:
 
 ```dockerfile
+FROM rust:1.91-slim AS builder
+
 ARG FEATURES=""
-# ...
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+
+# Pre-build dependencies with the same feature set to maximise layer cache reuse
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs
+RUN cargo build --release \
+    $([ -n "$FEATURES" ] && echo "--features $FEATURES" || true) || true
+RUN rm -rf src
+
+COPY . .
 RUN cargo build --release \
     $([ -n "$FEATURES" ] && echo "--features $FEATURES" || true)
 ```
 
-The stub pre-build step also passes `FEATURES` so the dependency cache remains valid across variants.
+The runtime stage is unchanged (distroless, copies the binary).
 
 ### GitHub Actions workflow changes
 
-A new `docker` job is added to `.github/workflows/release.yml`, running after the existing `build` job completes. It:
+A new `docker` job is added to `.github/workflows/release.yml`. It depends on both `build` and `release` so images are only pushed after the GitHub Release is successfully created. The image name is derived from `github.repository` (owner/repo) to avoid hardcoding.
 
-1. Checks out the repo
-2. Logs in to GHCR using `GITHUB_TOKEN`
-3. Sets up QEMU and `docker buildx`
-4. Runs a matrix of 4 variants, building and pushing each multi-arch image
-5. Sets package visibility to private via the GHCR API (or relies on repo default)
+GHA cache (`type=gha`) is used on `docker/build-push-action` to avoid redundant Rust compilation across the 4-variant matrix.
 
 ```yaml
 docker:
   name: Docker ${{ matrix.variant }}
-  needs: build
+  needs: [build, release]
   runs-on: ubuntu-latest
   permissions:
     contents: read
     packages: write
+  env:
+    IMAGE_NAME: ${{ github.repository }}
   strategy:
     matrix:
       include:
@@ -150,9 +171,11 @@ docker:
         platforms: linux/amd64,linux/arm64
         push: true
         build-args: FEATURES=${{ matrix.features }}
+        cache-from: type=gha,scope=${{ matrix.variant }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
         tags: |
-          ghcr.io/${{ github.repository_owner }}/modelrouter:${{ github.ref_name }}${{ matrix.tag_suffix }}
-          ghcr.io/${{ github.repository_owner }}/modelrouter:latest${{ matrix.tag_suffix }}
+          ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}${{ matrix.tag_suffix }}
+          ghcr.io/${{ env.IMAGE_NAME }}:latest${{ matrix.tag_suffix }}
 ```
 
 ### GHCR visibility
@@ -171,7 +194,6 @@ Packages inherit the repository visibility on first push. Since the repo is priv
 | `ghcr.io/keithmackay/modelrouter:latest-postgres` | + PostgreSQL |
 | `ghcr.io/keithmackay/modelrouter:latest-full` | All features |
 
-```bash
 docker pull ghcr.io/keithmackay/modelrouter:latest
 docker run \
   -v /host/config:/config \
@@ -179,7 +201,8 @@ docker run \
   -e MODELROUTER_CONFIG=/config/config.toml \
   -p 8080:8080 \
   ghcr.io/keithmackay/modelrouter:latest
-```
+
+# Port 8080 maps to server.port in config.toml (default 8080)
 ```
 
 ---
@@ -190,3 +213,4 @@ docker run \
 - Helm chart updates (separate phase)
 - Making the GHCR package public (deferred)
 - Cross-compiling non-Linux targets into Docker
+- `s3-archival` feature (unimplemented stub, excluded from all images)
