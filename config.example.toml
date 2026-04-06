@@ -127,3 +127,43 @@ fail_open    = true
 # model = "my-private-llama"
 # input_per_million = 0.10
 # output_per_million = 0.30
+
+# ---------------------------------------------------------------------------
+# Declarative Policy Rules
+# ---------------------------------------------------------------------------
+# Rules are evaluated before database budget rules. The highest-priority
+# matching rule wins. If no rule matches, database rules apply (backward compat).
+#
+# NOTE: Use [[policy_rules]] (not [[policy.rules]]) — flat top-level array.
+#
+# Condition fields (all optional — omit to match everyone):
+#   tag        = user's API key tag
+#   group_name = user's group
+#   user_id    = specific user ID
+#   model      = exact requested model string
+#
+# All condition fields provided must match (AND logic).
+#
+# [[policy_rules]]
+# name         = "research-team-opus"
+# priority     = 10
+# allow_models = ["claude-opus-4-5"]
+# budget_usd   = 200.0
+# window       = "monthly"         # "daily", "weekly", or "monthly"
+# [policy_rules.condition]
+# tag = "research"
+#
+# [[policy_rules]]
+# name     = "intern-budget"
+# priority = 5
+# budget_usd = 10.0
+# window   = "monthly"
+# [policy_rules.condition]
+# group_name = "interns"
+#
+# [[policy_rules]]
+# name     = "global-floor"
+# priority = 0
+# budget_usd = 50.0
+# window   = "monthly"
+# # No condition — matches all users (catch-all / default policy)
