@@ -99,6 +99,8 @@ pub struct Settings {
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub archival: ArchivalConfig,
+    #[serde(default)]
+    pub oidc: OidcConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -139,6 +141,43 @@ impl Default for ArchivalConfig {
 fn default_archive_after_days() -> u32 { 90 }
 fn default_archive_prefix() -> String { "modelrouter/cost-logs".to_string() }
 fn default_archive_region() -> String { "us-east-1".to_string() }
+
+fn default_oidc_role() -> String { "admin".to_string() }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub issuer_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+    #[serde(default)]
+    pub allowed_emails: Vec<String>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default = "default_oidc_role")]
+    pub auto_provision_role: String,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer_url: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            allowed_emails: vec![],
+            allowed_domains: vec![],
+            auto_provision_role: default_oidc_role(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {

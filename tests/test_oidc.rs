@@ -22,3 +22,38 @@ async fn test_find_by_oidc_subject() {
     assert_eq!(found.oidc_subject.as_deref(), Some("google|12345"));
     assert_eq!(found.password_hash, "");
 }
+
+#[cfg(test)]
+mod oidc_config_tests {
+    use modelrouter::config::schema::Settings;
+
+    #[test]
+    fn test_oidc_config_defaults() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(!settings.oidc.enabled);
+        assert_eq!(settings.oidc.auto_provision_role, "admin");
+        assert!(settings.oidc.allowed_emails.is_empty());
+        assert!(settings.oidc.allowed_domains.is_empty());
+    }
+
+    #[test]
+    fn test_oidc_config_full_parse() {
+        let toml_str = r#"
+[oidc]
+enabled = true
+issuer_url = "https://accounts.google.com"
+client_id = "my-client-id"
+client_secret = "my-secret"
+redirect_uri = "http://localhost:8080/admin/auth/oidc/callback"
+allowed_emails = ["alice@example.com"]
+allowed_domains = ["example.com"]
+auto_provision_role = "superadmin"
+"#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(settings.oidc.enabled);
+        assert_eq!(settings.oidc.issuer_url, "https://accounts.google.com");
+        assert_eq!(settings.oidc.client_id, "my-client-id");
+        assert_eq!(settings.oidc.allowed_domains, vec!["example.com"]);
+        assert_eq!(settings.oidc.auto_provision_role, "superadmin");
+    }
+}
