@@ -1,8 +1,12 @@
 use std::sync::Arc;
+use arc_swap::ArcSwap;
 use crate::{api::app::DatabaseProvider, db::models::User};
+use crate::config::schema::Settings;
+use crate::router::declarative_policy::find_matching_rule;
 
 pub struct PolicyEngine {
     pub db: Arc<dyn DatabaseProvider>,
+    settings: Option<Arc<ArcSwap<Settings>>>,
 }
 
 pub struct BudgetContext {
@@ -26,7 +30,14 @@ pub enum PolicyDecision {
 
 impl PolicyEngine {
     pub fn new(db: Arc<dyn DatabaseProvider>) -> Self {
-        Self { db }
+        Self { db, settings: None }
+    }
+
+    /// Attach live settings for declarative policy rule evaluation.
+    /// Call this on the production instance; test instances can skip it.
+    pub fn with_settings(mut self, settings: Arc<ArcSwap<Settings>>) -> Self {
+        self.settings = Some(settings);
+        self
     }
 
     #[tracing::instrument(skip(self), fields(
@@ -56,6 +67,54 @@ impl PolicyEngine {
         }
 
         let span = tracing::Span::current();
+
+        // ── Declarative policy rules (config-driven, highest priority) ──────
+        if let Some(ref live) = self.settings {
+            let settings = live.load();
+            if !settings.policy_rules.is_empty() {
+                if let Some(rule) = find_matching_rule(&settings.policy_rules, user, model) {
+                    tracing::debug!(rule.name = rule.name.as_str(), "declarative policy rule matched");
+
+                    // 1. Model allow-list check
+                    if !rule.allow_models.is_empty() && !rule.allow_models.contains(&model.to_string()) {
+                        let reason = format!("model '{}' not permitted by policy rule '{}'", model, rule.name);
+                        span.record("policy.result", "deny");
+                        span.record("policy.reason", reason.as_str());
+                        return Ok(PolicyDecision::Deny { reason, status: 403, budget_context: None });
+                    }
+
+                    // 2. USD budget check
+                    if let Some(limit_usd) = rule.budget_usd {
+                        use crate::db::repositories::costs::CostRepository;
+                        let window_start = window_start_for(&rule.window);
+                        let spent = CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?;
+                        if spent >= limit_usd {
+                            let reason = format!(
+                                "budget exceeded by policy rule '{}': ${:.4} of ${:.2} {} limit",
+                                rule.name, spent, limit_usd, rule.window
+                            );
+                            span.record("policy.result", "deny");
+                            span.record("policy.reason", reason.as_str());
+                            return Ok(PolicyDecision::Deny {
+                                reason,
+                                status: 429,
+                                budget_context: Some(BudgetContext {
+                                    limit_usd,
+                                    spent_usd: spent,
+                                    window: rule.window.clone(),
+                                }),
+                            });
+                        }
+                    }
+
+                    // Rule matched and all checks passed — allow, skip DB rules
+                    span.record("policy.result", "allow");
+                    return Ok(PolicyDecision::Allow { max_concurrent: None });
+                }
+            }
+        }
+        // ── Fallthrough: existing database-driven rules ──────────────────────
+
         let mut min_concurrent: Option<u32> = None;
 
         for rule in &rules {
