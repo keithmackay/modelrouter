@@ -60,6 +60,12 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 | `ghcr.io/keithmackay/modelrouter:latest-postgres` | + PostgreSQL |
 | `ghcr.io/keithmackay/modelrouter:latest-full` | All features (OTel + Postgres + Bedrock + Prometheus) |
 
+> **Note:** These images are hosted on a private GHCR package. Authenticate first:
+> ```bash
+> docker login ghcr.io -u <your-github-username> --password-stdin <<< <your-github-pat>
+> ```
+> A GitHub Personal Access Token with `read:packages` scope is required.
+
 ```bash
 docker pull ghcr.io/keithmackay/modelrouter:latest
 docker run \
@@ -67,7 +73,7 @@ docker run \
   -v /host/data:/data \
   -e MODELROUTER_CONFIG=/config/config.toml \
   -p 8080:8080 \
-  ghcr.io/keithmackay/modelrouter:latest
+  ghcr.io/keithmackay/modelrouter:latest serve
 # -p 8080:8080 maps to server.port in config.toml (default: 8080)
 ```
 
