@@ -29,7 +29,11 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 - **Drop-in OpenAI compatibility** — any SDK that speaks `POST /v1/chat/completions` works without modification
 - **Multi-provider routing** — route to OpenAI, Anthropic, Google Gemini, or Ollama; switch providers by changing one config line
-- **Per-user budget enforcement** — set monthly or custom-window spend limits; over-budget requests are rejected before they reach the upstream
+- **Per-user budget enforcement** — set monthly, weekly, or daily spend limits; over-budget requests are rejected before they reach the upstream
+- **Declarative policy engine** — TOML-configured rules that match users by tag, group, or ID and enforce model allow-lists and budgets without touching the database
+- **Content guardrails** — pluggable safety layer runs OpenAI moderation (or a custom HTTP endpoint) on requests and responses; configurable fail-open/fail-closed
+- **MCP server registry** — register and discover Model Context Protocol servers via REST; semantic search ranks results by relevance to a query
+- **SSO / OIDC** — admin users can authenticate via Google, Okta, Auth0, or any OIDC provider using authorization code flow with PKCE; new admins are auto-provisioned from email allow-lists
 - **Hook system** — run shell scripts or HTTP webhooks at lifecycle events and in the request pipeline; grant capabilities per-user via `hook_permissions`
 - **Admin dashboard** — web UI at `/admin` with usage stats, audit log, budget management, and user administration
 - **Feature-flagged optional components** — `--features postgres` for Postgres backend, `--features otel` for full OpenTelemetry observability (traces, metrics, logs via OTLP)
@@ -122,11 +126,19 @@ curl http://localhost:8080/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
+# MCP server registry — list registered servers
+curl http://localhost:8080/v1/mcp/servers \
+  -H "Authorization: Bearer <api-key>"
+
+# MCP server registry — discover servers by semantic query
+curl "http://localhost:8080/v1/mcp/servers/discover?q=code+review+tools" \
+  -H "Authorization: Bearer <api-key>"
+
 # Health check
 curl http://localhost:8080/health
 ```
 
-Admin endpoints at `/admin/*` require a JWT from `POST /admin/login`. A browser-based dashboard is available at `/admin`.
+Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. Admin login via OIDC SSO is available at `GET /admin/auth/oidc/login` when configured. A browser-based dashboard is available at `/admin`.
 
 ---
 
@@ -327,6 +339,40 @@ modelrouter budget list --user abdoul
 
 Cross-reference with the cost report: Abdoul has spent $0.03 of his $50.00 monthly limit.
 
+### 7. (Optional) Enable OIDC SSO for admin login
+
+By default, admin users log in with a username and password at `/admin/login`. If your team uses an identity provider (Google, Okta, Auth0, Keycloak, or any OIDC-compliant IdP), you can configure SSO so admins authenticate through their normal corporate credentials instead.
+
+**Register a new OAuth2 application in your IdP.** Set the redirect URI to:
+
+```
+http://localhost:8080/admin/auth/oidc/callback
+```
+
+(Replace `localhost:8080` with your actual hostname in production.)
+
+**Add an `[oidc]` block to `~/.modelrouter/config.toml`:**
+
+```toml
+[oidc]
+enabled = true
+issuer_url    = "https://accounts.google.com"   # or your Okta/Auth0 tenant URL
+client_id     = "your-client-id"
+client_secret = "your-client-secret"
+redirect_uri  = "http://localhost:8080/admin/auth/oidc/callback"
+
+# Restrict login to specific email addresses or entire domains
+allowed_emails  = []
+allowed_domains = ["yourcompany.com"]
+
+# Role assigned to newly provisioned admins ("admin" or "superadmin")
+auto_provision_role = "admin"
+```
+
+Restart modelrouter. Navigate to `http://localhost:8080/admin/auth/oidc/login` — you will be redirected to your IdP. After a successful login, modelrouter creates an admin account for you (if one doesn't already exist) and sets a session cookie.
+
+> **Note:** Password-based login at `/admin/login` remains available alongside OIDC. Existing admin accounts are not affected. OIDC-provisioned accounts have an empty password hash and cannot log in via the password form.
+
 ---
 
 ## Configuration
@@ -342,11 +388,14 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 | `routing.model_aliases` | Map short names to canonical model IDs | — |
 | `providers.<name>.api_key` | Upstream provider API key | required |
 | `providers.<name>.base_url` | Override provider endpoint | provider default |
-| `auth.admin_secret` | Secret for admin JWT signing | required |
+| `auth.jwt_secret` | Secret for admin JWT signing | required |
+| `[[guardrails]]` | Content safety rules (type, fail_open, api_key, endpoint) | — |
+| `[[policy_rules]]` | Declarative access rules matched by tag/group/user/model | — |
+| `[oidc]` | OIDC SSO for admin login (issuer_url, client_id, client_secret, …) | disabled |
 | `telemetry.endpoint` | OTLP gRPC endpoint (`--features otel`) | disabled |
 | `telemetry.sample_ratio` | Fraction of normal requests to trace | `0.1` |
 
-See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration covering all providers, hook definitions, and telemetry options.
+See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration covering all providers, hook definitions, guardrails, policy rules, OIDC, and telemetry options.
 
 ### Model routing
 
@@ -363,21 +412,38 @@ Models resolve in this order:
 ```
 src/
 ├── api/
-│   ├── app.rs              — axum router assembly, middleware stack
+│   ├── admin/
+│   │   ├── auth.rs             — JWT issuance and verification, AdminSession extractor
+│   │   ├── dashboard.rs        — browser dashboard handlers (HTMX, mr_admin_session cookie)
+│   │   ├── oidc.rs             — OIDC state store, PKCE, discovery, token validation, SSO handlers
+│   │   └── routes.rs           — admin REST API handlers
+│   ├── app.rs                  — axum router assembly, AppState, middleware stack
+│   ├── auth.rs                 — Bearer token auth for /v1/* endpoints
 │   └── routes/
-│       ├── completions.rs  — POST /v1/chat/completions handler
-│       ├── models.rs       — GET /v1/models handler
-│       └── admin/          — admin REST + dashboard handlers
-├── cli/                    — Clap CLI commands (serve, init, migrate, user, budget, report)
-├── config/                 — Config loading and schema (TelemetryConfig, Settings, …)
-├── db/                     — sqlx migrations and repository types
+│       ├── completions.rs      — POST /v1/chat/completions handler
+│       ├── mcp.rs              — MCP server registry REST + discover endpoint
+│       ├── models.rs           — GET /v1/models handler
+│       └── ...                 — embeddings, images, audio, responses
+├── cli/                        — Clap CLI commands (serve, init, migrate, user, budget, report)
+├── config/                     — Config loading and schema (Settings, GuardrailConfig, OidcConfig, …)
+├── db/                         — sqlx migrations, model types, repository traits
+│   ├── repositories/           — trait definitions (one file per domain)
+│   ├── sqlite/                 — SQLite implementations
+│   └── postgres/               — Postgres implementations (--features postgres)
+├── guardrails/
+│   ├── mod.rs                  — GuardrailChain, Guardrail trait, GuardrailDecision
+│   └── openai_moderation.rs    — OpenAI moderation API integration
 ├── hooks/
-│   ├── lifecycle.rs        — before/after request lifecycle hooks
-│   └── pipeline.rs         — streaming pipeline hooks
+│   ├── lifecycle.rs            — before/after request lifecycle hooks
+│   └── pipeline.rs             — streaming pipeline hooks
+├── providers/                  — Upstream adapters (Anthropic, OpenAI, Bedrock, Azure, Gemini, Ollama)
 ├── router/
-│   └── policy.rs           — budget and rate-limit policy engine
-├── report/                 — cost reporting and audit log formatting
-└── telemetry/              — OTel init, SmartSampler, metrics instruments (--features otel)
+│   ├── declarative_policy.rs   — TOML-configured policy rule matching (condition + allow-list + budget)
+│   ├── policy.rs               — PolicyEngine: declarative rules (priority) then DB budget/rate rules
+│   ├── engine.rs               — RequestRouter: alias resolution, provider selection, load balancing
+│   └── ...                     — cache, circuit_breaker, fallback, retry, session_limits
+├── report/                     — Cost reporting and audit log formatting
+└── telemetry/                  — OTel init, SmartSampler, metrics instruments (--features otel)
 ```
 
 The binary entry point at `src/main.rs` delegates entirely to the library crate, keeping all logic testable without spinning up a process.
