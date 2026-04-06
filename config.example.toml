@@ -167,3 +167,32 @@ fail_open    = true
 # budget_usd = 50.0
 # window   = "monthly"
 # # No condition — matches all users (catch-all / default policy)
+
+# ── SSO / OIDC (optional) ─────────────────────────────────────────────────────
+# Enable OpenID Connect SSO for admin login.
+# When enabled, admins can authenticate at /admin/auth/oidc/login instead of
+# (or in addition to) the username/password form.
+#
+# Tested with: Google, GitHub (using GHES OIDC), Okta, Auth0, Keycloak.
+#
+# [oidc]
+# enabled = false
+#
+# # OIDC issuer URL — discovery document fetched from {issuer_url}/.well-known/openid-configuration
+# issuer_url = "https://accounts.google.com"
+#
+# # OAuth2 client credentials (create in your IdP console)
+# client_id = "your-client-id.apps.googleusercontent.com"
+# client_secret = "your-client-secret"
+#
+# # Redirect URI — must match exactly what you registered in the IdP console
+# redirect_uri = "https://your-modelrouter.example.com/admin/auth/oidc/callback"
+#
+# # Optional: restrict login to specific email addresses
+# allowed_emails = ["alice@example.com", "bob@example.com"]
+#
+# # Optional: restrict login to email domains (checked if email not in allowed_emails)
+# allowed_domains = ["example.com", "corp.example.com"]
+#
+# # Role assigned to auto-provisioned admins (default: "admin"; use "superadmin" for full access)
+# auto_provision_role = "admin"
