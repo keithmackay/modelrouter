@@ -10,6 +10,7 @@ mod audit;
 mod hooks;
 mod rate_limits;
 mod api_keys;
+mod mcp_servers;
 
 use sqlx::PgPool;
 
