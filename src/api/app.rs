@@ -85,7 +85,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         completions::chat_completions, embeddings::embeddings, health::health_check,
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler,
-        mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server},
+        mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user, rotate_user_key,
@@ -149,6 +149,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         // MCP Server Registry
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))
+        .route("/v1/mcp/discover", post(discover_mcp_tools))
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(
