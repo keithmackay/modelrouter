@@ -370,6 +370,8 @@ pub async fn oidc_callback(
     // Update last login (fire and forget)
     let _ = AdminUserRepository::update_last_login(&*state.db, admin.id).await;
 
+    // TODO: Add `; Secure` flag when TLS is configured (HTTPS deployments).
+    // Currently omitted because this dev tool may run on plain HTTP.
     let cookie = format!("mr_admin_session={}; Path=/; HttpOnly; SameSite=Lax", token);
     (
         StatusCode::SEE_OTHER,
