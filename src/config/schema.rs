@@ -92,6 +92,8 @@ pub struct Settings {
     pub callbacks: CallbacksConfig,
     #[serde(default)]
     pub guardrails: Vec<GuardrailConfig>,
+    #[serde(default)]
+    pub policy_rules: Vec<PolicyRuleConfig>,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -430,3 +432,84 @@ fn default_batch_queue_size() -> usize { 2048 }
 fn default_batch_delay_ms() -> u64 { 5000 }
 #[cfg(feature = "otel")]
 fn default_batch_export_size() -> usize { 512 }
+
+/// Condition for a declarative policy rule. All provided fields must match.
+/// An empty condition matches every request.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PolicyConditionConfig {
+    /// Match on the user's API key tag.
+    pub tag: Option<String>,
+    /// Match on the user's group name.
+    pub group_name: Option<String>,
+    /// Match on a specific user ID.
+    pub user_id: Option<i64>,
+    /// Match on the requested model string.
+    pub model: Option<String>,
+}
+
+fn default_policy_window() -> String { "monthly".to_string() }
+
+/// A single declarative policy rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PolicyRuleConfig {
+    /// Human-readable name (logged on match, not used for uniqueness checks).
+    pub name: String,
+    /// Conditions that must ALL match for this rule to apply.
+    #[serde(default)]
+    pub condition: PolicyConditionConfig,
+    /// Allowlist of model strings. If non-empty, any model not in the list is denied 403.
+    #[serde(default)]
+    pub allow_models: Vec<String>,
+    /// USD spend limit for the window. None = no budget cap.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    /// Budget window: "daily", "weekly", or "monthly".
+    #[serde(default = "default_policy_window")]
+    pub window: String,
+    /// Sort order — higher priority rules are evaluated first. Default 0.
+    #[serde(default)]
+    pub priority: i32,
+}
+
+#[cfg(test)]
+mod policy_rule_tests {
+    use super::*;
+
+    #[test]
+    fn policy_rule_defaults() {
+        let rule: PolicyRuleConfig = toml::from_str(r#"
+            name = "test"
+        "#).unwrap();
+        assert_eq!(rule.name, "test");
+        assert_eq!(rule.priority, 0);
+        assert_eq!(rule.window, "monthly");
+        assert!(rule.allow_models.is_empty());
+        assert!(rule.budget_usd.is_none());
+        assert!(rule.condition.tag.is_none());
+    }
+
+    #[test]
+    fn policy_rule_full_parse() {
+        let rule: PolicyRuleConfig = toml::from_str(r#"
+            name = "research-team-opus"
+            priority = 10
+            allow_models = ["claude-opus-4-5"]
+            budget_usd = 200.0
+            window = "monthly"
+            [condition]
+            tag = "research"
+        "#).unwrap();
+        assert_eq!(rule.priority, 10);
+        assert_eq!(rule.condition.tag.as_deref(), Some("research"));
+        assert_eq!(rule.budget_usd, Some(200.0));
+    }
+
+    #[test]
+    fn settings_policy_rules_field() {
+        let s: Settings = toml::from_str(r#"
+            [[policy_rules]]
+            name = "allow-all"
+        "#).unwrap();
+        assert_eq!(s.policy_rules.len(), 1);
+    }
+}
