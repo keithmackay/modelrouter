@@ -11,6 +11,8 @@
 # ── Builder stage ────────────────────────────────────────────────────────────
 FROM rust:1.91-slim AS builder
 
+ARG FEATURES=""
+
 WORKDIR /build
 
 # Install build dependencies for SQLite bundled feature
@@ -21,14 +23,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
 
-# Create a stub src/main.rs to pre-build dependencies
+# Create a stub src/main.rs to pre-build dependencies with the same feature set
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs
-RUN cargo build --release || true
+RUN if [ -n "$FEATURES" ]; then \
+      cargo build --release --features "$FEATURES" || true; \
+    else \
+      cargo build --release || true; \
+    fi
 RUN rm -rf src
 
 # Copy full source and build for real
 COPY . .
-RUN cargo build --release
+RUN if [ -n "$FEATURES" ]; then \
+      cargo build --release --features "$FEATURES"; \
+    else \
+      cargo build --release; \
+    fi
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12
