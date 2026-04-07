@@ -522,9 +522,11 @@ Now the correct key is automatically active whenever the developer `cd`s into a 
 
 > **Add `.envrc` to `.gitignore`** — it contains credentials and should never be committed.
 
-### Mixing modelrouter and direct Anthropic access
+### Mixing modelrouter and direct Anthropic or OpenAI access
 
-modelrouter is only in the path when a tool is explicitly pointed at it. If `ANTHROPIC_BASE_URL` is not set, Claude Code and the Anthropic SDK talk directly to Anthropic as normal. This makes it easy to opt only specific projects in, leaving everything else unchanged.
+> The same patterns apply to OpenAI-compatible tools. Substitute `OPENAI_BASE_URL` and `OPENAI_API_KEY` wherever `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` appear below — the behaviour is identical.
+
+modelrouter is only in the path when a tool is explicitly pointed at it. If `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`) is not set, tools talk directly to the upstream provider as normal. This makes it easy to opt only specific projects in, leaving everything else unchanged.
 
 **Pattern 1 — Direct Anthropic by default, opt specific projects into modelrouter (recommended for most teams)**
 
