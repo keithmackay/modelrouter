@@ -7,18 +7,53 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.variant }} / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux amd64 — all 4 variants (used by Docker jobs)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            variant: default
+            features: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            variant: otel
+            features: "otel"
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            variant: postgres
+            features: "postgres"
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            variant: full
+            features: "otel,postgres,bedrock,prometheus"
+
+          # Linux arm64 — all 4 variants (used by Docker jobs)
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            variant: default
+            features: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            variant: otel
+            features: "otel"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            variant: postgres
+            features: "postgres"
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            variant: full
+            features: "otel,postgres,bedrock,prometheus"
+
+          # macOS arm64 — default only (attached to GitHub Release)
           - target: aarch64-apple-darwin
             os: macos-latest
+            variant: default
+            features: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -34,22 +69,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ matrix.variant }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
+            ${{ runner.os }}-${{ matrix.target }}-${{ matrix.variant }}-cargo-
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Rename binary
         run: |
-          cp target/${{ matrix.target }}/release/modelrouter modelrouter-${{ matrix.target }}
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Stage binary
+        run: |
+          cp target/${{ matrix.target }}/release/modelrouter modelrouter-${{ matrix.variant }}-${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: modelrouter-${{ matrix.target }}
-          path: modelrouter-${{ matrix.target }}
+          name: modelrouter-${{ matrix.variant }}-${{ matrix.target }}
+          path: modelrouter-${{ matrix.variant }}-${{ matrix.target }}
 
   release:
     name: Create GitHub Release
@@ -60,21 +100,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download default variant artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: modelrouter-default-*
           path: artifacts
+          merge-multiple: false
 
-      - name: Collect binaries
-        run: |
-          find artifacts -type f | xargs ls -la
+      - name: List artifacts
+        run: find artifacts -type f | xargs ls -la
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/modelrouter-x86_64-unknown-linux-gnu/modelrouter-x86_64-unknown-linux-gnu
-            artifacts/modelrouter-aarch64-unknown-linux-gnu/modelrouter-aarch64-unknown-linux-gnu
-            artifacts/modelrouter-aarch64-apple-darwin/modelrouter-aarch64-apple-darwin
+            artifacts/modelrouter-default-x86_64-unknown-linux-gnu/modelrouter-default-x86_64-unknown-linux-gnu
+            artifacts/modelrouter-default-aarch64-unknown-linux-gnu/modelrouter-default-aarch64-unknown-linux-gnu
+            artifacts/modelrouter-default-aarch64-apple-darwin/modelrouter-default-aarch64-apple-darwin
           generate_release_notes: true
 
   docker:
@@ -91,19 +132,34 @@ jobs:
       matrix:
         include:
           - variant: default
-            features: ""
             tag_suffix: ""
           - variant: otel
-            features: "otel"
             tag_suffix: "-otel"
           - variant: postgres
-            features: "postgres"
             tag_suffix: "-postgres"
           - variant: full
-            features: "otel,postgres,bedrock,prometheus"
             tag_suffix: "-full"
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: modelrouter-${{ matrix.variant }}-x86_64-unknown-linux-gnu
+          path: binaries
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: modelrouter-${{ matrix.variant }}-aarch64-unknown-linux-gnu
+          path: binaries
+
+      - name: Prepare binaries for Docker context
+        run: |
+          cp binaries/modelrouter-${{ matrix.variant }}-x86_64-unknown-linux-gnu modelrouter-linux-amd64
+          cp binaries/modelrouter-${{ matrix.variant }}-aarch64-unknown-linux-gnu modelrouter-linux-arm64
+          chmod +x modelrouter-linux-amd64 modelrouter-linux-arm64
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -122,11 +178,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
-          build-args: FEATURES=${{ matrix.features }}
-          cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}${{ matrix.tag_suffix }}
             ${{ !contains(github.ref_name, '-') && format('ghcr.io/{0}:latest{1}', env.IMAGE_NAME, matrix.tag_suffix) || '' }}

@@ -1,0 +1,17 @@
+# Release Dockerfile — uses pre-built binaries injected by CI.
+#
+# Expects the following files to exist in the build context before calling
+# `docker buildx build`:
+#   modelrouter-linux-amd64   (x86_64-unknown-linux-gnu binary)
+#   modelrouter-linux-arm64   (aarch64-unknown-linux-gnu binary)
+#
+# Docker Buildx sets TARGETARCH automatically when building multi-arch manifests.
+# For local use, build with the full Dockerfile instead.
+
+FROM gcr.io/distroless/cc-debian12
+
+ARG TARGETARCH
+COPY modelrouter-linux-${TARGETARCH} /modelrouter
+
+ENTRYPOINT ["/modelrouter"]
+CMD ["serve"]
