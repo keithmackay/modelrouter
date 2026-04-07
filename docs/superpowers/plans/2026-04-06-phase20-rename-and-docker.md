@@ -461,6 +461,84 @@ git push origin --delete v0.1.1-test
 
 ---
 
+## Releasing a New Version
+
+This section covers how to publish a release after the workflow is set up. Repeat these steps for every future release.
+
+### Step 1: Tag the release
+
+Tags must follow the `v*` pattern to trigger the workflow. Use semantic versioning:
+
+```bash
+# Stable release
+git tag v0.2.0
+git push origin v0.2.0
+
+# Pre-release (will NOT receive a `latest` tag — see note below)
+git tag v0.2.0-beta.1
+git push origin v0.2.0-beta.1
+```
+
+> **`latest` tag behavior:** The workflow applies `latest`/`latest-otel`/etc. only when the tag contains no `-` (i.e., stable releases). Pre-release tags like `v0.2.0-beta.1` get versioned tags only.
+
+### Step 2: Watch the Actions run
+
+Open `https://github.com/keithmackay/modelrouter/actions` and confirm all three jobs complete:
+
+| Job | What it does |
+|-----|-------------|
+| `build` (×4) | Compiles binaries for Linux x86_64, Linux arm64, macOS arm64, macOS x86_64 |
+| `release` | Creates a GitHub Release with those 4 binaries attached |
+| `docker` (×4) | Builds and pushes all 4 image variants to GHCR |
+
+If any `docker` job fails but `build` and `release` succeed, re-run just the failed matrix entry from the Actions UI — no need to re-tag.
+
+### Step 3: Verify the images were pushed
+
+After the workflow completes, the following tags will exist on GHCR (using `v0.2.0` as an example):
+
+```
+ghcr.io/keithmackay/modelrouter:v0.2.0
+ghcr.io/keithmackay/modelrouter:v0.2.0-otel
+ghcr.io/keithmackay/modelrouter:v0.2.0-postgres
+ghcr.io/keithmackay/modelrouter:v0.2.0-full
+ghcr.io/keithmackay/modelrouter:latest
+ghcr.io/keithmackay/modelrouter:latest-otel
+ghcr.io/keithmackay/modelrouter:latest-postgres
+ghcr.io/keithmackay/modelrouter:latest-full
+```
+
+Check them at: `https://github.com/keithmackay?tab=packages` or `https://github.com/keithmackay/modelrouter/pkgs/container/modelrouter`
+
+---
+
+## First-Time Package Privacy Setup (One-Time Manual Step)
+
+**GHCR packages are PUBLIC by default.** The workflow cannot set visibility — this must be done manually in the GitHub UI after the first push.
+
+### How to make the package private
+
+1. Go to `https://github.com/keithmackay/modelrouter/pkgs/container/modelrouter`
+2. Click **Package settings** (gear icon, right side)
+3. Scroll to **Danger Zone** → **Change visibility**
+4. Select **Private** → confirm
+
+> **This is a single package** (`modelrouter`) even though there are multiple tagged variants (`:latest`, `:latest-otel`, etc.). Setting the package to private covers all tags at once. You do not need to repeat this per tag or per variant.
+
+### Granting pull access to other users or machines
+
+Once private, only repo members with at least `read` access can pull the image. To pull on a machine:
+
+```bash
+# Authenticate with a GitHub Personal Access Token (PAT) that has `read:packages` scope
+echo "<YOUR_PAT>" | docker login ghcr.io -u <github-username> --password-stdin
+
+# Then pull normally
+docker pull ghcr.io/keithmackay/modelrouter:latest
+```
+
+---
+
 ## Completion Checklist
 
 - [ ] GitHub repos renamed (manual)
