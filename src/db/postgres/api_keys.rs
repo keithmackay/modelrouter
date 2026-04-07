@@ -14,6 +14,8 @@ struct ApiKeyRow {
     label: Option<String>,
     enabled: bool,
     created_at: String,
+    expires_at: Option<String>,
+    tag: Option<String>,
 }
 
 impl From<ApiKeyRow> for ApiKey {
@@ -25,6 +27,8 @@ impl From<ApiKeyRow> for ApiKey {
             label: r.label,
             enabled: r.enabled,
             created_at: r.created_at,
+            expires_at: r.expires_at,
+            tag: r.tag,
         }
     }
 }
@@ -33,7 +37,7 @@ impl From<ApiKeyRow> for ApiKey {
 impl ApiKeyRepository for PostgresDb {
     async fn find_api_key_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<ApiKey>> {
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at FROM api_keys WHERE key_hash = $1 AND enabled = true"
+            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, tag FROM api_keys WHERE key_hash = $1 AND enabled = true"
         )
         .bind(key_hash)
         .fetch_optional(&self.pool)
@@ -43,7 +47,7 @@ impl ApiKeyRepository for PostgresDb {
 
     async fn list_api_keys_for_user(&self, user_id: i64) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at FROM api_keys WHERE user_id = $1 ORDER BY id"
+            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, tag FROM api_keys WHERE user_id = $1 ORDER BY id"
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -54,14 +58,16 @@ impl ApiKeyRepository for PostgresDb {
     async fn create_api_key(&self, key: NewApiKey) -> anyhow::Result<ApiKey> {
         let now = now_utc();
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            r#"INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at)
-               VALUES ($1, $2, $3, true, $4)
-               RETURNING id, user_id, key_hash, label, enabled, created_at"#
+            r#"INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, tag)
+               VALUES ($1, $2, $3, true, $4, $5, $6)
+               RETURNING id, user_id, key_hash, label, enabled, created_at, expires_at, tag"#
         )
         .bind(key.user_id)
         .bind(&key.key_hash)
         .bind(&key.label)
         .bind(&now)
+        .bind(&key.expires_at)
+        .bind(&key.tag)
         .fetch_one(&self.pool)
         .await?;
         Ok(ApiKey::from(row))

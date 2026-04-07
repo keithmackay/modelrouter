@@ -18,6 +18,7 @@ struct UserRow {
     enabled: bool,
     created_at: String,
     metadata: String,
+    spend_reset_at: Option<String>,
 }
 
 impl From<UserRow> for User {
@@ -33,6 +34,8 @@ impl From<UserRow> for User {
             created_at: r.created_at,
             metadata: r.metadata,
             api_key_id: None,
+            spend_reset_at: r.spend_reset_at,
+            api_key_tag: None,
         }
     }
 }
@@ -43,7 +46,7 @@ impl UserRepository for PostgresDb {
         let now = chrono::Utc::now().to_rfc3339();
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users
                WHERE api_key = $1
                   OR (api_key_old = $2 AND api_key_old_expires_at > $3)
@@ -60,7 +63,7 @@ impl UserRepository for PostgresDb {
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE name = $1"#,
         )
         .bind(name)
@@ -72,7 +75,7 @@ impl UserRepository for PostgresDb {
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE id = $1"#,
         )
         .bind(id)
@@ -84,7 +87,7 @@ impl UserRepository for PostgresDb {
     async fn list(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, api_key, api_key_old, api_key_old_expires_at,
-                      group_name, enabled, created_at, metadata
+                      group_name, enabled, created_at, metadata, spend_reset_at
                FROM users ORDER BY id"#,
         )
         .fetch_all(&self.pool)
@@ -98,7 +101,7 @@ impl UserRepository for PostgresDb {
             r#"INSERT INTO users (name, api_key, group_name, enabled, created_at, metadata)
                VALUES ($1, $2, $3, true, $4, '{}')
                RETURNING id, name, api_key, api_key_old, api_key_old_expires_at,
-                         group_name, enabled, created_at, metadata"#,
+                         group_name, enabled, created_at, metadata, spend_reset_at"#,
         )
         .bind(&user.name)
         .bind(&user.api_key_hash)
@@ -131,6 +134,16 @@ impl UserRepository for PostgresDb {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn reset_spend(&self, user_id: i64) -> anyhow::Result<()> {
+        let now = now_utc();
+        sqlx::query("UPDATE users SET spend_reset_at = $1 WHERE id = $2")
+            .bind(&now)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

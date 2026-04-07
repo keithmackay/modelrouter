@@ -56,14 +56,14 @@ jobs:
             features: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -86,7 +86,7 @@ jobs:
           cp target/${{ matrix.target }}/release/modelrouter modelrouter-${{ matrix.variant }}-${{ matrix.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: modelrouter-${{ matrix.variant }}-${{ matrix.target }}
           path: modelrouter-${{ matrix.variant }}-${{ matrix.target }}
@@ -98,10 +98,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Download default variant artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.2.1
         with:
           pattern: modelrouter-default-*
           path: artifacts
@@ -141,16 +141,16 @@ jobs:
             tag_suffix: "-full"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Download amd64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.2.1
         with:
           name: modelrouter-${{ matrix.variant }}-x86_64-unknown-linux-gnu
           path: binaries
 
       - name: Download arm64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.2.1
         with:
           name: modelrouter-${{ matrix.variant }}-aarch64-unknown-linux-gnu
           path: binaries
