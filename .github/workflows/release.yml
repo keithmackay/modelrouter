@@ -102,6 +102,7 @@ jobs:
     env:
       IMAGE_NAME: ${{ github.repository }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - variant: default
@@ -143,4 +144,4 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}${{ matrix.tag_suffix }}
-            ghcr.io/${{ env.IMAGE_NAME }}:latest${{ matrix.tag_suffix }}
+            ${{ !contains(github.ref_name, '-') && format('ghcr.io/{0}:latest{1}', env.IMAGE_NAME, matrix.tag_suffix) || '' }}
