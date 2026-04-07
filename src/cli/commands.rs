@@ -104,6 +104,9 @@ pub enum ReportCommands {
     Cost {
         #[arg(long)]
         user: Option<String>,
+        /// Filter by API key tag (e.g. project name)
+        #[arg(long)]
+        tag: Option<String>,
         #[arg(long, default_value = "monthly")]
         window: String,
         #[arg(long, default_value = "table")]

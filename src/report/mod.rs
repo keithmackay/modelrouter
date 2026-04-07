@@ -56,6 +56,46 @@ pub struct HookStats {
     pub p99_duration_ms: i64,
 }
 
+pub async fn cost_by_tag_window(
+    pool: &sqlx::SqlitePool,
+    window: &str,
+    tag: &str,
+) -> Result<Vec<CostRow>> {
+    let window_start = window_start_str(window)?;
+    let rows = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(
+        r#"SELECT u.name, cl.model,
+                  COALESCE(SUM(cl.cost_usd), 0.0) as total_cost,
+                  COALESCE(SUM(cl.tokens_in), 0) as tokens_in,
+                  COALESCE(SUM(cl.tokens_out), 0) as tokens_out,
+                  COUNT(*) as request_count
+           FROM cost_ledger cl
+           JOIN users u ON cl.user_id = u.id
+           JOIN api_keys ak ON cl.api_key_id = ak.id
+           WHERE cl.created_at >= ? AND ak.tag = ?
+           GROUP BY u.name, cl.model
+           ORDER BY total_cost DESC"#,
+    )
+    .bind(&window_start)
+    .bind(tag)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count)| {
+                CostRow {
+                    user_name,
+                    model,
+                    total_cost_usd,
+                    total_tokens_in,
+                    total_tokens_out,
+                    request_count,
+                }
+            },
+        )
+        .collect())
+}
+
 pub async fn cost_by_user_window(
     pool: &sqlx::SqlitePool,
     window: &str,

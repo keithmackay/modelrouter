@@ -333,9 +333,39 @@ modelrouter report cost --window monthly
 # becky   anthropic/claude-opus-4-5    0.087600    12000        6800         31
 ```
 
-**Per project — usage by model across a group:**
+**Per project — cost by API key tag:**
 
-The `report usage` command filters by model and date range. To narrow to a project's spend, filter by `--since` and review the per-user breakdown alongside it:
+If a single user runs multiple projects, create one tagged API key per project via the admin API. Every cost entry is linked to the key that made the request, so `--tag` filters cost to exactly that project.
+
+Create a key with a tag (requires superadmin JWT — see [Admin API](#admin-api)):
+
+```bash
+# Create a tagged API key for user id=1
+curl -s http://localhost:8080/admin/api/users/1/keys \
+  -H "Authorization: Bearer <admin-jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "project-alpha key", "tag": "project-alpha"}'
+# → {"id":3,"key":"mr-xxxx...","label":"project-alpha key","tag":"project-alpha","created_at":"..."}
+# Save the key value — it cannot be retrieved later.
+```
+
+Set the returned key in the project's environment and use `--tag` to report its spend:
+
+```bash
+export ANTHROPIC_API_KEY="mr-xxxx..."   # the tagged key
+
+# Report cost for project-alpha only
+modelrouter report cost --tag project-alpha --window monthly
+# User    Model                        Cost (USD)   Tokens In   Tokens Out   Requests
+# abdoul  anthropic/claude-opus-4-5    0.019400     3200        1400         8
+
+# Report cost for a different project on the same user
+modelrouter report cost --tag project-beta --window monthly
+```
+
+Multiple projects can share a single user account — each project gets its own key and tag, and spend is tracked independently. `--user` and `--tag` are independent filters; you cannot combine them in a single command.
+
+**Per project — usage by model:**
 
 ```bash
 # Model-level breakdown since the start of the month
@@ -344,8 +374,6 @@ modelrouter report usage --since 2026-04-01T00:00:00Z
 # Detailed prompt log for Abdoul this week
 modelrouter report prompts --user abdoul --since 2026-03-25T00:00:00Z
 ```
-
-> **Note on project filtering:** The `report usage --project <name>` flag is available but requires a `project` label to be set on requests at the time they are made. This is not yet populated from request metadata. Until it is, use user groups and per-user reports as shown above to track project-level spend.
 
 **Check remaining budget headroom:**
 
