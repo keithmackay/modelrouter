@@ -17,6 +17,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - [Getting Started](#getting-started)
 - [Usage](#usage)
 - [Setup Walkthrough](#setup-walkthrough)
+- [Developer Setup](#developer-setup)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Development](#development)
@@ -335,57 +336,47 @@ modelrouter report cost --window monthly
 
 **Per project — cost by API key tag:**
 
-If a single user runs multiple projects, create one tagged API key per project via the admin API. Every cost entry is linked to the key that made the request, so `--tag` filters cost to exactly that project.
+Each project gets its own API key with a `tag`. Every cost entry is linked to the key that made the request, so filters compose to answer any question about spend. See [Developer Setup](#developer-setup) for how to configure per-project keys on developer machines.
 
-Create a key with a tag (requires superadmin JWT — see [Admin API](#admin-api)):
+Create a tagged key via the admin API (requires superadmin JWT):
 
 ```bash
-# Create a tagged API key for user id=1
 curl -s http://localhost:8080/admin/api/users/1/keys \
   -H "Authorization: Bearer <admin-jwt>" \
   -H "Content-Type: application/json" \
-  -d '{"label": "project-alpha key", "tag": "project-alpha"}'
-# → {"id":3,"key":"mr-xxxx...","label":"project-alpha key","tag":"project-alpha","created_at":"..."}
-# Save the key value — it cannot be retrieved later.
+  -d '{"label": "modelrouter dev — abdoul", "tag": "modelrouter"}'
+# → {"id":3,"key":"mr-xxxx...","label":"modelrouter dev — abdoul","tag":"modelrouter","created_at":"..."}
+# Save the key — it cannot be retrieved later.
 ```
 
-Set the returned key in the project's environment and use `--tag` to report its spend:
+**Cost report filter matrix:**
+
+`--user` and `--group` are mutually exclusive. `--tag` composes freely with either.
+
+| Command | What it shows |
+|---|---|
+| `report cost` | All users, all projects |
+| `report cost --user abdoul` | Abdoul across all his projects |
+| `report cost --group team-alpha` | All users in group, all projects |
+| `report cost --tag modelrouter` | All users on the `modelrouter` project |
+| `report cost --user abdoul --tag modelrouter` | Abdoul on `modelrouter` only |
+| `report cost --group team-alpha --tag modelrouter` | Entire group on `modelrouter` only |
 
 ```bash
-export ANTHROPIC_API_KEY="mr-xxxx..."   # the tagged key
-
-# Report cost for project-alpha only
-modelrouter report cost --tag project-alpha --window monthly
-# User    Model                        Cost (USD)   Tokens In   Tokens Out   Requests
-# abdoul  anthropic/claude-opus-4-5    0.019400     3200        1400         8
-
-# Report cost for a different project on the same user
-modelrouter report cost --tag project-beta --window monthly
-```
-
-Multiple projects can share a single user account — each project gets its own key and tag, and spend is tracked independently. `--user`, `--group`, and `--tag` can be used independently or combined (`--user` and `--group` are mutually exclusive):
-
-```bash
-# All users on project modelrouter (e.g. both abdoul and beatrice)
+# Cross-user project rollup — both abdoul and beatrice working on modelrouter
 modelrouter report cost --tag modelrouter --window monthly
 # User      Model                      Cost (USD)   Tokens In   Tokens Out   Requests
 # abdoul    anthropic/claude-opus-4-5  0.019400     3200        1400         8
 # beatrice  anthropic/claude-opus-4-5  0.031200     5100        2200         14
 
-# All projects for a single user
+# One user across all their projects
 modelrouter report cost --user abdoul --window monthly
 
-# One user, one project
+# Narrow to one user on one project
 modelrouter report cost --user abdoul --tag modelrouter --window monthly
-
-# All users in a group, all projects
-modelrouter report cost --group team-alpha --window monthly
-
-# All users in a group, one project
-modelrouter report cost --group team-alpha --tag modelrouter --window monthly
 ```
 
-**Per project — usage by model:**
+**Usage and prompt detail:**
 
 ```bash
 # Model-level breakdown since the start of the month
@@ -437,6 +428,154 @@ auto_provision_role = "admin"
 Restart modelrouter. Navigate to `http://localhost:8080/admin/auth/oidc/login` — you will be redirected to your IdP. After a successful login, modelrouter creates an admin account for you (if one doesn't already exist) and sets a session cookie.
 
 > **Note:** Password-based login at `/admin/login` remains available alongside OIDC. Existing admin accounts are not affected. OIDC-provisioned accounts have an empty password hash and cannot log in via the password form.
+
+---
+
+## Developer Setup
+
+This section covers how individual developers configure their local tools to route through modelrouter, and how to use per-project tagged keys so spend is attributed correctly.
+
+### How it works
+
+modelrouter is OpenAI-API-compatible. Every tool that supports a custom base URL and API key — Claude Code, Codex, Cursor, Continue, the OpenAI Python/Node SDKs — can be pointed at it. The developer sets two environment variables:
+
+- **Base URL** — points the tool at modelrouter instead of the upstream provider
+- **API key** — the modelrouter key that identifies the user and (if tagged) the project
+
+No code changes. No plugin. Just environment variables.
+
+### Global setup — one key for everything
+
+The simplest approach: one key per developer, set in their shell profile, applies to all projects.
+
+**`~/.zshrc` or `~/.bashrc`:**
+
+```bash
+# Route all AI tools through modelrouter
+export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
+export ANTHROPIC_API_KEY="mr-a1b2c3d4e5f6..."   # Abdoul's key
+
+# For OpenAI-compatible tools (Codex, Continue, etc.)
+export OPENAI_BASE_URL="http://modelrouter.internal:8080"
+export OPENAI_API_KEY="mr-a1b2c3d4e5f6..."       # same key — modelrouter accepts both
+```
+
+After `source ~/.zshrc`, every tool that reads these variables routes through modelrouter and records spend against Abdoul's account.
+
+### Per-project setup — one tagged key per project
+
+For per-project cost tracking, each project gets its own tagged API key. The admin creates it via the API, then the developer sets it in the project directory using [direnv](https://direnv.net/).
+
+**1. Admin creates a tagged key for the user:**
+
+```bash
+# Create a key tagged "modelrouter" for Abdoul (user id=1)
+curl -s http://modelrouter.internal:8080/admin/api/users/1/keys \
+  -H "Authorization: Bearer <admin-jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "modelrouter dev — abdoul", "tag": "modelrouter"}'
+# → {"id":3,"key":"mr-xxxx...","tag":"modelrouter",...}
+
+# Create a key tagged "other-app" for Abdoul
+curl -s http://modelrouter.internal:8080/admin/api/users/1/keys \
+  -H "Authorization: Bearer <admin-jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "other-app dev — abdoul", "tag": "other-app"}'
+# → {"id":4,"key":"mr-yyyy...","tag":"other-app",...}
+```
+
+**2. Developer installs direnv (once):**
+
+```bash
+# macOS
+brew install direnv
+
+# Add to ~/.zshrc or ~/.bashrc
+eval "$(direnv hook zsh)"   # or bash
+```
+
+**3. Developer creates a `.envrc` in each project root:**
+
+`~/Projects/modelrouter/.envrc`:
+```bash
+export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
+export ANTHROPIC_API_KEY="mr-xxxx..."   # the key tagged "modelrouter"
+export OPENAI_BASE_URL="http://modelrouter.internal:8080"
+export OPENAI_API_KEY="mr-xxxx..."
+```
+
+`~/Projects/other-app/.envrc`:
+```bash
+export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
+export ANTHROPIC_API_KEY="mr-yyyy..."   # the key tagged "other-app"
+export OPENAI_BASE_URL="http://modelrouter.internal:8080"
+export OPENAI_API_KEY="mr-yyyy..."
+```
+
+```bash
+# Allow each .envrc (once per directory)
+cd ~/Projects/modelrouter && direnv allow
+cd ~/Projects/other-app   && direnv allow
+```
+
+Now the correct key is automatically active whenever the developer `cd`s into a project. No manual switching. Claude Code, Codex, and any other tool in that shell session uses the project's key.
+
+> **Add `.envrc` to `.gitignore`** — it contains credentials and should never be committed.
+
+### Tool-specific notes
+
+**Claude Code**
+
+Claude Code reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` from the environment. No config file changes needed. When the env vars are set (globally or via direnv), Claude Code routes through modelrouter automatically.
+
+**OpenAI Codex CLI**
+
+Codex reads `OPENAI_BASE_URL` and `OPENAI_API_KEY`. modelrouter's `/v1/chat/completions` endpoint is fully OpenAI-compatible. Set both variables as shown above — Codex will not know it is talking to a proxy.
+
+**OpenAI Python or Node SDK**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://modelrouter.internal:8080/v1",
+    api_key="mr-xxxx...",
+)
+```
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://modelrouter.internal:8080/v1",
+  apiKey: "mr-xxxx...",
+});
+```
+
+**Other tools (Cursor, Continue, etc.)**
+
+Any tool with an "OpenAI base URL" or "custom endpoint" setting works. Point it at `http://modelrouter.internal:8080` and use the modelrouter API key as the API key. The tool does not need to know it is talking to a proxy.
+
+### What the resulting spend matrix looks like
+
+With Abdoul and Beatrice each having keys for `modelrouter` and `other-app`, the admin can slice spend any way:
+
+```bash
+# Total spend this month — everyone, everything
+modelrouter report cost --window monthly
+
+# All work on modelrouter — both developers combined
+modelrouter report cost --tag modelrouter --window monthly
+
+# Abdoul's total across both projects
+modelrouter report cost --user abdoul --window monthly
+
+# Abdoul on modelrouter only
+modelrouter report cost --user abdoul --tag modelrouter --window monthly
+
+# Beatrice on other-app only
+modelrouter report cost --user beatrice --tag other-app --window monthly
+```
 
 ---
 
