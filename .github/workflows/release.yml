@@ -19,8 +19,6 @@ jobs:
             os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-13-large
 
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +75,6 @@ jobs:
             artifacts/modelrouter-x86_64-unknown-linux-gnu/modelrouter-x86_64-unknown-linux-gnu
             artifacts/modelrouter-aarch64-unknown-linux-gnu/modelrouter-aarch64-unknown-linux-gnu
             artifacts/modelrouter-aarch64-apple-darwin/modelrouter-aarch64-apple-darwin
-            artifacts/modelrouter-x86_64-apple-darwin/modelrouter-x86_64-apple-darwin
           generate_release_notes: true
 
   docker:
