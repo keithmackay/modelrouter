@@ -363,7 +363,21 @@ modelrouter report cost --tag project-alpha --window monthly
 modelrouter report cost --tag project-beta --window monthly
 ```
 
-Multiple projects can share a single user account — each project gets its own key and tag, and spend is tracked independently. `--user` and `--tag` are independent filters; you cannot combine them in a single command.
+Multiple projects can share a single user account — each project gets its own key and tag, and spend is tracked independently. `--user` and `--tag` can be used independently or combined:
+
+```bash
+# All users on project modelrouter (e.g. both abdoul and beatrice)
+modelrouter report cost --tag modelrouter --window monthly
+# User      Model                      Cost (USD)   Tokens In   Tokens Out   Requests
+# abdoul    anthropic/claude-opus-4-5  0.019400     3200        1400         8
+# beatrice  anthropic/claude-opus-4-5  0.031200     5100        2200         14
+
+# All projects for a single user
+modelrouter report cost --user abdoul --window monthly
+
+# One user, one project
+modelrouter report cost --user abdoul --tag modelrouter --window monthly
+```
 
 **Per project — usage by model:**
 

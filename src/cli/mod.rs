@@ -475,12 +475,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             match report_args.command {
                 ReportCommands::Cost { user, tag, window, format } => {
-                    let rows = if let Some(ref t) = tag {
-                        crate::report::cost_by_tag_window(&db.pool, &window, t).await?
-                    } else {
-                        crate::report::cost_by_user_window(&db.pool, &window, user.as_deref())
-                            .await?
-                    };
+                    let rows = crate::report::cost_by_user_window(
+                        &db.pool, &window, user.as_deref(), tag.as_deref(),
+                    ).await?;
                     print_rows(
                         &rows,
                         &["User", "Model", "Cost (USD)", "Tokens In", "Tokens Out", "Requests"],

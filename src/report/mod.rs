@@ -56,13 +56,34 @@ pub struct HookStats {
     pub p99_duration_ms: i64,
 }
 
-pub async fn cost_by_tag_window(
+pub async fn cost_by_user_window(
     pool: &sqlx::SqlitePool,
     window: &str,
-    tag: &str,
+    user_name: Option<&str>,
+    tag: Option<&str>,
 ) -> Result<Vec<CostRow>> {
     let window_start = window_start_str(window)?;
-    let rows = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(
+
+    // Build query dynamically based on which filters are set.
+    // When tag is present we must join api_keys; otherwise the join is skipped.
+    let (join_clause, where_extras) = match tag {
+        Some(_) => (
+            "JOIN api_keys ak ON cl.api_key_id = ak.id",
+            match user_name {
+                Some(_) => " AND u.name = ? AND ak.tag = ?",
+                None    => " AND ak.tag = ?",
+            },
+        ),
+        None => (
+            "",
+            match user_name {
+                Some(_) => " AND u.name = ?",
+                None    => "",
+            },
+        ),
+    };
+
+    let sql = format!(
         r#"SELECT u.name, cl.model,
                   COALESCE(SUM(cl.cost_usd), 0.0) as total_cost,
                   COALESCE(SUM(cl.tokens_in), 0) as tokens_in,
@@ -70,103 +91,31 @@ pub async fn cost_by_tag_window(
                   COUNT(*) as request_count
            FROM cost_ledger cl
            JOIN users u ON cl.user_id = u.id
-           JOIN api_keys ak ON cl.api_key_id = ak.id
-           WHERE cl.created_at >= ? AND ak.tag = ?
+           {join}
+           WHERE cl.created_at >= ?{extras}
            GROUP BY u.name, cl.model
            ORDER BY total_cost DESC"#,
-    )
-    .bind(&window_start)
-    .bind(tag)
-    .fetch_all(pool)
-    .await?;
+        join = join_clause,
+        extras = where_extras,
+    );
+
+    let mut q = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(&sql);
+    q = q.bind(&window_start);
+    // Bind positional parameters in the order they appear in the WHERE clause.
+    if tag.is_some() {
+        if let Some(name) = user_name { q = q.bind(name); }
+        q = q.bind(tag.unwrap());
+    } else if let Some(name) = user_name {
+        q = q.bind(name);
+    }
+
+    let rows = q.fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .map(
-            |(user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count)| {
-                CostRow {
-                    user_name,
-                    model,
-                    total_cost_usd,
-                    total_tokens_in,
-                    total_tokens_out,
-                    request_count,
-                }
-            },
-        )
+        .map(|(user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count)| {
+            CostRow { user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count }
+        })
         .collect())
-}
-
-pub async fn cost_by_user_window(
-    pool: &sqlx::SqlitePool,
-    window: &str,
-    user_name: Option<&str>,
-) -> Result<Vec<CostRow>> {
-    let window_start = window_start_str(window)?;
-
-    if let Some(name) = user_name {
-        let rows = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(
-            r#"SELECT u.name, cl.model,
-                      COALESCE(SUM(cl.cost_usd), 0.0) as total_cost,
-                      COALESCE(SUM(cl.tokens_in), 0) as tokens_in,
-                      COALESCE(SUM(cl.tokens_out), 0) as tokens_out,
-                      COUNT(*) as request_count
-               FROM cost_ledger cl
-               JOIN users u ON cl.user_id = u.id
-               WHERE cl.created_at >= ? AND u.name = ?
-               GROUP BY u.name, cl.model
-               ORDER BY total_cost DESC"#,
-        )
-        .bind(&window_start)
-        .bind(name)
-        .fetch_all(pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count)| {
-                    CostRow {
-                        user_name,
-                        model,
-                        total_cost_usd,
-                        total_tokens_in,
-                        total_tokens_out,
-                        request_count,
-                    }
-                },
-            )
-            .collect())
-    } else {
-        let rows = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(
-            r#"SELECT u.name, cl.model,
-                      COALESCE(SUM(cl.cost_usd), 0.0) as total_cost,
-                      COALESCE(SUM(cl.tokens_in), 0) as tokens_in,
-                      COALESCE(SUM(cl.tokens_out), 0) as tokens_out,
-                      COUNT(*) as request_count
-               FROM cost_ledger cl
-               JOIN users u ON cl.user_id = u.id
-               WHERE cl.created_at >= ?
-               GROUP BY u.name, cl.model
-               ORDER BY total_cost DESC"#,
-        )
-        .bind(&window_start)
-        .fetch_all(pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count)| {
-                    CostRow {
-                        user_name,
-                        model,
-                        total_cost_usd,
-                        total_tokens_in,
-                        total_tokens_out,
-                        request_count,
-                    }
-                },
-            )
-            .collect())
-    }
 }
 
 pub async fn usage_by_model(
