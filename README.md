@@ -522,6 +522,47 @@ Now the correct key is automatically active whenever the developer `cd`s into a 
 
 > **Add `.envrc` to `.gitignore`** — it contains credentials and should never be committed.
 
+### Mixing modelrouter and direct Anthropic access
+
+modelrouter is only in the path when a tool is explicitly pointed at it. If `ANTHROPIC_BASE_URL` is not set, Claude Code and the Anthropic SDK talk directly to Anthropic as normal. This makes it easy to opt only specific projects in, leaving everything else unchanged.
+
+**Pattern 1 — Direct Anthropic by default, opt specific projects into modelrouter (recommended for most teams)**
+
+Shell profile uses a real Anthropic key with no base URL override:
+
+```bash
+# ~/.zshrc — direct Anthropic everywhere by default
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Projects that should be tracked add a `.envrc` that switches to modelrouter:
+
+```bash
+# ~/Projects/work-project/.envrc
+export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
+export ANTHROPIC_API_KEY="mr-xxxx..."   # modelrouter key for this project
+```
+
+When the developer `cd`s into `work-project`, direnv activates the modelrouter vars. When they leave, the vars are unset and direct Anthropic resumes. Personal projects and any directory without a `.envrc` are unaffected.
+
+**Pattern 2 — modelrouter by default, opt specific projects out**
+
+Shell profile points at modelrouter globally, and personal or private projects revert to direct Anthropic:
+
+```bash
+# ~/.zshrc — route everything through modelrouter by default
+export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
+export ANTHROPIC_API_KEY="mr-default..."
+```
+
+```bash
+# ~/Projects/personal-project/.envrc
+unset ANTHROPIC_BASE_URL        # remove the override — revert to direct Anthropic
+export ANTHROPIC_API_KEY="sk-ant-..."   # personal Anthropic key
+```
+
+Pattern 1 is safer for developers who have personal Anthropic usage alongside org work — there is no risk of accidentally routing private sessions through the org's proxy.
+
 ### Tool-specific notes
 
 **Claude Code**
