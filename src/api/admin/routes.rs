@@ -504,7 +504,7 @@ pub async fn list_user_api_keys(
 #[derive(serde::Deserialize)]
 pub struct CreateApiKeyRequest {
     pub label: Option<String>,
-    pub tag: Option<String>,
+    pub project: Option<String>,
 }
 
 pub async fn create_user_api_key(
@@ -524,7 +524,7 @@ pub async fn create_user_api_key(
         key_hash,
         label: body.label,
         expires_at: None,
-        tag: body.tag,
+        project: body.project,
     })
     .await
     .map_err(|_| ApiError::Internal)?;
@@ -536,7 +536,7 @@ pub async fn create_user_api_key(
         "create_api_key",
         Some(format!("user:{}", user_id)),
         None,
-        Some(format!("label:{:?} tag:{:?}", created.label, created.tag)),
+        Some(format!("label:{:?} project:{:?}", created.label, created.project)),
     )
     .await;
 
@@ -545,7 +545,7 @@ pub async fn create_user_api_key(
         "id": created.id,
         "key": raw_key,
         "label": created.label,
-        "tag": created.tag,
+        "project": created.project,
         "created_at": created.created_at,
     })))
 }

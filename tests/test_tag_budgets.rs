@@ -1,13 +1,15 @@
 // tests/test_tag_budgets.rs
+// Note: api_keys.tag has been replaced by api_keys.project for per-project cost attribution.
+// BudgetRule.tag is retained as a potential future addition for tag-based budget rules.
 
 #[test]
-fn api_key_tag_field_compiles() {
+fn api_key_project_field_compiles() {
     let _key = modelrouter::db::models::NewApiKey {
         user_id: 1,
         key_hash: "abc".to_string(),
         label: None,
         expires_at: None,
-        tag: Some("ci".to_string()),
+        project: Some("my-project".to_string()),
     };
 }
 
@@ -29,7 +31,7 @@ fn budget_rule_tag_field_compiles() {
 }
 
 #[test]
-fn user_has_api_key_tag_field() {
+fn user_has_api_key_project_field() {
     let user = modelrouter::db::models::User {
         id: 1,
         name: "test".to_string(),
@@ -42,7 +44,7 @@ fn user_has_api_key_tag_field() {
         metadata: "{}".to_string(),
         api_key_id: None,
         spend_reset_at: None,
-        api_key_tag: None,
+        api_key_project: None,
     };
-    assert!(user.api_key_tag.is_none());
+    assert!(user.api_key_project.is_none());
 }

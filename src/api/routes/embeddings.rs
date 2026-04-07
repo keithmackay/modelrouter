@@ -133,6 +133,7 @@ async fn embeddings_inner(
     let provider_clone = provider_name.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
+    let user_project = user.api_key_project.clone();
     let prompt_tokens = result.prompt_tokens;
 
     tokio::spawn(async move {
@@ -150,7 +151,7 @@ async fn embeddings_inner(
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
-            project: None,
+            project: user_project.clone(),
         };
         match PromptRepository::create(&*state_clone.db, prompt).await {
             Ok(saved) => {
@@ -159,7 +160,7 @@ async fn embeddings_inner(
                     prompt_id: saved.id,
                     model: canonical_clone,
                     provider: provider_clone,
-                    project: None,
+                    project: user_project.clone(),
                     tokens_in: prompt_tokens as i64,
                     tokens_out: 0,
                     cost_usd: cost,

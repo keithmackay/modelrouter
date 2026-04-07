@@ -108,9 +108,9 @@ pub enum ReportCommands {
         /// Filter by group name
         #[arg(long, conflicts_with = "user")]
         group: Option<String>,
-        /// Filter by API key tag (e.g. project name)
+        /// Filter by project (matches api_keys.project assigned at key creation)
         #[arg(long)]
-        tag: Option<String>,
+        project: Option<String>,
         #[arg(long, default_value = "monthly")]
         window: String,
         #[arg(long, default_value = "table")]

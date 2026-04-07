@@ -14,7 +14,7 @@ struct ApiKeyRow {
     #[sqlx(default)]
     expires_at: Option<String>,
     #[sqlx(default)]
-    tag: Option<String>,
+    project: Option<String>,
 }
 
 impl From<ApiKeyRow> for ApiKey {
@@ -27,7 +27,7 @@ impl From<ApiKeyRow> for ApiKey {
             enabled: r.enabled != 0,
             created_at: r.created_at,
             expires_at: r.expires_at,
-            tag: r.tag,
+            project: r.project,
         }
     }
 }
@@ -36,7 +36,7 @@ impl From<ApiKeyRow> for ApiKey {
 impl ApiKeyRepository for SqliteDb {
     async fn find_api_key_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<ApiKey>> {
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, tag FROM api_keys WHERE key_hash = ? AND enabled = 1"
+            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE key_hash = ? AND enabled = 1"
         )
         .bind(key_hash)
         .fetch_optional(&self.pool)
@@ -46,7 +46,7 @@ impl ApiKeyRepository for SqliteDb {
 
     async fn list_api_keys_for_user(&self, user_id: i64) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, tag FROM api_keys WHERE user_id = ? ORDER BY id"
+            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE user_id = ? ORDER BY id"
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -57,20 +57,20 @@ impl ApiKeyRepository for SqliteDb {
     async fn create_api_key(&self, key: NewApiKey) -> anyhow::Result<ApiKey> {
         let now = now_utc();
         let result = sqlx::query(
-            "INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, tag) VALUES (?, ?, ?, 1, ?, ?, ?)"
+            "INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, project) VALUES (?, ?, ?, 1, ?, ?, ?)"
         )
         .bind(key.user_id)
         .bind(&key.key_hash)
         .bind(&key.label)
         .bind(&now)
         .bind(&key.expires_at)
-        .bind(&key.tag)
+        .bind(&key.project)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, tag FROM api_keys WHERE id = ?"
+            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE id = ?"
         )
         .bind(id)
         .fetch_one(&self.pool)

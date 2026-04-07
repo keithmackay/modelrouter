@@ -5,7 +5,7 @@ use crate::db::models::User;
 /// An all-None condition matches everything.
 pub fn condition_matches(condition: &PolicyConditionConfig, user: &User, model: &str) -> bool {
     if let Some(tag) = &condition.tag {
-        if user.api_key_tag.as_deref() != Some(tag.as_str()) {
+        if user.api_key_project.as_deref() != Some(tag.as_str()) {
             return false;
         }
     }
@@ -57,7 +57,7 @@ mod tests {
             metadata: "{}".to_string(),
             api_key_id: None,
             spend_reset_at: None,
-            api_key_tag: tag.map(str::to_string),
+            api_key_project: tag.map(str::to_string),
         }
     }
 

@@ -85,7 +85,7 @@ async fn api_key_auth_works() {
         key_hash: hash_token("per-key-token"),
         label: Some("test-key".to_string()),
         expires_at: None,
-        tag: None,
+        project: None,
     })
     .await
     .unwrap();
@@ -132,7 +132,7 @@ async fn revoked_api_key_returns_401() {
         key_hash: hash_token("revokable-token"),
         label: None,
         expires_at: None,
-        tag: None,
+        project: None,
     })
     .await
     .unwrap();

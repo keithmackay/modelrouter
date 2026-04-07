@@ -126,6 +126,7 @@ async fn responses_inner(
     let db = state.db.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
+    let user_project = user.api_key_project.clone();
     let model_clone = model.clone();
     let canonical_clone = canonical_model.clone();
     let provider_clone = provider_name.clone();
@@ -153,7 +154,7 @@ async fn responses_inner(
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
-            project: None,
+            project: user_project.clone(),
         };
         match PromptRepository::create(&*db, prompt).await {
             Ok(saved_prompt) => {
@@ -162,7 +163,7 @@ async fn responses_inner(
                     prompt_id: saved_prompt.id,
                     model: canonical_clone,
                     provider: provider_clone,
-                    project: None,
+                    project: user_project.clone(),
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
                     cost_usd: cost,

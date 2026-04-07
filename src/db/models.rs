@@ -17,9 +17,9 @@ pub struct User {
     /// If set, only costs recorded after this timestamp count toward budget limits.
     #[sqlx(default)]
     pub spend_reset_at: Option<String>,
-    /// Tag from the authenticating API key. Set in memory by auth extractor.
+    /// Project from the authenticating API key. Set in memory by auth extractor.
     #[sqlx(default)]
-    pub api_key_tag: Option<String>,
+    pub api_key_project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,8 +32,8 @@ pub struct ApiKey {
     pub created_at: String,
     /// RFC3339 UTC expiry. None = never expires.
     pub expires_at: Option<String>,
-    /// Optional tag for per-tag budget matching (e.g., "ci", "project-x").
-    pub tag: Option<String>,
+    /// Project this key is associated with (e.g., "modelrouter-api", "other-app").
+    pub project: Option<String>,
 }
 
 impl ApiKey {
@@ -56,7 +56,7 @@ pub struct NewApiKey {
     pub key_hash: String,
     pub label: Option<String>,
     pub expires_at: Option<String>,
-    pub tag: Option<String>,
+    pub project: Option<String>,
 }
 
 #[derive(Debug)]

@@ -32,7 +32,7 @@ fn test_user(tag: Option<&str>) -> User {
         metadata: "{}".to_string(),
         api_key_id: None,
         spend_reset_at: None,
-        api_key_tag: tag.map(|s| s.to_string()),
+        api_key_project: tag.map(|s| s.to_string()),
     }
 }
 

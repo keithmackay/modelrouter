@@ -231,6 +231,7 @@ async fn chat_completions_inner(
                 state: state.clone(),
                 user_id: user.id,
                 api_key_id: user.api_key_id,
+                user_project: user.api_key_project.clone(),
                 user_name: user.name.clone(),
                 model: model.clone(),
                 canonical_model: canonical_model.clone(),
@@ -377,6 +378,7 @@ async fn chat_completions_inner(
     let finish_clone = result.finish_reason.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
+    let user_project = user.api_key_project.clone();
     let user_name_clone = user.name.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
@@ -396,7 +398,7 @@ async fn chat_completions_inner(
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
-            project: None,
+            project: user_project.clone(),
         };
         match PromptRepository::create(&*state_clone.db, prompt).await {
             Ok(saved_prompt) => {
@@ -405,7 +407,7 @@ async fn chat_completions_inner(
                     prompt_id: saved_prompt.id,
                     model: canonical_clone.clone(),
                     provider: provider_clone.clone(),
-                    project: None,
+                    project: user_project.clone(),
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
                     cost_usd: cost,
@@ -457,6 +459,7 @@ struct StreamLogCtx {
     state: AppState,
     user_id: i64,
     api_key_id: Option<i64>,
+    user_project: Option<String>,
     user_name: String,
     model: String,
     canonical_model: String,
@@ -481,6 +484,7 @@ fn log_streaming_request(
     let lifecycle_hooks = ctx.state.settings.hooks.lifecycle.clone();
     let user_id = ctx.user_id;
     let api_key_id = ctx.api_key_id;
+    let user_project = ctx.user_project;
     let user_name = ctx.user_name;
     let model = ctx.model;
     let canonical_model = ctx.canonical_model;
@@ -518,6 +522,7 @@ fn log_streaming_request(
                 let messages_c = messages_json.clone();
                 let user_name_c = user_name.clone();
                 let lifecycle_hooks_c = lifecycle_hooks.clone();
+                let user_project_c = user_project.clone();
 
                 tokio::spawn(async move {
                     use crate::db::repositories::{
@@ -539,7 +544,7 @@ fn log_streaming_request(
                         cost_usd: cost,
                         latency_ms: Some(latency_ms),
                         tags: "[]".to_string(),
-                        project: None,
+                        project: user_project_c.clone(),
                     };
                     match PromptRepository::create(&*db_c, prompt).await {
                         Ok(saved) => {
@@ -548,7 +553,7 @@ fn log_streaming_request(
                                 prompt_id: saved.id,
                                 model: canonical_c.clone(),
                                 provider: provider_c,
-                                project: None,
+                                project: user_project_c.clone(),
                                 tokens_in: prompt_tokens as i64,
                                 tokens_out: completion_tokens as i64,
                                 cost_usd: cost,

@@ -108,11 +108,8 @@ impl PolicyEngine {
             let key_rules = BudgetRepository::list_for_key(&*self.db, key_id).await?;
             rules = key_rules.into_iter().chain(rules).collect();
         }
-        // Include budget rules targeting this key's tag (lowest priority — appended last)
-        if let Some(tag) = &user.api_key_tag {
-            let tag_rules = self.db.list_for_tag(tag).await.unwrap_or_default();
-            rules.extend(tag_rules);
-        }
+        // Note: tag-based budget rules (BudgetRule.tag) are a potential future addition.
+        // api_key_tag has been replaced by api_key_project (project attribution, not bearer-embedded).
 
         let mut min_concurrent: Option<u32> = None;
 

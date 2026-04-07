@@ -61,17 +61,14 @@ pub async fn cost_by_user_window(
     window: &str,
     user_name: Option<&str>,
     group_name: Option<&str>,
-    tag: Option<&str>,
+    project: Option<&str>,
 ) -> Result<Vec<CostRow>> {
     let window_start = window_start_str(window)?;
-
-    // Build WHERE extras and optional api_keys join dynamically.
-    let key_join = if tag.is_some() { "JOIN api_keys ak ON cl.api_key_id = ak.id" } else { "" };
 
     let mut extras = String::new();
     if user_name.is_some()  { extras.push_str(" AND u.name = ?"); }
     if group_name.is_some() { extras.push_str(" AND u.group_name = ?"); }
-    if tag.is_some()        { extras.push_str(" AND ak.tag = ?"); }
+    if project.is_some()    { extras.push_str(" AND cl.project = ?"); }
 
     let sql = format!(
         r#"SELECT u.name, cl.model,
@@ -81,7 +78,6 @@ pub async fn cost_by_user_window(
                   COUNT(*) as request_count
            FROM cost_ledger cl
            JOIN users u ON cl.user_id = u.id
-           {key_join}
            WHERE cl.created_at >= ?{extras}
            GROUP BY u.name, cl.model
            ORDER BY total_cost DESC"#,
@@ -91,7 +87,7 @@ pub async fn cost_by_user_window(
     q = q.bind(&window_start);
     if let Some(v) = user_name  { q = q.bind(v); }
     if let Some(v) = group_name { q = q.bind(v); }
-    if let Some(v) = tag        { q = q.bind(v); }
+    if let Some(v) = project    { q = q.bind(v); }
 
     let rows = q.fetch_all(pool).await?;
     Ok(rows
