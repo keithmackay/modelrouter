@@ -474,9 +474,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             use crate::cli::commands::ReportCommands;
 
             match report_args.command {
-                ReportCommands::Cost { user, tag, window, format } => {
+                ReportCommands::Cost { user, group, tag, window, format } => {
                     let rows = crate::report::cost_by_user_window(
-                        &db.pool, &window, user.as_deref(), tag.as_deref(),
+                        &db.pool, &window, user.as_deref(), group.as_deref(), tag.as_deref(),
                     ).await?;
                     print_rows(
                         &rows,

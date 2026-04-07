@@ -102,8 +102,12 @@ pub struct ReportArgs {
 pub enum ReportCommands {
     /// Cost report
     Cost {
-        #[arg(long)]
+        /// Filter by user name
+        #[arg(long, conflicts_with = "group")]
         user: Option<String>,
+        /// Filter by group name
+        #[arg(long, conflicts_with = "user")]
+        group: Option<String>,
         /// Filter by API key tag (e.g. project name)
         #[arg(long)]
         tag: Option<String>,

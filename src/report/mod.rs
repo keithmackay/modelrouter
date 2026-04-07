@@ -60,28 +60,18 @@ pub async fn cost_by_user_window(
     pool: &sqlx::SqlitePool,
     window: &str,
     user_name: Option<&str>,
+    group_name: Option<&str>,
     tag: Option<&str>,
 ) -> Result<Vec<CostRow>> {
     let window_start = window_start_str(window)?;
 
-    // Build query dynamically based on which filters are set.
-    // When tag is present we must join api_keys; otherwise the join is skipped.
-    let (join_clause, where_extras) = match tag {
-        Some(_) => (
-            "JOIN api_keys ak ON cl.api_key_id = ak.id",
-            match user_name {
-                Some(_) => " AND u.name = ? AND ak.tag = ?",
-                None    => " AND ak.tag = ?",
-            },
-        ),
-        None => (
-            "",
-            match user_name {
-                Some(_) => " AND u.name = ?",
-                None    => "",
-            },
-        ),
-    };
+    // Build WHERE extras and optional api_keys join dynamically.
+    let key_join = if tag.is_some() { "JOIN api_keys ak ON cl.api_key_id = ak.id" } else { "" };
+
+    let mut extras = String::new();
+    if user_name.is_some()  { extras.push_str(" AND u.name = ?"); }
+    if group_name.is_some() { extras.push_str(" AND u.group_name = ?"); }
+    if tag.is_some()        { extras.push_str(" AND ak.tag = ?"); }
 
     let sql = format!(
         r#"SELECT u.name, cl.model,
@@ -91,23 +81,17 @@ pub async fn cost_by_user_window(
                   COUNT(*) as request_count
            FROM cost_ledger cl
            JOIN users u ON cl.user_id = u.id
-           {join}
+           {key_join}
            WHERE cl.created_at >= ?{extras}
            GROUP BY u.name, cl.model
            ORDER BY total_cost DESC"#,
-        join = join_clause,
-        extras = where_extras,
     );
 
     let mut q = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(&sql);
     q = q.bind(&window_start);
-    // Bind positional parameters in the order they appear in the WHERE clause.
-    if tag.is_some() {
-        if let Some(name) = user_name { q = q.bind(name); }
-        q = q.bind(tag.unwrap());
-    } else if let Some(name) = user_name {
-        q = q.bind(name);
-    }
+    if let Some(v) = user_name  { q = q.bind(v); }
+    if let Some(v) = group_name { q = q.bind(v); }
+    if let Some(v) = tag        { q = q.bind(v); }
 
     let rows = q.fetch_all(pool).await?;
     Ok(rows
