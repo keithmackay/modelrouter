@@ -5,7 +5,7 @@ use crate::db::repositories::{
     admin_users::AdminUserRepository,
     audit::AuditRepository,
 };
-use crate::report::formatter::{print_rows, OutputFormat};
+use crate::report::formatter::print_rows;
 
 /// DB bootstrap shared by all admin commands.
 /// NOTE: Always uses SQLite. The `--features postgres` build still uses SQLite
@@ -58,7 +58,6 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
                 anyhow::bail!("passwords do not match");
             }
 
-            let role_str = role.to_string();
             let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
                 .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
 
@@ -67,7 +66,7 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
                 crate::db::models::NewAdminUser {
                     name: name.clone(),
                     password_hash,
-                    role: role_str.clone(),
+                    role: role.to_string(),
                 },
             )
             .await?;
