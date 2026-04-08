@@ -1,0 +1,62 @@
+# docker-compose.otel.yml — modelrouter with OpenTelemetry observability stack
+#
+# Usage:
+#   1. Copy config.example.toml → config/config.toml and add your provider API keys
+#   2. docker-compose -f docker-compose.otel.yml up -d
+#
+# Services:
+#   modelrouter   http://localhost:8080   (proxy, built with --features otel)
+#   otel-collector                        (OTLP gRPC :4317, HTTP :4318)
+#   jaeger        http://localhost:16686  (trace UI)
+#   prometheus    http://localhost:9090   (metrics UI)
+#
+# To view traces: open http://localhost:16686
+# To view metrics: open http://localhost:9090
+
+services:
+  modelrouter:
+    image: modelrouter:otel
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FEATURES: "otel"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    environment:
+      MODELROUTER_CONFIG: /config/config.toml
+      MODELROUTER_DATABASE__PATH: /data/router.db
+    restart: unless-stopped
+    command: ["serve", "--host", "0.0.0.0"]
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    volumes:
+      - ./otel-collector/config.yml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus scrape endpoint (collector self-metrics)
+    depends_on:
+      - jaeger
+      - prometheus
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # gRPC for collector → jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./otel-collector/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"

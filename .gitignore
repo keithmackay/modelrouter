@@ -5,3 +5,7 @@
 
 /target
 session_stats.md
+
+# Local dev config and data (contain secrets / DB files)
+/config/
+/data/

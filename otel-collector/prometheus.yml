@@ -1,0 +1,8 @@
+# Prometheus scrape config — pulls metrics from the OTel Collector's Prometheus exporter
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: modelrouter
+    static_configs:
+      - targets: ["otel-collector:8889"]
