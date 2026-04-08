@@ -1,0 +1,6 @@
+target/
+.worktrees/
+config/
+data/
+*.md
+.git/

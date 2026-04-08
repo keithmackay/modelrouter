@@ -1,0 +1,14 @@
+[package]
+name = "auto-future"
+authors = ["Joseph Lenton <josephlenton@gmail.com>"]
+description = "For quickly making a struct into a future via an async fn"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+keywords = ["async", "future", "futures"]
+categories = ["asynchronous"]
+repository = "https://github.com/JosephLenton/auto-future"
+documentation = "https://docs.rs/auto-future/latest/auto-future"
+readme = "README.md"
+
+[dependencies]
