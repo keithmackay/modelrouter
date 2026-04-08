@@ -5,15 +5,15 @@
 <div class="stat-grid">
     <div class="stat-card">
         <div class="stat-label">Spend Today</div>
-        <div class="stat-value">${{ spend_today | round(precision=4) }}</div>
+        <div class="stat-value">${{ spend_today | round(4) }}</div>
     </div>
     <div class="stat-card">
         <div class="stat-label">Spend This Week</div>
-        <div class="stat-value">${{ spend_week | round(precision=4) }}</div>
+        <div class="stat-value">${{ spend_week | round(4) }}</div>
     </div>
     <div class="stat-card">
         <div class="stat-label">Spend This Month</div>
-        <div class="stat-value">${{ spend_month | round(precision=4) }}</div>
+        <div class="stat-value">${{ spend_month | round(4) }}</div>
     </div>
     <div class="stat-card">
         <div class="stat-label">Total Requests</div>
@@ -25,7 +25,7 @@
 <h2 style="margin-bottom: 0.75rem; font-size: 1.1rem;">Budget Warnings</h2>
 {% for w in budget_warnings %}
 <div class="alert alert-warning">
-    <strong>{{ w.user_name }}</strong> has spent ${{ w.spend | round(precision=4) }} of ${{ w.limit | round(precision=4) }} ({{ (w.spend / w.limit * 100) | int }}% of {{ w.window }} budget)
+    <strong>{{ w.user_name }}</strong> has spent ${{ w.spend | round(4) }} of ${{ w.limit | round(4) }} ({{ (w.spend / w.limit * 100) | int }}% of {{ w.window }} budget)
 </div>
 {% endfor %}
 {% endif %}

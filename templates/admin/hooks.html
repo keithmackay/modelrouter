@@ -19,8 +19,8 @@
         <tr>
             <td>{{ h.hook_name }}</td>
             <td>{{ h.invocation_count }}</td>
-            <td>{{ (h.success_rate * 100) | round(precision=1) }}%</td>
-            <td>{{ h.avg_duration_ms | round(precision=1) }}</td>
+            <td>{{ (h.success_rate * 100) | round(1) }}%</td>
+            <td>{{ h.avg_duration_ms | round(1) }}</td>
             <td>{{ h.p50_duration_ms }}</td>
             <td>{{ h.p95_duration_ms }}</td>
             <td>{{ h.p99_duration_ms }}</td>

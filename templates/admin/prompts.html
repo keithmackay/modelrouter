@@ -22,7 +22,7 @@
             <td>{{ p.user_id }}</td>
             <td>{{ p.request_model }}</td>
             <td>{{ p.routed_model }}</td>
-            <td>${{ p.cost_usd | round(precision=6) }}</td>
+            <td>${{ p.cost_usd | round(6) }}</td>
             <td>{{ p.prompt_tokens }} / {{ p.completion_tokens }}</td>
             <td>{{ p.created_at }}</td>
             <td>
