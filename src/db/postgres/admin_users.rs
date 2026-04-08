@@ -139,4 +139,13 @@ impl AdminUserRepository for PostgresDb {
         .await?;
         Ok(AdminUser::from(row))
     }
+
+    async fn update_password_hash(&self, id: i64, hash: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE admin_users SET password_hash = $1 WHERE id = $2")
+            .bind(hash)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

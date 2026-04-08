@@ -12,4 +12,5 @@ pub trait AdminUserRepository: Send + Sync {
     async fn update_last_login(&self, id: i64) -> anyhow::Result<()>;
     async fn find_by_oidc_subject(&self, subject: &str) -> anyhow::Result<Option<AdminUser>>;
     async fn create_from_oidc(&self, user: NewAdminUserFromOidc) -> anyhow::Result<AdminUser>;
+    async fn update_password_hash(&self, id: i64, hash: &str) -> anyhow::Result<()>;
 }
