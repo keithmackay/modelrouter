@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "1"
 anyhow = "1"
 bcrypt = "0.15"
+rpassword = "7"
 jsonwebtoken = "9"
 comfy-table = "7"
 tower = { version = "0.4", features = ["util"] }
