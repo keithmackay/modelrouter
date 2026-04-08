@@ -98,7 +98,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     };
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
-        get_overview, get_users, post_disable_user, post_enable_user, post_rotate_user_key,
+        get_overview, get_users, post_create_user, post_disable_user, post_enable_user, post_rotate_user_key,
         get_prompts as dash_get_prompts, get_prompt_detail,
         get_cost, get_hooks,
         get_audit as dash_get_audit,
@@ -139,7 +139,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/logout", post(post_logout))
         // Admin Dashboard (requires DashboardSession cookie)
         .route("/admin", get(get_overview))
-        .route("/admin/users", get(get_users))
+        .route("/admin/users", get(get_users).post(post_create_user))
         .route("/admin/users/:id/disable", post(post_disable_user))
         .route("/admin/users/:id/enable", post(post_enable_user))
         .route("/admin/users/:id/rotate-key", post(post_rotate_user_key))

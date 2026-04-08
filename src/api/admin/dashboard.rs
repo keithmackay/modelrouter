@@ -29,6 +29,7 @@ pub enum DashboardError {
     Template(String),
     Unauthorized,
     Forbidden,
+    BadRequest(String),
     Internal,
 }
 
@@ -47,6 +48,10 @@ impl IntoResponse for DashboardError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Html(format!("<h1>Template error</h1><pre>{}</pre>", msg)),
                 )
+                    .into_response()
+            }
+            DashboardError::BadRequest(msg) => {
+                (StatusCode::BAD_REQUEST, Html(format!("<h1>Bad Request</h1><p>{}</p>", msg)))
                     .into_response()
             }
             DashboardError::Internal => {
@@ -487,6 +492,61 @@ pub async fn post_rotate_user_key(
     };
 
     let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, Some(&new_token));
+    Ok(Html(html))
+}
+
+// ── Create user ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CreateUserForm {
+    pub name: String,
+    pub group_name: Option<String>,
+}
+
+pub async fn post_create_user(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Form(form): Form<CreateUserForm>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::api::auth::hash_token;
+    use crate::db::models::NewUser;
+    use crate::db::repositories::users::UserRepository;
+
+    let name = form.name.trim().to_string();
+    if name.is_empty() {
+        return Err(DashboardError::BadRequest("name is required".into()));
+    }
+
+    let token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let hash = hash_token(&token);
+    let group_name = form.group_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+
+    let user = UserRepository::create(
+        &*state.db,
+        NewUser { name: name.clone(), api_key_hash: hash, group_name },
+    )
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "user.create",
+        Some(format!("user:{}", user.id)),
+        None,
+        Some(serde_json::json!({ "name": user.name }).to_string()),
+    )
+    .await;
+
+    let html = user_row_html(
+        user.id,
+        &user.name,
+        user.group_name.as_deref().unwrap_or("—"),
+        true,
+        &user.created_at,
+        Some(&token),
+    );
     Ok(Html(html))
 }
 

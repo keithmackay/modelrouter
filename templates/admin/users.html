@@ -2,6 +2,19 @@
 {% block title %}Users — modelrouter Admin{% endblock %}
 {% block content %}
 <h1>Users</h1>
+
+<form hx-post="/admin/users" hx-target="#users-tbody" hx-swap="afterbegin" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1.5rem;">
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name</label>
+        <input type="text" name="name" required placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+    </div>
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Group (optional)</label>
+        <input type="text" name="group_name" placeholder="team-a" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+    </div>
+    <button type="submit" class="btn btn-success">Create User</button>
+</form>
+
 <table>
     <thead>
         <tr>
