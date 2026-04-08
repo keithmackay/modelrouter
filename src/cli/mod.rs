@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod admin;
 
 use std::sync::Arc;
 
@@ -576,8 +577,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::UninstallService => {
             uninstall_service()?;
         }
-        Commands::Admin(_) => {
-            todo!("Admin commands not yet implemented")
+        Commands::Admin(admin_args) => {
+            admin::run(cli.config, admin_args.command).await?;
         }
     }
     Ok(())
