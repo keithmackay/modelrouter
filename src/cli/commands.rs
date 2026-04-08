@@ -159,7 +159,7 @@ pub enum ReportCommands {
 
 // ── Admin subcommands ────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AdminRole {
     Superadmin,
     Viewer,
