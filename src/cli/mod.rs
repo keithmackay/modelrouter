@@ -148,6 +148,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .unwrap_or_default()
                 .join(".modelrouter");
             tokio::fs::create_dir_all(&config_dir).await?;
+            // Set config dir to owner-only so the DB and config (which holds API keys)
+            // are not readable by other OS users on shared servers.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o700);
+                std::fs::set_permissions(&config_dir, perms)?;
+            }
             let config_path = config_dir.join("config.toml");
             if config_path.exists() {
                 print!(
@@ -160,6 +168,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim().eq_ignore_ascii_case("y") {
                     tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let perms = std::fs::Permissions::from_mode(0o600);
+                        std::fs::set_permissions(&config_path, perms)?;
+                    }
                     println!("Overwrote config at {}", config_path.display());
                 } else {
                     println!("Aborted.");
@@ -167,6 +181,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             } else {
                 tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o600);
+                    std::fs::set_permissions(&config_path, perms)?;
+                }
                 println!("Created config at {}", config_path.display());
             }
             println!();
@@ -582,4 +602,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn config_dir_permission_mode() {
+        // 0o700 = rwx for owner only
+        assert_eq!(0o700u32, 0b111_000_000);
+    }
 }
