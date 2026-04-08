@@ -568,7 +568,87 @@ git commit -m "feat: add modelrouter admin CLI subcommand group"
 
 ---
 
-## Task 8: Manual smoke test
+## Task 8: Secure file permissions in `modelrouter init`
+
+**Files:**
+- Modify: `src/cli/mod.rs` (inside `Commands::Init` arm)
+
+`init` creates `~/.modelrouter/` but leaves it world-accessible. The DB file that sqlx later creates inside it inherits the directory's umask — which may be `644` or looser. Fix: after creating the config dir, set it to `0700` (owner-only). This means the DB file and config file (which contains provider API keys) are never readable by other OS users.
+
+- [ ] Write a failing test first. Add to the `#[cfg(test)]` section of `src/cli/mod.rs` (create the module if it doesn't exist):
+
+```rust
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn config_dir_permission_mode() {
+        // Verify the unix permission bits we intend to set
+        // 0o700 = rwx for owner only
+        assert_eq!(0o700u32, 0b111_000_000);
+    }
+}
+```
+
+- [ ] Run the test:
+
+```bash
+cargo test config_dir_permission_mode
+```
+
+Expected: PASS (this is a sanity check on the constant, not the filesystem).
+
+- [ ] In `src/cli/mod.rs`, find the `Commands::Init` arm. After `tokio::fs::create_dir_all(&config_dir).await?;`, add:
+
+```rust
+// Set config dir to owner-only so the DB and config (which holds API keys)
+// are not readable by other OS users on shared servers.
+#[cfg(unix)]
+{
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(&config_dir, perms)?;
+}
+```
+
+The `#[cfg(unix)]` guard means Windows builds compile cleanly (Windows uses ACLs, not Unix mode bits).
+
+- [ ] Also set the config file itself to `0600` immediately after writing it. Find the two `tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;` calls and add after each:
+
+```rust
+#[cfg(unix)]
+{
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(&config_path, perms)?;
+}
+```
+
+- [ ] Build:
+
+```bash
+cargo build
+```
+
+Expected: clean.
+
+- [ ] Run all tests:
+
+```bash
+cargo test
+```
+
+Expected: all pass.
+
+- [ ] Commit:
+
+```bash
+git add src/cli/mod.rs
+git commit -m "feat: set 0700/0600 permissions on modelrouter init config dir and file"
+```
+
+---
+
+## Task 9: Manual smoke test
 
 - [ ] Ensure you have a config file at `~/.modelrouter/config.toml` (or use `--config`). Run migrations if needed:
 
