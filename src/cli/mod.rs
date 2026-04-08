@@ -576,6 +576,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::UninstallService => {
             uninstall_service()?;
         }
+        Commands::Admin(_) => {
+            todo!("Admin commands not yet implemented")
+        }
     }
     Ok(())
 }

@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use std::fmt;
 use std::path::PathBuf;
 use crate::report::formatter::OutputFormat;
 
@@ -42,6 +43,8 @@ pub enum Commands {
     InstallService,
     /// Uninstall system service
     UninstallService,
+    /// Manage admin users
+    Admin(AdminArgs),
 }
 
 #[derive(Args)]
@@ -152,4 +155,94 @@ pub enum ReportCommands {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+}
+
+// ── Admin subcommands ────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub enum AdminRole {
+    Superadmin,
+    Viewer,
+}
+
+impl fmt::Display for AdminRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AdminRole::Superadmin => write!(f, "superadmin"),
+            AdminRole::Viewer => write!(f, "viewer"),
+        }
+    }
+}
+
+impl std::str::FromStr for AdminRole {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "superadmin" => Ok(AdminRole::Superadmin),
+            "viewer" => Ok(AdminRole::Viewer),
+            other => Err(format!("role must be 'superadmin' or 'viewer', got '{}'", other)),
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct AdminArgs {
+    #[command(subcommand)]
+    pub command: AdminCommands,
+}
+
+#[derive(Subcommand)]
+pub enum AdminCommands {
+    /// Create a new admin user (prompts for password)
+    Create {
+        #[arg(long)]
+        name: String,
+        /// Role to assign. Default: superadmin.
+        #[arg(long, default_value = "superadmin")]
+        role: AdminRole,
+    },
+    /// List all admin users
+    List {
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Reset an admin user's password (prompts for new password)
+    ResetPassword {
+        #[arg(long)]
+        name: String,
+    },
+    /// Enable an admin user
+    Enable {
+        name: String,
+    },
+    /// Disable an admin user
+    Disable {
+        name: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdminRole;
+    use std::str::FromStr;
+
+    #[test]
+    fn admin_role_superadmin_parses() {
+        let r = AdminRole::from_str("superadmin").unwrap();
+        assert!(matches!(r, AdminRole::Superadmin));
+        assert_eq!(r.to_string(), "superadmin");
+    }
+
+    #[test]
+    fn admin_role_viewer_parses() {
+        let r = AdminRole::from_str("viewer").unwrap();
+        assert!(matches!(r, AdminRole::Viewer));
+        assert_eq!(r.to_string(), "viewer");
+    }
+
+    #[test]
+    fn admin_role_invalid_rejected() {
+        let err = AdminRole::from_str("god").unwrap_err();
+        assert!(err.contains("superadmin") && err.contains("viewer"));
+    }
 }
