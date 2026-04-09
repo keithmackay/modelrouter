@@ -30,6 +30,7 @@ pub enum DashboardError {
     Unauthorized,
     Forbidden,
     BadRequest(String),
+    NotFound(String),
     Internal,
 }
 
@@ -52,6 +53,10 @@ impl IntoResponse for DashboardError {
             }
             DashboardError::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, Html(format!("<h1>Bad Request</h1><p>{}</p>", msg)))
+                    .into_response()
+            }
+            DashboardError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, Html(format!("<h1>Not Found</h1><p>{}</p>", msg)))
                     .into_response()
             }
             DashboardError::Internal => {
@@ -640,7 +645,7 @@ fn key_row_html(view: &KeyView) -> String {
 
 pub async fn get_keys(
     State(state): State<AppState>,
-    _session: DashboardSession,
+    session: DashboardSession,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
     use std::collections::HashMap;
@@ -697,6 +702,10 @@ pub async fn get_keys(
             keys => key_vals,
             user_names => user_names,
             projects => projects,
+            session => minijinja::context! {
+                user_name => session.0.name.clone(),
+                role => session.0.role.clone(),
+            },
         },
     )
 }
@@ -793,7 +802,7 @@ pub async fn post_disable_key(
         .await
         .map_err(|_| DashboardError::Internal)?;
     let key = keys.iter().find(|k| k.id == id)
-        .ok_or_else(|| DashboardError::BadRequest(format!("key {} not found", id)))?;
+        .ok_or_else(|| DashboardError::NotFound(format!("key {} not found", id)))?;
 
     let users = UserRepository::list(&*state.db)
         .await
@@ -844,7 +853,7 @@ pub async fn post_rotate_key(
         .await
         .map_err(|_| DashboardError::Internal)?;
     let old_key = keys.iter().find(|k| k.id == id)
-        .ok_or_else(|| DashboardError::BadRequest(format!("key {} not found", id)))?;
+        .ok_or_else(|| DashboardError::NotFound(format!("key {} not found", id)))?;
 
     let users = UserRepository::list(&*state.db)
         .await
