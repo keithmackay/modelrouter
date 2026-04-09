@@ -20,7 +20,7 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
 
     db.create(NewUser {
         name: "base-user".to_string(),
-        api_key_hash: hash_token("legacy-token"),
+        email: None,
         group_name: None,
     })
     .await

@@ -25,7 +25,7 @@ async fn test_app() -> TestServer {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
-        api_key_hash: hash_token("test-token"),
+        email: None,
         group_name: None,
     })
     .await
