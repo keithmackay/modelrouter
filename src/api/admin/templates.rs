@@ -29,6 +29,12 @@ pub fn build_env() -> Environment<'static> {
     .expect("overview.html template is valid");
 
     env.add_template_owned(
+        "keys.html",
+        include_str!("../../../templates/admin/keys.html").to_string(),
+    )
+    .expect("keys.html template is valid");
+
+    env.add_template_owned(
         "users.html",
         include_str!("../../../templates/admin/users.html").to_string(),
     )
