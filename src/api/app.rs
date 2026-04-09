@@ -103,6 +103,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_cost, get_hooks,
         get_audit as dash_get_audit,
         get_admins, post_create_admin, post_delete_admin,
+        get_keys, post_create_key, post_disable_key, post_rotate_key,
     };
 
     axum::Router::new()
@@ -141,6 +142,9 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/users", get(get_users).post(post_create_user))
         .route("/admin/users/:id/disable", post(post_disable_user))
         .route("/admin/users/:id/enable", post(post_enable_user))
+        .route("/admin/keys", get(get_keys).post(post_create_key))
+        .route("/admin/keys/:id/disable", post(post_disable_key))
+        .route("/admin/keys/:id/rotate", post(post_rotate_key))
 
         .route("/admin/prompts", get(dash_get_prompts))
         .route("/admin/prompts/:id", get(get_prompt_detail))
