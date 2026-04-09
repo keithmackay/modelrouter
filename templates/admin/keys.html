@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Keys — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Keys</h1>
+
+<datalist id="user-list">
+    {% for name in user_names %}<option value="{{ name }}">{% endfor %}
+</datalist>
+<datalist id="project-list">
+    {% for p in projects %}<option value="{{ p }}">{% endfor %}
+</datalist>
+
+<form hx-post="/admin/keys" hx-target="#keys-tbody" hx-swap="afterbegin" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1.5rem;">
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">User *</label>
+        <input type="text" name="user_name" required list="user-list" placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+    </div>
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Project</label>
+        <input type="text" name="project" list="project-list" placeholder="my-project" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+    </div>
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Label</label>
+        <input type="text" name="label" placeholder="laptop" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+    </div>
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Email</label>
+        <input type="email" name="email" disabled placeholder="Coming soon — will email key to user" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;opacity:0.6;">
+    </div>
+    <button type="submit" class="btn btn-success">Create Key</button>
+</form>
+
+<table>
+    <thead>
+        <tr>
+            <th>User</th>
+            <th>Project</th>
+            <th>Label</th>
+            <th>Status</th>
+            <th>Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody id="keys-tbody">
+        {% for key in keys %}
+        <tr id="key-row-{{ key.id }}">
+            <td>{{ key.user_name }}</td>
+            <td>{{ key.project | default(value="—") }}</td>
+            <td>{{ key.label | default(value="—") }}</td>
+            <td>
+                {% if key.enabled %}
+                <span class="tag tag-enabled">Enabled</span>
+                {% else %}
+                <span class="tag tag-disabled">Disabled</span>
+                {% endif %}
+            </td>
+            <td>{{ key.created_at }}</td>
+            <td>
+                {% if key.enabled %}
+                <button class="btn btn-danger" hx-post="/admin/keys/{{ key.id }}/disable" hx-target="#key-row-{{ key.id }}" hx-swap="outerHTML">Disable</button>
+                {% endif %}
+                <button class="btn btn-secondary" hx-post="/admin/keys/{{ key.id }}/rotate" hx-target="#key-row-{{ key.id }}" hx-swap="outerHTML">Rotate</button>
+                {% if key.raw_key %}
+                <span style="color:green;font-family:monospace;font-size:0.85rem;">{{ key.raw_key }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
