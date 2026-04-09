@@ -10,4 +10,6 @@ pub trait ApiKeyRepository: Send + Sync {
     async fn set_key_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()>;
     async fn disable_all_keys_for_user(&self, user_id: i64) -> anyhow::Result<()>;
     async fn revoke_api_key(&self, id: i64) -> anyhow::Result<()>;
+    /// Find any key (enabled or disabled) for the given user+project combo.
+    async fn find_key_by_user_project(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Option<ApiKey>>;
 }

@@ -687,11 +687,48 @@ pub async fn post_create_key(
         Err(_) => return Err(DashboardError::Internal),
     };
 
-    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let key_hash = hash_token(&raw_key);
-
     let label = if form.label.trim().is_empty() { None } else { Some(form.label.trim().to_string()) };
     let project = if form.project.trim().is_empty() { None } else { Some(form.project.trim().to_string()) };
+
+    // Reject duplicate user+project combos (enabled or disabled)
+    if let Some(existing) = state.db
+        .find_key_by_user_project(user.id, project.as_deref())
+        .await
+        .map_err(|_| DashboardError::Internal)?
+    {
+        let proj_label = project.as_deref().unwrap_or("(no project)");
+        let status_tag = if existing.enabled {
+            "<span class=\"tag tag-enabled\">Enabled</span>"
+        } else {
+            "<span class=\"tag tag-disabled\">Disabled</span>"
+        };
+        let id_s = existing.id.to_string();
+        let msg = format!(
+            "<div class=\"alert alert-warning\" style=\"display:flex;align-items:center;gap:1rem;\">\
+              <span>A key for <strong>{user}</strong> / project <strong>{proj}</strong> already exists ({status}). \
+              Scroll down to see it, or rotate it to generate a new secret.</span>\
+              <button class=\"btn btn-secondary\" \
+                hx-post=\"/admin/keys/{id}/rotate\" \
+                hx-target=\"#key-row-{id}\" hx-swap=\"outerHTML\" \
+                onclick=\"document.getElementById('key-form-message').innerHTML=''\"\
+              >Rotate existing key</button>\
+            </div>\
+            <script>(function(){{\
+              var el=document.getElementById('key-row-{id}');\
+              if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});\
+              el.classList.add('row-highlight');\
+              setTimeout(function(){{el.classList.remove('row-highlight');}},2500);}}\
+            }})();</script>",
+            user = user_name,
+            proj = proj_label,
+            status = status_tag,
+            id = id_s,
+        );
+        return Ok(Html(msg));
+    }
+
+    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = hash_token(&raw_key);
 
     let new_key = state.db.create_api_key(NewApiKey {
         user_id: user.id,
@@ -726,7 +763,11 @@ pub async fn post_create_key(
         created_at: new_key.created_at,
         raw_key: Some(raw_key),
     };
-    Ok(Html(key_row_html(&view)))
+    // Wrap the row in an OOB swap so it lands in #keys-tbody while the
+    // main response (empty) clears #key-form-message.
+    let tr = key_row_html(&view);
+    let oob_tr = tr.replacen("<tr ", "<tr hx-swap-oob=\"afterbegin:#keys-tbody\" ", 1);
+    Ok(Html(oob_tr))
 }
 
 pub async fn post_disable_key(

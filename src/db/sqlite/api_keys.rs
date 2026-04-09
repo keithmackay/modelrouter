@@ -111,4 +111,16 @@ impl ApiKeyRepository for SqliteDb {
             .await?;
         Ok(())
     }
+
+    async fn find_key_by_user_project(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Option<ApiKey>> {
+        let row = match project {
+            Some(p) => sqlx::query_as::<_, ApiKeyRow>(
+                "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE user_id = ? AND project = ? LIMIT 1"
+            ).bind(user_id).bind(p).fetch_optional(&self.pool).await?,
+            None => sqlx::query_as::<_, ApiKeyRow>(
+                "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE user_id = ? AND project IS NULL LIMIT 1"
+            ).bind(user_id).fetch_optional(&self.pool).await?,
+        };
+        Ok(row.map(ApiKey::from))
+    }
 }

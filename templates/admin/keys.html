@@ -10,7 +10,7 @@
     {% for p in projects %}<option value="{{ p }}">{% endfor %}
 </datalist>
 
-<form hx-post="/admin/keys" hx-target="#keys-tbody" hx-swap="afterbegin" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1.5rem;">
+<form hx-post="/admin/keys" hx-target="#key-form-message" hx-swap="innerHTML" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;">
     <div>
         <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">User *</label>
         <input type="text" name="user_name" required list="user-list" placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
@@ -29,6 +29,12 @@
     </div>
     <button type="submit" class="btn btn-success">Create Key</button>
 </form>
+<div id="key-form-message" style="margin-bottom:1rem;"></div>
+
+<style>
+@keyframes rowFlash { 0%,100%{background:transparent} 50%{background:#fff3cd} }
+.row-highlight { animation: rowFlash 0.6s ease 3; }
+</style>
 
 <table>
     <thead>
