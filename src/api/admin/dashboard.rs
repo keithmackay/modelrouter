@@ -331,16 +331,15 @@ pub async fn get_overview(
 
 // ── User row fragment helper ──────────────────────────────────────────────────
 
-fn user_row_html(id: i64, name: &str, group: &str, enabled: bool, created_at: &str, new_key: Option<&str>) -> String {
-    let id_s = id.to_string();
-    let status_tag = if enabled {
+fn user_row_html(user: &crate::db::models::User) -> String {
+    let id_s = user.id.to_string();
+    let status_tag = if user.enabled {
         "<span class=\"tag tag-enabled\">Enabled</span>"
     } else {
         "<span class=\"tag tag-disabled\">Disabled</span>"
     };
 
-    // Build action buttons using string concatenation to avoid Rust 2021 format! issues
-    let (toggle_action, toggle_label, toggle_class) = if enabled {
+    let (toggle_action, toggle_label, toggle_class) = if user.enabled {
         ("/disable", "Disable", "btn btn-danger")
     } else {
         ("/enable", "Enable", "btn btn-success")
@@ -353,31 +352,17 @@ fn user_row_html(id: i64, name: &str, group: &str, enabled: bool, created_at: &s
         "\" hx-swap=\"outerHTML\">", toggle_label, "</button>",
     ].concat();
 
-    let rotate_btn = [
-        "<button class=\"btn btn-secondary\" hx-post=\"/admin/users/",
-        id_s.as_str(), "/rotate-key",
-        "\" hx-target=\"#user-row-", id_s.as_str(),
-        "\" hx-swap=\"outerHTML\">Rotate Key</button>",
-    ].concat();
-
-    let new_key_html = if let Some(key) = new_key {
-        ["<br><small style=\"color:#27ae60\">New key: ", key, "</small>"].concat()
-    } else {
-        String::new()
-    };
+    let email_str = user.email.as_deref().unwrap_or("—");
 
     [
         "<tr id=\"user-row-", id_s.as_str(), "\">",
         "<td>", id_s.as_str(), "</td>",
-        "<td>", name, "</td>",
-        "<td>", group, "</td>",
+        "<td>", user.name.as_str(), "</td>",
+        "<td>", email_str, "</td>",
         "<td>", status_tag, "</td>",
-        "<td>", created_at, "</td>",
-        "<td>",
-        toggle_btn.as_str(), " ",
-        rotate_btn.as_str(),
-        new_key_html.as_str(),
-        "</td></tr>",
+        "<td>", user.created_at.as_str(), "</td>",
+        "<td>", toggle_btn.as_str(), "</td>",
+        "</tr>",
     ].concat()
 }
 
@@ -410,7 +395,7 @@ pub async fn get_users(
 
 pub async fn post_disable_user(
     State(state): State<AppState>,
-    _session: SuperDashboardSession,
+    session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::users::UserRepository;
@@ -418,24 +403,32 @@ pub async fn post_disable_user(
         .await
         .map_err(|_| DashboardError::Internal)?;
 
+    state.db.disable_all_keys_for_user(id)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "user.disable",
+        Some(format!("user:{}", id)),
+        None,
+        Some(serde_json::json!({ "enabled": false }).to_string()),
+    )
+    .await;
+
     let user = UserRepository::find_by_id(&*state.db, id)
         .await
-        .ok()
-        .flatten();
-    // Return updated row fragment
-    let (name, group_name, created_at) = if let Some(u) = user {
-        (u.name, u.group_name, u.created_at)
-    } else {
-        (format!("user:{}", id), None, String::new())
-    };
+        .map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("user {} not found", id)))?;
 
-    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), false, &created_at, None);
-    Ok(Html(html))
+    Ok(Html(user_row_html(&user)))
 }
 
 pub async fn post_enable_user(
     State(state): State<AppState>,
-    _session: SuperDashboardSession,
+    session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::users::UserRepository;
@@ -443,68 +436,23 @@ pub async fn post_enable_user(
         .await
         .map_err(|_| DashboardError::Internal)?;
 
-    let user = UserRepository::find_by_id(&*state.db, id)
-        .await
-        .ok()
-        .flatten();
-    let (name, group_name, created_at) = if let Some(u) = user {
-        (u.name, u.group_name, u.created_at)
-    } else {
-        (format!("user:{}", id), None, String::new())
-    };
-
-    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, None);
-    Ok(Html(html))
-}
-
-pub async fn post_rotate_user_key(
-    State(state): State<AppState>,
-    session: DashboardSession,
-    Path(id): Path<i64>,
-) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::users::UserRepository;
-    use crate::db::repositories::api_keys::ApiKeyRepository;
-    use crate::api::auth::hash_token;
-
-    let new_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let new_hash = hash_token(&new_token);
-
-    state.db.disable_all_keys_for_user(id)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    state.db.create_api_key(crate::db::models::NewApiKey {
-        user_id: id,
-        key_hash: new_hash,
-        label: Some("dashboard-rotate".to_string()),
-        expires_at: None,
-        project: None,
-    })
-    .await
-    .map_err(|_| DashboardError::Internal)?;
-
     audit(
         &state.db,
         Some(session.0.sub),
         &session.0.name,
-        "user.rotate_key",
+        "user.enable",
         Some(format!("user:{}", id)),
         None,
-        None,
+        Some(serde_json::json!({ "enabled": true }).to_string()),
     )
     .await;
 
     let user = UserRepository::find_by_id(&*state.db, id)
         .await
-        .ok()
-        .flatten();
-    let (name, group_name, created_at) = if let Some(u) = user {
-        (u.name, u.group_name, u.created_at)
-    } else {
-        (format!("user:{}", id), None, String::new())
-    };
+        .map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("user {} not found", id)))?;
 
-    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, Some(&new_token));
-    Ok(Html(html))
+    Ok(Html(user_row_html(&user)))
 }
 
 // ── Create user ───────────────────────────────────────────────────────────────
@@ -563,14 +511,7 @@ pub async fn post_create_user(
     )
     .await;
 
-    let html = user_row_html(
-        user.id,
-        &user.name,
-        user.group_name.as_deref().unwrap_or("—"),
-        true,
-        &user.created_at,
-        Some(&token),
-    );
+    let html = user_row_html(&user);
     Ok(Html(html))
 }
 
