@@ -23,7 +23,7 @@ pub async fn run_dev_seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
 
 async fn warn_if_dev_key_active(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let dev_hash = hash_token("mr-dev-key");
-    let row = sqlx::query("SELECT id FROM users WHERE api_key = ?")
+    let row = sqlx::query("SELECT id FROM api_keys WHERE key_hash = ? AND enabled = 1")
         .bind(&dev_hash)
         .fetch_optional(pool)
         .await?;

@@ -4,7 +4,8 @@ use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
 use modelrouter::api::auth::hash_token;
 use modelrouter::config::schema::{CacheConfig, Settings};
-use modelrouter::db::models::NewUser;
+use modelrouter::db::models::{NewApiKey, NewUser};
+use modelrouter::db::repositories::api_keys::ApiKeyRepository;
 use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::providers::{
     embed_registry::EmbeddingRegistry,
@@ -25,8 +26,19 @@ async fn test_app() -> TestServer {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
-        api_key_hash: hash_token("test-token"),
+        email: None,
         group_name: None,
+    })
+    .await
+    .unwrap();
+
+    let user = UserRepository::find_by_name(&db, "test-user").await.unwrap().unwrap();
+    ApiKeyRepository::create_api_key(&db, NewApiKey {
+        user_id: user.id,
+        key_hash: hash_token("test-token"),
+        label: Some("test".to_string()),
+        expires_at: None,
+        project: None,
     })
     .await
     .unwrap();

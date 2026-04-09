@@ -4,10 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct User {
     pub id: i64,
     pub name: String,
-    pub api_key: String,
-    pub api_key_old: Option<String>,
-    pub api_key_old_expires_at: Option<String>,
     pub group_name: Option<String>,
+    pub email: Option<String>,
     pub enabled: bool,
     pub created_at: String,
     pub metadata: String,
@@ -62,8 +60,8 @@ pub struct NewApiKey {
 #[derive(Debug)]
 pub struct NewUser {
     pub name: String,
-    pub api_key_hash: String,
     pub group_name: Option<String>,
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

@@ -89,7 +89,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
     };
     use crate::api::admin::routes::{
-        admin_login, list_users, create_user, update_user, rotate_user_key,
+        admin_login, list_users, create_user, update_user,
         list_budgets, create_budget, delete_budget,
         get_stats, get_audit, get_prompts,
         list_admins, create_admin,
@@ -98,11 +98,12 @@ pub fn build_router(state: AppState) -> axum::Router {
     };
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
-        get_overview, get_users, post_create_user, post_disable_user, post_enable_user, post_rotate_user_key,
+        get_overview, get_users, post_create_user, post_disable_user, post_enable_user,
         get_prompts as dash_get_prompts, get_prompt_detail,
         get_cost, get_hooks,
         get_audit as dash_get_audit,
         get_admins, post_create_admin, post_delete_admin,
+        get_keys, post_create_key, post_disable_key, post_rotate_key,
     };
 
     axum::Router::new()
@@ -121,7 +122,6 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))
         .route("/admin/api/users/:id", patch(update_user))
-        .route("/admin/api/users/:id/rotate-key", post(rotate_user_key))
         .route("/admin/api/budgets", get(list_budgets).post(create_budget))
         .route("/admin/api/budgets/:id", delete(delete_budget))
         .route("/admin/api/stats", get(get_stats))
@@ -142,7 +142,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/users", get(get_users).post(post_create_user))
         .route("/admin/users/:id/disable", post(post_disable_user))
         .route("/admin/users/:id/enable", post(post_enable_user))
-        .route("/admin/users/:id/rotate-key", post(post_rotate_user_key))
+        .route("/admin/keys", get(get_keys).post(post_create_key))
+        .route("/admin/keys/:id/disable", post(post_disable_key))
+        .route("/admin/keys/:id/rotate", post(post_rotate_key))
+
         .route("/admin/prompts", get(dash_get_prompts))
         .route("/admin/prompts/:id", get(get_prompt_detail))
         .route("/admin/cost", get(get_cost))

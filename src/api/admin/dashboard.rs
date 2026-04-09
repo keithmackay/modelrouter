@@ -30,6 +30,7 @@ pub enum DashboardError {
     Unauthorized,
     Forbidden,
     BadRequest(String),
+    NotFound(String),
     Internal,
 }
 
@@ -52,6 +53,10 @@ impl IntoResponse for DashboardError {
             }
             DashboardError::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, Html(format!("<h1>Bad Request</h1><p>{}</p>", msg)))
+                    .into_response()
+            }
+            DashboardError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, Html(format!("<h1>Not Found</h1><p>{}</p>", msg)))
                     .into_response()
             }
             DashboardError::Internal => {
@@ -326,16 +331,15 @@ pub async fn get_overview(
 
 // ── User row fragment helper ──────────────────────────────────────────────────
 
-fn user_row_html(id: i64, name: &str, group: &str, enabled: bool, created_at: &str, new_key: Option<&str>) -> String {
-    let id_s = id.to_string();
-    let status_tag = if enabled {
+fn user_row_html(user: &crate::db::models::User) -> String {
+    let id_s = user.id.to_string();
+    let status_tag = if user.enabled {
         "<span class=\"tag tag-enabled\">Enabled</span>"
     } else {
         "<span class=\"tag tag-disabled\">Disabled</span>"
     };
 
-    // Build action buttons using string concatenation to avoid Rust 2021 format! issues
-    let (toggle_action, toggle_label, toggle_class) = if enabled {
+    let (toggle_action, toggle_label, toggle_class) = if user.enabled {
         ("/disable", "Disable", "btn btn-danger")
     } else {
         ("/enable", "Enable", "btn btn-success")
@@ -348,31 +352,17 @@ fn user_row_html(id: i64, name: &str, group: &str, enabled: bool, created_at: &s
         "\" hx-swap=\"outerHTML\">", toggle_label, "</button>",
     ].concat();
 
-    let rotate_btn = [
-        "<button class=\"btn btn-secondary\" hx-post=\"/admin/users/",
-        id_s.as_str(), "/rotate-key",
-        "\" hx-target=\"#user-row-", id_s.as_str(),
-        "\" hx-swap=\"outerHTML\">Rotate Key</button>",
-    ].concat();
-
-    let new_key_html = if let Some(key) = new_key {
-        ["<br><small style=\"color:#27ae60\">New key: ", key, "</small>"].concat()
-    } else {
-        String::new()
-    };
+    let email_str = user.email.as_deref().unwrap_or("—");
 
     [
         "<tr id=\"user-row-", id_s.as_str(), "\">",
         "<td>", id_s.as_str(), "</td>",
-        "<td>", name, "</td>",
-        "<td>", group, "</td>",
+        "<td>", user.name.as_str(), "</td>",
+        "<td>", email_str, "</td>",
         "<td>", status_tag, "</td>",
-        "<td>", created_at, "</td>",
-        "<td>",
-        toggle_btn.as_str(), " ",
-        rotate_btn.as_str(),
-        new_key_html.as_str(),
-        "</td></tr>",
+        "<td>", user.created_at.as_str(), "</td>",
+        "<td>", toggle_btn.as_str(), "</td>",
+        "</tr>",
     ].concat()
 }
 
@@ -393,6 +383,7 @@ pub async fn get_users(
             minijinja::context! {
                 id => u.id,
                 name => u.name.clone(),
+                email => u.email.clone(),
                 group_name => u.group_name.clone(),
                 enabled => u.enabled,
                 created_at => u.created_at.clone(),
@@ -405,7 +396,7 @@ pub async fn get_users(
 
 pub async fn post_disable_user(
     State(state): State<AppState>,
-    _session: SuperDashboardSession,
+    session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::users::UserRepository;
@@ -413,60 +404,7 @@ pub async fn post_disable_user(
         .await
         .map_err(|_| DashboardError::Internal)?;
 
-    let user = UserRepository::find_by_id(&*state.db, id)
-        .await
-        .ok()
-        .flatten();
-    // Return updated row fragment
-    let (name, group_name, created_at) = if let Some(u) = user {
-        (u.name, u.group_name, u.created_at)
-    } else {
-        (format!("user:{}", id), None, String::new())
-    };
-
-    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), false, &created_at, None);
-    Ok(Html(html))
-}
-
-pub async fn post_enable_user(
-    State(state): State<AppState>,
-    _session: SuperDashboardSession,
-    Path(id): Path<i64>,
-) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::users::UserRepository;
-    UserRepository::set_enabled(&*state.db, id, true)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-
-    let user = UserRepository::find_by_id(&*state.db, id)
-        .await
-        .ok()
-        .flatten();
-    let (name, group_name, created_at) = if let Some(u) = user {
-        (u.name, u.group_name, u.created_at)
-    } else {
-        (format!("user:{}", id), None, String::new())
-    };
-
-    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, None);
-    Ok(Html(html))
-}
-
-pub async fn post_rotate_user_key(
-    State(state): State<AppState>,
-    session: DashboardSession,
-    Path(id): Path<i64>,
-) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::users::UserRepository;
-    use crate::api::auth::hash_token;
-
-    let new_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let new_hash = hash_token(&new_token);
-    let overlap_expires_at = (chrono::Utc::now()
-        + chrono::Duration::minutes(state.settings.auth.rotation_overlap_mins))
-    .to_rfc3339();
-
-    UserRepository::rotate_key(&*state.db, id, &new_hash, &overlap_expires_at)
+    state.db.disable_all_keys_for_user(id)
         .await
         .map_err(|_| DashboardError::Internal)?;
 
@@ -474,25 +412,48 @@ pub async fn post_rotate_user_key(
         &state.db,
         Some(session.0.sub),
         &session.0.name,
-        "user.rotate_key",
+        "user.disable",
         Some(format!("user:{}", id)),
         None,
-        None,
+        Some(serde_json::json!({ "enabled": false }).to_string()),
     )
     .await;
 
     let user = UserRepository::find_by_id(&*state.db, id)
         .await
-        .ok()
-        .flatten();
-    let (name, group_name, created_at) = if let Some(u) = user {
-        (u.name, u.group_name, u.created_at)
-    } else {
-        (format!("user:{}", id), None, String::new())
-    };
+        .map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("user {} not found", id)))?;
 
-    let html = user_row_html(id, &name, group_name.as_deref().unwrap_or("—"), true, &created_at, Some(&new_token));
-    Ok(Html(html))
+    Ok(Html(user_row_html(&user)))
+}
+
+pub async fn post_enable_user(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::users::UserRepository;
+    UserRepository::set_enabled(&*state.db, id, true)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "user.enable",
+        Some(format!("user:{}", id)),
+        None,
+        Some(serde_json::json!({ "enabled": true }).to_string()),
+    )
+    .await;
+
+    let user = UserRepository::find_by_id(&*state.db, id)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("user {} not found", id)))?;
+
+    Ok(Html(user_row_html(&user)))
 }
 
 // ── Create user ───────────────────────────────────────────────────────────────
@@ -508,7 +469,6 @@ pub async fn post_create_user(
     session: SuperDashboardSession,
     Form(form): Form<CreateUserForm>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::api::auth::hash_token;
     use crate::db::models::NewUser;
     use crate::db::repositories::users::UserRepository;
 
@@ -517,13 +477,11 @@ pub async fn post_create_user(
         return Err(DashboardError::BadRequest("name is required".into()));
     }
 
-    let token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let hash = hash_token(&token);
     let group_name = form.group_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
 
     let user = UserRepository::create(
         &*state.db,
-        NewUser { name: name.clone(), api_key_hash: hash, group_name },
+        NewUser { name: name.clone(), group_name, email: None },
     )
     .await
     .map_err(|_| DashboardError::Internal)?;
@@ -539,15 +497,336 @@ pub async fn post_create_user(
     )
     .await;
 
-    let html = user_row_html(
-        user.id,
-        &user.name,
-        user.group_name.as_deref().unwrap_or("—"),
-        true,
-        &user.created_at,
-        Some(&token),
-    );
+    let html = user_row_html(&user);
     Ok(Html(html))
+}
+
+// ── Keys page ─────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct KeyView {
+    id: i64,
+    user_id: i64,
+    user_name: String,
+    project: Option<String>,
+    label: Option<String>,
+    enabled: bool,
+    created_at: String,
+    raw_key: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateKeyForm {
+    pub user_name: String,
+    pub project: String,
+    pub label: String,
+    pub email: String,
+}
+
+fn key_row_html(view: &KeyView) -> String {
+    let id_s = view.id.to_string();
+    let status_tag = if view.enabled {
+        "<span class=\"tag tag-enabled\">Enabled</span>"
+    } else {
+        "<span class=\"tag tag-disabled\">Disabled</span>"
+    };
+
+    let disable_btn = if view.enabled {
+        [
+            "<button class=\"btn btn-danger\" hx-post=\"/admin/keys/",
+            id_s.as_str(), "/disable",
+            "\" hx-target=\"#key-row-", id_s.as_str(),
+            "\" hx-swap=\"outerHTML\">Disable</button> ",
+        ].concat()
+    } else {
+        String::new()
+    };
+
+    let rotate_btn = [
+        "<button class=\"btn btn-secondary\" hx-post=\"/admin/keys/",
+        id_s.as_str(), "/rotate",
+        "\" hx-target=\"#key-row-", id_s.as_str(),
+        "\" hx-swap=\"outerHTML\">Rotate</button>",
+    ].concat();
+
+    let raw_key_html = if let Some(raw) = &view.raw_key {
+        ["<br><span style=\"color:green;font-family:monospace;font-size:0.85rem;\">", raw.as_str(), "</span>"].concat()
+    } else {
+        String::new()
+    };
+
+    [
+        "<tr id=\"key-row-", id_s.as_str(), "\">",
+        "<td>", view.user_name.as_str(), "</td>",
+        "<td>", view.project.as_deref().unwrap_or("—"), "</td>",
+        "<td>", view.label.as_deref().unwrap_or("—"), "</td>",
+        "<td>", status_tag, "</td>",
+        "<td>", view.created_at.as_str(), "</td>",
+        "<td>",
+        disable_btn.as_str(),
+        rotate_btn.as_str(),
+        raw_key_html.as_str(),
+        "</td></tr>",
+    ].concat()
+}
+
+pub async fn get_keys(
+    State(state): State<AppState>,
+    session: DashboardSession,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    use std::collections::HashMap;
+
+    let keys = state.db.list_all_api_keys()
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+
+    let mut projects: Vec<String> = Vec::new();
+    let key_views: Vec<KeyView> = keys.iter().map(|k| {
+        let user_name = user_map.get(&k.user_id).cloned().unwrap_or_else(|| format!("user:{}", k.user_id));
+        if let Some(p) = &k.project {
+            if !projects.contains(p) {
+                projects.push(p.clone());
+            }
+        }
+        KeyView {
+            id: k.id,
+            user_id: k.user_id,
+            user_name,
+            project: k.project.clone(),
+            label: k.label.clone(),
+            enabled: k.enabled,
+            created_at: k.created_at.clone(),
+            raw_key: None,
+        }
+    }).collect();
+
+    let mut user_names: Vec<String> = users.iter().map(|u| u.name.clone()).collect();
+    user_names.sort();
+
+    let key_vals: Vec<minijinja::Value> = key_views.iter().map(|k| {
+        minijinja::context! {
+            id => k.id,
+            user_id => k.user_id,
+            user_name => k.user_name.clone(),
+            project => k.project.clone(),
+            label => k.label.clone(),
+            enabled => k.enabled,
+            created_at => k.created_at.clone(),
+            raw_key => k.raw_key.clone(),
+        }
+    }).collect();
+
+    render(
+        "keys.html",
+        minijinja::context! {
+            keys => key_vals,
+            user_names => user_names,
+            projects => projects,
+            session => minijinja::context! {
+                user_name => session.0.name.clone(),
+                role => session.0.role.clone(),
+            },
+        },
+    )
+}
+
+pub async fn post_create_key(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Form(form): Form<CreateKeyForm>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::models::{NewApiKey, NewUser};
+    use crate::db::repositories::users::UserRepository;
+    use crate::api::auth::hash_token;
+
+    if form.user_name.trim().is_empty() {
+        return Err(DashboardError::BadRequest("user_name is required".into()));
+    }
+
+    let user_name = form.user_name.trim().to_string();
+
+    // Find or create user
+    let user = match UserRepository::find_by_name(&*state.db, &user_name).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            // Auto-create user
+            match UserRepository::create(&*state.db, NewUser {
+                name: user_name.clone(),
+                group_name: None,
+                email: None,
+            }).await {
+                Ok(u) => u,
+                Err(_) => {
+                    // UNIQUE collision — try find again
+                    UserRepository::find_by_name(&*state.db, &user_name)
+                        .await
+                        .map_err(|_| DashboardError::Internal)?
+                        .ok_or(DashboardError::Internal)?
+                }
+            }
+        }
+        Err(_) => return Err(DashboardError::Internal),
+    };
+
+    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = hash_token(&raw_key);
+
+    let label = if form.label.trim().is_empty() { None } else { Some(form.label.trim().to_string()) };
+    let project = if form.project.trim().is_empty() { None } else { Some(form.project.trim().to_string()) };
+
+    let new_key = state.db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash,
+        label: label.clone(),
+        expires_at: None,
+        project: project.clone(),
+    })
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "key.create",
+        Some(format!("key:{}", new_key.id)),
+        None,
+        Some(serde_json::json!({ "user_id": user.id, "project": project, "label": label }).to_string()),
+    )
+    .await;
+
+    // TODO: send welcome email — stub only
+
+    let view = KeyView {
+        id: new_key.id,
+        user_id: user.id,
+        user_name: user.name,
+        project: new_key.project,
+        label: new_key.label,
+        enabled: new_key.enabled,
+        created_at: new_key.created_at,
+        raw_key: Some(raw_key),
+    };
+    Ok(Html(key_row_html(&view)))
+}
+
+pub async fn post_disable_key(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    use std::collections::HashMap;
+
+    let keys = state.db.list_all_api_keys()
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let key = keys.iter().find(|k| k.id == id)
+        .ok_or_else(|| DashboardError::NotFound(format!("key {} not found", id)))?;
+
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let user_name = user_map.get(&key.user_id).cloned().unwrap_or_else(|| format!("user:{}", key.user_id));
+
+    let view = KeyView {
+        id: key.id,
+        user_id: key.user_id,
+        user_name,
+        project: key.project.clone(),
+        label: key.label.clone(),
+        enabled: false,
+        created_at: key.created_at.clone(),
+        raw_key: None,
+    };
+
+    state.db.set_key_enabled(id, false)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "key.disable",
+        Some(format!("key:{}", id)),
+        None,
+        Some(serde_json::json!({"enabled": false}).to_string()),
+    )
+    .await;
+
+    Ok(Html(key_row_html(&view)))
+}
+
+pub async fn post_rotate_key(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::models::NewApiKey;
+    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    use crate::api::auth::hash_token;
+    use std::collections::HashMap;
+
+    let keys = state.db.list_all_api_keys()
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let old_key = keys.iter().find(|k| k.id == id)
+        .ok_or_else(|| DashboardError::NotFound(format!("key {} not found", id)))?;
+
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let user_name = user_map.get(&old_key.user_id).cloned().unwrap_or_else(|| format!("user:{}", old_key.user_id));
+
+    state.db.set_key_enabled(id, false)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = hash_token(&raw_key);
+
+    let new_key = state.db.create_api_key(NewApiKey {
+        user_id: old_key.user_id,
+        key_hash,
+        label: old_key.label.clone(),
+        expires_at: None,
+        project: old_key.project.clone(),
+    })
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "key.rotate",
+        Some(format!("key:{}", new_key.id)),
+        None,
+        Some(serde_json::json!({ "user_id": new_key.user_id, "replaced_key_id": id }).to_string()),
+    )
+    .await;
+
+    let view = KeyView {
+        id: new_key.id,
+        user_id: new_key.user_id,
+        user_name,
+        project: new_key.project.clone(),
+        label: new_key.label.clone(),
+        enabled: new_key.enabled,
+        created_at: new_key.created_at.clone(),
+        raw_key: Some(raw_key),
+    };
+    Ok(Html(key_row_html(&view)))
 }
 
 // ── Prompts page ──────────────────────────────────────────────────────────────

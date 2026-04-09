@@ -48,9 +48,7 @@ mod tests {
         User {
             id,
             name: "test".to_string(),
-            api_key: "hash".to_string(),
-            api_key_old: None,
-            api_key_old_expires_at: None,
+            email: None,
             group_name: group.map(str::to_string),
             enabled: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),

@@ -56,17 +56,6 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             return Ok(AuthenticatedUser(user));
         }
 
-        // 2. Fall back to legacy users.api_key
-        let user = state
-            .db
-            .find_by_api_key(&key_hash)
-            .await
-            .map_err(|_| ApiError::Internal)?
-            .ok_or(ApiError::Unauthorized)?;
-
-        if !user.enabled {
-            return Err(ApiError::Unauthorized);
-        }
-        Ok(AuthenticatedUser(user))
+        Err(ApiError::Unauthorized)
     }
 }

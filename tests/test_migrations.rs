@@ -1,7 +1,8 @@
 mod common;
 
 use modelrouter::db::repositories::users::UserRepository;
-use modelrouter::db::models::NewUser;
+use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+use modelrouter::db::models::{NewUser, NewApiKey};
 
 #[tokio::test]
 async fn migrations_create_all_tables() {
@@ -33,15 +34,25 @@ async fn create_and_find_user() {
     let db = common::in_memory_db().await;
     let new_user = NewUser {
         name: "alice".to_string(),
-        api_key_hash: "abc123hash".to_string(),
         group_name: None,
+        email: None,
     };
     let created = db.create(new_user).await.unwrap();
     assert_eq!(created.name, "alice");
 
-    let found = db.find_by_api_key("abc123hash").await.unwrap();
+    // Create an API key for the user and verify it can be found
+    let key = db.create_api_key(NewApiKey {
+        user_id: created.id,
+        key_hash: "abc123hash".to_string(),
+        label: None,
+        expires_at: None,
+        project: None,
+    }).await.unwrap();
+
+    let found = db.find_api_key_by_hash("abc123hash").await.unwrap();
     assert!(found.is_some());
-    assert_eq!(found.unwrap().name, "alice");
+    assert_eq!(found.unwrap().user_id, created.id);
+    let _ = key;
 }
 
 #[tokio::test]
@@ -49,43 +60,81 @@ async fn token_rotation_overlap_window() {
     let db = common::in_memory_db().await;
     let new_user = NewUser {
         name: "bob".to_string(),
-        api_key_hash: "old_hash".to_string(),
         group_name: None,
+        email: None,
     };
     let user = db.create(new_user).await.unwrap();
 
-    // Rotate key with future expiry
-    let future_expiry = "2099-12-31T23:59:59Z";
-    db.rotate_key(user.id, "new_hash", future_expiry).await.unwrap();
+    // Create the old key
+    db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash: "old_hash".to_string(),
+        label: None,
+        expires_at: None,
+        project: None,
+    }).await.unwrap();
 
-    // Old key should still work within overlap window
-    let found = db.find_by_api_key("old_hash").await.unwrap();
-    assert!(found.is_some(), "old key should work in overlap window");
+    // Rotate: disable all old keys, then create new key with future expiry
+    db.disable_all_keys_for_user(user.id).await.unwrap();
+    db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash: "new_hash".to_string(),
+        label: None,
+        expires_at: Some("2099-12-31T23:59:59Z".to_string()),
+        project: None,
+    }).await.unwrap();
 
-    // New key should also work
-    let found_new = db.find_by_api_key("new_hash").await.unwrap();
-    assert!(found_new.is_some(), "new key should work");
+    // Old key should be disabled (not found as valid)
+    let found_old = db.find_api_key_by_hash("old_hash").await.unwrap();
+    assert!(
+        found_old.map(|k| !k.enabled).unwrap_or(true),
+        "old key should be disabled after rotation"
+    );
+
+    // New key should be enabled
+    let found_new = db.find_api_key_by_hash("new_hash").await.unwrap();
+    assert!(found_new.is_some(), "new key should exist");
+    assert!(found_new.unwrap().enabled, "new key should be enabled");
 }
 
 #[tokio::test]
-async fn old_key_rejected_after_expiry() {
+async fn old_key_disabled_after_rotation() {
     let db = common::in_memory_db().await;
     let new_user = NewUser {
         name: "carol".to_string(),
-        api_key_hash: "carol_old".to_string(),
         group_name: None,
+        email: None,
     };
     let user = db.create(new_user).await.unwrap();
 
-    // Rotate with PAST expiry
-    let past_expiry = "2000-01-01T00:00:00Z";
-    db.rotate_key(user.id, "carol_new", past_expiry).await.unwrap();
+    // Create old key
+    db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash: "carol_old".to_string(),
+        label: None,
+        expires_at: None,
+        project: None,
+    }).await.unwrap();
 
-    // Old key should be rejected
-    let found = db.find_by_api_key("carol_old").await.unwrap();
-    assert!(found.is_none(), "expired old key should be rejected");
+    // Rotate: disable old keys, create new key
+    db.disable_all_keys_for_user(user.id).await.unwrap();
+    db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash: "carol_new".to_string(),
+        label: None,
+        expires_at: None,
+        project: None,
+    }).await.unwrap();
+
+    // Old key should be disabled
+    let found_old = db.find_api_key_by_hash("carol_old").await.unwrap();
+    assert!(
+        found_old.map(|k| !k.enabled).unwrap_or(true),
+        "old key should be disabled after rotation"
+    );
 
     // New key should work
-    let found_new = db.find_by_api_key("carol_new").await.unwrap();
+    let found_new = db.find_api_key_by_hash("carol_new").await.unwrap();
     assert!(found_new.is_some());
+    assert!(found_new.unwrap().enabled);
 }
