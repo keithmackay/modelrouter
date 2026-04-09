@@ -63,7 +63,7 @@ impl UserRepository for PostgresDb {
     async fn list(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
             r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
-               FROM users ORDER BY id"#,
+               FROM users ORDER BY enabled DESC, created_at DESC"#,
         )
         .fetch_all(&self.pool)
         .await?;

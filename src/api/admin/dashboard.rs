@@ -383,6 +383,7 @@ pub async fn get_users(
             minijinja::context! {
                 id => u.id,
                 name => u.name.clone(),
+                email => u.email.clone(),
                 group_name => u.group_name.clone(),
                 enabled => u.enabled,
                 created_at => u.created_at.clone(),
@@ -482,21 +483,6 @@ pub async fn post_create_user(
         &*state.db,
         NewUser { name: name.clone(), group_name, email: None },
     )
-    .await
-    .map_err(|_| DashboardError::Internal)?;
-
-    // Generate an initial API key for this user
-    use crate::api::auth::hash_token;
-    use crate::db::repositories::api_keys::ApiKeyRepository;
-    let token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let hash = hash_token(&token);
-    state.db.create_api_key(crate::db::models::NewApiKey {
-        user_id: user.id,
-        key_hash: hash,
-        label: Some("initial".to_string()),
-        expires_at: None,
-        project: None,
-    })
     .await
     .map_err(|_| DashboardError::Internal)?;
 
