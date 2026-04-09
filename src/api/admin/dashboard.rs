@@ -520,7 +520,7 @@ pub struct CreateKeyForm {
     pub user_name: String,
     pub project: String,
     pub label: String,
-    pub email: String,
+    pub email: Option<String>,
 }
 
 fn key_row_html(view: &KeyView) -> String {
