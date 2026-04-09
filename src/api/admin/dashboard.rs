@@ -527,6 +527,11 @@ fn he(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// Format an RFC3339 timestamp as "YYYY-MM-DD HH:MM:SS" for display.
+fn fmt_ts(s: &str) -> &str {
+    if s.len() >= 19 { &s[..19] } else { s }
+}
+
 /// Render a group of keys (1 active + N disabled) as a `<tbody>`.
 /// group_id = id of the first/active key (used as the tbody anchor for hx-target).
 fn key_group_html(group_id: i64, active: Option<&KeyView>, disabled_keys: &[KeyView], expanded: bool) -> String {
@@ -598,7 +603,7 @@ fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_h
         String::new()
     };
 
-    let disabled_at = view.disabled_at.as_deref().unwrap_or("—");
+    let disabled_at = view.disabled_at.as_deref().map(fmt_ts).unwrap_or("—");
 
     format!(
         "<tr id=\"key-row-{id_s}\">\
@@ -608,13 +613,13 @@ fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_h
         user = he(&view.user_name),
         proj = he(view.project.as_deref().unwrap_or("—")),
         label = he(view.label.as_deref().unwrap_or("—")),
-        created = view.created_at,
+        created = fmt_ts(&view.created_at),
     )
 }
 
 fn key_sub_row_html(view: &KeyView, group_id: &str, display: &str) -> String {
     let id_s = view.id.to_string();
-    let disabled_at = view.disabled_at.as_deref().unwrap_or("—");
+    let disabled_at = view.disabled_at.as_deref().map(fmt_ts).unwrap_or("—");
     let rotate_btn = format!(
         "<button class=\"btn btn-secondary\" \
         hx-post=\"/admin/keys/{id_s}/rotate\" \
@@ -631,7 +636,7 @@ fn key_sub_row_html(view: &KeyView, group_id: &str, display: &str) -> String {
         user = he(&view.user_name),
         proj = he(view.project.as_deref().unwrap_or("—")),
         label = he(view.label.as_deref().unwrap_or("—")),
-        created = view.created_at,
+        created = fmt_ts(&view.created_at),
     )
 }
 

@@ -26,7 +26,7 @@
                 <span class="tag tag-disabled">Disabled</span>
                 {% endif %}
             </td>
-            <td>{{ admin.last_login_at | default("Never") }}</td>
+            <td>{{ admin.last_login_at | default("Never") | fmt_ts }}</td>
             <td>
                 {% if admin.id != current_admin_id %}
                 <button class="btn btn-danger" hx-post="/admin/admins/{{ admin.id }}/delete" hx-target="#admin-row-{{ admin.id }}" hx-swap="outerHTML" hx-confirm="Delete admin {{ admin.name }}?">Delete</button>

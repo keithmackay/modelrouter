@@ -7,8 +7,20 @@ pub fn env() -> &'static Environment<'static> {
     ENV.get_or_init(build_env)
 }
 
+/// Format an RFC3339 timestamp as "YYYY-MM-DD HH:MM:SS" for display.
+pub fn fmt_ts(s: &str) -> String {
+    let trimmed = if s.len() >= 19 { &s[..19] } else { s };
+    trimmed.replace('T', " ")
+}
+
 pub fn build_env() -> Environment<'static> {
     let mut env = Environment::new();
+
+    env.add_filter("fmt_ts", |v: minijinja::Value| -> minijinja::Value {
+        let s = v.to_string();
+        let trimmed = if s.len() >= 19 { &s[..19] } else { &s };
+        minijinja::Value::from(trimmed.replace('T', " "))
+    });
 
     env.add_template_owned(
         "base.html",

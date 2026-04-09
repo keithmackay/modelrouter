@@ -45,6 +45,8 @@ pub enum Commands {
     UninstallService,
     /// Manage admin users
     Admin(AdminArgs),
+    /// Manage API keys
+    Key(KeyArgs),
 }
 
 #[derive(Args)]
@@ -154,6 +156,51 @@ pub enum ReportCommands {
     Hooks {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+    },
+}
+
+// ── Key subcommands ──────────────────────────────────────────────────────────
+
+#[derive(Args)]
+pub struct KeyArgs {
+    #[command(subcommand)]
+    pub command: KeyCommands,
+}
+
+#[derive(Subcommand)]
+pub enum KeyCommands {
+    /// Create a new API key for a user+project
+    Create {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Email address (reserved for future use — key will be printed to stdout)
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// List API keys
+    List {
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Rotate the active key for a user+project (disables current, creates new)
+    Rotate {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        project: String,
+    },
+    /// Disable the active key for a user+project
+    Disable {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        project: String,
     },
 }
 

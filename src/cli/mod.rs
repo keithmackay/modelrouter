@@ -4,7 +4,7 @@ pub mod admin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use commands::{Cli, Commands, UserCommands, BudgetCommands};
+use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands};
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
@@ -615,6 +615,122 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Admin(admin_args) => {
             admin::run(cli.config, admin_args.command).await?;
+        }
+        Commands::Key(key_args) => {
+            use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+            use crate::db::models::NewUser;
+
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            match key_args.command {
+                KeyCommands::Create { user, project, label, email: _ } => {
+                    use crate::api::auth::hash_token;
+
+                    // Find or create user
+                    let u = match UserRepository::find_by_name(&db, &user).await? {
+                        Some(u) => u,
+                        None => UserRepository::create(&db, NewUser {
+                            name: user.clone(),
+                            group_name: None,
+                            email: None,
+                        }).await?,
+                    };
+
+                    // Reject duplicate user+project
+                    if db.find_key_by_user_project(u.id, Some(&project)).await?.is_some() {
+                        anyhow::bail!("A key for user '{}' / project '{}' already exists. Use `key rotate` to replace it.", user, project);
+                    }
+
+                    let raw = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+                    db.create_api_key(crate::db::models::NewApiKey {
+                        user_id: u.id,
+                        key_hash: hash_token(&raw),
+                        label,
+                        expires_at: None,
+                        project: Some(project.clone()),
+                    }).await?;
+
+                    println!("Created key for '{}' / project '{}'", user, project);
+                    println!("Key: {}", raw);
+                    println!("Store this securely — it cannot be retrieved later.");
+                }
+                KeyCommands::List { user, project } => {
+                    let keys = db.list_all_api_keys().await?;
+                    let users = UserRepository::list(&db).await?;
+                    let user_map: std::collections::HashMap<i64, String> =
+                        users.iter().map(|u| (u.id, u.name.clone())).collect();
+
+                    let filtered = keys.iter().filter(|k| {
+                        let name_match = user.as_ref().map(|n| {
+                            user_map.get(&k.user_id).map(|u| u == n).unwrap_or(false)
+                        }).unwrap_or(true);
+                        let proj_match = project.as_ref().map(|p| {
+                            k.project.as_deref() == Some(p.as_str())
+                        }).unwrap_or(true);
+                        name_match && proj_match
+                    });
+
+                    let fmt_ts = |s: &str| if s.len() >= 19 { s[..19].replace('T', " ") } else { s.to_string() };
+                    println!("{:>4}  {:16}  {:16}  {:16}  {:8}  {:19}  {}", "ID", "User", "Project", "Label", "Status", "Created", "Disabled");
+                    for k in filtered {
+                        println!("{:>4}  {:16}  {:16}  {:16}  {:8}  {:19}  {}",
+                            k.id,
+                            user_map.get(&k.user_id).map(|s| s.as_str()).unwrap_or("?"),
+                            k.project.as_deref().unwrap_or("—"),
+                            k.label.as_deref().unwrap_or("—"),
+                            if k.enabled { "enabled" } else { "disabled" },
+                            fmt_ts(&k.created_at),
+                            k.disabled_at.as_deref().map(|s| fmt_ts(s)).unwrap_or_else(|| "—".to_string()),
+                        );
+                    }
+                }
+                KeyCommands::Rotate { user, project } => {
+                    use crate::api::auth::hash_token;
+
+                    let u = UserRepository::find_by_name(&db, &user).await?
+                        .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
+
+                    let group_keys = db.list_keys_for_group(u.id, Some(&project)).await?;
+                    if group_keys.is_empty() {
+                        anyhow::bail!("No key found for user '{}' / project '{}'", user, project);
+                    }
+                    let label = group_keys.first().and_then(|k| k.label.clone());
+
+                    // Disable all active keys in this group
+                    for k in group_keys.iter().filter(|k| k.enabled) {
+                        db.disable_key(k.id).await?;
+                    }
+
+                    let raw = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+                    db.create_api_key(crate::db::models::NewApiKey {
+                        user_id: u.id,
+                        key_hash: hash_token(&raw),
+                        label,
+                        expires_at: None,
+                        project: Some(project.clone()),
+                    }).await?;
+
+                    println!("Rotated key for '{}' / project '{}'", user, project);
+                    println!("New key: {}", raw);
+                    println!("Store this securely — it cannot be retrieved later.");
+                }
+                KeyCommands::Disable { user, project } => {
+                    let u = UserRepository::find_by_name(&db, &user).await?
+                        .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
+
+                    let group_keys = db.list_keys_for_group(u.id, Some(&project)).await?;
+                    let active: Vec<_> = group_keys.iter().filter(|k| k.enabled).collect();
+                    if active.is_empty() {
+                        anyhow::bail!("No active key found for user '{}' / project '{}'", user, project);
+                    }
+                    for k in active {
+                        db.disable_key(k.id).await?;
+                    }
+                    println!("Disabled key(s) for '{}' / project '{}'", user, project);
+                }
+            }
         }
     }
     Ok(())

@@ -24,7 +24,7 @@
             <td>{{ p.routed_model }}</td>
             <td>${{ p.cost_usd | round(6) }}</td>
             <td>{{ p.prompt_tokens }} / {{ p.completion_tokens }}</td>
-            <td>{{ p.created_at }}</td>
+            <td>{{ p.created_at | fmt_ts }}</td>
             <td>
                 <button class="btn btn-secondary" hx-get="/admin/prompts/{{ p.id }}" hx-target="#prompt-detail-{{ p.id }}" hx-swap="innerHTML">Expand</button>
                 <div id="prompt-detail-{{ p.id }}"></div>

@@ -19,7 +19,7 @@
             <td>{{ entry.actor_name }}</td>
             <td><code>{{ entry.action }}</code></td>
             <td>{{ entry.target | default("—") }}</td>
-            <td>{{ entry.created_at }}</td>
+            <td>{{ entry.created_at | fmt_ts }}</td>
         </tr>
         {% else %}
         <tr><td colspan="5" style="text-align:center; color:#777; padding: 2rem;">No audit entries.</td></tr>
