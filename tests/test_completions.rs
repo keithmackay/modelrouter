@@ -2,7 +2,6 @@ mod common;
 
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
-use modelrouter::api::auth::hash_token;
 use modelrouter::config::Settings;
 use modelrouter::db::models::NewUser;
 use modelrouter::db::repositories::users::UserRepository;
@@ -18,8 +17,8 @@ async fn test_app() -> TestServer {
     // Create a test user
     db.create(NewUser {
         name: "test-user".to_string(),
-        api_key_hash: hash_token("test-token"),
         group_name: None,
+        email: None,
     })
     .await
     .unwrap();
@@ -138,8 +137,8 @@ async fn test_app_with_blocking_guardrail() -> TestServer {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
-        api_key_hash: hash_token("test-token"),
         group_name: None,
+        email: None,
     })
     .await
     .unwrap();

@@ -35,9 +35,7 @@ fn user_has_api_key_project_field() {
     let user = modelrouter::db::models::User {
         id: 1,
         name: "test".to_string(),
-        api_key: "hash".to_string(),
-        api_key_old: None,
-        api_key_old_expires_at: None,
+        email: None,
         group_name: None,
         enabled: true,
         created_at: "2026-01-01T00:00:00+00:00".to_string(),

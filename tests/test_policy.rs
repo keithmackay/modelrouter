@@ -15,8 +15,8 @@ async fn make_user_with_budget(
         db,
         NewUser {
             name: format!("test-user-{}", uuid::Uuid::new_v4()),
-            api_key_hash: hash_token(&uuid::Uuid::new_v4().to_string()),
             group_name: None,
+            email: None,
         },
     )
     .await
@@ -59,8 +59,8 @@ async fn model_in_deny_list_returns_403() {
         &db,
         NewUser {
             name: "deny-test".to_string(),
-            api_key_hash: hash_token("deny-test"),
             group_name: None,
+            email: None,
         },
     )
     .await
@@ -96,8 +96,8 @@ async fn model_not_in_allow_list_returns_403() {
         &db,
         NewUser {
             name: "allow-test".to_string(),
-            api_key_hash: hash_token("allow-test"),
             group_name: None,
+            email: None,
         },
     )
     .await
@@ -133,8 +133,8 @@ async fn no_budget_rules_allows_request() {
         &db,
         NewUser {
             name: "no-rules".to_string(),
-            api_key_hash: hash_token("no-rules-token"),
             group_name: None,
+            email: None,
         },
     )
     .await
@@ -158,8 +158,8 @@ async fn budget_exceeded_returns_deny() {
         &db,
         NewUser {
             name: "budget-exceeded-test".to_string(),
-            api_key_hash: hash_token("budget-exceeded-test"),
             group_name: None,
+            email: None,
         },
     )
     .await
@@ -245,8 +245,8 @@ async fn test_policy_token_limit_under_budget() {
         &db,
         NewUser {
             name: format!("token-under-{}", uuid::Uuid::new_v4()),
-            api_key_hash: hash_token(&uuid::Uuid::new_v4().to_string()),
             group_name: None,
+            email: None,
         },
     )
     .await
@@ -332,8 +332,8 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
         &db,
         NewUser {
             name: format!("token-exceeded-{}", uuid::Uuid::new_v4()),
-            api_key_hash: hash_token(&uuid::Uuid::new_v4().to_string()),
             group_name: None,
+            email: None,
         },
     )
     .await

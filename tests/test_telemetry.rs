@@ -246,7 +246,7 @@ async fn completions_span_has_required_attributes() {
     // Build test AppState using the common test helpers
     let db = common::in_memory_db().await;
     use modelrouter::{
-        api::{app::{AppState, build_router}, auth::hash_token},
+        api::app::{AppState, build_router},
         db::models::NewUser,
         providers::registry::ProviderRegistry,
         router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine},
@@ -255,11 +255,10 @@ async fn completions_span_has_required_attributes() {
     use std::collections::HashMap;
 
     let api_key = "test-span-key";
-    let hash = hash_token(api_key);
     db.create(NewUser {
         name: "span-test-user".to_string(),
-        api_key_hash: hash,
         group_name: None,
+        email: None,
     }).await.unwrap();
 
     let mut mock_providers = HashMap::new();
