@@ -7,10 +7,10 @@
 # Services:
 #   modelrouter   http://localhost:8080   (proxy, built with --features otel)
 #   otel-collector                        (OTLP gRPC :4317, HTTP :4318)
-#   jaeger        http://localhost:16686  (trace UI)
+#   phoenix       http://localhost:6006   (trace + LLM observability UI)
 #   prometheus    http://localhost:9090   (metrics UI)
 #
-# To view traces: open http://localhost:16686
+# To view traces: open http://localhost:6006
 # To view metrics: open http://localhost:9090
 
 services:
@@ -43,16 +43,15 @@ services:
       - "4318:4318"   # OTLP HTTP
       - "8889:8889"   # Prometheus scrape endpoint (collector self-metrics)
     depends_on:
-      - jaeger
+      - phoenix
       - prometheus
 
-  jaeger:
-    image: jaegertracing/all-in-one:1.57
+  phoenix:
+    image: arizephoenix/phoenix:latest
     ports:
-      - "16686:16686"  # Jaeger UI
-      - "14250:14250"  # gRPC for collector → jaeger
+      - "6006:6006"   # Phoenix UI + OTLP HTTP
     environment:
-      COLLECTOR_OTLP_ENABLED: "true"
+      PHOENIX_WORKING_DIR: /phoenix
 
   prometheus:
     image: prom/prometheus:v2.52.0

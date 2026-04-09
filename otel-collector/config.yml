@@ -1,7 +1,7 @@
 # OpenTelemetry Collector config for local modelrouter development
 #
 # Receives OTLP from modelrouter, exports to:
-#   - Jaeger  (traces)
+#   - Arize Phoenix  (traces)
 #   - Prometheus scrape endpoint (metrics)
 #   - stdout  (logs — visible via docker logs otel-collector)
 
@@ -19,8 +19,8 @@ processors:
     send_batch_size: 512
 
 exporters:
-  otlp/jaeger:
-    endpoint: jaeger:14250
+  otlp/phoenix:
+    endpoint: phoenix:4317
     tls:
       insecure: true
 
@@ -36,7 +36,7 @@ service:
     traces:
       receivers:  [otlp]
       processors: [batch]
-      exporters:  [otlp/jaeger, debug]
+      exporters:  [otlp/phoenix, debug]
 
     metrics:
       receivers:  [otlp]
