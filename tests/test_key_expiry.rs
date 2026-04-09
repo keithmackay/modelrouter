@@ -11,6 +11,7 @@ fn make_key(expires_at: Option<String>) -> ApiKey {
         created_at: "2026-01-01T00:00:00+00:00".to_string(),
         expires_at,
         project: None,
+        disabled_at: None,
     }
 }
 

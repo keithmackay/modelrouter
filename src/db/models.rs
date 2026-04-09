@@ -32,6 +32,8 @@ pub struct ApiKey {
     pub expires_at: Option<String>,
     /// Project this key is associated with (e.g., "modelrouter-api", "other-app").
     pub project: Option<String>,
+    /// RFC3339 UTC timestamp of when the key was explicitly disabled via admin UI.
+    pub disabled_at: Option<String>,
 }
 
 impl ApiKey {

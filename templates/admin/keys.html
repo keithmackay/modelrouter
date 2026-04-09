@@ -36,7 +36,20 @@
 .row-highlight { animation: rowFlash 0.6s ease 3; }
 </style>
 
-<table>
+<script>
+function toggleGroup(gid) {
+    var rows = document.querySelectorAll('.sub-' + gid);
+    var btn = document.getElementById('toggle-' + gid);
+    var show = rows.length > 0 && rows[0].style.display === 'none';
+    rows.forEach(function(r) { r.style.display = show ? 'table-row' : 'none'; });
+    if (btn) {
+        var count = btn.dataset.count;
+        btn.textContent = (show ? '▼ ' : '▶ ') + count + ' old key' + (count == 1 ? '' : 's');
+    }
+}
+</script>
+
+<table id="keys-table">
     <thead>
         <tr>
             <th>User</th>
@@ -44,34 +57,10 @@
             <th>Label</th>
             <th>Status</th>
             <th>Created</th>
+            <th>Disabled</th>
             <th>Actions</th>
         </tr>
     </thead>
-    <tbody id="keys-tbody">
-        {% for key in keys %}
-        <tr id="key-row-{{ key.id }}">
-            <td>{{ key.user_name }}</td>
-            <td>{{ key.project | default(value="—") }}</td>
-            <td>{{ key.label | default(value="—") }}</td>
-            <td>
-                {% if key.enabled %}
-                <span class="tag tag-enabled">Enabled</span>
-                {% else %}
-                <span class="tag tag-disabled">Disabled</span>
-                {% endif %}
-            </td>
-            <td>{{ key.created_at }}</td>
-            <td>
-                {% if key.enabled %}
-                <button class="btn btn-danger" hx-post="/admin/keys/{{ key.id }}/disable" hx-target="#key-row-{{ key.id }}" hx-swap="outerHTML">Disable</button>
-                {% endif %}
-                <button class="btn btn-secondary" hx-post="/admin/keys/{{ key.id }}/rotate" hx-target="#key-row-{{ key.id }}" hx-swap="outerHTML">Rotate</button>
-                {% if key.raw_key %}
-                <span style="color:green;font-family:monospace;font-size:0.85rem;">{{ key.raw_key }}</span>
-                {% endif %}
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
+    {{ groups_html | safe }}
 </table>
 {% endblock %}

@@ -503,7 +503,6 @@ pub async fn post_create_user(
 
 // ── Keys page ─────────────────────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
 struct KeyView {
     id: i64,
     user_id: i64,
@@ -512,6 +511,7 @@ struct KeyView {
     label: Option<String>,
     enabled: bool,
     created_at: String,
+    disabled_at: Option<String>,
     raw_key: Option<String>,
 }
 
@@ -523,7 +523,42 @@ pub struct CreateKeyForm {
     pub email: Option<String>,
 }
 
-fn key_row_html(view: &KeyView) -> String {
+fn he(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Render a group of keys (1 active + N disabled) as a `<tbody>`.
+/// group_id = id of the first/active key (used as the tbody anchor for hx-target).
+fn key_group_html(group_id: i64, active: Option<&KeyView>, disabled_keys: &[KeyView], expanded: bool) -> String {
+    let gid = group_id.to_string();
+    // Sub-rows are all disabled keys when there's an active header, or all-but-first when all disabled
+    let sub_keys = if active.is_some() { disabled_keys } else { &disabled_keys[1..] };
+    let sub_count = sub_keys.len();
+
+    let toggle_html = if sub_count > 0 {
+        let arrow = if expanded { "▼" } else { "▶" };
+        let label = if sub_count == 1 { "1 old key".to_string() } else { format!("{} old keys", sub_count) };
+        format!(
+            " <button id=\"toggle-{gid}\" type=\"button\" onclick=\"toggleGroup('{gid}')\" \
+            class=\"btn btn-secondary\" style=\"font-size:0.8rem;padding:0.2rem 0.5rem;\" \
+            data-count=\"{sub_count}\">{arrow} {label}</button>"
+        )
+    } else {
+        String::new()
+    };
+
+    let header = match active {
+        Some(k) => key_header_row_html(k, &gid, true, &toggle_html),
+        None => key_header_row_html(&disabled_keys[0], &gid, false, &toggle_html),
+    };
+
+    let display = if expanded { "table-row" } else { "none" };
+    let sub_rows: String = sub_keys.iter().map(|k| key_sub_row_html(k, &gid, display)).collect();
+
+    format!("<tbody id=\"key-group-{gid}\">{header}{sub_rows}</tbody>")
+}
+
+fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_html: &str) -> String {
     let id_s = view.id.to_string();
     let status_tag = if view.enabled {
         "<span class=\"tag tag-enabled\">Enabled</span>"
@@ -531,55 +566,116 @@ fn key_row_html(view: &KeyView) -> String {
         "<span class=\"tag tag-disabled\">Disabled</span>"
     };
 
-    let disable_btn = if view.enabled {
-        [
-            "<button class=\"btn btn-danger\" hx-post=\"/admin/keys/",
-            id_s.as_str(), "/disable",
-            "\" hx-target=\"#key-row-", id_s.as_str(),
-            "\" hx-swap=\"outerHTML\">Disable</button> ",
-        ].concat()
+    let disable_btn = if is_active {
+        format!(
+            "<button class=\"btn btn-danger\" hx-post=\"/admin/keys/{id_s}/disable\" \
+            hx-target=\"#key-group-{group_id}\" hx-swap=\"outerHTML\">Disable</button> "
+        )
     } else {
         String::new()
     };
 
-    let rotate_btn = [
-        "<button class=\"btn btn-secondary\" hx-post=\"/admin/keys/",
-        id_s.as_str(), "/rotate",
-        "\" hx-target=\"#key-row-", id_s.as_str(),
-        "\" hx-swap=\"outerHTML\">Rotate</button>",
-    ].concat();
+    let rotate_btn = format!(
+        "<button class=\"btn btn-secondary\" hx-post=\"/admin/keys/{id_s}/rotate\" \
+        hx-target=\"#key-group-{group_id}\" hx-swap=\"outerHTML\">Rotate</button>"
+    );
 
     let raw_key_html = if let Some(raw) = &view.raw_key {
-        [
-            "<br><span style=\"display:inline-flex;align-items:center;gap:0.4rem;margin-top:0.4rem;\">",
-            "<code style=\"color:green;font-family:monospace;font-size:0.85rem;background:#f0fff0;padding:0.2rem 0.4rem;border-radius:3px;border:1px solid #c3e6cb;\">",
-            raw.as_str(),
-            "</code>",
-            "<button type=\"button\" title=\"Copy to clipboard\" ",
-            "onclick=\"navigator.clipboard.writeText('", raw.as_str(), "').then(function(){",
-            "var b=this;b.textContent='✓';setTimeout(function(){b.textContent='⧉'},1500)",
-            "}.bind(this))\" ",
-            "style=\"background:none;border:1px solid #aaa;border-radius:3px;padding:0.1rem 0.35rem;cursor:pointer;font-size:0.85rem;color:#555;\">",
-            "⧉</button>",
-            "</span>",
-        ].concat()
+        let raw_e = he(raw);
+        format!(
+            "<br><span style=\"display:inline-flex;align-items:center;gap:0.4rem;margin-top:0.4rem;\">\
+            <code style=\"color:green;font-family:monospace;font-size:0.85rem;background:#f0fff0;\
+            padding:0.2rem 0.4rem;border-radius:3px;border:1px solid #c3e6cb;\">{raw_e}</code>\
+            <button type=\"button\" title=\"Copy to clipboard\" \
+            onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{var b=this;\
+            b.textContent='✓';setTimeout(function(){{b.textContent='⧉'}},1500)}}.bind(this))\" \
+            style=\"background:none;border:1px solid #aaa;border-radius:3px;padding:0.1rem 0.35rem;\
+            cursor:pointer;font-size:0.85rem;color:#555;\">⧉</button></span>"
+        )
     } else {
         String::new()
     };
 
-    [
-        "<tr id=\"key-row-", id_s.as_str(), "\">",
-        "<td>", view.user_name.as_str(), "</td>",
-        "<td>", view.project.as_deref().unwrap_or("—"), "</td>",
-        "<td>", view.label.as_deref().unwrap_or("—"), "</td>",
-        "<td>", status_tag, "</td>",
-        "<td>", view.created_at.as_str(), "</td>",
-        "<td>",
-        disable_btn.as_str(),
-        rotate_btn.as_str(),
-        raw_key_html.as_str(),
-        "</td></tr>",
-    ].concat()
+    let disabled_at = view.disabled_at.as_deref().unwrap_or("—");
+
+    format!(
+        "<tr id=\"key-row-{id_s}\">\
+        <td>{user}</td><td>{proj}</td><td>{label}</td>\
+        <td>{status_tag}</td><td>{created}</td><td>{disabled_at}</td>\
+        <td>{disable_btn}{rotate_btn}{toggle_html}{raw_key_html}</td></tr>",
+        user = he(&view.user_name),
+        proj = he(view.project.as_deref().unwrap_or("—")),
+        label = he(view.label.as_deref().unwrap_or("—")),
+        created = view.created_at,
+    )
+}
+
+fn key_sub_row_html(view: &KeyView, group_id: &str, display: &str) -> String {
+    let id_s = view.id.to_string();
+    let disabled_at = view.disabled_at.as_deref().unwrap_or("—");
+    let rotate_btn = format!(
+        "<button class=\"btn btn-secondary\" style=\"font-size:0.8rem;\" \
+        hx-post=\"/admin/keys/{id_s}/rotate\" \
+        hx-target=\"#key-group-{group_id}\" hx-swap=\"outerHTML\">Rotate</button>"
+    );
+    format!(
+        "<tr id=\"key-row-{id_s}\" class=\"key-sub-row sub-{group_id}\" \
+        style=\"display:{display};background:#fff0f0;\">\
+        <td style=\"padding-left:2rem;\">↳ {user}</td>\
+        <td>{proj}</td><td>{label}</td>\
+        <td><span class=\"tag tag-disabled\">Disabled</span></td>\
+        <td>{created}</td><td>{disabled_at}</td>\
+        <td>{rotate_btn}</td></tr>",
+        user = he(&view.user_name),
+        proj = he(view.project.as_deref().unwrap_or("—")),
+        label = he(view.label.as_deref().unwrap_or("—")),
+        created = view.created_at,
+    )
+}
+
+/// Build a KeyView from an ApiKey + user_name.
+fn to_key_view(k: &crate::db::models::ApiKey, user_name: String) -> KeyView {
+    KeyView {
+        id: k.id,
+        user_id: k.user_id,
+        user_name,
+        project: k.project.clone(),
+        label: k.label.clone(),
+        enabled: k.enabled,
+        created_at: k.created_at.clone(),
+        disabled_at: k.disabled_at.clone(),
+        raw_key: None,
+    }
+}
+
+/// Render all keys for a group (fetched fresh from DB) as HTML.
+async fn render_group(
+    db: &dyn crate::api::app::DatabaseProvider,
+    user_id: i64,
+    project: Option<&str>,
+    expanded: bool,
+) -> Result<String, DashboardError> {
+    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    let group_keys = db.list_keys_for_group(user_id, project)
+        .await.map_err(|_| DashboardError::Internal)?;
+    if group_keys.is_empty() {
+        return Ok(String::new());
+    }
+    let users = UserRepository::list(db).await.map_err(|_| DashboardError::Internal)?;
+    let user_map: std::collections::HashMap<i64, String> =
+        users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let get_name = |uid: i64| user_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+
+    let active = group_keys.iter().find(|k| k.enabled)
+        .map(|k| to_key_view(k, get_name(k.user_id)));
+    let disabled_views: Vec<KeyView> = group_keys.iter()
+        .filter(|k| !k.enabled)
+        .map(|k| to_key_view(k, get_name(k.user_id)))
+        .collect();
+
+    let group_id = active.as_ref().map(|k| k.id)
+        .unwrap_or(disabled_views[0].id);
+    Ok(key_group_html(group_id, active.as_ref(), &disabled_views, expanded))
 }
 
 pub async fn get_keys(
@@ -590,55 +686,46 @@ pub async fn get_keys(
     use std::collections::HashMap;
 
     let keys = state.db.list_all_api_keys()
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-
+        .await.map_err(|_| DashboardError::Internal)?;
     let users = UserRepository::list(&*state.db)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
+        .await.map_err(|_| DashboardError::Internal)?;
 
     let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let get_name = |uid: i64| user_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
 
-    let mut projects: Vec<String> = Vec::new();
-    let key_views: Vec<KeyView> = keys.iter().map(|k| {
-        let user_name = user_map.get(&k.user_id).cloned().unwrap_or_else(|| format!("user:{}", k.user_id));
-        if let Some(p) = &k.project {
-            if !projects.contains(p) {
-                projects.push(p.clone());
-            }
-        }
-        KeyView {
-            id: k.id,
-            user_id: k.user_id,
-            user_name,
-            project: k.project.clone(),
-            label: k.label.clone(),
-            enabled: k.enabled,
-            created_at: k.created_at.clone(),
-            raw_key: None,
-        }
-    }).collect();
-
+    // Collect datalist values
     let mut user_names: Vec<String> = users.iter().map(|u| u.name.clone()).collect();
     user_names.sort();
+    let mut projects: Vec<String> = Vec::new();
 
-    let key_vals: Vec<minijinja::Value> = key_views.iter().map(|k| {
-        minijinja::context! {
-            id => k.id,
-            user_id => k.user_id,
-            user_name => k.user_name.clone(),
-            project => k.project.clone(),
-            label => k.label.clone(),
-            enabled => k.enabled,
-            created_at => k.created_at.clone(),
-            raw_key => k.raw_key.clone(),
-        }
+    // Group keys by (user_id, project) preserving order from list_all (enabled DESC, created_at DESC)
+    let mut seen_groups: Vec<(i64, Option<String>)> = Vec::new();
+    let mut group_map: HashMap<(i64, Option<String>), Vec<&crate::db::models::ApiKey>> = HashMap::new();
+    for k in &keys {
+        let gk = (k.user_id, k.project.clone());
+        if !group_map.contains_key(&gk) { seen_groups.push(gk.clone()); }
+        group_map.entry(gk).or_default().push(k);
+        if let Some(p) = &k.project { if !projects.contains(p) { projects.push(p.clone()); } }
+    }
+
+    // Render each group as a <tbody>
+    let groups_html: String = seen_groups.iter().map(|gk| {
+        let group_keys = &group_map[gk];
+        let active = group_keys.iter().find(|k| k.enabled)
+            .map(|k| to_key_view(k, get_name(k.user_id)));
+        let disabled_views: Vec<KeyView> = group_keys.iter()
+            .filter(|k| !k.enabled)
+            .map(|k| to_key_view(k, get_name(k.user_id)))
+            .collect();
+        let group_id = active.as_ref().map(|k| k.id)
+            .unwrap_or(disabled_views[0].id);
+        key_group_html(group_id, active.as_ref(), &disabled_views, false)
     }).collect();
 
     render(
         "keys.html",
         minijinja::context! {
-            keys => key_vals,
+            groups_html => groups_html,
             user_names => user_names,
             projects => projects,
             session => minijinja::context! {
@@ -668,7 +755,6 @@ pub async fn post_create_key(
     let user = match UserRepository::find_by_name(&*state.db, &user_name).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            // Auto-create user
             match UserRepository::create(&*state.db, NewUser {
                 name: user_name.clone(),
                 group_name: None,
@@ -676,10 +762,8 @@ pub async fn post_create_key(
             }).await {
                 Ok(u) => u,
                 Err(_) => {
-                    // UNIQUE collision — try find again
                     UserRepository::find_by_name(&*state.db, &user_name)
-                        .await
-                        .map_err(|_| DashboardError::Internal)?
+                        .await.map_err(|_| DashboardError::Internal)?
                         .ok_or(DashboardError::Internal)?
                 }
             }
@@ -693,8 +777,7 @@ pub async fn post_create_key(
     // Reject duplicate user+project combos (enabled or disabled)
     if let Some(existing) = state.db
         .find_key_by_user_project(user.id, project.as_deref())
-        .await
-        .map_err(|_| DashboardError::Internal)?
+        .await.map_err(|_| DashboardError::Internal)?
     {
         let proj_label = project.as_deref().unwrap_or("(no project)");
         let status_tag = if existing.enabled {
@@ -702,27 +785,28 @@ pub async fn post_create_key(
         } else {
             "<span class=\"tag tag-disabled\">Disabled</span>"
         };
-        let id_s = existing.id.to_string();
+        // Find the group id (active key's id or the existing key's id)
+        let group_id = existing.id.to_string();
         let msg = format!(
             "<div class=\"alert alert-warning\" style=\"display:flex;align-items:center;gap:1rem;\">\
               <span>A key for <strong>{user}</strong> / project <strong>{proj}</strong> already exists ({status}). \
               Scroll down to see it, or rotate it to generate a new secret.</span>\
               <button class=\"btn btn-secondary\" \
-                hx-post=\"/admin/keys/{id}/rotate\" \
-                hx-target=\"#key-row-{id}\" hx-swap=\"outerHTML\" \
+                hx-post=\"/admin/keys/{gid}/rotate\" \
+                hx-target=\"#key-group-{gid}\" hx-swap=\"outerHTML\" \
                 onclick=\"document.getElementById('key-form-message').innerHTML=''\"\
               >Rotate existing key</button>\
             </div>\
             <script>(function(){{\
-              var el=document.getElementById('key-row-{id}');\
+              var el=document.getElementById('key-group-{gid}');\
               if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});\
               el.classList.add('row-highlight');\
               setTimeout(function(){{el.classList.remove('row-highlight');}},2500);}}\
             }})();</script>",
-            user = user_name,
-            proj = proj_label,
+            user = he(&user_name),
+            proj = he(proj_label),
             status = status_tag,
-            id = id_s,
+            gid = group_id,
         );
         return Ok(Html(msg));
     }
@@ -737,8 +821,7 @@ pub async fn post_create_key(
         expires_at: None,
         project: project.clone(),
     })
-    .await
-    .map_err(|_| DashboardError::Internal)?;
+    .await.map_err(|_| DashboardError::Internal)?;
 
     audit(
         &state.db,
@@ -751,23 +834,39 @@ pub async fn post_create_key(
     )
     .await;
 
-    // TODO: send welcome email — stub only
+    // Render the new group tbody (no raw_key in table row)
+    let view = to_key_view(&new_key, user.name.clone());
+    let tbody = key_group_html(view.id, Some(&view), &[], false);
 
-    let view = KeyView {
-        id: new_key.id,
-        user_id: user.id,
-        user_name: user.name,
-        project: new_key.project,
-        label: new_key.label,
-        enabled: new_key.enabled,
-        created_at: new_key.created_at,
-        raw_key: Some(raw_key),
-    };
-    // Wrap the row in an OOB swap so it lands in #keys-tbody while the
-    // main response (empty) clears #key-form-message.
-    let tr = key_row_html(&view);
-    let oob_tr = tr.replacen("<tr ", "<tr hx-swap-oob=\"afterbegin:#keys-tbody\" ", 1);
-    Ok(Html(oob_tr))
+    // Show the one-time raw key in the message area, inject the group into the table via script
+    let proj_str = project.as_ref().map(|p| format!(" / {p}")).unwrap_or_default();
+    let raw_e = he(&raw_key);
+    let html = format!(
+        "<div class=\"alert\" style=\"background:#d4edda;border:1px solid #c3e6cb;color:#155724;\
+        display:flex;align-items:center;gap:1rem;flex-wrap:wrap;\">\
+        <span>✓ Key created for <strong>{user}</strong>{proj_str}. Copy it now — it won't be shown again:</span>\
+        <code style=\"font-family:monospace;background:#f0fff0;padding:0.2rem 0.4rem;\
+        border-radius:3px;border:1px solid #c3e6cb;\">{raw_e}</code>\
+        <button type=\"button\" onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{\
+        var b=this;b.textContent='✓ Copied';setTimeout(function(){{b.textContent='⧉ Copy'}},1500)\
+        }}.bind(this))\" class=\"btn btn-secondary\">⧉ Copy</button>\
+        </div>\
+        <template id=\"__new_group__\">{tbody}</template>\
+        <script>(function(){{\
+        var t=document.getElementById('__new_group__');\
+        var el=t.content.firstElementChild.cloneNode(true);\
+        var table=document.getElementById('keys-table');\
+        var first=table.querySelector('tbody');\
+        table.insertBefore(el,first||null);\
+        htmx.process(el);\
+        t.remove();\
+        }})();</script>",
+        user = he(&user.name),
+        proj_str = proj_str,
+        raw_e = raw_e,
+        tbody = tbody,
+    );
+    Ok(Html(html))
 }
 
 pub async fn post_disable_key(
@@ -775,48 +874,22 @@ pub async fn post_disable_key(
     session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
-    use std::collections::HashMap;
+    use crate::db::repositories::api_keys::ApiKeyRepository;
 
-    let keys = state.db.list_all_api_keys()
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let key = keys.iter().find(|k| k.id == id)
-        .ok_or_else(|| DashboardError::NotFound(format!("key {} not found", id)))?;
+    // Look up key to get user_id + project before disabling
+    let all = state.db.list_all_api_keys().await.map_err(|_| DashboardError::Internal)?;
+    let key = all.iter().find(|k| k.id == id)
+        .ok_or_else(|| DashboardError::NotFound(format!("key {id} not found")))?;
+    let (user_id, project) = (key.user_id, key.project.clone());
 
-    let users = UserRepository::list(&*state.db)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
-    let user_name = user_map.get(&key.user_id).cloned().unwrap_or_else(|| format!("user:{}", key.user_id));
+    state.db.disable_key(id).await.map_err(|_| DashboardError::Internal)?;
 
-    let view = KeyView {
-        id: key.id,
-        user_id: key.user_id,
-        user_name,
-        project: key.project.clone(),
-        label: key.label.clone(),
-        enabled: false,
-        created_at: key.created_at.clone(),
-        raw_key: None,
-    };
-
-    state.db.set_key_enabled(id, false)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-
-    audit(
-        &state.db,
-        Some(session.0.sub),
-        &session.0.name,
-        "key.disable",
-        Some(format!("key:{}", id)),
-        None,
+    audit(&state.db, Some(session.0.sub), &session.0.name, "key.disable",
+        Some(format!("key:{id}")), None,
         Some(serde_json::json!({"enabled": false}).to_string()),
-    )
-    .await;
+    ).await;
 
-    Ok(Html(key_row_html(&view)))
+    Ok(Html(render_group(&*state.db, user_id, project.as_deref(), false).await?))
 }
 
 pub async fn post_rotate_key(
@@ -825,61 +898,55 @@ pub async fn post_rotate_key(
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::models::NewApiKey;
-    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    use crate::db::repositories::api_keys::ApiKeyRepository;
     use crate::api::auth::hash_token;
-    use std::collections::HashMap;
 
-    let keys = state.db.list_all_api_keys()
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let old_key = keys.iter().find(|k| k.id == id)
-        .ok_or_else(|| DashboardError::NotFound(format!("key {} not found", id)))?;
+    // Look up key to get user_id, project, label
+    let all = state.db.list_all_api_keys().await.map_err(|_| DashboardError::Internal)?;
+    let old_key = all.iter().find(|k| k.id == id)
+        .ok_or_else(|| DashboardError::NotFound(format!("key {id} not found")))?;
+    let (user_id, project, label) = (old_key.user_id, old_key.project.clone(), old_key.label.clone());
 
-    let users = UserRepository::list(&*state.db)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
-    let user_name = user_map.get(&old_key.user_id).cloned().unwrap_or_else(|| format!("user:{}", old_key.user_id));
-
-    state.db.set_key_enabled(id, false)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
+    // Disable all currently active keys for this group, then create a new one
+    let group_keys = state.db.list_keys_for_group(user_id, project.as_deref())
+        .await.map_err(|_| DashboardError::Internal)?;
+    for k in group_keys.iter().filter(|k| k.enabled) {
+        state.db.disable_key(k.id).await.map_err(|_| DashboardError::Internal)?;
+    }
 
     let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let key_hash = hash_token(&raw_key);
-
     let new_key = state.db.create_api_key(NewApiKey {
-        user_id: old_key.user_id,
-        key_hash,
-        label: old_key.label.clone(),
-        expires_at: None,
-        project: old_key.project.clone(),
-    })
-    .await
-    .map_err(|_| DashboardError::Internal)?;
+        user_id, key_hash, label, expires_at: None, project: project.clone(),
+    }).await.map_err(|_| DashboardError::Internal)?;
 
-    audit(
-        &state.db,
-        Some(session.0.sub),
-        &session.0.name,
-        "key.rotate",
-        Some(format!("key:{}", new_key.id)),
-        None,
-        Some(serde_json::json!({ "user_id": new_key.user_id, "replaced_key_id": id }).to_string()),
-    )
-    .await;
+    audit(&state.db, Some(session.0.sub), &session.0.name, "key.rotate",
+        Some(format!("key:{}", new_key.id)), None,
+        Some(serde_json::json!({ "user_id": user_id, "replaced_key_id": id }).to_string()),
+    ).await;
 
-    let view = KeyView {
-        id: new_key.id,
-        user_id: new_key.user_id,
-        user_name,
-        project: new_key.project.clone(),
-        label: new_key.label.clone(),
-        enabled: new_key.enabled,
-        created_at: new_key.created_at.clone(),
-        raw_key: Some(raw_key),
-    };
-    Ok(Html(key_row_html(&view)))
+    // Fetch updated group and render expanded (so user sees the newly disabled old key)
+    let group_keys = state.db.list_keys_for_group(user_id, project.as_deref())
+        .await.map_err(|_| DashboardError::Internal)?;
+    use crate::db::repositories::users::UserRepository;
+    let users = UserRepository::list(&*state.db).await.map_err(|_| DashboardError::Internal)?;
+    let user_map: std::collections::HashMap<i64, String> =
+        users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let get_name = |uid: i64| user_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+
+    let active_view = group_keys.iter().find(|k| k.enabled).map(|k| {
+        let mut v = to_key_view(k, get_name(k.user_id));
+        // Show raw key on the new active row
+        v.raw_key = Some(raw_key.clone());
+        v
+    });
+    let disabled_views: Vec<KeyView> = group_keys.iter()
+        .filter(|k| !k.enabled)
+        .map(|k| to_key_view(k, get_name(k.user_id)))
+        .collect();
+
+    let group_id = active_view.as_ref().map(|k| k.id).unwrap_or(disabled_views[0].id);
+    Ok(Html(key_group_html(group_id, active_view.as_ref(), &disabled_views, true)))
 }
 
 // ── Prompts page ──────────────────────────────────────────────────────────────

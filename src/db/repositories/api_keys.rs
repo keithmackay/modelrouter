@@ -12,4 +12,8 @@ pub trait ApiKeyRepository: Send + Sync {
     async fn revoke_api_key(&self, id: i64) -> anyhow::Result<()>;
     /// Find any key (enabled or disabled) for the given user+project combo.
     async fn find_key_by_user_project(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Option<ApiKey>>;
+    /// Disable a single key and record the disabled_at timestamp.
+    async fn disable_key(&self, id: i64) -> anyhow::Result<()>;
+    /// All keys (any status) for a user+project group, sorted enabled DESC, created_at DESC.
+    async fn list_keys_for_group(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Vec<ApiKey>>;
 }

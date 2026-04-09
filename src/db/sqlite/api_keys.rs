@@ -3,6 +3,8 @@ use crate::db::models::{ApiKey, NewApiKey};
 use crate::db::repositories::api_keys::ApiKeyRepository;
 use super::{SqliteDb, now_utc};
 
+const SELECT: &str = "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at FROM api_keys";
+
 #[derive(sqlx::FromRow)]
 struct ApiKeyRow {
     id: i64,
@@ -15,6 +17,8 @@ struct ApiKeyRow {
     expires_at: Option<String>,
     #[sqlx(default)]
     project: Option<String>,
+    #[sqlx(default)]
+    disabled_at: Option<String>,
 }
 
 impl From<ApiKeyRow> for ApiKey {
@@ -28,6 +32,7 @@ impl From<ApiKeyRow> for ApiKey {
             created_at: r.created_at,
             expires_at: r.expires_at,
             project: r.project,
+            disabled_at: r.disabled_at,
         }
     }
 }
@@ -36,7 +41,7 @@ impl From<ApiKeyRow> for ApiKey {
 impl ApiKeyRepository for SqliteDb {
     async fn find_api_key_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<ApiKey>> {
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE key_hash = ? AND enabled = 1"
+            &format!("{SELECT} WHERE key_hash = ? AND enabled = 1")
         )
         .bind(key_hash)
         .fetch_optional(&self.pool)
@@ -46,7 +51,7 @@ impl ApiKeyRepository for SqliteDb {
 
     async fn list_api_keys_for_user(&self, user_id: i64) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE user_id = ? ORDER BY id"
+            &format!("{SELECT} WHERE user_id = ? ORDER BY id")
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -70,7 +75,7 @@ impl ApiKeyRepository for SqliteDb {
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE id = ?"
+            &format!("{SELECT} WHERE id = ?")
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -88,7 +93,7 @@ impl ApiKeyRepository for SqliteDb {
 
     async fn list_all_api_keys(&self) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys ORDER BY enabled DESC, created_at DESC"
+            &format!("{SELECT} ORDER BY enabled DESC, created_at DESC")
         )
         .fetch_all(&self.pool)
         .await?;
@@ -115,12 +120,34 @@ impl ApiKeyRepository for SqliteDb {
     async fn find_key_by_user_project(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Option<ApiKey>> {
         let row = match project {
             Some(p) => sqlx::query_as::<_, ApiKeyRow>(
-                "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE user_id = ? AND project = ? LIMIT 1"
+                &format!("{SELECT} WHERE user_id = ? AND project = ? LIMIT 1")
             ).bind(user_id).bind(p).fetch_optional(&self.pool).await?,
             None => sqlx::query_as::<_, ApiKeyRow>(
-                "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys WHERE user_id = ? AND project IS NULL LIMIT 1"
+                &format!("{SELECT} WHERE user_id = ? AND project IS NULL LIMIT 1")
             ).bind(user_id).fetch_optional(&self.pool).await?,
         };
         Ok(row.map(ApiKey::from))
+    }
+
+    async fn disable_key(&self, id: i64) -> anyhow::Result<()> {
+        let now = now_utc();
+        sqlx::query("UPDATE api_keys SET enabled = 0, disabled_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_keys_for_group(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Vec<ApiKey>> {
+        let rows = match project {
+            Some(p) => sqlx::query_as::<_, ApiKeyRow>(
+                &format!("{SELECT} WHERE user_id = ? AND project = ? ORDER BY enabled DESC, created_at DESC")
+            ).bind(user_id).bind(p).fetch_all(&self.pool).await?,
+            None => sqlx::query_as::<_, ApiKeyRow>(
+                &format!("{SELECT} WHERE user_id = ? AND project IS NULL ORDER BY enabled DESC, created_at DESC")
+            ).bind(user_id).fetch_all(&self.pool).await?,
+        };
+        Ok(rows.into_iter().map(ApiKey::from).collect())
     }
 }
