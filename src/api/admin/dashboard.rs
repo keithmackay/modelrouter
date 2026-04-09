@@ -548,7 +548,10 @@ fn key_group_html(group_id: i64, active: Option<&KeyView>, disabled_keys: &[KeyV
 
     let header = match active {
         Some(k) => key_header_row_html(k, &gid, true, &toggle_html),
-        None => key_header_row_html(&disabled_keys[0], &gid, false, &toggle_html),
+        None => match disabled_keys.first() {
+            Some(k) => key_header_row_html(k, &gid, false, &toggle_html),
+            None => return String::new(), // empty group — should not happen
+        },
     };
 
     let display = if expanded { "table-row" } else { "none" };
@@ -673,7 +676,8 @@ async fn render_group(
         .collect();
 
     let group_id = active.as_ref().map(|k| k.id)
-        .unwrap_or(disabled_views[0].id);
+        .or_else(|| disabled_views.first().map(|k| k.id))
+        .unwrap_or(0);
     Ok(key_group_html(group_id, active.as_ref(), &disabled_views, expanded))
 }
 
@@ -708,7 +712,7 @@ pub async fn get_keys(
     }
 
     // Render each group as a <tbody>
-    let groups_html: String = seen_groups.iter().map(|gk| {
+    let groups_html: String = seen_groups.iter().filter_map(|gk| {
         let group_keys = &group_map[gk];
         let active = group_keys.iter().find(|k| k.enabled)
             .map(|k| to_key_view(k, get_name(k.user_id)));
@@ -717,8 +721,8 @@ pub async fn get_keys(
             .map(|k| to_key_view(k, get_name(k.user_id)))
             .collect();
         let group_id = active.as_ref().map(|k| k.id)
-            .unwrap_or(disabled_views[0].id);
-        key_group_html(group_id, active.as_ref(), &disabled_views, false)
+            .or_else(|| disabled_views.first().map(|k| k.id))?;
+        Some(key_group_html(group_id, active.as_ref(), &disabled_views, false))
     }).collect();
 
     render(
