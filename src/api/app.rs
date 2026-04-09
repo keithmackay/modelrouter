@@ -107,6 +107,13 @@ pub fn build_router(state: AppState) -> axum::Router {
     };
 
     axum::Router::new()
+        // Embedded static assets
+        .route("/static/htmx.js", get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                include_str!("admin/htmx.min.js"),
+            )
+        }))
         // Health + API routes
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_handler))
