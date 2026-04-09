@@ -458,17 +458,24 @@ pub async fn post_rotate_user_key(
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::users::UserRepository;
+    use crate::db::repositories::api_keys::ApiKeyRepository;
     use crate::api::auth::hash_token;
 
     let new_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let new_hash = hash_token(&new_token);
-    let overlap_expires_at = (chrono::Utc::now()
-        + chrono::Duration::minutes(state.settings.auth.rotation_overlap_mins))
-    .to_rfc3339();
 
-    UserRepository::rotate_key(&*state.db, id, &new_hash, &overlap_expires_at)
+    state.db.disable_all_keys_for_user(id)
         .await
         .map_err(|_| DashboardError::Internal)?;
+    state.db.create_api_key(crate::db::models::NewApiKey {
+        user_id: id,
+        key_hash: new_hash,
+        label: Some("dashboard-rotate".to_string()),
+        expires_at: None,
+        project: None,
+    })
+    .await
+    .map_err(|_| DashboardError::Internal)?;
 
     audit(
         &state.db,
@@ -508,7 +515,6 @@ pub async fn post_create_user(
     session: SuperDashboardSession,
     Form(form): Form<CreateUserForm>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::api::auth::hash_token;
     use crate::db::models::NewUser;
     use crate::db::repositories::users::UserRepository;
 
@@ -517,14 +523,27 @@ pub async fn post_create_user(
         return Err(DashboardError::BadRequest("name is required".into()));
     }
 
-    let token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let hash = hash_token(&token);
     let group_name = form.group_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
 
     let user = UserRepository::create(
         &*state.db,
-        NewUser { name: name.clone(), api_key_hash: hash, group_name },
+        NewUser { name: name.clone(), group_name, email: None },
     )
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    // Generate an initial API key for this user
+    use crate::api::auth::hash_token;
+    use crate::db::repositories::api_keys::ApiKeyRepository;
+    let token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let hash = hash_token(&token);
+    state.db.create_api_key(crate::db::models::NewApiKey {
+        user_id: user.id,
+        key_hash: hash,
+        label: Some("initial".to_string()),
+        expires_at: None,
+        project: None,
+    })
     .await
     .map_err(|_| DashboardError::Internal)?;
 

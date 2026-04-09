@@ -382,16 +382,26 @@ pub async fn run(cli: Cli) -> Result<()> {
             match user_args.command {
                 UserCommands::Create { name, group } => {
                     use crate::db::repositories::users::UserRepository;
+                    use crate::db::repositories::api_keys::ApiKeyRepository;
                     use crate::db::models::NewUser;
                     use crate::api::auth::hash_token;
 
-                    let raw_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-                    let hash = hash_token(&raw_token);
                     let user = UserRepository::create(&db, NewUser {
                         name: name.clone(),
-                        api_key_hash: hash,
                         group_name: group,
+                        email: None,
                     }).await?;
+
+                    let raw_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+                    let hash = hash_token(&raw_token);
+                    db.create_api_key(crate::db::models::NewApiKey {
+                        user_id: user.id,
+                        key_hash: hash,
+                        label: Some("initial".to_string()),
+                        expires_at: None,
+                        project: None,
+                    }).await?;
+
                     println!("Created user '{}' (id={})", user.name, user.id);
                     println!("API key: {}", raw_token);
                     println!("Store this key securely — it cannot be retrieved later.");
@@ -425,18 +435,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 UserCommands::RotateKey { name } => {
                     use crate::db::repositories::users::UserRepository;
+                    use crate::db::repositories::api_keys::ApiKeyRepository;
                     use crate::api::auth::hash_token;
                     let user = UserRepository::find_by_name(&db, &name).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", name))?;
-                    let new_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-                    let new_hash = hash_token(&new_token);
-                    let overlap_expires_at = (chrono::Utc::now()
-                        + chrono::Duration::minutes(settings.auth.rotation_overlap_mins))
-                        .to_rfc3339();
-                    UserRepository::rotate_key(&db, user.id, &new_hash, &overlap_expires_at).await?;
-                    println!("Rotated key for user '{}'", name);
-                    println!("New API key: {}", new_token);
-                    println!("Old key valid until: {}", overlap_expires_at);
+                    // Generate new key
+                    let new_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+                    let hash = hash_token(&new_key);
+                    // Disable old keys for user
+                    db.disable_all_keys_for_user(user.id).await?;
+                    // Create new key
+                    let _api_key = db.create_api_key(crate::db::models::NewApiKey {
+                        user_id: user.id,
+                        key_hash: hash,
+                        label: Some("cli-rotate".to_string()),
+                        expires_at: None,
+                        project: None,
+                    }).await?;
+                    println!("New key for {}: {}", user.name, new_key);
                 }
             }
         }

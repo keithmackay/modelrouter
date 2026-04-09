@@ -89,7 +89,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
     };
     use crate::api::admin::routes::{
-        admin_login, list_users, create_user, update_user, rotate_user_key,
+        admin_login, list_users, create_user, update_user,
         list_budgets, create_budget, delete_budget,
         get_stats, get_audit, get_prompts,
         list_admins, create_admin,
@@ -121,7 +121,6 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))
         .route("/admin/api/users/:id", patch(update_user))
-        .route("/admin/api/users/:id/rotate-key", post(rotate_user_key))
         .route("/admin/api/budgets", get(list_budgets).post(create_budget))
         .route("/admin/api/budgets/:id", delete(delete_budget))
         .route("/admin/api/stats", get(get_stats))

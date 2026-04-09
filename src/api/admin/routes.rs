@@ -130,16 +130,13 @@ pub async fn create_user(
     Json(body): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     use crate::db::{models::NewUser, repositories::users::UserRepository};
-    use crate::api::auth::hash_token;
 
-    let raw_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let hash = hash_token(&raw_token);
     let user = UserRepository::create(
         &*state.db,
         NewUser {
             name: body.name.clone(),
-            api_key_hash: hash,
             group_name: body.group.clone(),
+            email: None,
         },
     )
     .await
@@ -159,7 +156,6 @@ pub async fn create_user(
 
     Ok(Json(serde_json::json!({
         "user": safe_user,
-        "api_key": raw_token,
     })))
 }
 
@@ -195,41 +191,6 @@ pub async fn update_user(
     }
 
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-pub async fn rotate_user_key(
-    State(state): State<AppState>,
-    session: SuperAdminSession,
-    Path(id): Path<i64>,
-) -> Result<impl IntoResponse, ApiError> {
-    use crate::db::repositories::users::UserRepository;
-    use crate::api::auth::hash_token;
-
-    let new_token = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let new_hash = hash_token(&new_token);
-    let overlap_expires_at = (chrono::Utc::now()
-        + chrono::Duration::minutes(state.settings.auth.rotation_overlap_mins))
-    .to_rfc3339();
-
-    UserRepository::rotate_key(&*state.db, id, &new_hash, &overlap_expires_at)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-
-    audit(
-        &state.db,
-        Some(session.0.sub),
-        &session.0.name,
-        "user.rotate_key",
-        Some(format!("user:{}", id)),
-        None,
-        None,
-    )
-    .await;
-
-    Ok(Json(serde_json::json!({
-        "api_key": new_token,
-        "old_key_valid_until": overlap_expires_at,
-    })))
 }
 
 // ── Budget management ─────────────────────────────────────────────────────────
