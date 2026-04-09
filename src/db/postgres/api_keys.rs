@@ -80,4 +80,30 @@ impl ApiKeyRepository for PostgresDb {
             .await?;
         Ok(())
     }
+
+    async fn list_all_api_keys(&self) -> anyhow::Result<Vec<ApiKey>> {
+        let rows = sqlx::query_as::<_, ApiKeyRow>(
+            "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project FROM api_keys ORDER BY enabled DESC, created_at DESC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(ApiKey::from).collect())
+    }
+
+    async fn set_key_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET enabled = $1 WHERE id = $2")
+            .bind(enabled)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn disable_all_keys_for_user(&self, user_id: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET enabled = FALSE WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
