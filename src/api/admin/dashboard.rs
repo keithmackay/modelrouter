@@ -540,8 +540,7 @@ fn key_group_html(group_id: i64, active: Option<&KeyView>, disabled_keys: &[KeyV
         let label = if sub_count == 1 { "1 old key".to_string() } else { format!("{} old keys", sub_count) };
         format!(
             " <button id=\"toggle-{gid}\" type=\"button\" onclick=\"toggleGroup('{gid}')\" \
-            class=\"btn btn-secondary\" style=\"font-size:0.8rem;padding:0.2rem 0.5rem;\" \
-            data-count=\"{sub_count}\">{arrow} {label}</button>"
+            class=\"btn btn-secondary\" data-count=\"{sub_count}\">{arrow} {label}</button>"
         )
     } else {
         String::new()
@@ -614,7 +613,7 @@ fn key_sub_row_html(view: &KeyView, group_id: &str, display: &str) -> String {
     let id_s = view.id.to_string();
     let disabled_at = view.disabled_at.as_deref().unwrap_or("—");
     let rotate_btn = format!(
-        "<button class=\"btn btn-secondary\" style=\"font-size:0.8rem;\" \
+        "<button class=\"btn btn-secondary\" \
         hx-post=\"/admin/keys/{id_s}/rotate\" \
         hx-target=\"#key-group-{group_id}\" hx-swap=\"outerHTML\">Rotate</button>"
     );
