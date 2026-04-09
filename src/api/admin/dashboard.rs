@@ -550,7 +550,19 @@ fn key_row_html(view: &KeyView) -> String {
     ].concat();
 
     let raw_key_html = if let Some(raw) = &view.raw_key {
-        ["<br><span style=\"color:green;font-family:monospace;font-size:0.85rem;\">", raw.as_str(), "</span>"].concat()
+        [
+            "<br><span style=\"display:inline-flex;align-items:center;gap:0.4rem;margin-top:0.4rem;\">",
+            "<code style=\"color:green;font-family:monospace;font-size:0.85rem;background:#f0fff0;padding:0.2rem 0.4rem;border-radius:3px;border:1px solid #c3e6cb;\">",
+            raw.as_str(),
+            "</code>",
+            "<button type=\"button\" title=\"Copy to clipboard\" ",
+            "onclick=\"navigator.clipboard.writeText('", raw.as_str(), "').then(function(){",
+            "var b=this;b.textContent='✓';setTimeout(function(){b.textContent='⧉'},1500)",
+            "}.bind(this))\" ",
+            "style=\"background:none;border:1px solid #aaa;border-radius:3px;padding:0.1rem 0.35rem;cursor:pointer;font-size:0.85rem;color:#555;\">",
+            "⧉</button>",
+            "</span>",
+        ].concat()
     } else {
         String::new()
     };
