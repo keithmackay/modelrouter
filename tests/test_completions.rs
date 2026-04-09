@@ -3,7 +3,9 @@ mod common;
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
 use modelrouter::config::Settings;
-use modelrouter::db::models::NewUser;
+use modelrouter::api::auth::hash_token;
+use modelrouter::db::models::{NewApiKey, NewUser};
+use modelrouter::db::repositories::api_keys::ApiKeyRepository;
 use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::guardrails::{Guardrail, GuardrailChain, GuardrailContext, GuardrailDecision};
 use modelrouter::providers::registry::ProviderRegistry;
@@ -19,6 +21,17 @@ async fn test_app() -> TestServer {
         name: "test-user".to_string(),
         group_name: None,
         email: None,
+    })
+    .await
+    .unwrap();
+
+    let user = UserRepository::find_by_name(&db, "test-user").await.unwrap().unwrap();
+    ApiKeyRepository::create_api_key(&db, NewApiKey {
+        user_id: user.id,
+        key_hash: hash_token("test-token"),
+        label: Some("test".to_string()),
+        expires_at: None,
+        project: None,
     })
     .await
     .unwrap();
@@ -142,6 +155,18 @@ async fn test_app_with_blocking_guardrail() -> TestServer {
     })
     .await
     .unwrap();
+
+    let user = UserRepository::find_by_name(&db, "test-user").await.unwrap().unwrap();
+    ApiKeyRepository::create_api_key(&db, NewApiKey {
+        user_id: user.id,
+        key_hash: hash_token("test-token"),
+        label: Some("test".to_string()),
+        expires_at: None,
+        project: None,
+    })
+    .await
+    .unwrap();
+
     let settings = Arc::new(Settings::default());
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
     let router = Arc::new(RequestRouter::new(settings.clone()));

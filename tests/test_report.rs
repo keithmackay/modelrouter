@@ -5,9 +5,8 @@ use modelrouter::report;
 async fn setup_test_data(pool: &sqlx::SqlitePool) {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO users (name, api_key, enabled, created_at, metadata) VALUES ('alice', ?, 1, ?, '{}')",
+        "INSERT INTO users (name, enabled, created_at, metadata) VALUES ('alice', 1, ?, '{}')",
     )
-    .bind(hash_token("alice-key"))
     .bind(&now)
     .execute(pool)
     .await
@@ -203,7 +202,7 @@ async fn usage_by_model_filters_by_project() {
 
     // Insert a user
     sqlx::query(
-        "INSERT INTO users (name, api_key, enabled, created_at, metadata) VALUES ('bob', 'hash-bob', 1, ?, '{}')",
+        "INSERT INTO users (name, enabled, created_at, metadata) VALUES ('bob', 1, ?, '{}')",
     )
     .bind(&now)
     .execute(pool)

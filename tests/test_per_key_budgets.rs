@@ -105,21 +105,22 @@ async fn api_key_auth_works() {
 }
 
 #[tokio::test]
-async fn legacy_token_still_works() {
+async fn unknown_token_returns_401() {
     let (server, _db) = test_app().await;
 
+    // Tokens not in api_keys table are rejected
     let resp = server
         .post("/v1/chat/completions")
         .add_header(
             axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer legacy-token"),
+            axum::http::HeaderValue::from_static("Bearer unknown-token"),
         )
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "Hello"}]
         }))
         .await;
-    assert_eq!(resp.status_code(), 200);
+    assert_eq!(resp.status_code(), 401);
 }
 
 #[tokio::test]
