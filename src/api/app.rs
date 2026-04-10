@@ -107,6 +107,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_admins, post_create_admin, post_delete_admin,
         get_keys, post_create_key, post_disable_key, post_rotate_key,
     };
+    use crate::api::admin::groups::{
+        get_groups, post_create_group, post_enable_group, post_disable_group,
+        post_add_member, post_disable_member,
+    };
 
     axum::Router::new()
         // Embedded static assets
@@ -162,6 +166,11 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/audit", get(dash_get_audit))
         .route("/admin/admins", get(get_admins).post(post_create_admin))
         .route("/admin/admins/:id/delete", post(post_delete_admin))
+        .route("/admin/groups", get(get_groups).post(post_create_group))
+        .route("/admin/groups/:id/enable", post(post_enable_group))
+        .route("/admin/groups/:id/disable", post(post_disable_group))
+        .route("/admin/groups/:id/members", post(post_add_member))
+        .route("/admin/groups/:id/members/:uid/disable", post(post_disable_member))
         // MCP Server Registry
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Groups — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Groups</h1>
+
+<div style="background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);padding:1.25rem;margin-bottom:2rem;">
+    <h2 style="font-size:1rem;margin-bottom:1rem;">Create Group</h2>
+    <form hx-post="/admin/groups" hx-target="#group-form-result" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;">
+            <div>
+                <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Name *</label>
+                <input type="text" name="name" required placeholder="engineering" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+            </div>
+            <div>
+                <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Priority</label>
+                <input type="number" name="priority" value="0" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:6rem;">
+            </div>
+            <button type="submit" class="btn btn-primary">Create Group</button>
+        </div>
+    </form>
+    <div id="group-form-result" style="margin-top:0.75rem;"></div>
+</div>
+
+<div id="groups-list">
+    {{ groups_html | safe }}
+</div>
+{% endblock %}

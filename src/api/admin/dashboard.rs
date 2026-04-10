@@ -12,7 +12,7 @@ use crate::api::app::AppState;
 
 // ── Template environment ──────────────────────────────────────────────────────
 
-fn render(template: &str, ctx: minijinja::Value) -> Result<Html<String>, DashboardError> {
+pub(super) fn render(template: &str, ctx: minijinja::Value) -> Result<Html<String>, DashboardError> {
     let tmpl = super::templates::env()
         .get_template(template)
         .map_err(|e| DashboardError::Template(e.to_string()))?;
