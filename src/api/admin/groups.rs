@@ -245,6 +245,11 @@ pub async fn post_create_group(
     let card = group_card_html(&group, &[], &all_users);
 
     // Inject new card into #groups-list via inline script (HTMX can't swap afterbegin on tbody reliably)
+    let card_json = serde_json::to_string(&card)
+        .map_err(|_| DashboardError::Internal)?
+        // Replace </script> sequences so they can't break out of the <script> block.
+        .replace("</", r"<\/");
+
     Ok(Html(format!(
         r#"<div></div>
         <script>
@@ -256,7 +261,7 @@ pub async fn post_create_group(
                 htmx.process(list.firstElementChild);
             }})();
         </script>"#,
-        card_json = serde_json::to_string(&card).unwrap_or_default(),
+        card_json = card_json,
     )))
 }
 
