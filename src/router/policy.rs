@@ -45,6 +45,7 @@ impl PolicyEngine {
         policy.reason = tracing::field::Empty,
     ))]
     pub async fn check(&self, user: &User, model: &str) -> anyhow::Result<PolicyDecision> {
+        use crate::db::models::BudgetScope;
         use crate::db::repositories::budgets::BudgetRepository;
         use crate::db::repositories::costs::CostRepository;
         use crate::db::repositories::rate_limits::RateLimitRepository;
@@ -165,6 +166,7 @@ impl PolicyEngine {
                     let start = rule.window_start.as_deref().unwrap_or("1970-01-01T00:00:00Z");
                     let end = rule.window_end.as_deref().unwrap_or("9999-12-31T23:59:59Z");
                     if let Some(key_id) = rule.api_key_id {
+                        // TODO: window_end not enforced for key-scoped total rules (no sum_for_key_between yet)
                         CostRepository::sum_for_key_since(&*self.db, key_id, start).await?
                     } else {
                         CostRepository::sum_for_user_between(&*self.db, user.id, start, end).await?
@@ -237,11 +239,17 @@ impl PolicyEngine {
             }
         }
 
+        // Project and global rules are checked after user/key rules.
+        // Most-specific rules (user/key) are enforced first; project and global
+        // act as backstops that apply regardless of per-user limits.
+
         // ── Project-scope rules ──────────────────────────────────────────────────
-        use crate::db::models::BudgetScope;
         if let Some(proj) = user.api_key_project.as_deref() {
             let project_rules = BudgetRepository::list_for_scope(&*self.db, &BudgetScope::Project(proj.to_string())).await?;
             for rule in &project_rules {
+                // Note: only limit_usd is enforced for project/global rules here.
+                // limit_tokens, model_allow, model_deny, and rate_rpm are stored but not yet
+                // enforced at this scope level; per-user/key rules cover those.
                 if let Some(limit_usd) = rule.limit_usd {
                     let spent = match rule.window.as_str() {
                         "total" => {
@@ -274,6 +282,9 @@ impl PolicyEngine {
         // ── Global rules ──────────────────────────────────────────────────────────
         let global_rules = BudgetRepository::list_for_scope(&*self.db, &BudgetScope::Global).await?;
         for rule in &global_rules {
+            // Note: only limit_usd is enforced for project/global rules here.
+            // limit_tokens, model_allow, model_deny, and rate_rpm are stored but not yet
+            // enforced at this scope level; per-user/key rules cover those.
             if let Some(limit_usd) = rule.limit_usd {
                 let spent = match rule.window.as_str() {
                     "total" => {
