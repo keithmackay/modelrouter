@@ -16,3 +16,6 @@ CREATE TABLE IF NOT EXISTS group_memberships (
     joined_at   TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     disabled_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_group_memberships_group_id ON group_memberships(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_memberships_user_id  ON group_memberships(user_id);

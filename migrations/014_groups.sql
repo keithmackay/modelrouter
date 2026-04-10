@@ -33,3 +33,7 @@ CREATE TABLE group_memberships (
     joined_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     disabled_at TEXT
 );
+
+-- Indexes for common access patterns
+CREATE INDEX idx_group_memberships_group_id ON group_memberships(group_id);
+CREATE INDEX idx_group_memberships_user_id  ON group_memberships(user_id);

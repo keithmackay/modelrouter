@@ -109,14 +109,18 @@ mod tests {
 
     #[test]
     fn multiple_conditions_all_must_match() {
-        let u_research = user(Some("research"), 1);
-        let u_no_tag = user(None, 1);
+        // Both tag AND user_id must match
+        let u_match = user(Some("research"), 42);
+        let u_wrong_tag = user(Some("intern"), 42);
+        let u_wrong_id = user(Some("research"), 99);
         let cond = PolicyConditionConfig {
             tag: Some("research".to_string()),
+            user_id: Some(42),
             ..Default::default()
         };
-        assert!(condition_matches(&cond, &u_research, "gpt-4o"));
-        assert!(!condition_matches(&cond, &u_no_tag, "gpt-4o"));
+        assert!(condition_matches(&cond, &u_match, "gpt-4o"));
+        assert!(!condition_matches(&cond, &u_wrong_tag, "gpt-4o"));
+        assert!(!condition_matches(&cond, &u_wrong_id, "gpt-4o"));
     }
 
     #[test]
