@@ -85,4 +85,53 @@ impl CostRepository for PostgresDb {
     async fn delete_cost_entries_by_ids(&self, _ids: &[i64]) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn sum_for_user_between(&self, user_id: i64, start: &str, end: &str) -> anyhow::Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger \
+             WHERE user_id = $1 AND created_at >= $2 AND created_at < $3"
+        )
+        .bind(user_id).bind(start).bind(end)
+        .fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    async fn sum_for_project_since(&self, project: &str, since: &str) -> anyhow::Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger \
+             WHERE project = $1 AND created_at >= $2"
+        )
+        .bind(project).bind(since)
+        .fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    async fn sum_for_project_between(&self, project: &str, start: &str, end: &str) -> anyhow::Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger \
+             WHERE project = $1 AND created_at >= $2 AND created_at < $3"
+        )
+        .bind(project).bind(start).bind(end)
+        .fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    async fn sum_global_since(&self, since: &str) -> anyhow::Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE created_at >= $1"
+        )
+        .bind(since)
+        .fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    async fn sum_global_between(&self, start: &str, end: &str) -> anyhow::Result<f64> {
+        let row: (f64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger \
+             WHERE created_at >= $1 AND created_at < $2"
+        )
+        .bind(start).bind(end)
+        .fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
 }
