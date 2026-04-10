@@ -110,6 +110,9 @@ impl PolicyEngine {
         let mut min_concurrent: Option<u32> = None;
 
         for rule in &rules {
+            // Skip "target" window rules — these are informational group targets, not enforceable limits
+            if rule.window == "target" { continue; }
+
             // 1. Check model_allow (JSON array)
             let model_allow: Vec<String> =
                 serde_json::from_str(&rule.model_allow).unwrap_or_default();
@@ -158,19 +161,29 @@ impl PolicyEngine {
 
             // 4. Check USD budget
             if let Some(limit_usd) = rule.limit_usd {
-                let raw_window_start = window_start_for(&rule.window);
-                // Honor spend_reset_at: use whichever timestamp is later
-                // SAFETY: both strings are produced by chrono::to_rfc3339() with UTC offset +00:00
-                // (via now_utc()). Lexicographic ordering is correct when format is consistent.
-                // Do not mix with Z-suffix or fractional-second timestamps from external sources.
-                let window_start = match &user.spend_reset_at {
-                    Some(reset_at) if reset_at.as_str() > raw_window_start.as_str() => reset_at.clone(),
-                    _ => raw_window_start,
-                };
-                let spent = if let Some(key_id) = rule.api_key_id {
-                    CostRepository::sum_for_key_since(&*self.db, key_id, &window_start).await?
+                let spent = if rule.window == "total" {
+                    let start = rule.window_start.as_deref().unwrap_or("1970-01-01T00:00:00Z");
+                    let end = rule.window_end.as_deref().unwrap_or("9999-12-31T23:59:59Z");
+                    if let Some(key_id) = rule.api_key_id {
+                        CostRepository::sum_for_key_since(&*self.db, key_id, start).await?
+                    } else {
+                        CostRepository::sum_for_user_between(&*self.db, user.id, start, end).await?
+                    }
                 } else {
-                    CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?
+                    let raw_window_start = window_start_for(&rule.window);
+                    // Honor spend_reset_at: use whichever timestamp is later
+                    // SAFETY: both strings are produced by chrono::to_rfc3339() with UTC offset +00:00
+                    // (via now_utc()). Lexicographic ordering is correct when format is consistent.
+                    // Do not mix with Z-suffix or fractional-second timestamps from external sources.
+                    let window_start = match &user.spend_reset_at {
+                        Some(reset_at) if reset_at.as_str() > raw_window_start.as_str() => reset_at.clone(),
+                        _ => raw_window_start,
+                    };
+                    if let Some(key_id) = rule.api_key_id {
+                        CostRepository::sum_for_key_since(&*self.db, key_id, &window_start).await?
+                    } else {
+                        CostRepository::sum_for_user_since(&*self.db, user.id, &window_start).await?
+                    }
                 };
                 if spent >= limit_usd {
                     let reason = format!(
@@ -224,6 +237,71 @@ impl PolicyEngine {
             }
         }
 
+        // ── Project-scope rules ──────────────────────────────────────────────────
+        use crate::db::models::BudgetScope;
+        if let Some(proj) = user.api_key_project.as_deref() {
+            let project_rules = BudgetRepository::list_for_scope(&*self.db, &BudgetScope::Project(proj.to_string())).await?;
+            for rule in &project_rules {
+                if let Some(limit_usd) = rule.limit_usd {
+                    let spent = match rule.window.as_str() {
+                        "total" => {
+                            let start = rule.window_start.as_deref().unwrap_or("1970-01-01T00:00:00Z");
+                            let end = rule.window_end.as_deref().unwrap_or("9999-12-31T23:59:59Z");
+                            CostRepository::sum_for_project_between(&*self.db, proj, start, end).await?
+                        }
+                        _ => {
+                            let since = window_start_for(&rule.window);
+                            CostRepository::sum_for_project_since(&*self.db, proj, &since).await?
+                        }
+                    };
+                    if spent >= limit_usd {
+                        let reason = format!(
+                            "project budget exceeded: ${:.4} of ${:.2} {} limit for project '{}'",
+                            spent, limit_usd, rule.window, proj
+                        );
+                        span.record("policy.result", "deny");
+                        span.record("policy.reason", reason.as_str());
+                        return Ok(PolicyDecision::Deny {
+                            reason,
+                            status: 429,
+                            budget_context: Some(BudgetContext { limit_usd, spent_usd: spent, window: rule.window.clone() }),
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── Global rules ──────────────────────────────────────────────────────────
+        let global_rules = BudgetRepository::list_for_scope(&*self.db, &BudgetScope::Global).await?;
+        for rule in &global_rules {
+            if let Some(limit_usd) = rule.limit_usd {
+                let spent = match rule.window.as_str() {
+                    "total" => {
+                        let start = rule.window_start.as_deref().unwrap_or("1970-01-01T00:00:00Z");
+                        let end = rule.window_end.as_deref().unwrap_or("9999-12-31T23:59:59Z");
+                        CostRepository::sum_global_between(&*self.db, start, end).await?
+                    }
+                    _ => {
+                        let since = window_start_for(&rule.window);
+                        CostRepository::sum_global_since(&*self.db, &since).await?
+                    }
+                };
+                if spent >= limit_usd {
+                    let reason = format!(
+                        "global budget exceeded: ${:.4} of ${:.2} {} limit",
+                        spent, limit_usd, rule.window
+                    );
+                    span.record("policy.result", "deny");
+                    span.record("policy.reason", reason.as_str());
+                    return Ok(PolicyDecision::Deny {
+                        reason,
+                        status: 429,
+                        budget_context: Some(BudgetContext { limit_usd, spent_usd: spent, window: rule.window.clone() }),
+                    });
+                }
+            }
+        }
+
         span.record("policy.result", "allow");
         Ok(PolicyDecision::Allow { max_concurrent: min_concurrent })
     }
@@ -231,6 +309,102 @@ impl PolicyEngine {
 
 fn current_minute_bucket() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::models::{BudgetScope, NewBudgetRule, NewUser};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::repositories::budgets::BudgetRepository;
+    use crate::db::repositories::users::UserRepository;
+    use crate::db::models::User;
+    use crate::api::app::DatabaseProvider;
+    use crate::router::policy::{PolicyDecision, PolicyEngine};
+    use std::sync::Arc;
+
+    async fn make_db() -> Arc<SqliteDb> {
+        let db = SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        Arc::new(db)
+    }
+
+    async fn make_user(db: &SqliteDb) -> User {
+        UserRepository::create(db, NewUser {
+            name: "alice".to_string(),
+            email: None,
+        }).await.unwrap()
+    }
+
+    async fn insert_spend(db: &SqliteDb, user_id: i64, cost: f64) {
+        // Insert a prompt first (prompt_id NOT NULL in cost_ledger)
+        let prompt_id: i64 = sqlx::query_scalar(
+            "INSERT INTO prompts (user_id, session_id, request_model, routed_model, provider, \
+             messages, response, finish_reason, prompt_tokens, completion_tokens, cost_usd, \
+             latency_ms, tags, project, created_at) \
+             VALUES (?, NULL, 'test', 'test', 'test', '[]', NULL, NULL, 0, 0, ?, NULL, '[]', NULL, ?) \
+             RETURNING id"
+        )
+        .bind(user_id)
+        .bind(cost)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&db.pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project, \
+             tokens_in, tokens_out, cost_usd, api_key_id, created_at) \
+             VALUES (?, ?, 'test', 'test', NULL, 0, 0, ?, NULL, ?)"
+        )
+        .bind(user_id)
+        .bind(prompt_id)
+        .bind(cost)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db.pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_monthly_rule_blocks_when_exceeded() {
+        let db = make_db().await;
+        let user = make_user(&db).await;
+
+        // Add spend directly so the global sum > limit
+        insert_spend(&db, user.id, 200.0).await;
+
+        // Global rule: $100/month
+        BudgetRepository::create(&*db, NewBudgetRule {
+            user_id: None, group_name: None, api_key_id: None, tag: None, project: None,
+            window: "monthly".to_string(),
+            limit_usd: Some(100.0),
+            limit_tokens: None, model_allow: vec![], model_deny: vec![],
+            rate_rpm: None, max_concurrent: None, window_start: None, window_end: None,
+        }).await.unwrap();
+
+        let engine = PolicyEngine::new(db.clone() as Arc<dyn DatabaseProvider>);
+        let decision = engine.check(&user, "claude-sonnet-4-6").await.unwrap();
+        assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn group_target_rule_does_not_block() {
+        let db = make_db().await;
+        let user = make_user(&db).await;
+
+        // Add lots of spend
+        insert_spend(&db, user.id, 9999.0).await;
+
+        // Group target rule — should NOT enforce (window="target" is skipped)
+        BudgetRepository::create(&*db, NewBudgetRule {
+            user_id: None, group_name: Some("engineering".to_string()), api_key_id: None,
+            tag: None, project: None,
+            window: "target".to_string(),
+            limit_usd: Some(1.0),
+            limit_tokens: None, model_allow: vec![], model_deny: vec![],
+            rate_rpm: None, max_concurrent: None, window_start: None, window_end: None,
+        }).await.unwrap();
+
+        let engine = PolicyEngine::new(db.clone() as Arc<dyn DatabaseProvider>);
+        let decision = engine.check(&user, "claude-sonnet-4-6").await.unwrap();
+        assert!(matches!(decision, PolicyDecision::Allow { .. }));
+    }
 }
 
 fn window_start_for(window: &str) -> String {
