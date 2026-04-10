@@ -8,7 +8,7 @@ use crate::{
     db::repositories::{
         admin_users::AdminUserRepository, api_keys::ApiKeyRepository, audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, hooks::HookRepository,
-        mcp_servers::McpServerRepository, prompts::PromptRepository,
+        groups::GroupRepository, mcp_servers::McpServerRepository, prompts::PromptRepository,
         rate_limits::RateLimitRepository, sessions::SessionRepository, users::UserRepository,
     },
     providers::{embed_registry::EmbeddingRegistry, registry::ProviderRegistry},
@@ -28,6 +28,7 @@ pub trait DatabaseProvider:
     + RateLimitRepository
     + ApiKeyRepository
     + McpServerRepository
+    + GroupRepository
     + Send
     + Sync
 {
@@ -46,6 +47,7 @@ impl<T> DatabaseProvider for T where
         + RateLimitRepository
         + ApiKeyRepository
         + McpServerRepository
+        + GroupRepository
         + Send
         + Sync
 {

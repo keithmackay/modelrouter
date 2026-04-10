@@ -1,3 +1,4 @@
+pub mod groups;
 pub mod admin_users;
 pub mod api_keys;
 pub mod audit;
@@ -10,6 +11,7 @@ pub mod rate_limits;
 pub mod sessions;
 pub mod users;
 
+pub use groups::GroupRepository;
 pub use admin_users::AdminUserRepository;
 pub use api_keys::ApiKeyRepository;
 pub use audit::AuditRepository;
