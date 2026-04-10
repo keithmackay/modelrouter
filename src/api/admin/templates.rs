@@ -88,5 +88,11 @@ pub fn build_env() -> Environment<'static> {
     )
     .expect("groups.html template is valid");
 
+    env.add_template_owned(
+        "budgets.html",
+        include_str!("../../../templates/admin/budgets.html").to_string(),
+    )
+    .expect("budgets.html template is valid");
+
     env
 }

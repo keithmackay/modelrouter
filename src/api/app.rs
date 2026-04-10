@@ -111,6 +111,9 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_groups, post_create_group, post_enable_group, post_disable_group,
         post_add_member, post_disable_member,
     };
+    use crate::api::admin::budgets::{
+        get_budgets, post_create_budget, post_edit_budget, post_delete_budget,
+    };
 
     axum::Router::new()
         // Embedded static assets
@@ -171,6 +174,9 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/groups/:id/disable", post(post_disable_group))
         .route("/admin/groups/:id/members", post(post_add_member))
         .route("/admin/groups/:id/members/:uid/disable", post(post_disable_member))
+        .route("/admin/budgets", get(get_budgets).post(post_create_budget))
+        .route("/admin/budgets/:id/edit", post(post_edit_budget))
+        .route("/admin/budgets/:id/delete", post(post_delete_budget))
         // MCP Server Registry
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))

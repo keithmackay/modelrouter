@@ -5,3 +5,4 @@ pub mod routes;
 pub mod templates;
 pub mod dashboard;
 pub mod groups;
+pub mod budgets;
