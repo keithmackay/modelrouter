@@ -257,6 +257,9 @@ pub struct UpdateBudgetRule {
     pub window_end: Option<String>,
 }
 
+/// Scope discriminator for budget rule queries.
+/// Note: the `tag` field in BudgetRule is a legacy scope mechanism not represented here;
+/// tag-scoped rules are still enforced via the existing `list_for_tag` path in policy.rs.
 #[derive(Debug, Clone)]
 pub enum BudgetScope {
     Global,
