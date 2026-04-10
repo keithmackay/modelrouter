@@ -5,9 +5,9 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 
-An OpenAI-compatible LLM proxy that routes requests across providers, enforces per-user spend budgets, and runs configurable hooks — all from a single self-hosted binary.
+An OpenAI-compatible LLM proxy that routes requests across providers, enforces spend budgets at every scope — global, project, user, and group — and runs configurable hooks, all from a single self-hosted binary.
 
-Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It authenticates your users with API keys, resolves model aliases, selects the right upstream provider, and tracks token spend — stopping requests that would blow a user's monthly budget before they hit the provider.
+Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It authenticates your users with API keys, resolves model aliases, selects the right upstream provider, tracks token spend, and stops requests that would blow a budget before they reach the provider.
 
 ---
 
@@ -15,10 +15,10 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 - [Highlights](#highlights)
 - [Getting Started](#getting-started)
-- [Usage](#usage)
-- [Setup Walkthrough](#setup-walkthrough)
+- [Admin Setup Walkthrough](#admin-setup-walkthrough)
 - [Developer Setup](#developer-setup)
 - [Configuration](#configuration)
+- [Usage](#usage)
 - [Architecture](#architecture)
 - [Development](#development)
 - [Contributing](#contributing)
@@ -30,13 +30,13 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 - **Drop-in OpenAI compatibility** — any SDK that speaks `POST /v1/chat/completions` works without modification
 - **Multi-provider routing** — route to OpenAI, Anthropic, Google Gemini, or Ollama; switch providers by changing one config line
-- **Per-user budget enforcement** — set monthly, weekly, or daily spend limits; over-budget requests are rejected before they reach the upstream
+- **Multi-scope budget enforcement** — set monthly or fixed date-range limits at the global (org-wide), project, user, or group level; any limit hit blocks the request before it reaches the upstream
+- **Admin dashboard** — web UI at `/admin` with usage stats, audit log, and full management pages for users, API keys, groups, and budgets
 - **Declarative policy engine** — TOML-configured rules that match users by project, group, or ID and enforce model allow-lists and budgets without touching the database
 - **Content guardrails** — pluggable safety layer runs OpenAI moderation (or a custom HTTP endpoint) on requests and responses; configurable fail-open/fail-closed
 - **MCP server registry** — register and discover Model Context Protocol servers via REST; semantic search ranks results by relevance to a query
 - **SSO / OIDC** — admin users can authenticate via Google, Okta, Auth0, or any OIDC provider using authorization code flow with PKCE; new admins are auto-provisioned from email allow-lists
 - **Hook system** — run shell scripts or HTTP webhooks at lifecycle events and in the request pipeline; grant capabilities per-user via `hook_permissions`
-- **Admin dashboard** — web UI at `/admin` with usage stats, audit log, budget management, and user administration
 - **Feature-flagged optional components** — `--features postgres` for Postgres backend, `--features otel` for full OpenTelemetry observability (traces, metrics, logs via OTLP)
 - **Single static binary** — SQLite bundled, no runtime dependencies; ships as a distroless Docker image
 
@@ -46,13 +46,15 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 ### Prerequisites
 
-- Rust 1.75+ (for building from source)
 - At least one upstream provider API key (OpenAI, Anthropic, Gemini, or a local Ollama instance)
+- Rust 1.75+ if building from source
 - Optional: PostgreSQL 14+ if using `--features postgres`
 
 ### Installation
 
 **Docker (from GHCR):**
+
+Pick the image that matches the features you need:
 
 | Image | Features |
 |---|---|
@@ -75,7 +77,6 @@ docker run \
   -e MODELROUTER_CONFIG=/config/config.toml \
   -p 8080:8080 \
   ghcr.io/keithmackay/modelrouter:latest serve
-# -p 8080:8080 maps to server.port in config.toml (default: 8080)
 ```
 
 **Build from source:**
@@ -87,106 +88,43 @@ cargo build --release
 # Binary is at target/release/modelrouter
 ```
 
-**With OTel support:**
-
 ```bash
+# With OTel support
 cargo build --release --features otel
-```
 
-**Initial setup:**
-
-```bash
-# Generate a starter config at ~/.modelrouter/config.toml
-modelrouter init
-
-# Run database migrations
-modelrouter migrate
-
-# Start the proxy
-modelrouter serve
+# With Postgres support
+cargo build --release --features postgres
 ```
 
 ---
 
-## Usage
+## Admin Setup Walkthrough
 
-### CLI
+This walkthrough takes a fresh modelrouter install to a fully configured team deployment: provider keys, superadmin, users, project keys, groups, and budgets.
 
-```bash
-# User and budget management
-modelrouter user create --name alice
-modelrouter user list
-modelrouter budget set --user alice --limit-usd 10.0 --window monthly
+### 1. Configure upstream provider keys
 
-# Cost reporting
-modelrouter report cost --user alice --window monthly --format table
-modelrouter report cost --window monthly --format csv > report.csv
-
-# Install as a system service (macOS or Linux)
-modelrouter install-service
-```
-
-### API
-
-All `/v1/*` endpoints accept `Authorization: Bearer <api-key>`.
-
-```bash
-# List available models
-curl http://localhost:8080/v1/models \
-  -H "Authorization: Bearer <api-key>"
-
-# Chat completion — identical to OpenAI API
-curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer <api-key>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-opus-4-5",
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'
-
-# MCP server registry — list registered servers
-curl http://localhost:8080/v1/mcp/servers \
-  -H "Authorization: Bearer <api-key>"
-
-# MCP server registry — discover servers by semantic query
-curl "http://localhost:8080/v1/mcp/servers/discover?q=code+review+tools" \
-  -H "Authorization: Bearer <api-key>"
-
-# Health check
-curl http://localhost:8080/health
-```
-
-Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. Admin login via OIDC SSO is available at `GET /admin/auth/oidc/login` when configured. A browser-based dashboard is available at `/admin`.
-
----
-
-## Setup Walkthrough
-
-This walkthrough covers a complete team deployment: two users with separate budgets, Claude Code configured as the client, and Arize Phoenix receiving OTel traces and metrics.
-
-**Prerequisites for this walkthrough:**
-- modelrouter built with `--features otel`
-- Anthropic API key
-- Arize Phoenix running locally or on your network
-
-### 1. Configure the Anthropic provider
-
-Edit `~/.modelrouter/config.toml`. Set your Anthropic API key and add a `claude-code` alias for convenience:
+Edit `~/.modelrouter/config.toml`. Add your provider API keys and configure routing:
 
 ```toml
 [providers.anthropic]
 api_key = "sk-ant-..."
 timeout_secs = 120
 
+[providers.openai]
+api_key = "sk-..."
+
 [routing]
 default_provider = "anthropic"
-default_model = "claude-opus-4-5"
+default_model = "claude-opus-4-6"
 
 [routing.model_aliases]
-"claude-code" = "anthropic/claude-opus-4-5"
+"claude-code" = "anthropic/claude-opus-4-6"
 ```
 
-Run migrations and verify the server starts:
+See [`config.example.toml`](config.example.toml) for all provider options, guardrail definitions, policy rules, OIDC, and telemetry settings.
+
+### 2. Run migrations and start the server
 
 ```bash
 modelrouter migrate
@@ -194,301 +132,127 @@ modelrouter serve
 curl http://localhost:8080/health   # → {"status":"ok"}
 ```
 
-### 2. Create users
+### 3. Create the first superadmin
 
-Create Abdoul and Becky, assigning them to a group. Groups are used for group-level budget rules and cost reporting.
+The first admin must be created via the CLI. All subsequent admin management is available in the web UI.
 
 ```bash
-modelrouter user create --name abdoul --group team-alpha
+modelrouter admin create --name ops --password <strong-password> --role superadmin
+# Admin 'ops' created (id=1, role=superadmin)
+```
+
+Log in at `http://localhost:8080/admin` with these credentials. Superadmin accounts can create additional admins, manage users, and configure budgets. Viewer accounts can read the dashboard but cannot mutate anything.
+
+> **Optional OIDC SSO:** If your team uses Google, Okta, Auth0, or another OIDC provider, see [OIDC Configuration](#oidc-sso-for-admin-login) to let admins log in with their corporate credentials.
+
+### 4. Create users
+
+Create users via the CLI or the **Users** page in the admin dashboard.
+
+**CLI:**
+
+```bash
+modelrouter user create --name abdoul
 # Created user 'abdoul' (id=1)
 # API key: mr-a1b2c3d4e5f6...
 # Store this key securely — it cannot be retrieved later.
 
-modelrouter user create --name becky --group team-alpha
+modelrouter user create --name becky
 # Created user 'becky' (id=2)
 # API key: mr-9z8y7x6w5v4u...
-# Store this key securely — it cannot be retrieved later.
 ```
 
-Save each API key — it is shown exactly once and the plaintext is never stored.
-
-Verify both users appear:
+Each user gets a default API key at creation. Keys are shown exactly once — save them before closing the terminal.
 
 ```bash
 modelrouter user list
-#    1  abdoul               enabled  team-alpha
-#    2  becky                enabled  team-alpha
+#    1  abdoul  enabled
+#    2  becky   enabled
 ```
 
-### 3. Set budgets
+### 5. Create projects and issue per-project keys
 
-Give Abdoul a $50/month limit and Becky a $100/month limit:
+A **project** is a label applied to API keys. Every request made with a project key is attributed to that project in the cost ledger, enabling per-project spend reports and budget enforcement.
+
+Create project keys via the **API Keys** page in the admin dashboard, or via the API (requires a superadmin JWT from `POST /admin/api/login`):
 
 ```bash
-modelrouter budget set --user abdoul --window monthly --limit-usd 50.0
-# Created budget rule (id=1) for user 'abdoul': monthly window, limit=$50.0
-
-modelrouter budget set --user becky --window monthly --limit-usd 100.0
-# Created budget rule (id=2) for user 'becky': monthly window, limit=$100.0
-```
-
-Confirm the rules:
-
-```bash
-modelrouter budget list
-#    1  user=abdoul  window=monthly  limit_usd=Some(50.0)  rate_rpm=None
-#    2  user=becky   window=monthly  limit_usd=Some(100.0)  rate_rpm=None
-```
-
-When a user hits their limit, subsequent requests receive a `429 Budget exceeded` response and are not forwarded to the provider.
-
-### 4. Configure Claude Code
-
-Claude Code uses the Anthropic SDK, which respects the `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` environment variables. Set these per developer so their Claude Code sessions route through modelrouter.
-
-**Abdoul's machine:**
-
-```bash
-export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
-export ANTHROPIC_API_KEY="mr-a1b2c3d4e5f6..."
-```
-
-**Becky's machine:**
-
-```bash
-export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
-export ANTHROPIC_API_KEY="mr-9z8y7x6w5v4u..."
-```
-
-Add these to each developer's shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to make them permanent. After this, every Claude Code invocation authenticates as that user and records spend against their budget.
-
-> **Note:** `ANTHROPIC_BASE_URL` overrides the SDK's default `api.anthropic.com` endpoint. modelrouter receives the request, authenticates the bearer token against its user database, checks the budget, proxies the call upstream to Anthropic, and records the cost.
-
-### 5. Connect OTel to Arize Phoenix
-
-[Arize Phoenix](https://docs.arize.com/phoenix) is an open-source LLM observability platform. Start it locally:
-
-```bash
-pip install arize-phoenix
-phoenix serve
-# Phoenix UI: http://localhost:6006
-# OTLP gRPC:  http://localhost:4317
-```
-
-Or via Docker:
-
-```bash
-docker run -p 6006:6006 -p 4317:4317 arizephoenix/phoenix:latest
-```
-
-Add the `[telemetry]` block to `~/.modelrouter/config.toml`:
-
-```toml
-[telemetry]
-enabled = true
-endpoint = "http://localhost:4317"   # Phoenix OTLP gRPC endpoint
-service_name = "modelrouter"
-sample_ratio = 1.0                   # Trace every request during initial setup
-slow_threshold_ms = 2000             # Always trace requests slower than 2s
-```
-
-Restart modelrouter. Send a test request:
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer mr-a1b2c3d4e5f6..." \
-  -H "Content-Type: application/json" \
-  -d '{"model": "claude-code", "messages": [{"role": "user", "content": "ping"}]}'
-```
-
-Open Phoenix at `http://localhost:6006` — the trace should appear within a few seconds. You will see the `chat_completions` root span with child spans for `modelrouter.policy_check` and `modelrouter.provider_call`, and attributes including `user.id`, `model.canonical`, `provider.name`, `tokens.prompt`, `tokens.completion`, and `cost.usd`.
-
-For a production deployment, lower `sample_ratio` to reduce volume:
-
-```toml
-sample_ratio = 0.1   # Trace 10% of normal requests; errors always traced
-```
-
-### 6. Review budget usage
-
-**Per user — check how much Abdoul has spent this month:**
-
-```bash
-modelrouter report cost --user abdoul --window monthly
-# User    Model                   Cost (USD)   Tokens In   Tokens Out   Requests
-# abdoul  anthropic/claude-opus-4-5  0.031200     4800        2100         12
-```
-
-**Per user — same for Becky:**
-
-```bash
-modelrouter report cost --user becky --window monthly
-```
-
-**Entire org — all users, this month:**
-
-```bash
-modelrouter report cost --window monthly
-# User    Model                     Cost (USD)   Tokens In   Tokens Out   Requests
-# abdoul  anthropic/claude-opus-4-5    0.031200     4800        2100         12
-# becky   anthropic/claude-opus-4-5    0.087600    12000        6800         31
-```
-
-**Per project — cost by API key project:**
-
-Each project gets its own API key with a `project` field set at creation time. Every cost entry is linked to that project, so filters compose to answer any question about spend. See [Developer Setup](#developer-setup) for how to configure per-project keys on developer machines.
-
-Create a project key via the admin API (requires superadmin JWT):
-
-```bash
+# Issue Abdoul a key for the "modelrouter" project
 curl -s http://localhost:8080/admin/api/users/1/keys \
   -H "Authorization: Bearer <admin-jwt>" \
   -H "Content-Type: application/json" \
   -d '{"label": "modelrouter dev — abdoul", "project": "modelrouter"}'
-# → {"id":3,"key":"mr-xxxx...","label":"modelrouter dev — abdoul","project":"modelrouter","created_at":"..."}
+# → {"id":3,"key":"mr-xxxx...","label":"modelrouter dev — abdoul","project":"modelrouter"}
 # Save the key — it cannot be retrieved later.
+
+# Issue Becky a key for the same project
+curl -s http://localhost:8080/admin/api/users/2/keys \
+  -H "Authorization: Bearer <admin-jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "modelrouter dev — becky", "project": "modelrouter"}'
 ```
 
-All requests made with this key are automatically attributed to the `modelrouter` project in the cost ledger.
+Share each key with the corresponding developer. See [Developer Setup](#developer-setup) for how developers add these to their environment.
 
-**Cost report filter matrix:**
+### 6. (Optional) Create groups
 
-`--user` and `--group` are mutually exclusive. `--project` composes freely with either.
+Groups collect users for spend tracking and reporting. A user can belong to multiple groups; spend is attributed to their highest-priority group.
 
-| Command | What it shows |
-|---|---|
-| `report cost` | All users, all projects |
-| `report cost --user abdoul` | Abdoul across all his projects |
-| `report cost --group team-alpha` | All users in group, all projects |
-| `report cost --project modelrouter` | All users on the `modelrouter` project |
-| `report cost --user abdoul --project modelrouter` | Abdoul on `modelrouter` only |
-| `report cost --group team-alpha --project modelrouter` | Entire group on `modelrouter` only |
+Go to **Admin → Groups** to create a group and add members. Groups are managed entirely in the web UI — there is no CLI command for group creation.
+
+1. Click **Create Group**, enter a name (e.g. `team-alpha`) and priority (default 0; higher number = higher priority when a user belongs to multiple groups).
+2. On the group card, use the **Add Member** dropdown to add Abdoul and Becky.
+
+Once members are added, cost reports can be filtered by group:
 
 ```bash
-# Cross-user project rollup — both abdoul and becky working on modelrouter
-modelrouter report cost --project modelrouter --window monthly
-# User    Model                      Cost (USD)   Tokens In   Tokens Out   Requests
-# abdoul  anthropic/claude-opus-4-5  0.019400     3200        1400         8
-# becky   anthropic/claude-opus-4-5  0.031200     5100        2200         14
-
-# One user across all their projects
-modelrouter report cost --user abdoul --window monthly
-
-# Narrow to one user on one project
-modelrouter report cost --user abdoul --project modelrouter --window monthly
+modelrouter report cost --group team-alpha --window monthly
 ```
 
-**Usage and prompt detail:**
+### 7. Configure budgets
 
-```bash
-# Model-level breakdown since the start of the month
-modelrouter report usage --since 2026-04-01T00:00:00Z
+Go to **Admin → Budgets** to set spend limits. Budgets are enforced independently — a request is blocked when *any* applicable rule is exceeded.
 
-# Detailed prompt log for Abdoul this week
-modelrouter report prompts --user abdoul --since 2026-03-25T00:00:00Z
-```
+The Budgets page has four tabs:
 
-**Check remaining budget headroom:**
+**Global** — applies to all traffic org-wide. Use this as a hard ceiling on total provider spend.
 
-```bash
-modelrouter budget list --user abdoul
-#    1  user_id=Some(1)  window=monthly  limit_usd=Some(50.0)  rate_rpm=None
-```
+- Example: add a **Monthly** rule with a $500 USD limit to cut off all requests once the org hits $500 for the month.
+- Example: add a **Total** rule with a date range of `2026-04-01` → `2026-06-30` to cap spend for a fiscal quarter.
 
-Cross-reference with the cost report: Abdoul has spent $0.03 of his $50.00 monthly limit.
+**Projects** — one card per project. Any project with an API key or an existing rule appears here.
 
-### 7. (Optional) Enable OIDC SSO for admin login
+- Example: add a **Monthly** $200 limit on the `modelrouter` project to cap all requests made with that project's keys.
 
-By default, admin users log in with a username and password at `/admin/login`. If your team uses an identity provider (Google, Okta, Auth0, Keycloak, or any OIDC-compliant IdP), you can configure SSO so admins authenticate through their normal corporate credentials instead.
+**Users** — one card per user. Set per-developer monthly or total limits.
 
-**Register a new OAuth2 application in your IdP.** Set the redirect URI to:
+- Example: give Abdoul a **Monthly** $50 limit and Becky a **Monthly** $100 limit.
 
-```
-http://localhost:8080/admin/auth/oidc/callback
-```
+**Groups** — informational spend targets, not hard limits. These are tracked but never block a request.
 
-(Replace `localhost:8080` with your actual hostname in production.)
+- Example: set a **Target** of $300 for `team-alpha` to track aggregate group spend without blocking any individual user.
 
-**Add an `[oidc]` block to `~/.modelrouter/config.toml`:**
-
-```toml
-[oidc]
-enabled = true
-issuer_url    = "https://accounts.google.com"   # or your Okta/Auth0 tenant URL
-client_id     = "your-client-id"
-client_secret = "your-client-secret"
-redirect_uri  = "http://localhost:8080/admin/auth/oidc/callback"
-
-# Restrict login to specific email addresses or entire domains
-allowed_emails  = []
-allowed_domains = ["yourcompany.com"]
-
-# Role assigned to newly provisioned admins ("admin" or "superadmin")
-auto_provision_role = "admin"
-```
-
-Restart modelrouter. Navigate to `http://localhost:8080/admin/auth/oidc/login` — you will be redirected to your IdP. After a successful login, modelrouter creates an admin account for you (if one doesn't already exist) and sets a session cookie.
-
-> **Note:** Password-based login at `/admin/login` remains available alongside OIDC. Existing admin accounts are not affected. OIDC-provisioned accounts have an empty password hash and cannot log in via the password form.
+When a user hits their user limit, all their keys return `429 Budget exceeded` until the next monthly period. When a project or global limit is hit, all keys associated with that project (or all keys, for global) are blocked until the limit resets or is raised.
 
 ---
 
 ## Developer Setup
 
-This section covers how individual developers configure their local tools to route through modelrouter, and how to use per-project keys so spend is attributed correctly.
+Once an admin has created your account and issued you a project key, connecting your AI tools to modelrouter takes two steps.
 
-### How it works
+### 1. Receive your key
 
-modelrouter is OpenAI-API-compatible. Every tool that supports a custom base URL and API key — Claude Code, Codex, Cursor, Continue, the OpenAI Python/Node SDKs — can be pointed at it. The developer sets two environment variables:
+The admin will give you:
+- **A modelrouter URL** — e.g. `http://modelrouter.internal:8080`
+- **A project key** — a `mr-...` token specific to you and your project
 
-- **Base URL** — points the tool at modelrouter instead of the upstream provider
-- **API key** — the modelrouter key that identifies the user and (if a project key) the project
+You may receive one key per project if your team tracks spend by project.
 
-No code changes. No plugin. Just environment variables.
+### 2. Set the key in your project's `.envrc`
 
-### Global setup — one key for everything
+[direnv](https://direnv.net/) automatically loads environment variables when you enter a directory, making it easy to use the right key for each project without manual switching.
 
-The simplest approach: one key per developer, set in their shell profile, applies to all projects.
-
-**`~/.zshrc` or `~/.bashrc`:**
-
-```bash
-# Route all AI tools through modelrouter
-export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
-export ANTHROPIC_API_KEY="mr-a1b2c3d4e5f6..."   # Abdoul's key
-
-# For OpenAI-compatible tools (Codex, Continue, etc.)
-export OPENAI_BASE_URL="http://modelrouter.internal:8080"
-export OPENAI_API_KEY="mr-a1b2c3d4e5f6..."       # same key — modelrouter accepts both
-```
-
-After `source ~/.zshrc`, every tool that reads these variables routes through modelrouter and records spend against Abdoul's account.
-
-### Per-project setup — one key per project
-
-For per-project cost tracking, each project gets its own API key with a `project` field set at creation time. modelrouter writes that project name into the cost ledger on every request, so spend can be filtered by project in reports. The admin creates keys via the API, then each developer sets the right key in their project directory using [direnv](https://direnv.net/).
-
-A single upstream provider key (Anthropic, OpenAI, etc.) is configured once in `config.toml` server-side. All modelrouter keys (`mr-...`) are internal tokens that modelrouter issues and validates — the upstream provider key is never exposed to developers.
-
-**1. Admin creates a project key for each user/project combination:**
-
-```bash
-# Create a key for Abdoul attributed to the "modelrouter" project (user id=1)
-curl -s http://modelrouter.internal:8080/admin/api/users/1/keys \
-  -H "Authorization: Bearer <admin-jwt>" \
-  -H "Content-Type: application/json" \
-  -d '{"label": "modelrouter dev — abdoul", "project": "modelrouter"}'
-# → {"id":3,"key":"mr-xxxx...","project":"modelrouter",...}
-
-# Create a key for Abdoul attributed to the "other-app" project
-curl -s http://modelrouter.internal:8080/admin/api/users/1/keys \
-  -H "Authorization: Bearer <admin-jwt>" \
-  -H "Content-Type: application/json" \
-  -d '{"label": "other-app dev — abdoul", "project": "other-app"}'
-# → {"id":4,"key":"mr-yyyy...","project":"other-app",...}
-```
-
-**2. Developer installs direnv (once):**
+**Install direnv (once):**
 
 ```bash
 # macOS
@@ -498,62 +262,58 @@ brew install direnv
 eval "$(direnv hook zsh)"   # or bash
 ```
 
-**3. Developer creates a `.envrc` in each project root:**
+**Create a `.envrc` in each project root:**
 
-`~/Projects/modelrouter/.envrc`:
+`~/Projects/my-project/.envrc`:
 ```bash
+# Route AI tools through modelrouter for this project
 export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
-export ANTHROPIC_API_KEY="mr-xxxx..."   # Abdoul's key for the "modelrouter" project
+export ANTHROPIC_API_KEY="mr-xxxx..."   # your key for this project
+
+# Also set the OpenAI vars for tools that use the OpenAI SDK
 export OPENAI_BASE_URL="http://modelrouter.internal:8080"
-export OPENAI_API_KEY="mr-xxxx..."
+export OPENAI_API_KEY="mr-xxxx..."      # same key — modelrouter accepts both
 ```
 
-`~/Projects/other-app/.envrc`:
+```bash
+# Allow the .envrc (once per directory)
+cd ~/Projects/my-project && direnv allow
+```
+
+From this point, every AI tool in that shell session — Claude Code, Codex, Cursor, Continue, or any OpenAI-compatible SDK — automatically routes through modelrouter when you are working in that directory. When you leave the directory, the variables are unset.
+
+> **Add `.envrc` to `.gitignore`** — it contains credentials and should never be committed.
+
+### Multiple projects
+
+If you work on multiple tracked projects, create a separate `.envrc` per project with the key for that project:
+
+`~/Projects/other-project/.envrc`:
 ```bash
 export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
-export ANTHROPIC_API_KEY="mr-yyyy..."   # Abdoul's key for the "other-app" project
+export ANTHROPIC_API_KEY="mr-yyyy..."   # your key for other-project
 export OPENAI_BASE_URL="http://modelrouter.internal:8080"
 export OPENAI_API_KEY="mr-yyyy..."
 ```
 
-```bash
-# Allow each .envrc (once per directory)
-cd ~/Projects/modelrouter && direnv allow
-cd ~/Projects/other-app   && direnv allow
-```
+Changing directories automatically switches keys. No manual work needed.
 
-Now the correct key is automatically active whenever the developer `cd`s into a project. No manual switching. Claude Code, Codex, and any other tool in that shell session uses the project's key.
+### Opting specific projects in or out
 
-> **Add `.envrc` to `.gitignore`** — it contains credentials and should never be committed.
-
-### Mixing modelrouter and direct Anthropic or OpenAI access
-
-> The same patterns apply to OpenAI-compatible tools. Substitute `OPENAI_BASE_URL` and `OPENAI_API_KEY` wherever `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` appear below — the behaviour is identical.
-
-modelrouter is only in the path when a tool is explicitly pointed at it. If `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`) is not set, tools talk directly to the upstream provider as normal. This makes it easy to opt only specific projects in, leaving everything else unchanged.
-
-**Pattern 1 — Direct Anthropic by default, opt specific projects into modelrouter (recommended for most teams)**
-
-Shell profile uses a real Anthropic key with no base URL override:
+**Default to direct Anthropic, opt specific projects into modelrouter:**
 
 ```bash
 # ~/.zshrc — direct Anthropic everywhere by default
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Projects that should be tracked add a `.envrc` that switches to modelrouter:
-
 ```bash
-# ~/Projects/work-project/.envrc
+# ~/Projects/work-project/.envrc — switch to modelrouter for this project
 export ANTHROPIC_BASE_URL="http://modelrouter.internal:8080"
-export ANTHROPIC_API_KEY="mr-xxxx..."   # modelrouter key for this project
+export ANTHROPIC_API_KEY="mr-xxxx..."
 ```
 
-When the developer `cd`s into `work-project`, direnv activates the modelrouter vars. When they leave, the vars are unset and direct Anthropic resumes. Personal projects and any directory without a `.envrc` are unaffected.
-
-**Pattern 2 — modelrouter by default, opt specific projects out**
-
-Shell profile points at modelrouter globally, and personal or private projects revert to direct Anthropic:
+**Default to modelrouter, opt specific projects out:**
 
 ```bash
 # ~/.zshrc — route everything through modelrouter by default
@@ -562,70 +322,30 @@ export ANTHROPIC_API_KEY="mr-default..."
 ```
 
 ```bash
-# ~/Projects/personal-project/.envrc
-unset ANTHROPIC_BASE_URL        # remove the override — revert to direct Anthropic
+# ~/Projects/personal-project/.envrc — revert to direct Anthropic
+unset ANTHROPIC_BASE_URL
 export ANTHROPIC_API_KEY="sk-ant-..."   # personal Anthropic key
 ```
 
-Pattern 1 is safer for developers who have personal Anthropic usage alongside org work — there is no risk of accidentally routing private sessions through the org's proxy.
-
 ### Tool-specific notes
 
-**Claude Code**
+**Claude Code** — reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` from the environment. No config file changes needed.
 
-Claude Code reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` from the environment. No config file changes needed. When the env vars are set (globally or via direnv), Claude Code routes through modelrouter automatically.
+**OpenAI Codex CLI** — reads `OPENAI_BASE_URL` and `OPENAI_API_KEY`. modelrouter's `/v1` endpoint is fully OpenAI-compatible.
 
-**OpenAI Codex CLI**
-
-Codex reads `OPENAI_BASE_URL` and `OPENAI_API_KEY`. modelrouter's `/v1/chat/completions` endpoint is fully OpenAI-compatible. Set both variables as shown above — Codex will not know it is talking to a proxy.
-
-**OpenAI Python or Node SDK**
+**OpenAI Python or Node SDK:**
 
 ```python
 from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://modelrouter.internal:8080/v1",
-    api_key="mr-xxxx...",
-)
+client = OpenAI(base_url="http://modelrouter.internal:8080/v1", api_key="mr-xxxx...")
 ```
 
 ```typescript
 import OpenAI from "openai";
-
-const client = new OpenAI({
-  baseURL: "http://modelrouter.internal:8080/v1",
-  apiKey: "mr-xxxx...",
-});
+const client = new OpenAI({ baseURL: "http://modelrouter.internal:8080/v1", apiKey: "mr-xxxx..." });
 ```
 
-**Other tools (Cursor, Continue, etc.)**
-
-Any tool with an "OpenAI base URL" or "custom endpoint" setting works. Point it at `http://modelrouter.internal:8080` and use the modelrouter API key as the API key. The tool does not need to know it is talking to a proxy.
-
-### What the resulting spend matrix looks like
-
-With Abdoul and Becky each having keys for `modelrouter` and `other-app`, the admin can slice spend any way:
-
-```bash
-# Total spend this month — everyone, everything
-modelrouter report cost --window monthly
-
-# All work on the modelrouter project — all developers combined
-modelrouter report cost --project modelrouter --window monthly
-
-# Abdoul's total across all his projects
-modelrouter report cost --user abdoul --window monthly
-
-# Abdoul on modelrouter only
-modelrouter report cost --user abdoul --project modelrouter --window monthly
-
-# Becky on other-app only
-modelrouter report cost --user becky --project other-app --window monthly
-
-# All of team-alpha on modelrouter
-modelrouter report cost --group team-alpha --project modelrouter --window monthly
-```
+**Cursor, Continue, and other tools** — use the "custom OpenAI base URL" or equivalent setting. Point it at `http://modelrouter.internal:8080` and use your modelrouter key as the API key.
 
 ---
 
@@ -649,15 +369,129 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 | `telemetry.endpoint` | OTLP gRPC endpoint (`--features otel`) | disabled |
 | `telemetry.sample_ratio` | Fraction of normal requests to trace | `0.1` |
 
-See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration covering all providers, hook definitions, guardrails, policy rules, OIDC, and telemetry options.
+See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration.
 
 ### Model routing
 
 Models resolve in this order:
 
 1. Alias lookup from `routing.model_aliases`
-2. Provider prefix — `anthropic/claude-opus-4-5` routes to the `anthropic` provider
+2. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
 3. Fall back to `routing.default_provider`
+
+### OIDC SSO for admin login
+
+By default, admins log in with username and password at `/admin/login`. To use an identity provider instead:
+
+**Register an OAuth2 application in your IdP.** Set the redirect URI to:
+
+```
+http://localhost:8080/admin/auth/oidc/callback
+```
+
+**Add an `[oidc]` block to `config.toml`:**
+
+```toml
+[oidc]
+enabled = true
+issuer_url    = "https://accounts.google.com"   # or your Okta/Auth0 tenant URL
+client_id     = "your-client-id"
+client_secret = "your-client-secret"
+redirect_uri  = "http://localhost:8080/admin/auth/oidc/callback"
+
+# Restrict login to specific emails or entire domains
+allowed_emails  = []
+allowed_domains = ["yourcompany.com"]
+
+# Role assigned to newly provisioned admins
+auto_provision_role = "admin"
+```
+
+Restart modelrouter. Navigate to `/admin/auth/oidc/login` to authenticate via your IdP. Password-based login remains available alongside OIDC.
+
+---
+
+## Usage
+
+### CLI
+
+```bash
+# User management
+modelrouter user create --name alice
+modelrouter user list
+
+# Budget management (basic — see Admin → Budgets for full scope options)
+modelrouter budget set --user alice --limit-usd 10.0 --window monthly
+
+# Cost reporting
+modelrouter report cost --user alice --window monthly --format table
+modelrouter report cost --group team-alpha --window monthly
+modelrouter report cost --project modelrouter --window monthly --format csv > report.csv
+
+# Install as a system service (macOS or Linux)
+modelrouter install-service
+```
+
+**Cost report filter matrix** — `--user` and `--group` are mutually exclusive; `--project` composes freely with either:
+
+| Command | What it shows |
+|---|---|
+| `report cost` | All users, all projects |
+| `report cost --user alice` | Alice across all her projects |
+| `report cost --group team-alpha` | All users in group, all projects |
+| `report cost --project modelrouter` | All users on the `modelrouter` project |
+| `report cost --user alice --project modelrouter` | Alice on `modelrouter` only |
+| `report cost --group team-alpha --project modelrouter` | Entire group on `modelrouter` only |
+
+### API
+
+All `/v1/*` endpoints accept `Authorization: Bearer <api-key>`.
+
+```bash
+# List available models
+curl http://localhost:8080/v1/models \
+  -H "Authorization: Bearer <api-key>"
+
+# Chat completion — identical to OpenAI API
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus-4-6",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+
+# MCP server registry
+curl "http://localhost:8080/v1/mcp/servers/discover?q=code+review+tools" \
+  -H "Authorization: Bearer <api-key>"
+
+# Health check
+curl http://localhost:8080/health
+```
+
+Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
+
+### OTel / Arize Phoenix
+
+[Arize Phoenix](https://docs.arize.com/phoenix) is an open-source LLM observability platform. Start it locally:
+
+```bash
+pip install arize-phoenix && phoenix serve
+# Phoenix UI: http://localhost:6006   OTLP gRPC: localhost:4317
+```
+
+Add to `config.toml` (requires `--features otel` build):
+
+```toml
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4317"
+service_name = "modelrouter"
+sample_ratio = 1.0        # trace everything during initial setup
+slow_threshold_ms = 2000  # always trace slow requests
+```
+
+Each trace includes `user.id`, `model.canonical`, `provider.name`, `tokens.prompt`, `tokens.completion`, and `cost.usd` attributes.
 
 ---
 
@@ -668,8 +502,10 @@ src/
 ├── api/
 │   ├── admin/
 │   │   ├── auth.rs             — JWT issuance and verification, AdminSession extractor
+│   │   ├── budgets.rs          — Budget admin handlers (get/create/edit/delete per scope)
 │   │   ├── dashboard.rs        — browser dashboard handlers (HTMX, mr_admin_session cookie)
-│   │   ├── oidc.rs             — OIDC state store, PKCE, discovery, token validation, SSO handlers
+│   │   ├── groups.rs           — Groups admin handlers (create, enable/disable, membership)
+│   │   ├── oidc.rs             — OIDC state store, PKCE, discovery, token validation
 │   │   └── routes.rs           — admin REST API handlers
 │   ├── app.rs                  — axum router assembly, AppState, middleware stack
 │   ├── auth.rs                 — Bearer token auth for /v1/* endpoints
@@ -692,13 +528,15 @@ src/
 │   └── pipeline.rs             — streaming pipeline hooks
 ├── providers/                  — Upstream adapters (Anthropic, OpenAI, Bedrock, Azure, Gemini, Ollama)
 ├── router/
-│   ├── declarative_policy.rs   — TOML-configured policy rule matching (condition + allow-list + budget)
-│   ├── policy.rs               — PolicyEngine: declarative rules (priority) then DB budget/rate rules
+│   ├── declarative_policy.rs   — TOML-configured policy rule matching
+│   ├── policy.rs               — PolicyEngine: user/key → project → global budget enforcement
 │   ├── engine.rs               — RequestRouter: alias resolution, provider selection, load balancing
 │   └── ...                     — cache, circuit_breaker, fallback, retry, session_limits
 ├── report/                     — Cost reporting and audit log formatting
 └── telemetry/                  — OTel init, SmartSampler, metrics instruments (--features otel)
 ```
+
+**Budget enforcement order:** per-user/key rules are checked first, then project-scope rules, then global rules. A request is blocked when any applicable rule is exceeded. Group-scope rules are informational targets only and never block requests.
 
 The binary entry point at `src/main.rs` delegates entirely to the library crate, keeping all logic testable without spinning up a process.
 
