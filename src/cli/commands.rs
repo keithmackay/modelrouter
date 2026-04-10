@@ -61,8 +61,6 @@ pub enum UserCommands {
     Create {
         #[arg(long)]
         name: String,
-        #[arg(long)]
-        group: Option<String>,
     },
     /// List all users
     List,
@@ -108,11 +106,8 @@ pub enum ReportCommands {
     /// Cost report
     Cost {
         /// Filter by user name
-        #[arg(long, conflicts_with = "group")]
+        #[arg(long)]
         user: Option<String>,
-        /// Filter by group name
-        #[arg(long, conflicts_with = "user")]
-        group: Option<String>,
         /// Filter by project (matches api_keys.project assigned at key creation)
         #[arg(long)]
         project: Option<String>,

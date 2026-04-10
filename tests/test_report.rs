@@ -43,7 +43,7 @@ async fn cost_report_sums_cost_ledger_by_window() {
     let db = common::in_memory_db().await;
     setup_test_data(&db.pool).await;
 
-    let rows = report::cost_by_user_window(&db.pool, "monthly", None, None, None)
+    let rows = report::cost_by_user_window(&db.pool, "monthly", None, None)
         .await
         .unwrap();
     assert!(!rows.is_empty(), "should have at least one cost row");
@@ -57,7 +57,7 @@ async fn cost_report_filters_by_user() {
     let db = common::in_memory_db().await;
     setup_test_data(&db.pool).await;
 
-    let rows = report::cost_by_user_window(&db.pool, "monthly", Some("alice"), None, None)
+    let rows = report::cost_by_user_window(&db.pool, "monthly", Some("alice"), None)
         .await
         .unwrap();
     assert!(
@@ -65,7 +65,7 @@ async fn cost_report_filters_by_user() {
         "filter should only return alice"
     );
 
-    let rows_other = report::cost_by_user_window(&db.pool, "monthly", Some("nonexistent"), None, None)
+    let rows_other = report::cost_by_user_window(&db.pool, "monthly", Some("nonexistent"), None)
         .await
         .unwrap();
     assert!(rows_other.is_empty(), "nonexistent user should have no rows");
@@ -87,7 +87,7 @@ async fn json_format_is_valid_parseable_json() {
     let db = common::in_memory_db().await;
     setup_test_data(&db.pool).await;
 
-    let rows = report::cost_by_user_window(&db.pool, "monthly", None, None, None)
+    let rows = report::cost_by_user_window(&db.pool, "monthly", None, None)
         .await
         .unwrap();
     let json_str = serde_json::to_string(&rows).expect("should serialize to JSON");

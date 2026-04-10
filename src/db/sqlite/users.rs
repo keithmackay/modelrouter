@@ -10,7 +10,6 @@ struct UserRow {
     id: i64,
     name: String,
     email: Option<String>,
-    group_name: Option<String>,
     enabled: i64,
     created_at: String,
     metadata: String,
@@ -24,7 +23,6 @@ impl From<UserRow> for User {
             id: r.id,
             name: r.name,
             email: r.email,
-            group_name: r.group_name,
             enabled: r.enabled != 0,
             created_at: r.created_at,
             metadata: r.metadata,
@@ -39,7 +37,7 @@ impl From<UserRow> for User {
 impl UserRepository for SqliteDb {
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE name = ?"#,
         )
         .bind(name)
@@ -50,7 +48,7 @@ impl UserRepository for SqliteDb {
 
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE id = ?"#,
         )
         .bind(id)
@@ -61,7 +59,7 @@ impl UserRepository for SqliteDb {
 
     async fn list(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users ORDER BY enabled DESC, created_at DESC"#,
         )
         .fetch_all(&self.pool)
@@ -72,11 +70,10 @@ impl UserRepository for SqliteDb {
     async fn create(&self, user: NewUser) -> anyhow::Result<User> {
         let now = now_utc();
         let result = sqlx::query(
-            r#"INSERT INTO users (name, group_name, email, enabled, created_at, metadata)
-               VALUES (?, ?, ?, 1, ?, '{}')"#,
+            r#"INSERT INTO users (name, email, enabled, created_at, metadata)
+               VALUES (?, ?, 1, ?, '{}')"#,
         )
         .bind(&user.name)
-        .bind(&user.group_name)
         .bind(&user.email)
         .bind(&now)
         .execute(&self.pool)
@@ -84,7 +81,7 @@ impl UserRepository for SqliteDb {
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE id = ?"#,
         )
         .bind(id)

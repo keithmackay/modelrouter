@@ -19,7 +19,6 @@ async fn test_app() -> TestServer {
     // Create a test user
     db.create(NewUser {
         name: "test-user".to_string(),
-        group_name: None,
         email: None,
     })
     .await
@@ -150,7 +149,6 @@ async fn test_app_with_blocking_guardrail() -> TestServer {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
-        group_name: None,
         email: None,
     })
     .await

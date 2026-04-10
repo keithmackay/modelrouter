@@ -27,7 +27,6 @@ async fn test_app() -> TestServer {
     db.create(NewUser {
         name: "test-user".to_string(),
         email: None,
-        group_name: None,
     })
     .await
     .unwrap();

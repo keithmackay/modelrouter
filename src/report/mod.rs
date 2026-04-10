@@ -60,14 +60,12 @@ pub async fn cost_by_user_window(
     pool: &sqlx::SqlitePool,
     window: &str,
     user_name: Option<&str>,
-    group_name: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<CostRow>> {
     let window_start = window_start_str(window)?;
 
     let mut extras = String::new();
     if user_name.is_some()  { extras.push_str(" AND u.name = ?"); }
-    if group_name.is_some() { extras.push_str(" AND u.group_name = ?"); }
     if project.is_some()    { extras.push_str(" AND cl.project = ?"); }
 
     let sql = format!(
@@ -86,7 +84,6 @@ pub async fn cost_by_user_window(
     let mut q = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(&sql);
     q = q.bind(&window_start);
     if let Some(v) = user_name  { q = q.bind(v); }
-    if let Some(v) = group_name { q = q.bind(v); }
     if let Some(v) = project    { q = q.bind(v); }
 
     let rows = q.fetch_all(pool).await?;

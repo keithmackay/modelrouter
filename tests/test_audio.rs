@@ -15,7 +15,6 @@ async fn test_app() -> TestServer {
 
     db.create(NewUser {
         name: "test-user".to_string(),
-        group_name: None,
         email: None,
     })
     .await

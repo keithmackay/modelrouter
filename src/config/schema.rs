@@ -478,8 +478,6 @@ fn default_batch_export_size() -> usize { 512 }
 pub struct PolicyConditionConfig {
     /// Match on the user's API key tag.
     pub tag: Option<String>,
-    /// Match on the user's group name.
-    pub group_name: Option<String>,
     /// Match on a specific user ID.
     pub user_id: Option<i64>,
     /// Match on the requested model string.

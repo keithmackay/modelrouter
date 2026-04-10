@@ -15,7 +15,6 @@ async fn make_user_with_budget(
         db,
         NewUser {
             name: format!("test-user-{}", uuid::Uuid::new_v4()),
-            group_name: None,
             email: None,
         },
     )
@@ -59,7 +58,6 @@ async fn model_in_deny_list_returns_403() {
         &db,
         NewUser {
             name: "deny-test".to_string(),
-            group_name: None,
             email: None,
         },
     )
@@ -96,7 +94,6 @@ async fn model_not_in_allow_list_returns_403() {
         &db,
         NewUser {
             name: "allow-test".to_string(),
-            group_name: None,
             email: None,
         },
     )
@@ -133,7 +130,6 @@ async fn no_budget_rules_allows_request() {
         &db,
         NewUser {
             name: "no-rules".to_string(),
-            group_name: None,
             email: None,
         },
     )
@@ -158,7 +154,6 @@ async fn budget_exceeded_returns_deny() {
         &db,
         NewUser {
             name: "budget-exceeded-test".to_string(),
-            group_name: None,
             email: None,
         },
     )
@@ -245,7 +240,6 @@ async fn test_policy_token_limit_under_budget() {
         &db,
         NewUser {
             name: format!("token-under-{}", uuid::Uuid::new_v4()),
-            group_name: None,
             email: None,
         },
     )
@@ -332,7 +326,6 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
         &db,
         NewUser {
             name: format!("token-exceeded-{}", uuid::Uuid::new_v4()),
-            group_name: None,
             email: None,
         },
     )

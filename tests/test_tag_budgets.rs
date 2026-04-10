@@ -36,7 +36,6 @@ fn user_has_api_key_project_field() {
         id: 1,
         name: "test".to_string(),
         email: None,
-        group_name: None,
         enabled: true,
         created_at: "2026-01-01T00:00:00+00:00".to_string(),
         metadata: "{}".to_string(),

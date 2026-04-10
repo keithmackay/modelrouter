@@ -380,7 +380,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::db::migrations::run_migrations(&db.pool).await?;
 
             match user_args.command {
-                UserCommands::Create { name, group } => {
+                UserCommands::Create { name } => {
                     use crate::db::repositories::users::UserRepository;
                     use crate::db::repositories::api_keys::ApiKeyRepository;
                     use crate::db::models::NewUser;
@@ -388,7 +388,6 @@ pub async fn run(cli: Cli) -> Result<()> {
 
                     let user = UserRepository::create(&db, NewUser {
                         name: name.clone(),
-                        group_name: group,
                         email: None,
                     }).await?;
 
@@ -411,11 +410,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let users = UserRepository::list(&db).await?;
                     for u in users {
                         println!(
-                            "{:>4}  {:20}  {}  {}",
+                            "{:>4}  {:20}  {}",
                             u.id,
                             u.name,
                             if u.enabled { "enabled" } else { "disabled" },
-                            u.group_name.as_deref().unwrap_or("-")
                         );
                     }
                 }
@@ -511,9 +509,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             use crate::cli::commands::ReportCommands;
 
             match report_args.command {
-                ReportCommands::Cost { user, group, project, window, format } => {
+                ReportCommands::Cost { user, project, window, format } => {
                     let rows = crate::report::cost_by_user_window(
-                        &db.pool, &window, user.as_deref(), group.as_deref(), project.as_deref(),
+                        &db.pool, &window, user.as_deref(), project.as_deref(),
                     ).await?;
                     print_rows(
                         &rows,
@@ -633,7 +631,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                         Some(u) => u,
                         None => UserRepository::create(&db, NewUser {
                             name: user.clone(),
-                            group_name: None,
                             email: None,
                         }).await?,
                     };

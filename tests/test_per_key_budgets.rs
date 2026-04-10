@@ -21,7 +21,6 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
     db.create(NewUser {
         name: "base-user".to_string(),
         email: None,
-        group_name: None,
     })
     .await
     .unwrap();

@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct User {
     pub id: i64,
     pub name: String,
-    pub group_name: Option<String>,
     pub email: Option<String>,
     pub enabled: bool,
     pub created_at: String,
@@ -62,8 +61,27 @@ pub struct NewApiKey {
 #[derive(Debug)]
 pub struct NewUser {
     pub name: String,
-    pub group_name: Option<String>,
     pub email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id: i64,
+    pub name: String,
+    pub priority: i64,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMembership {
+    pub id: i64,
+    pub group_id: i64,
+    pub user_id: i64,
+    /// Joined from the users table via aliased column `user_name`.
+    pub user_name: String,
+    pub joined_at: String,
+    pub disabled_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -270,6 +288,37 @@ pub struct NewMcpServer {
     pub name: String,
     pub url: String,
     pub description: Option<String>,
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    #[test]
+    fn group_enabled_default() {
+        let g = Group {
+            id: 1,
+            name: "eng".to_string(),
+            priority: 10,
+            enabled: true,
+            created_at: "2026-04-10T00:00:00Z".to_string(),
+        };
+        assert!(g.enabled);
+    }
+
+    #[test]
+    fn group_membership_fields() {
+        let m = GroupMembership {
+            id: 1,
+            group_id: 1,
+            user_id: 2,
+            user_name: "alice".to_string(),
+            joined_at: "2026-04-10T00:00:00Z".to_string(),
+            disabled_at: None,
+        };
+        assert_eq!(m.user_name, "alice");
+        assert!(m.disabled_at.is_none());
+    }
 }
 
 #[cfg(test)]

@@ -36,7 +36,6 @@ impl From<crate::db::models::ApiKey> for ApiKeyResponse {
 struct UserResponse {
     id: i64,
     name: String,
-    group_name: Option<String>,
     enabled: bool,
     created_at: String,
     metadata: String,
@@ -47,7 +46,6 @@ impl From<crate::db::models::User> for UserResponse {
         UserResponse {
             id: u.id,
             name: u.name,
-            group_name: u.group_name,
             enabled: u.enabled,
             created_at: u.created_at,
             metadata: u.metadata,
@@ -121,7 +119,6 @@ pub async fn list_users(
 #[derive(Deserialize)]
 pub struct CreateUserRequest {
     pub name: String,
-    pub group: Option<String>,
 }
 
 pub async fn create_user(
@@ -135,7 +132,6 @@ pub async fn create_user(
         &*state.db,
         NewUser {
             name: body.name.clone(),
-            group_name: body.group.clone(),
             email: None,
         },
     )

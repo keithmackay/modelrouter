@@ -257,7 +257,6 @@ async fn completions_span_has_required_attributes() {
     let api_key = "test-span-key";
     db.create(NewUser {
         name: "span-test-user".to_string(),
-        group_name: None,
         email: None,
     }).await.unwrap();
 

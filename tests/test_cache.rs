@@ -114,7 +114,6 @@ async fn test_app_with_cache() -> TestServer {
     db.create(NewUser {
         name: "test-user".to_string(),
         email: None,
-        group_name: None,
     })
     .await
     .unwrap();

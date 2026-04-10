@@ -384,7 +384,6 @@ pub async fn get_users(
                 id => u.id,
                 name => u.name.clone(),
                 email => u.email.clone(),
-                group_name => u.group_name.clone(),
                 enabled => u.enabled,
                 created_at => u.created_at.clone(),
             }
@@ -461,7 +460,6 @@ pub async fn post_enable_user(
 #[derive(Deserialize)]
 pub struct CreateUserForm {
     pub name: String,
-    pub group_name: Option<String>,
 }
 
 pub async fn post_create_user(
@@ -477,11 +475,9 @@ pub async fn post_create_user(
         return Err(DashboardError::BadRequest("name is required".into()));
     }
 
-    let group_name = form.group_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-
     let user = UserRepository::create(
         &*state.db,
-        NewUser { name: name.clone(), group_name, email: None },
+        NewUser { name: name.clone(), email: None },
     )
     .await
     .map_err(|_| DashboardError::Internal)?;
@@ -765,7 +761,6 @@ pub async fn post_create_key(
         Ok(None) => {
             match UserRepository::create(&*state.db, NewUser {
                 name: user_name.clone(),
-                group_name: None,
                 email: None,
             }).await {
                 Ok(u) => u,

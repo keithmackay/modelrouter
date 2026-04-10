@@ -34,7 +34,6 @@ async fn create_and_find_user() {
     let db = common::in_memory_db().await;
     let new_user = NewUser {
         name: "alice".to_string(),
-        group_name: None,
         email: None,
     };
     let created = db.create(new_user).await.unwrap();
@@ -60,7 +59,6 @@ async fn token_rotation_overlap_window() {
     let db = common::in_memory_db().await;
     let new_user = NewUser {
         name: "bob".to_string(),
-        group_name: None,
         email: None,
     };
     let user = db.create(new_user).await.unwrap();
@@ -102,7 +100,6 @@ async fn old_key_disabled_after_rotation() {
     let db = common::in_memory_db().await;
     let new_user = NewUser {
         name: "carol".to_string(),
-        group_name: None,
         email: None,
     };
     let user = db.create(new_user).await.unwrap();

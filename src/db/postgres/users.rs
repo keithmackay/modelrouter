@@ -12,7 +12,6 @@ struct UserRow {
     id: i64,
     name: String,
     email: Option<String>,
-    group_name: Option<String>,
     enabled: bool,
     created_at: String,
     metadata: String,
@@ -25,7 +24,6 @@ impl From<UserRow> for User {
             id: r.id,
             name: r.name,
             email: r.email,
-            group_name: r.group_name,
             enabled: r.enabled,
             created_at: r.created_at,
             metadata: r.metadata,
@@ -40,7 +38,7 @@ impl From<UserRow> for User {
 impl UserRepository for PostgresDb {
     async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE name = $1"#,
         )
         .bind(name)
@@ -51,7 +49,7 @@ impl UserRepository for PostgresDb {
 
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users WHERE id = $1"#,
         )
         .bind(id)
@@ -62,7 +60,7 @@ impl UserRepository for PostgresDb {
 
     async fn list(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
-            r#"SELECT id, name, email, group_name, enabled, created_at, metadata, spend_reset_at
+            r#"SELECT id, name, email, enabled, created_at, metadata, spend_reset_at
                FROM users ORDER BY enabled DESC, created_at DESC"#,
         )
         .fetch_all(&self.pool)
@@ -73,13 +71,12 @@ impl UserRepository for PostgresDb {
     async fn create(&self, user: NewUser) -> anyhow::Result<User> {
         let now = now_utc();
         let row = sqlx::query_as::<_, UserRow>(
-            r#"INSERT INTO users (name, email, group_name, enabled, created_at, metadata)
-               VALUES ($1, $2, $3, true, $4, '{}')
-               RETURNING id, name, email, group_name, enabled, created_at, metadata, spend_reset_at"#,
+            r#"INSERT INTO users (name, email, enabled, created_at, metadata)
+               VALUES ($1, $2, true, $3, '{}')
+               RETURNING id, name, email, enabled, created_at, metadata, spend_reset_at"#,
         )
         .bind(&user.name)
         .bind(&user.email)
-        .bind(&user.group_name)
         .bind(&now)
         .fetch_one(&self.pool)
         .await?;
