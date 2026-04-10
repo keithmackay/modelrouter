@@ -19,7 +19,7 @@ fn rule_row_html(rule: &BudgetRule, card_target: &str) -> String {
         "total" => {
             let start = rule.window_start.as_deref().unwrap_or("?");
             let end = rule.window_end.as_deref().unwrap_or("?");
-            format!("Total ({} – {})", start, end)
+            format!("Total ({} – {})", he(start), he(end))
         }
         "target" => "Target".to_string(),
         w => he(w),
@@ -47,8 +47,8 @@ fn rule_row_html(rule: &BudgetRule, card_target: &str) -> String {
             format!(
                 r#"<input type="date" name="window_start" value="{ws}" style="padding:0.25rem;border:1px solid #ccc;border-radius:4px;">
                    <input type="date" name="window_end" value="{we}" style="padding:0.25rem;border:1px solid #ccc;border-radius:4px;">"#,
-                ws = rule.window_start.as_deref().and_then(|s| s.get(..10)).unwrap_or(""),
-                we = rule.window_end.as_deref().and_then(|s| s.get(..10)).unwrap_or(""),
+                ws = rule.window_start.as_deref().and_then(|s| s.get(..10)).map(he).unwrap_or_default(),
+                we = rule.window_end.as_deref().and_then(|s| s.get(..10)).map(he).unwrap_or_default(),
             )
         } else {
             String::new()
@@ -139,6 +139,51 @@ fn budget_card_html(card_id: &str, title: &str, rules: &[BudgetRule], scope_fiel
     )
 }
 
+fn group_card_html(group_name: &str, rules: &[BudgetRule]) -> String {
+    let group_slug: String = group_name.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let card_id = format!("budget-card-group-{}", group_slug);
+    let card_target = format!("#{}", card_id);
+    let target_html = if let Some(rule) = rules.first() {
+        format!(
+            r##"<p style="margin:0.5rem 0;">Target: <strong>${:.2}</strong>
+                <button class="btn btn-danger" style="font-size:0.8rem;padding:0.2rem 0.5rem;margin-left:0.5rem;" hx-post="/admin/budgets/{id}/delete" hx-target="{target}" hx-swap="outerHTML" hx-confirm="Remove group target?">Remove</button>
+                <form hx-post="/admin/budgets/{id}/edit" hx-target="{target}" hx-swap="outerHTML" style="display:inline;">
+                    <input type="number" name="limit_usd" step="0.01" value="{lusd}" style="width:80px;padding:0.25rem;">
+                    <button type="submit" class="btn btn-secondary" style="font-size:0.8rem;padding:0.3rem 0.6rem;">Save</button>
+                </form>
+            </p>"##,
+            rule.limit_usd.unwrap_or(0.0),
+            id = rule.id,
+            target = card_target,
+            lusd = rule.limit_usd.unwrap_or(0.0),
+        )
+    } else {
+        format!(
+            r##"<form hx-post="/admin/budgets" hx-target="{target}" hx-swap="outerHTML" style="display:flex;gap:0.5rem;align-items:flex-end;margin-top:0.5rem;">
+                <input type="hidden" name="scope" value="group">
+                <input type="hidden" name="group_name" value="{gn_escaped}">
+                <input type="hidden" name="window" value="target">
+                <div>
+                    <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Target USD</label>
+                    <input type="number" name="limit_usd" step="0.01" placeholder="1000.00" style="width:100px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
+                </div>
+                <button type="submit" class="btn btn-primary" style="font-size:0.85rem;">Set Target</button>
+            </form>"##,
+            target = card_target,
+            gn_escaped = he(group_name),
+        )
+    };
+    format!(
+        r#"<div id="{card_id}" style="background:#fff;border-radius:6px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:1rem;">
+            <h3 style="margin-bottom:0.5rem;font-size:1rem;">{name} <span style="font-size:0.75rem;color:#777;">(soft target)</span></h3>
+            {target_html}
+        </div>"#,
+        card_id = card_id,
+        name = he(group_name),
+        target_html = target_html,
+    )
+}
+
 pub async fn get_budgets(
     State(state): State<AppState>,
     _session: DashboardSession,
@@ -209,54 +254,7 @@ pub async fn get_budgets(
         let grp_rules: Vec<BudgetRule> = all_rules.iter()
             .filter(|r| r.group_name.as_deref() == Some(group.name.as_str()))
             .cloned().collect();
-        let card_id = format!("budget-card-group-{}", he(&group.name));
-        let target_html = if let Some(rule) = grp_rules.first() {
-            let edit_target = format!("#{}", card_id);
-            format!(
-                r##"<p style="margin:0.5rem 0;">Target: <strong>${:.2}</strong>
-                    <button class="btn btn-danger" style="font-size:0.8rem;padding:0.2rem 0.5rem;margin-left:0.5rem;" hx-post="/admin/budgets/{id}/delete" hx-target="#{cid}" hx-swap="outerHTML" hx-confirm="Remove group target?">Remove</button>
-                    {edit}
-                </p>"##,
-                rule.limit_usd.unwrap_or(0.0),
-                id = rule.id,
-                cid = card_id,
-                edit = format!(
-                    r##"<form hx-post="/admin/budgets/{id}/edit" hx-target="{etarget}" hx-swap="outerHTML" style="display:inline;">
-                        <input type="number" name="limit_usd" step="0.01" value="{lusd}" style="width:80px;padding:0.25rem;">
-                        <button type="submit" class="btn btn-secondary" style="font-size:0.8rem;padding:0.3rem 0.6rem;">Save</button>
-                    </form>"##,
-                    id = rule.id,
-                    etarget = edit_target,
-                    lusd = rule.limit_usd.unwrap_or(0.0),
-                )
-            )
-        } else {
-            let scope_fields = format!(
-                r#"<input type="hidden" name="scope" value="group"><input type="hidden" name="group_name" value="{}">"#,
-                he(&group.name)
-            );
-            format!(
-                r##"<form hx-post="/admin/budgets" hx-target="#{cid}" hx-swap="outerHTML" style="display:flex;gap:0.5rem;align-items:flex-end;margin-top:0.5rem;">
-                    {scope_fields}
-                    <input type="hidden" name="window" value="target">
-                    <div>
-                        <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Target USD</label>
-                        <input type="number" name="limit_usd" step="0.01" placeholder="1000.00" style="width:100px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
-                    </div>
-                    <button type="submit" class="btn btn-primary" style="font-size:0.85rem;">Set Target</button>
-                </form>"##,
-                cid = card_id,
-            )
-        };
-        group_cards.push_str(&format!(
-            r#"<div id="{card_id}" style="background:#fff;border-radius:6px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:1rem;">
-                <h3 style="margin-bottom:0.5rem;font-size:1rem;">{name} <span style="font-size:0.75rem;color:#777;">(soft target)</span></h3>
-                {target_html}
-            </div>"#,
-            card_id = card_id,
-            name = he(&group.name),
-            target_html = target_html,
-        ));
+        group_cards.push_str(&group_card_html(&group.name, &grp_rules));
     }
     // Orphaned group rules
     for r in all_rules.iter().filter(|r| r.group_name.is_some()) {
@@ -310,7 +308,16 @@ pub async fn post_create_budget(
 ) -> Result<Html<String>, DashboardError> {
     if form.window == "total" {
         match (&form.window_start, &form.window_end) {
-            (Some(s), Some(e)) if s < e => {}
+            (Some(s), Some(e)) if s < e => {
+                // Validate both are parseable dates
+                if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err()
+                    || chrono::NaiveDate::parse_from_str(e, "%Y-%m-%d").is_err()
+                {
+                    return Ok(Html(
+                        r#"<div class="alert alert-danger">Date must be in YYYY-MM-DD format.</div>"#.to_string()
+                    ));
+                }
+            }
             _ => return Ok(Html(
                 r#"<div class="alert alert-danger">Total window requires start &lt; end dates.</div>"#.to_string()
             )),
@@ -463,47 +470,7 @@ async fn render_scope_card(state: &AppState, scope: &BudgetScope) -> Result<Html
             )
         }
         BudgetScope::Group(gn) => {
-            let card_id = format!("budget-card-group-{}", he(gn));
-            let card_target = format!("#{}", card_id);
-            let target_html = if let Some(rule) = rules.first() {
-                format!(
-                    r##"<p style="margin:0.5rem 0;">Target: <strong>${:.2}</strong>
-                        <button class="btn btn-danger" style="font-size:0.8rem;padding:0.2rem 0.5rem;margin-left:0.5rem;" hx-post="/admin/budgets/{id}/delete" hx-target="{target}" hx-swap="outerHTML" hx-confirm="Remove group target?">Remove</button>
-                        <form hx-post="/admin/budgets/{id}/edit" hx-target="{target}" hx-swap="outerHTML" style="display:inline;">
-                            <input type="number" name="limit_usd" step="0.01" value="{lusd}" style="width:80px;padding:0.25rem;">
-                            <button type="submit" class="btn btn-secondary" style="font-size:0.8rem;padding:0.3rem 0.6rem;">Save</button>
-                        </form>
-                    </p>"##,
-                    rule.limit_usd.unwrap_or(0.0),
-                    id = rule.id,
-                    target = card_target,
-                    lusd = rule.limit_usd.unwrap_or(0.0),
-                )
-            } else {
-                format!(
-                    r##"<form hx-post="/admin/budgets" hx-target="{target}" hx-swap="outerHTML" style="display:flex;gap:0.5rem;align-items:flex-end;margin-top:0.5rem;">
-                        <input type="hidden" name="scope" value="group">
-                        <input type="hidden" name="group_name" value="{gn_escaped}">
-                        <input type="hidden" name="window" value="target">
-                        <div>
-                            <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Target USD</label>
-                            <input type="number" name="limit_usd" step="0.01" placeholder="1000.00" style="width:100px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
-                        </div>
-                        <button type="submit" class="btn btn-primary" style="font-size:0.85rem;">Set Target</button>
-                    </form>"##,
-                    target = card_target,
-                    gn_escaped = he(gn),
-                )
-            };
-            return Ok(Html(format!(
-                r#"<div id="{card_id}" style="background:#fff;border-radius:6px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:1rem;">
-                    <h3 style="margin-bottom:0.5rem;font-size:1rem;">{name} <span style="font-size:0.75rem;color:#777;">(soft target)</span></h3>
-                    {target_html}
-                </div>"#,
-                card_id = card_id,
-                name = he(gn),
-                target_html = target_html,
-            )));
+            return Ok(Html(group_card_html(gn, &rules)));
         }
     };
 
