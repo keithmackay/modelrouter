@@ -192,7 +192,8 @@ impl BudgetRepository for PostgresDb {
         .bind(&now)
         .bind(id)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(|_| anyhow::anyhow!("budget rule {id} not found"))?;
         Ok(row)
     }
 }

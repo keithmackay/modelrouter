@@ -172,7 +172,7 @@ impl BudgetRepository for SqliteDb {
             .map(|v| serde_json::to_string(v))
             .transpose()?;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"UPDATE budget_rules SET
                 limit_usd = COALESCE(?, limit_usd),
                 limit_tokens = COALESCE(?, limit_tokens),
@@ -197,6 +197,10 @@ impl BudgetRepository for SqliteDb {
         .bind(id)
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            anyhow::bail!("budget rule {id} not found");
+        }
 
         sqlx::query_as::<_, BudgetRule>(
             "SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens, \
