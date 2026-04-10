@@ -1,6 +1,40 @@
 {% extends "base.html" %}
 {% block title %}Budgets — modelrouter Admin{% endblock %}
 {% block content %}
-<h1>Budgets</h1>
-<p>Coming soon.</p>
+<h1>Budget Rules</h1>
+
+<div style="display:flex;gap:0.5rem;margin-bottom:1.5rem;border-bottom:2px solid #eee;padding-bottom:0.75rem;">
+    <button onclick="showTab('global')" id="tab-btn-global" class="btn btn-primary" style="font-size:0.85rem;">Global</button>
+    <button onclick="showTab('projects')" id="tab-btn-projects" class="btn btn-secondary" style="font-size:0.85rem;">Projects</button>
+    <button onclick="showTab('users')" id="tab-btn-users" class="btn btn-secondary" style="font-size:0.85rem;">Users</button>
+    <button onclick="showTab('groups')" id="tab-btn-groups" class="btn btn-secondary" style="font-size:0.85rem;">Groups</button>
+</div>
+
+<div id="tab-global">
+    {{ global_card | safe }}
+</div>
+<div id="tab-projects" style="display:none;">
+    {% if project_cards %}
+        {{ project_cards | safe }}
+    {% else %}
+        <p style="color:#999;">No project keys found. Create API keys with a project name to add project budgets.</p>
+    {% endif %}
+</div>
+<div id="tab-users" style="display:none;">
+    {{ user_cards | safe }}
+</div>
+<div id="tab-groups" style="display:none;">
+    {{ group_cards | safe }}
+</div>
+
+<script>
+function showTab(name) {
+    ['global','projects','users','groups'].forEach(function(t) {
+        document.getElementById('tab-' + t).style.display = (t === name) ? '' : 'none';
+        var btn = document.getElementById('tab-btn-' + t);
+        btn.className = (t === name) ? 'btn btn-primary' : 'btn btn-secondary';
+        btn.style.fontSize = '0.85rem';
+    });
+}
+</script>
 {% endblock %}
