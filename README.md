@@ -147,10 +147,6 @@ Log in at `http://localhost:8080/admin` with these credentials. Superadmin accou
 
 ### 4. Create users
 
-Create users via the CLI or the **Users** page in the admin dashboard.
-
-**CLI:**
-
 ```bash
 modelrouter user create --name abdoul
 # Created user 'abdoul' (id=1)
@@ -160,79 +156,109 @@ modelrouter user create --name abdoul
 modelrouter user create --name becky
 # Created user 'becky' (id=2)
 # API key: mr-9z8y7x6w5v4u...
-```
 
-Each user gets a default API key at creation. Keys are shown exactly once — save them before closing the terminal.
-
-```bash
 modelrouter user list
 #    1  abdoul  enabled
 #    2  becky   enabled
 ```
 
+Each user gets a default API key at creation. Keys are shown exactly once — save them before closing the terminal. Users can also be managed in the **Admin → Users** dashboard page.
+
 ### 5. Create projects and issue per-project keys
 
-A **project** is a label applied to API keys. Every request made with a project key is attributed to that project in the cost ledger, enabling per-project spend reports and budget enforcement.
-
-Create project keys via the **API Keys** page in the admin dashboard, or via the API (requires a superadmin JWT from `POST /admin/api/login`):
+A **project** is a label on an API key. Every request made with a project key is attributed to that project in the cost ledger, enabling per-project spend reports and budget enforcement.
 
 ```bash
 # Issue Abdoul a key for the "modelrouter" project
-curl -s http://localhost:8080/admin/api/users/1/keys \
-  -H "Authorization: Bearer <admin-jwt>" \
-  -H "Content-Type: application/json" \
-  -d '{"label": "modelrouter dev — abdoul", "project": "modelrouter"}'
-# → {"id":3,"key":"mr-xxxx...","label":"modelrouter dev — abdoul","project":"modelrouter"}
+modelrouter key create --user abdoul --project modelrouter --label "modelrouter dev — abdoul"
+# → key: mr-xxxx...  project: modelrouter
 # Save the key — it cannot be retrieved later.
 
-# Issue Becky a key for the same project
-curl -s http://localhost:8080/admin/api/users/2/keys \
-  -H "Authorization: Bearer <admin-jwt>" \
-  -H "Content-Type: application/json" \
-  -d '{"label": "modelrouter dev — becky", "project": "modelrouter"}'
+modelrouter key create --user becky --project modelrouter --label "modelrouter dev — becky"
 ```
 
-Share each key with the corresponding developer. See [Developer Setup](#developer-setup) for how developers add these to their environment.
+Share each key with the corresponding developer. See [Developer Setup](#developer-setup) for how they add it to their environment.
 
 ### 6. (Optional) Create groups
 
 Groups collect users for spend tracking and reporting. A user can belong to multiple groups; spend is attributed to their highest-priority group.
 
-Go to **Admin → Groups** to create a group and add members. Groups are managed entirely in the web UI — there is no CLI command for group creation.
-
-1. Click **Create Group**, enter a name (e.g. `team-alpha`) and priority (default 0; higher number = higher priority when a user belongs to multiple groups).
-2. On the group card, use the **Add Member** dropdown to add Abdoul and Becky.
-
-Once members are added, cost reports can be filtered by group:
-
 ```bash
-modelrouter report cost --group team-alpha --window monthly
+# Create a group (priority 0 is default; higher number = higher priority)
+modelrouter group create --name team-alpha --priority 0
+
+# Add members
+modelrouter group add-member --group team-alpha --user abdoul
+modelrouter group add-member --group team-alpha --user becky
+
+# Verify
+modelrouter group members --group team-alpha
+#  abdoul  joined 2026-04-10  Active
+#  becky   joined 2026-04-10  Active
 ```
+
+Groups can also be managed in the **Admin → Groups** dashboard page.
 
 ### 7. Configure budgets
 
-Go to **Admin → Budgets** to set spend limits. Budgets are enforced independently — a request is blocked when *any* applicable rule is exceeded.
+Budgets are enforced independently — a request is blocked when *any* applicable rule is exceeded.
 
-The Budgets page has four tabs:
+**Global limit** — hard ceiling on all org traffic:
 
-**Global** — applies to all traffic org-wide. Use this as a hard ceiling on total provider spend.
+```bash
+# Monthly global cap
+modelrouter budget set --global --window monthly --limit-usd 500
 
-- Example: add a **Monthly** rule with a $500 USD limit to cut off all requests once the org hits $500 for the month.
-- Example: add a **Total** rule with a date range of `2026-04-01` → `2026-06-30` to cap spend for a fiscal quarter.
+# Fiscal-year total cap
+modelrouter budget set --global --window total --window-start 2026-04-01 --window-end 2026-06-30 --limit-usd 5000
+```
 
-**Projects** — one card per project. Any project with an API key or an existing rule appears here.
+**Project limits** — block all traffic on a project once its budget is hit:
 
-- Example: add a **Monthly** $200 limit on the `modelrouter` project to cap all requests made with that project's keys.
+```bash
+modelrouter budget set --project modelrouter --window monthly --limit-usd 200
+```
 
-**Users** — one card per user. Set per-developer monthly or total limits.
+**User limits** — per-developer monthly or total spend caps:
 
-- Example: give Abdoul a **Monthly** $50 limit and Becky a **Monthly** $100 limit.
+```bash
+modelrouter budget set --user abdoul --window monthly --limit-usd 50
+modelrouter budget set --user becky  --window monthly --limit-usd 100
+```
 
-**Groups** — informational spend targets, not hard limits. These are tracked but never block a request.
+**Group targets** — informational only, never block requests:
 
-- Example: set a **Target** of $300 for `team-alpha` to track aggregate group spend without blocking any individual user.
+```bash
+modelrouter budget set --group team-alpha --limit-usd 300
+```
 
-When a user hits their user limit, all their keys return `429 Budget exceeded` until the next monthly period. When a project or global limit is hit, all keys associated with that project (or all keys, for global) are blocked until the limit resets or is raised.
+Additional limit types compose freely:
+
+```bash
+# Rate limit + spend cap together
+modelrouter budget set --user abdoul --window monthly --limit-usd 50 --rate-rpm 10
+
+# Model allow-list (only these models accepted for this user)
+modelrouter budget set --user abdoul --window monthly --limit-usd 50 \
+  --model-allow claude-haiku-4-5,claude-sonnet-4-6
+```
+
+Review and manage rules:
+
+```bash
+modelrouter budget list
+#   1  global         monthly       limit=$500.00
+#   2  global         total         2026-04-01→2026-06-30  limit=$5000.00
+#   3  project=modelrouter  monthly  limit=$200.00
+#   4  user=abdoul    monthly       limit=$50.00  rpm=10
+#   5  user=becky     monthly       limit=$100.00
+#   6  group=team-alpha  target     limit=$300.00
+
+modelrouter budget edit --id 4 --limit-usd 75
+modelrouter budget delete --id 6
+```
+
+When a user hits their user limit, all their keys return `429 Budget exceeded` until the next monthly period. When a project or global limit is hit, all keys associated with that project (or all keys, for global) are blocked until the limit resets or is raised. Budgets can also be managed in the **Admin → Budgets** dashboard page.
 
 ---
 
@@ -415,22 +441,67 @@ Restart modelrouter. Navigate to `/admin/auth/oidc/login` to authenticate via yo
 
 ### CLI
 
+**User management**
+
 ```bash
-# User management
 modelrouter user create --name alice
 modelrouter user list
+modelrouter user enable alice
+modelrouter user disable alice
+modelrouter user rotate-key alice
+```
 
-# Budget management (basic — see Admin → Budgets for full scope options)
-modelrouter budget set --user alice --limit-usd 10.0 --window monthly
+**API key management**
 
-# Cost reporting
+```bash
+modelrouter key create --user alice --project myapp --label "myapp dev — alice"
+modelrouter key list --user alice
+modelrouter key disable --user alice --project myapp
+```
+
+**Group management**
+
+```bash
+modelrouter group create --name team-alpha [--priority 0]
+modelrouter group list
+modelrouter group add-member --group team-alpha --user alice
+modelrouter group remove-member --group team-alpha --user alice
+modelrouter group members --group team-alpha
+modelrouter group enable team-alpha
+modelrouter group disable team-alpha
+```
+
+**Budget management**
+
+```bash
+# Set limits — exactly one scope flag required
+modelrouter budget set --global --window monthly --limit-usd 500
+modelrouter budget set --global --window total --window-start 2026-04-01 --window-end 2026-06-30 --limit-usd 5000
+modelrouter budget set --project myapp --window monthly --limit-usd 200
+modelrouter budget set --user alice --window monthly --limit-usd 50 --rate-rpm 10
+modelrouter budget set --group team-alpha --limit-usd 300          # soft target, not enforced
+
+# Optional limit fields (any combination)
+#   --limit-tokens <n>
+#   --rate-rpm <n>
+#   --max-concurrent <n>
+#   --model-allow <model1,model2,...>
+#   --model-deny <model1,model2,...>
+
+modelrouter budget list [--user alice]
+modelrouter budget edit --id 3 --limit-usd 75 [--window-start YYYY-MM-DD] [--window-end YYYY-MM-DD]
+modelrouter budget delete --id 3
+```
+
+**Cost reporting**
+
+```bash
 modelrouter report cost --user alice --window monthly --format table
 modelrouter report cost --group team-alpha --window monthly
-modelrouter report cost --project modelrouter --window monthly --format csv > report.csv
-
-# Install as a system service (macOS or Linux)
-modelrouter install-service
+modelrouter report cost --project myapp --window monthly --format csv > report.csv
 ```
+
+**Cost report filter matrix** — `--user` and `--group` are mutually exclusive; `--project` composes freely with either:
 
 **Cost report filter matrix** — `--user` and `--group` are mutually exclusive; `--project` composes freely with either:
 
