@@ -477,6 +477,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                         max_concurrent: None,
                         model_allow: vec![],
                         model_deny: vec![],
+                        project: None,
+                        window_start: None,
+                        window_end: None,
                     }).await?;
                     println!("Created budget rule (id={}) for user '{}': {} window, limit=${:?}", rule.id, user, window, limit_usd);
                 }

@@ -217,6 +217,12 @@ pub struct BudgetRule {
     pub max_concurrent: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+    #[sqlx(default)]
+    pub project: Option<String>,
+    #[sqlx(default)]
+    pub window_start: Option<String>,
+    #[sqlx(default)]
+    pub window_end: Option<String>,
 }
 
 #[derive(Debug)]
@@ -232,6 +238,31 @@ pub struct NewBudgetRule {
     pub model_deny: Vec<String>,
     pub rate_rpm: Option<i64>,
     pub max_concurrent: Option<i64>,
+    pub project: Option<String>,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+}
+
+/// Fields editable after creation. Scope fields (user_id, group_name, project)
+/// and window type are immutable — delete and recreate to change them.
+#[derive(Debug)]
+pub struct UpdateBudgetRule {
+    pub limit_usd: Option<f64>,
+    pub limit_tokens: Option<i64>,
+    pub model_allow: Option<Vec<String>>,
+    pub model_deny: Option<Vec<String>>,
+    pub rate_rpm: Option<i64>,
+    pub max_concurrent: Option<i64>,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BudgetScope {
+    Global,
+    Project(String),
+    User(i64),
+    Group(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

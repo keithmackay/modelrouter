@@ -244,6 +244,9 @@ pub async fn create_budget(
             max_concurrent: None,
             model_allow: body.model_allow,
             model_deny: body.model_deny,
+            project: None,
+            window_start: None,
+            window_end: None,
         },
     )
     .await
