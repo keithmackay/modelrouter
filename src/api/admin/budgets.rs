@@ -393,6 +393,9 @@ pub async fn post_edit_budget(
     axum::extract::Path(id): axum::extract::Path<i64>,
     Form(form): Form<EditBudgetForm>,
 ) -> Result<Html<String>, DashboardError> {
+    let window_start = form.window_start.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
+    let window_end = form.window_end.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
+
     BudgetRepository::update(&*state.db, id, &UpdateBudgetRule {
         limit_usd: form.limit_usd,
         limit_tokens: form.limit_tokens,
@@ -400,8 +403,8 @@ pub async fn post_edit_budget(
         model_deny: None,
         rate_rpm: form.rate_rpm,
         max_concurrent: form.max_concurrent,
-        window_start: form.window_start,
-        window_end: form.window_end,
+        window_start,
+        window_end,
     }).await.map_err(|_| DashboardError::Internal)?;
 
     let scope = scope_for_rule_id(&state, id).await?;
@@ -430,6 +433,13 @@ async fn scope_for_rule_id(state: &AppState, id: i64) -> Result<BudgetScope, Das
         BudgetScope::Group(rule.group_name.clone().unwrap())
     } else if rule.project.is_some() {
         BudgetScope::Project(rule.project.clone().unwrap())
+    } else if rule.api_key_id.is_some() {
+        // api_key_id-scoped rules are not managed by this UI (created via CLI).
+        // Return an error so the handler surfaces a clear message rather than
+        // silently re-rendering the Global card.
+        return Err(DashboardError::NotFound(
+            "api_key-scoped budget rules cannot be edited via the admin UI — use the CLI".to_string()
+        ));
     } else {
         BudgetScope::Global
     };

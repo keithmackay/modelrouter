@@ -258,6 +258,8 @@ impl PolicyEngine {
                             CostRepository::sum_for_project_between(&*self.db, proj, start, end).await?
                         }
                         _ => {
+                            // Note: spend_reset_at is not applied to project/global rules — only to user/key rules.
+                            // Project and global windows use a uniform calendar period, not per-entity resets.
                             let since = window_start_for(&rule.window);
                             CostRepository::sum_for_project_since(&*self.db, proj, &since).await?
                         }
@@ -293,6 +295,8 @@ impl PolicyEngine {
                         CostRepository::sum_global_between(&*self.db, start, end).await?
                     }
                     _ => {
+                        // Note: spend_reset_at is not applied to project/global rules — only to user/key rules.
+                        // Project and global windows use a uniform calendar period, not per-entity resets.
                         let since = window_start_for(&rule.window);
                         CostRepository::sum_global_since(&*self.db, &since).await?
                     }
