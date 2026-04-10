@@ -4,7 +4,7 @@ pub mod admin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands};
+use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands};
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
@@ -460,47 +460,298 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::db::migrations::run_migrations(&db.pool).await?;
 
             match budget_args.command {
-                BudgetCommands::Set { user, window, limit_usd } => {
+                BudgetCommands::Set {
+                    global,
+                    project,
+                    user,
+                    group,
+                    window,
+                    window_start,
+                    window_end,
+                    limit_usd,
+                    limit_tokens,
+                    rate_rpm,
+                    max_concurrent,
+                    model_allow,
+                    model_deny,
+                } => {
                     use crate::db::repositories::{users::UserRepository, budgets::BudgetRepository};
-                    use crate::db::models::NewBudgetRule;
-                    let found = UserRepository::find_by_name(&db, &user).await?
-                        .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
+                    use crate::db::models::{NewBudgetRule, BudgetScope};
+
+                    // Validate exactly one scope flag
+                    let scope_count = [global, project.is_some(), user.is_some(), group.is_some()]
+                        .iter()
+                        .filter(|&&b| b)
+                        .count();
+                    if scope_count == 0 {
+                        anyhow::bail!("Exactly one scope flag is required: --global, --project <name>, --user <name>, or --group <name>");
+                    }
+                    if scope_count > 1 {
+                        anyhow::bail!("Only one scope flag may be specified at a time: --global, --project, --user, --group");
+                    }
+
+                    // Helper: append date suffix
+                    let date_suffix = |s: &str| format!("{}T00:00:00+00:00", s);
+
+                    // Determine scope and window
+                    let (scope, effective_window, user_id, group_name_val, project_val) =
+                        if global {
+                            (BudgetScope::Global, window.clone(), None, None, None)
+                        } else if let Some(ref proj) = project {
+                            (BudgetScope::Project(proj.clone()), window.clone(), None, None, Some(proj.clone()))
+                        } else if let Some(ref uname) = user {
+                            let found = UserRepository::find_by_name(&db, uname).await?
+                                .ok_or_else(|| anyhow::anyhow!("User not found: {}", uname))?;
+                            (BudgetScope::User(found.id), window.clone(), Some(found.id), None, None)
+                        } else {
+                            // group
+                            let gname = group.as_ref().unwrap();
+                            if window != "monthly" {
+                                eprintln!("Warning: --window is ignored for --group scope; stored as 'target'");
+                            }
+                            (BudgetScope::Group(gname.clone()), "target".to_string(), None, Some(gname.clone()), None)
+                        };
+
+                    // Validate window=total requires start+end
+                    let (ws, we) = if effective_window == "total" {
+                        let start = window_start.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("--window total requires --window-start <YYYY-MM-DD>"))?;
+                        let end = window_end.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("--window total requires --window-end <YYYY-MM-DD>"))?;
+                        if start >= end {
+                            anyhow::bail!("--window-start must be before --window-end");
+                        }
+                        (Some(date_suffix(start)), Some(date_suffix(end)))
+                    } else {
+                        (None, None)
+                    };
+
+                    // Duplicate check
+                    let existing = BudgetRepository::list_for_scope(&db, &scope).await?;
+                    for r in &existing {
+                        if r.window == effective_window {
+                            anyhow::bail!(
+                                "A budget rule with window='{}' already exists for this scope (id={}). Delete it first.",
+                                effective_window,
+                                r.id
+                            );
+                        }
+                    }
+
+                    let model_allow_vec = model_allow
+                        .map(|s| s.split(',').map(|m| m.trim().to_string()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let model_deny_vec = model_deny
+                        .map(|s| s.split(',').map(|m| m.trim().to_string()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+
                     let rule = BudgetRepository::create(&db, NewBudgetRule {
-                        user_id: Some(found.id),
-                        group_name: None,
+                        user_id,
+                        group_name: group_name_val,
                         api_key_id: None,
                         tag: None,
-                        window: window.clone(),
+                        window: effective_window.clone(),
                         limit_usd,
-                        limit_tokens: None,
-                        rate_rpm: None,
-                        max_concurrent: None,
-                        model_allow: vec![],
-                        model_deny: vec![],
-                        project: None,
-                        window_start: None,
-                        window_end: None,
+                        limit_tokens,
+                        rate_rpm,
+                        max_concurrent,
+                        model_allow: model_allow_vec,
+                        model_deny: model_deny_vec,
+                        project: project_val,
+                        window_start: ws,
+                        window_end: we,
                     }).await?;
-                    println!("Created budget rule (id={}) for user '{}': {} window, limit=${:?}", rule.id, user, window, limit_usd);
+
+                    println!("Created budget rule id={}", rule.id);
+                }
+                BudgetCommands::Edit {
+                    id,
+                    limit_usd,
+                    limit_tokens,
+                    rate_rpm,
+                    max_concurrent,
+                    model_allow,
+                    model_deny,
+                    window_start,
+                    window_end,
+                } => {
+                    use crate::db::repositories::budgets::BudgetRepository;
+                    use crate::db::models::UpdateBudgetRule;
+
+                    let date_suffix = |s: &str| format!("{}T00:00:00+00:00", s);
+
+                    let changes = UpdateBudgetRule {
+                        limit_usd,
+                        limit_tokens,
+                        rate_rpm,
+                        max_concurrent,
+                        model_allow: model_allow.map(|s| {
+                            s.split(',').map(|m| m.trim().to_string()).collect()
+                        }),
+                        model_deny: model_deny.map(|s| {
+                            s.split(',').map(|m| m.trim().to_string()).collect()
+                        }),
+                        window_start: window_start.as_deref().map(date_suffix),
+                        window_end: window_end.as_deref().map(date_suffix),
+                    };
+
+                    let rule = BudgetRepository::update(&db, id, &changes).await?;
+                    println!("Updated budget rule id={}: window={} limit_usd={:?} limit_tokens={:?} rate_rpm={:?} max_concurrent={:?}",
+                        rule.id, rule.window, rule.limit_usd, rule.limit_tokens, rule.rate_rpm, rule.max_concurrent);
+                }
+                BudgetCommands::Delete { id } => {
+                    use crate::db::repositories::budgets::BudgetRepository;
+                    BudgetRepository::delete(&db, id).await?;
+                    println!("Deleted budget rule {}", id);
                 }
                 BudgetCommands::List { user } => {
                     use crate::db::repositories::{users::UserRepository, budgets::BudgetRepository};
-                    if let Some(name) = user {
-                        let found = UserRepository::find_by_name(&db, &name).await?
+
+                    let all_rules = BudgetRepository::list_all(&db).await?;
+                    let all_users = UserRepository::list(&db).await?;
+                    let user_map: std::collections::HashMap<i64, String> =
+                        all_users.iter().map(|u| (u.id, u.name.clone())).collect();
+
+                    // If --user filter, get that user's id
+                    let filter_user_id: Option<i64> = if let Some(ref name) = user {
+                        let found = UserRepository::find_by_name(&db, name).await?
                             .ok_or_else(|| anyhow::anyhow!("User not found: {}", name))?;
-                        let rules = BudgetRepository::list_for_user(&db, found.id).await?;
-                        for r in rules {
-                            println!("{:>4}  user_id={:?}  window={}  limit_usd={:?}  rate_rpm={:?}", r.id, r.user_id, r.window, r.limit_usd, r.rate_rpm);
-                        }
+                        Some(found.id)
                     } else {
-                        let users = UserRepository::list(&db).await?;
-                        for u in &users {
-                            let rules = BudgetRepository::list_for_user(&db, u.id).await?;
-                            for r in rules {
-                                println!("{:>4}  user={}  window={}  limit_usd={:?}  rate_rpm={:?}", r.id, u.name, r.window, r.limit_usd, r.rate_rpm);
-                            }
+                        None
+                    };
+
+                    let rules: Vec<_> = all_rules.iter().filter(|r| {
+                        match filter_user_id {
+                            Some(uid) => r.user_id == Some(uid),
+                            None => true,
                         }
+                    }).collect();
+
+                    for r in rules {
+                        // Determine scope label
+                        let scope_label = if r.user_id.is_none() && r.group_name.is_none() && r.project.is_none() {
+                            "global".to_string()
+                        } else if let Some(uid) = r.user_id {
+                            format!("user={}", user_map.get(&uid).map(|s| s.as_str()).unwrap_or("?"))
+                        } else if let Some(ref gname) = r.group_name {
+                            format!("group={}", gname)
+                        } else if let Some(ref proj) = r.project {
+                            format!("project={}", proj)
+                        } else {
+                            "?".to_string()
+                        };
+
+                        // Date range for total window
+                        let date_range = if r.window == "total" {
+                            let start = r.window_start.as_deref().unwrap_or("?");
+                            let end = r.window_end.as_deref().unwrap_or("?");
+                            // Trim to YYYY-MM-DD
+                            let start_s = if start.len() >= 10 { &start[..10] } else { start };
+                            let end_s = if end.len() >= 10 { &end[..10] } else { end };
+                            format!("  {}→{}", start_s, end_s)
+                        } else {
+                            String::new()
+                        };
+
+                        // Non-null fields
+                        let mut parts: Vec<String> = vec![];
+                        if let Some(v) = r.limit_usd { parts.push(format!("limit=${:.2}", v)); }
+                        if let Some(v) = r.limit_tokens { parts.push(format!("tokens={}", v)); }
+                        if let Some(v) = r.rate_rpm { parts.push(format!("rpm={}", v)); }
+                        if let Some(v) = r.max_concurrent { parts.push(format!("concurrent={}", v)); }
+                        if !r.model_allow.is_empty() && r.model_allow != "[]" {
+                            parts.push(format!("allow={}", r.model_allow));
+                        }
+                        if !r.model_deny.is_empty() && r.model_deny != "[]" {
+                            parts.push(format!("deny={}", r.model_deny));
+                        }
+
+                        println!("{:>4}  {:16}  {:10}{}  {}",
+                            r.id,
+                            scope_label,
+                            r.window,
+                            date_range,
+                            parts.join("  "),
+                        );
                     }
+                }
+            }
+        }
+        Commands::Group(group_args) => {
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            match group_args.command {
+                GroupCommands::Create { name, priority } => {
+                    use crate::db::repositories::groups::GroupRepository;
+                    if GroupRepository::find_group_by_name(&db, &name).await?.is_some() {
+                        anyhow::bail!("Group '{}' already exists", name);
+                    }
+                    let g = GroupRepository::create_group(&db, &name, priority).await?;
+                    println!("Created group '{}' (id={}, priority={})", g.name, g.id, g.priority);
+                }
+                GroupCommands::List => {
+                    use crate::db::repositories::groups::GroupRepository;
+                    let groups = GroupRepository::list_groups(&db).await?;
+                    for g in groups {
+                        println!("{:>4}  {:20}  priority={:<4}  {}",
+                            g.id, g.name, g.priority,
+                            if g.enabled { "enabled" } else { "disabled" });
+                    }
+                }
+                GroupCommands::Enable { name } => {
+                    use crate::db::repositories::groups::GroupRepository;
+                    let g = GroupRepository::find_group_by_name(&db, &name).await?
+                        .ok_or_else(|| anyhow::anyhow!("Group not found: {}", name))?;
+                    GroupRepository::set_group_enabled(&db, g.id, true).await?;
+                    println!("Enabled group '{}'", name);
+                }
+                GroupCommands::Disable { name } => {
+                    use crate::db::repositories::groups::GroupRepository;
+                    let g = GroupRepository::find_group_by_name(&db, &name).await?
+                        .ok_or_else(|| anyhow::anyhow!("Group not found: {}", name))?;
+                    GroupRepository::set_group_enabled(&db, g.id, false).await?;
+                    println!("Disabled group '{}'", name);
+                }
+                GroupCommands::Members { group } => {
+                    use crate::db::repositories::groups::GroupRepository;
+                    let g = GroupRepository::find_group_by_name(&db, &group).await?
+                        .ok_or_else(|| anyhow::anyhow!("Group not found: {}", group))?;
+                    let members = GroupRepository::list_memberships(&db, g.id).await?;
+                    for m in members {
+                        let status = if let Some(ref da) = m.disabled_at {
+                            format!("Disabled {}", &da[..10.min(da.len())])
+                        } else {
+                            "Active".to_string()
+                        };
+                        let joined = &m.joined_at[..10.min(m.joined_at.len())];
+                        println!("{:>4}  {:20}  joined={}  {}", m.id, m.user_name, joined, status);
+                    }
+                }
+                GroupCommands::AddMember { group, user } => {
+                    use crate::db::repositories::{groups::GroupRepository, users::UserRepository};
+                    let g = GroupRepository::find_group_by_name(&db, &group).await?
+                        .ok_or_else(|| anyhow::anyhow!("Group not found: {}", group))?;
+                    let u = UserRepository::find_by_name(&db, &user).await?
+                        .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
+                    if GroupRepository::find_active_membership(&db, g.id, u.id).await?.is_some() {
+                        anyhow::bail!("User '{}' is already an active member of group '{}'", user, group);
+                    }
+                    GroupRepository::add_member(&db, g.id, u.id).await?;
+                    println!("Added '{}' to group '{}'", user, group);
+                }
+                GroupCommands::RemoveMember { group, user } => {
+                    use crate::db::repositories::{groups::GroupRepository, users::UserRepository};
+                    let g = GroupRepository::find_group_by_name(&db, &group).await?
+                        .ok_or_else(|| anyhow::anyhow!("Group not found: {}", group))?;
+                    let u = UserRepository::find_by_name(&db, &user).await?
+                        .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
+                    let membership = GroupRepository::find_active_membership(&db, g.id, u.id).await?
+                        .ok_or_else(|| anyhow::anyhow!("No active membership for '{}' in group '{}'", user, group))?;
+                    GroupRepository::disable_membership(&db, membership.id).await?;
+                    println!("Removed '{}' from group '{}'", user, group);
                 }
             }
         }

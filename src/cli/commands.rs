@@ -30,6 +30,8 @@ pub enum Commands {
     User(UserArgs),
     /// Manage budget rules
     Budget(BudgetArgs),
+    /// Manage groups
+    Group(GroupArgs),
     /// Generate reports
     Report(ReportArgs),
     /// View audit log
@@ -79,19 +81,120 @@ pub struct BudgetArgs {
 
 #[derive(Subcommand)]
 pub enum BudgetCommands {
-    /// Set a budget rule
+    /// Set a budget rule (exactly one scope flag required)
     Set {
+        // Scope flags (exactly one required)
+        /// Org-wide rule
         #[arg(long)]
-        user: String,
+        global: bool,
+        /// Project-scoped rule
         #[arg(long)]
-        window: String, // daily|weekly|monthly
+        project: Option<String>,
+        /// User-scoped rule (by name)
+        #[arg(long)]
+        user: Option<String>,
+        /// Group soft target
+        #[arg(long)]
+        group: Option<String>,
+
+        // Window
+        #[arg(long, default_value = "monthly")]
+        window: String,
+        #[arg(long)]
+        window_start: Option<String>,
+        #[arg(long)]
+        window_end: Option<String>,
+
+        // Limits
         #[arg(long)]
         limit_usd: Option<f64>,
+        #[arg(long)]
+        limit_tokens: Option<i64>,
+        #[arg(long)]
+        rate_rpm: Option<i64>,
+        #[arg(long)]
+        max_concurrent: Option<i64>,
+        /// Comma-separated model names to allow
+        #[arg(long)]
+        model_allow: Option<String>,
+        /// Comma-separated model names to deny
+        #[arg(long)]
+        model_deny: Option<String>,
+    },
+    /// Edit an existing budget rule by ID
+    Edit {
+        #[arg(long)]
+        id: i64,
+        #[arg(long)]
+        limit_usd: Option<f64>,
+        #[arg(long)]
+        limit_tokens: Option<i64>,
+        #[arg(long)]
+        rate_rpm: Option<i64>,
+        #[arg(long)]
+        max_concurrent: Option<i64>,
+        #[arg(long)]
+        model_allow: Option<String>,
+        #[arg(long)]
+        model_deny: Option<String>,
+        #[arg(long)]
+        window_start: Option<String>,
+        #[arg(long)]
+        window_end: Option<String>,
+    },
+    /// Delete a budget rule by ID
+    Delete {
+        #[arg(long)]
+        id: i64,
     },
     /// List budget rules
     List {
         #[arg(long)]
         user: Option<String>,
+    },
+}
+
+// ── Group subcommands ─────────────────────────────────────────────────────────
+
+#[derive(Args)]
+pub struct GroupArgs {
+    #[command(subcommand)]
+    pub command: GroupCommands,
+}
+
+#[derive(Subcommand)]
+pub enum GroupCommands {
+    /// Create a new group
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+    },
+    /// List all groups
+    List,
+    /// Enable a group
+    Enable { name: String },
+    /// Disable a group
+    Disable { name: String },
+    /// List members of a group
+    Members {
+        #[arg(long)]
+        group: String,
+    },
+    /// Add a user to a group
+    AddMember {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        user: String,
+    },
+    /// Remove a user from a group
+    RemoveMember {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        user: String,
     },
 }
 
