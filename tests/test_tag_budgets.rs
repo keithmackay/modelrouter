@@ -20,6 +20,7 @@ fn budget_rule_tag_field_compiles() {
         group_name: None,
         api_key_id: None,
         tag: Some("ci".to_string()),
+        project: None,
         window: "monthly".to_string(),
         limit_usd: None,
         limit_tokens: None,
@@ -27,6 +28,8 @@ fn budget_rule_tag_field_compiles() {
         model_deny: vec![],
         rate_rpm: None,
         max_concurrent: None,
+        window_start: None,
+        window_end: None,
     };
 }
 

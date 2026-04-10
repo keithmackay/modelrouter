@@ -27,6 +27,7 @@ async fn make_user_with_budget(
             group_name: None,
             api_key_id: None,
             tag: None,
+            project: None,
             window: window.to_string(),
             limit_usd: Some(limit_usd),
             limit_tokens: None,
@@ -34,6 +35,8 @@ async fn make_user_with_budget(
             max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
+            window_start: None,
+            window_end: None,
         },
     )
     .await
@@ -70,6 +73,7 @@ async fn model_in_deny_list_returns_403() {
             group_name: None,
             api_key_id: None,
             tag: None,
+            project: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: None,
@@ -77,6 +81,8 @@ async fn model_in_deny_list_returns_403() {
             max_concurrent: None,
             model_allow: vec![],
             model_deny: vec!["gpt-4".to_string()],
+            window_start: None,
+            window_end: None,
         },
     )
     .await
@@ -106,6 +112,7 @@ async fn model_not_in_allow_list_returns_403() {
             group_name: None,
             api_key_id: None,
             tag: None,
+            project: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: None,
@@ -113,6 +120,8 @@ async fn model_not_in_allow_list_returns_403() {
             max_concurrent: None,
             model_allow: vec!["claude-haiku-4-5".to_string()],
             model_deny: vec![],
+            window_start: None,
+            window_end: None,
         },
     )
     .await
@@ -166,6 +175,7 @@ async fn budget_exceeded_returns_deny() {
             group_name: None,
             api_key_id: None,
             tag: None,
+            project: None,
             window: "monthly".to_string(),
             limit_usd: Some(0.01),
             limit_tokens: None,
@@ -173,6 +183,8 @@ async fn budget_exceeded_returns_deny() {
             max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
+            window_start: None,
+            window_end: None,
         },
     )
     .await
@@ -253,6 +265,7 @@ async fn test_policy_token_limit_under_budget() {
             group_name: None,
             api_key_id: None,
             tag: None,
+            project: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: Some(100),
@@ -260,6 +273,8 @@ async fn test_policy_token_limit_under_budget() {
             max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
+            window_start: None,
+            window_end: None,
         },
     )
     .await
@@ -339,6 +354,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             group_name: None,
             api_key_id: None,
             tag: None,
+            project: None,
             window: "monthly".to_string(),
             limit_usd: None,
             limit_tokens: Some(50),
@@ -346,6 +362,8 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             max_concurrent: None,
             model_allow: vec![],
             model_deny: vec![],
+            window_start: None,
+            window_end: None,
         },
     )
     .await
