@@ -311,10 +311,10 @@ pub struct CreateBudgetForm {
     pub user_id: Option<i64>,
     pub group_name: Option<String>,
     pub window: String,
-    pub limit_usd: Option<f64>,
-    pub limit_tokens: Option<i64>,
-    pub rate_rpm: Option<i64>,
-    pub max_concurrent: Option<i64>,
+    pub limit_usd: Option<String>,
+    pub limit_tokens: Option<String>,
+    pub rate_rpm: Option<String>,
+    pub max_concurrent: Option<String>,
     pub window_start: Option<String>,
     pub window_end: Option<String>,
     pub model_allow: Option<String>,
@@ -326,21 +326,39 @@ pub async fn post_create_budget(
     _session: SuperDashboardSession,
     Form(form): Form<CreateBudgetForm>,
 ) -> Result<Html<String>, DashboardError> {
+    let limit_usd: Option<f64> = parse_opt_f64(&form.limit_usd);
+    let limit_tokens: Option<i64> = parse_opt_i64(&form.limit_tokens);
+    let rate_rpm: Option<i64> = parse_opt_i64(&form.rate_rpm);
+    let max_concurrent: Option<i64> = parse_opt_i64(&form.max_concurrent);
+
+    if limit_usd.is_none() && limit_tokens.is_none() {
+        return Ok(Html(
+            r#"<div class="alert alert-danger">At least one of Limit USD or Limit Tokens is required.</div>"#.to_string()
+        ));
+    }
+
+    // Validate any provided dates for total window; blank dates are allowed (no cutoff).
     if form.window == "total" {
-        match (&form.window_start, &form.window_end) {
-            (Some(s), Some(e)) if s < e => {
-                // Validate both are parseable dates
-                if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err()
-                    || chrono::NaiveDate::parse_from_str(e, "%Y-%m-%d").is_err()
-                {
-                    return Ok(Html(
-                        r#"<div class="alert alert-danger">Date must be in YYYY-MM-DD format.</div>"#.to_string()
-                    ));
-                }
+        let start_ok = form.window_start.as_deref().filter(|s| !s.is_empty())
+            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+            .unwrap_or(true);
+        let end_ok = form.window_end.as_deref().filter(|s| !s.is_empty())
+            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+            .unwrap_or(true);
+        if !start_ok || !end_ok {
+            return Ok(Html(
+                r#"<div class="alert alert-danger">Date must be in YYYY-MM-DD format.</div>"#.to_string()
+            ));
+        }
+        if let (Some(s), Some(e)) = (
+            form.window_start.as_deref().filter(|s| !s.is_empty()),
+            form.window_end.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            if s >= e {
+                return Ok(Html(
+                    r#"<div class="alert alert-danger">Start date must be before end date.</div>"#.to_string()
+                ));
             }
-            _ => return Ok(Html(
-                r#"<div class="alert alert-danger">Total window requires start &lt; end dates.</div>"#.to_string()
-            )),
         }
     }
 
@@ -374,8 +392,8 @@ pub async fn post_create_budget(
         BudgetScope::Group(gn) => (None, Some(gn.clone()), None),
     };
 
-    let window_start = form.window_start.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
-    let window_end = form.window_end.as_deref().map(|d| format!("{}T23:59:59+00:00", d));
+    let window_start = form.window_start.as_deref().filter(|s| !s.is_empty()).map(|d| format!("{}T00:00:00+00:00", d));
+    let window_end = form.window_end.as_deref().filter(|s| !s.is_empty()).map(|d| format!("{}T23:59:59+00:00", d));
 
     let model_allow: Vec<String> = form.model_allow.as_deref()
         .unwrap_or("")
@@ -397,12 +415,12 @@ pub async fn post_create_budget(
         tag: None,
         project,
         window: form.window.clone(),
-        limit_usd: form.limit_usd,
-        limit_tokens: form.limit_tokens,
+        limit_usd,
+        limit_tokens,
         model_allow,
         model_deny,
-        rate_rpm: form.rate_rpm,
-        max_concurrent: form.max_concurrent,
+        rate_rpm,
+        max_concurrent,
         window_start,
         window_end,
     }).await.map_err(|_| DashboardError::Internal)?;
