@@ -783,24 +783,197 @@ pub async fn run(cli: Cli) -> Result<()> {
                         format,
                     );
                 }
-                ReportCommands::Usage { model, project, since, format } => {
-                    let rows =
-                        crate::report::usage_by_model(&db.pool, since.as_deref(), model.as_deref(), project.as_deref()).await?;
-                    print_rows(
-                        &rows,
-                        &["Model", "Provider", "Requests", "Tokens In", "Tokens Out", "Cost (USD)"],
-                        |r| {
-                            vec![
-                                r.model.clone(),
-                                r.provider.clone(),
-                                r.request_count.to_string(),
-                                r.total_tokens_in.to_string(),
-                                r.total_tokens_out.to_string(),
-                                format!("{:.6}", r.total_cost_usd),
-                            ]
-                        },
-                        format,
-                    );
+                ReportCommands::Usage {
+                    total, subtotal, detail,
+                    alltime, annual, monthly,
+                    global, group, project, user,
+                    format,
+                } => {
+                    use crate::report::{UsageScope, UsageWindow, UsageGranularity, fetch_usage_rows};
+
+                    // Validate granularity (exactly one)
+                    let gran_count = [total, subtotal, detail].iter().filter(|&&b| b).count();
+                    if gran_count == 0 {
+                        anyhow::bail!("Exactly one granularity flag required: --total, --subtotal, or --detail");
+                    }
+                    if gran_count > 1 {
+                        anyhow::bail!("Only one granularity flag may be specified: --total, --subtotal, --detail");
+                    }
+
+                    // Validate window (exactly one)
+                    let win_count = [alltime, annual, monthly].iter().filter(|&&b| b).count();
+                    if win_count == 0 {
+                        anyhow::bail!("Exactly one window flag required: --alltime, --annual, or --monthly");
+                    }
+                    if win_count > 1 {
+                        anyhow::bail!("Only one window flag may be specified: --alltime, --annual, --monthly");
+                    }
+
+                    // Validate scope (at least one)
+                    let scope_count = [global, group.is_some(), project.is_some(), user.is_some()]
+                        .iter().filter(|&&b| b).count();
+                    if scope_count == 0 {
+                        anyhow::bail!("At least one scope flag required: --global, --group <name>, --project <name>, or --user <name>");
+                    }
+
+                    let granularity = if total { UsageGranularity::Total }
+                        else if subtotal { UsageGranularity::Subtotal }
+                        else { UsageGranularity::Detail };
+
+                    let window = if alltime { UsageWindow::AllTime }
+                        else if annual { UsageWindow::Annual }
+                        else { UsageWindow::Monthly };
+
+                    // Build scope
+                    let scope = match (&user, &group, &project, global) {
+                        (Some(u), Some(g), _, _) => UsageScope::UserInGroup { user: u.clone(), group: g.clone() },
+                        (Some(u), _, Some(p), _) => UsageScope::UserInProject { user: u.clone(), project: p.clone() },
+                        (Some(u), _, _, _) => UsageScope::User(u.clone()),
+                        (_, Some(g), _, _) => UsageScope::Group(g.clone()),
+                        (_, _, Some(p), _) => UsageScope::Project(p.clone()),
+                        _ => UsageScope::Global,
+                    };
+
+                    let rows = fetch_usage_rows(&db.pool, &scope, &window, &granularity).await?;
+
+                    match format {
+                        OutputFormat::Json => {
+                            let json_rows: Vec<serde_json::Value> = rows.iter().map(|r| {
+                                serde_json::json!({
+                                    "bucket": r.bucket,
+                                    "user": r.user_name,
+                                    "project": r.project,
+                                    "model": r.model,
+                                    "tokens_in": r.tokens_in,
+                                    "tokens_out": r.tokens_out,
+                                    "cost_usd": r.cost_usd,
+                                })
+                            }).collect();
+                            println!("{}", serde_json::to_string_pretty(&json_rows)?);
+                        }
+                        OutputFormat::Csv => {
+                            println!("bucket,user,project,model,tokens_in,tokens_out,cost_usd");
+                            for r in &rows {
+                                println!("{},{},{},{},{},{},{:.6}",
+                                    r.bucket.as_deref().unwrap_or(""),
+                                    r.user_name.as_deref().unwrap_or(""),
+                                    r.project.as_deref().unwrap_or(""),
+                                    r.model.as_deref().unwrap_or(""),
+                                    r.tokens_in,
+                                    r.tokens_out,
+                                    r.cost_usd,
+                                );
+                            }
+                        }
+                        OutputFormat::Table => {
+                            // Group rows by bucket preserving order (rows are already sorted by bucket)
+                            let mut buckets: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+                            for (i, r) in rows.iter().enumerate() {
+                                if let Some(last) = buckets.last_mut() {
+                                    if last.0 == r.bucket {
+                                        last.1.push(i);
+                                        continue;
+                                    }
+                                }
+                                buckets.push((r.bucket.clone(), vec![i]));
+                            }
+
+                            let header = format!("{:<20} {:<20} {:<28} {:>12} {:>12} {:>10}",
+                                "User", "Project", "Model", "Tokens In", "Tokens Out", "Cost USD");
+
+                            let mut grand_in: i64 = 0;
+                            let mut grand_out: i64 = 0;
+                            let mut grand_cost: f64 = 0.0;
+
+                            fn fmt_num(n: i64) -> String {
+                                // Simple thousands formatting
+                                let s = n.to_string();
+                                let mut result = String::new();
+                                for (i, c) in s.chars().rev().enumerate() {
+                                    if i > 0 && i % 3 == 0 { result.push(','); }
+                                    result.push(c);
+                                }
+                                result.chars().rev().collect()
+                            }
+
+                            for (bucket, indices) in &buckets {
+                                if let Some(b) = bucket {
+                                    println!("\n=== {} ===", b);
+                                }
+                                println!("{}", header);
+                                println!("{}", "-".repeat(header.len()));
+
+                                let mut user_in: i64 = 0;
+                                let mut user_out: i64 = 0;
+                                let mut user_cost: f64 = 0.0;
+                                let mut last_user: Option<String> = None;
+
+                                for &idx in indices {
+                                    let r = &rows[idx];
+                                    if granularity == UsageGranularity::Detail {
+                                        let cur_user = r.user_name.clone();
+                                        if last_user.is_some() && last_user != cur_user {
+                                            println!("  {:30} {:>12} {:>12} {:>10}",
+                                                format!("Subtotal: {}", last_user.as_deref().unwrap_or("")),
+                                                fmt_num(user_in), fmt_num(user_out),
+                                                format!("${:.2}", user_cost));
+                                            user_in = 0; user_out = 0; user_cost = 0.0;
+                                        }
+                                        last_user = cur_user;
+                                        user_in += r.tokens_in;
+                                        user_out += r.tokens_out;
+                                        user_cost += r.cost_usd;
+                                    }
+
+                                    println!("{:<20} {:<20} {:<28} {:>12} {:>12} {:>10}",
+                                        r.user_name.as_deref().unwrap_or(""),
+                                        r.project.as_deref().unwrap_or(""),
+                                        r.model.as_deref().unwrap_or(""),
+                                        fmt_num(r.tokens_in),
+                                        fmt_num(r.tokens_out),
+                                        format!("${:.2}", r.cost_usd),
+                                    );
+
+                                    grand_in += r.tokens_in;
+                                    grand_out += r.tokens_out;
+                                    grand_cost += r.cost_usd;
+                                }
+
+                                if granularity == UsageGranularity::Detail {
+                                    if let Some(ref u) = last_user {
+                                        println!("  {:30} {:>12} {:>12} {:>10}",
+                                            format!("Subtotal: {}", u),
+                                            fmt_num(user_in), fmt_num(user_out),
+                                            format!("${:.2}", user_cost));
+                                    }
+                                }
+                            }
+
+                            println!();
+                            println!("{:<48} {:>12} {:>12} {:>10}",
+                                "Grand Total:",
+                                {
+                                    let s = grand_in.to_string();
+                                    let mut r = String::new();
+                                    for (i, c) in s.chars().rev().enumerate() {
+                                        if i > 0 && i % 3 == 0 { r.push(','); }
+                                        r.push(c);
+                                    }
+                                    r.chars().rev().collect::<String>()
+                                },
+                                {
+                                    let s = grand_out.to_string();
+                                    let mut r = String::new();
+                                    for (i, c) in s.chars().rev().enumerate() {
+                                        if i > 0 && i % 3 == 0 { r.push(','); }
+                                        r.push(c);
+                                    }
+                                    r.chars().rev().collect::<String>()
+                                },
+                                format!("${:.2}", grand_cost),
+                            );
+                        }
+                    }
                 }
                 ReportCommands::Prompts { user, limit, since, format } => {
                     let rows = crate::report::recent_prompts(

@@ -219,14 +219,45 @@ pub enum ReportCommands {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
-    /// Usage report
+    /// Usage report with flexible scope/window/granularity
     Usage {
+        // Granularity (exactly one required)
+        /// One aggregate row
         #[arg(long)]
-        model: Option<String>,
+        total: bool,
+        /// Broken out by natural sub-unit
+        #[arg(long)]
+        subtotal: bool,
+        /// Individual transactions + subtotals + totals
+        #[arg(long)]
+        detail: bool,
+
+        // Window (exactly one required)
+        /// No time bucketing
+        #[arg(long)]
+        alltime: bool,
+        /// Bucket per year
+        #[arg(long)]
+        annual: bool,
+        /// Bucket per month
+        #[arg(long)]
+        monthly: bool,
+
+        // Scope (at least one required)
+        /// All spend across all users
+        #[arg(long)]
+        global: bool,
+        /// All spend in a group
+        #[arg(long)]
+        group: Option<String>,
+        /// All spend on a project
         #[arg(long)]
         project: Option<String>,
+        /// A specific user's spend
         #[arg(long)]
-        since: Option<String>,
+        user: Option<String>,
+
+        // Output format
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },

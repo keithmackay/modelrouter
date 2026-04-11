@@ -328,6 +328,180 @@ pub async fn hook_latency_stats(pool: &sqlx::SqlitePool) -> Result<Vec<HookStats
     Ok(result)
 }
 
+// ── Usage report types ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum UsageScope {
+    Global,
+    Group(String),
+    Project(String),
+    User(String),
+    UserInGroup { user: String, group: String },
+    UserInProject { user: String, project: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageWindow {
+    AllTime,
+    Annual,
+    Monthly,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageGranularity {
+    Total,
+    Subtotal,
+    Detail,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageReportRow {
+    pub bucket: Option<String>,
+    pub user_name: Option<String>,
+    pub project: Option<String>,
+    pub model: Option<String>,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub cost_usd: f64,
+}
+
+pub async fn fetch_usage_rows(
+    pool: &sqlx::SqlitePool,
+    scope: &UsageScope,
+    window: &UsageWindow,
+    granularity: &UsageGranularity,
+) -> Result<Vec<UsageReportRow>> {
+    // Build bucket expression
+    let bucket_expr = match window {
+        UsageWindow::AllTime => "NULL".to_string(),
+        UsageWindow::Annual => "strftime('%Y', cl.created_at)".to_string(),
+        UsageWindow::Monthly => "strftime('%Y-%m', cl.created_at)".to_string(),
+    };
+
+    // Build SELECT fields based on granularity
+    let select_fields = match granularity {
+        UsageGranularity::Total => format!(
+            "{} as bucket, NULL as user_name, NULL as project_col, NULL as model_col, \
+             COALESCE(SUM(cl.tokens_in), 0) as tokens_in, \
+             COALESCE(SUM(cl.tokens_out), 0) as tokens_out, \
+             COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd",
+            bucket_expr
+        ),
+        UsageGranularity::Subtotal => format!(
+            "{} as bucket, u.name as user_name, cl.project as project_col, NULL as model_col, \
+             COALESCE(SUM(cl.tokens_in), 0) as tokens_in, \
+             COALESCE(SUM(cl.tokens_out), 0) as tokens_out, \
+             COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd",
+            bucket_expr
+        ),
+        UsageGranularity::Detail => format!(
+            "{} as bucket, u.name as user_name, cl.project as project_col, cl.model as model_col, \
+             cl.tokens_in as tokens_in, cl.tokens_out as tokens_out, cl.cost_usd",
+            bucket_expr
+        ),
+    };
+
+    // Build JOIN and WHERE clause
+    let (joins, mut where_parts, bind_values) = match scope {
+        UsageScope::Global => (
+            "JOIN users u ON cl.user_id = u.id".to_string(),
+            vec![],
+            vec![],
+        ),
+        UsageScope::Group(gname) => (
+            "JOIN users u ON cl.user_id = u.id \
+             JOIN group_memberships gm ON gm.user_id = cl.user_id \
+                 AND gm.joined_at <= cl.created_at \
+                 AND (gm.disabled_at IS NULL OR cl.created_at < gm.disabled_at) \
+             JOIN groups g ON g.id = gm.group_id".to_string(),
+            vec!["g.name = ?"],
+            vec![gname.clone()],
+        ),
+        UsageScope::Project(proj) => (
+            "JOIN users u ON cl.user_id = u.id".to_string(),
+            vec!["cl.project = ?"],
+            vec![proj.clone()],
+        ),
+        UsageScope::User(uname) => (
+            "JOIN users u ON cl.user_id = u.id".to_string(),
+            vec!["u.name = ?"],
+            vec![uname.clone()],
+        ),
+        UsageScope::UserInGroup { user, group } => (
+            "JOIN users u ON cl.user_id = u.id \
+             JOIN group_memberships gm ON gm.user_id = cl.user_id \
+                 AND gm.joined_at <= cl.created_at \
+                 AND (gm.disabled_at IS NULL OR cl.created_at < gm.disabled_at) \
+             JOIN groups g ON g.id = gm.group_id".to_string(),
+            vec!["u.name = ?", "g.name = ?"],
+            vec![user.clone(), group.clone()],
+        ),
+        UsageScope::UserInProject { user, project } => (
+            "JOIN users u ON cl.user_id = u.id".to_string(),
+            vec!["u.name = ?", "cl.project = ?"],
+            vec![user.clone(), project.clone()],
+        ),
+    };
+
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_parts.join(" AND "))
+    };
+
+    // Build GROUP BY
+    let group_by = match granularity {
+        UsageGranularity::Total => match window {
+            UsageWindow::AllTime => String::new(),
+            _ => "GROUP BY bucket".to_string(),
+        },
+        UsageGranularity::Subtotal => {
+            let mut cols = vec![];
+            if *window != UsageWindow::AllTime { cols.push("bucket"); }
+            cols.push("u.name");
+            cols.push("cl.project");
+            format!("GROUP BY {}", cols.join(", "))
+        },
+        UsageGranularity::Detail => {
+            let mut cols = vec![];
+            if *window != UsageWindow::AllTime { cols.push("bucket"); }
+            cols.push("u.name");
+            cols.push("cl.project");
+            cols.push("cl.model");
+            cols.push("cl.id");
+            format!("GROUP BY {}", cols.join(", "))
+        },
+    };
+
+    // Build ORDER BY
+    let order_by = "ORDER BY bucket ASC, user_name ASC, project_col ASC, model_col ASC";
+
+    let sql = format!(
+        "SELECT {select_fields} FROM cost_ledger cl {joins} {where_clause} {group_by} {order_by}"
+    );
+
+    let mut q = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, f64)>(&sql);
+    for val in &bind_values {
+        q = q.bind(val);
+    }
+
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(bucket, user_name, project, model, tokens_in, tokens_out, cost_usd)| {
+            UsageReportRow {
+                bucket,
+                user_name,
+                project,
+                model,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+            }
+        })
+        .collect())
+}
+
 pub fn window_start_str(window: &str) -> Result<String> {
     use chrono::Datelike;
     let now = chrono::Utc::now();
