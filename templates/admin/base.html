@@ -36,6 +36,11 @@
         .tag-disabled { background: #f8d7da; color: #721c24; }
         .pagination { margin-top: 1rem; display: flex; gap: 0.5rem; }
         .pagination a { padding: 0.4rem 0.75rem; background: #fff; border: 1px solid #ddd; border-radius: 4px; text-decoration: none; font-size: 0.85rem; }
+        input[type=number]::-webkit-outer-spin-button,
+        input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        input[type=number] { -moz-appearance: textfield; }
+        thead th[data-sortable], thead th { cursor: pointer; user-select: none; }
+        thead th:hover { background: #e0e0e0; }
     </style>
 </head>
 <body>
@@ -59,5 +64,59 @@
 <div class="container">
     {% block content %}{% endblock %}
 </div>
+<script>
+function initSortable(root) {
+    var tables = (root || document).querySelectorAll('table');
+    tables.forEach(function(table) {
+        var ths = table.querySelectorAll('thead th');
+        ths.forEach(function(th, colIdx) {
+            if (th._sortInit) return;
+            th._sortInit = true;
+            th.addEventListener('click', function() {
+                var dir = th.getAttribute('data-sort-dir') === 'asc' ? 'desc' : 'asc';
+                ths.forEach(function(t) {
+                    t.removeAttribute('data-sort-dir');
+                    t.textContent = t.textContent.replace(/ [↑↓]$/, '');
+                });
+                th.setAttribute('data-sort-dir', dir);
+                th.textContent = th.textContent + (dir === 'asc' ? ' ↑' : ' ↓');
+                var tbody = table.querySelector('tbody');
+                if (!tbody) return;
+                var rows = Array.from(tbody.querySelectorAll('tr'));
+                rows.sort(function(a, b) {
+                    var aCell = a.querySelectorAll('td')[colIdx];
+                    var bCell = b.querySelectorAll('td')[colIdx];
+                    var aText = aCell ? aCell.textContent.trim() : '';
+                    var bText = bCell ? bCell.textContent.trim() : '';
+                    var aNum = parseFloat(aText.replace(/[^0-9.\-]/g, ''));
+                    var bNum = parseFloat(bText.replace(/[^0-9.\-]/g, ''));
+                    var cmp = (!isNaN(aNum) && !isNaN(bNum))
+                        ? aNum - bNum
+                        : aText.localeCompare(bText);
+                    return dir === 'asc' ? cmp : -cmp;
+                });
+                rows.forEach(function(r) { tbody.appendChild(r); });
+            });
+        });
+    });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    initSortable();
+    document.querySelectorAll('table').forEach(function(table) {
+        var ths = table.querySelectorAll('thead th');
+        ths.forEach(function(th) {
+            if (/created/i.test(th.textContent)) {
+                th.setAttribute('data-sort-dir', 'asc'); // will be flipped to desc on click
+                th.click();
+            }
+        });
+    });
+});
+
+document.addEventListener('htmx:afterSwap', function(evt) {
+    initSortable(evt.detail.target);
+});
+</script>
 </body>
 </html>

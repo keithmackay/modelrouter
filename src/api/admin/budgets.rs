@@ -17,8 +17,8 @@ fn rule_row_html(rule: &BudgetRule, card_target: &str) -> String {
     let window_label = match rule.window.as_str() {
         "monthly" => "Monthly".to_string(),
         "total" => {
-            let start = rule.window_start.as_deref().unwrap_or("?");
-            let end = rule.window_end.as_deref().unwrap_or("?");
+            let start = rule.window_start.as_deref().and_then(|s| s.get(..10)).unwrap_or("?");
+            let end = rule.window_end.as_deref().and_then(|s| s.get(..10)).unwrap_or("?");
             format!("Total ({} – {})", he(start), he(end))
         }
         "target" => "Target".to_string(),
@@ -86,7 +86,7 @@ fn add_rule_form_html(card_target: &str, scope_fields: &str) -> String {
             {scope_fields}
             <div>
                 <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Window</label>
-                <select name="window" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+                <select name="window" onchange="var dr=this.closest('form').querySelector('.date-range-fields');if(dr)dr.style.display=this.value==='total'?'flex':'none';" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
                     <option value="monthly">Monthly</option>
                     <option value="total">Total (date range)</option>
                 </select>
@@ -96,12 +96,30 @@ fn add_rule_form_html(card_target: &str, scope_fields: &str) -> String {
                 <input type="number" name="limit_usd" step="0.01" placeholder="100.00" style="width:90px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
             </div>
             <div>
-                <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Start (total only)</label>
-                <input type="date" name="window_start" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
+                <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Limit Tokens</label>
+                <input type="number" name="limit_tokens" placeholder="100000" style="width:100px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
             </div>
             <div>
-                <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">End (total only)</label>
-                <input type="date" name="window_end" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
+                <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Rate (RPM)</label>
+                <input type="number" name="rate_rpm" placeholder="60" style="width:70px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
+            </div>
+            <div>
+                <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Allow Models</label>
+                <input type="text" name="model_allow" placeholder="claude-opus-4-6, ..." style="width:160px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;" title="Comma-separated model names to allow">
+            </div>
+            <div>
+                <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Deny Models</label>
+                <input type="text" name="model_deny" placeholder="gpt-4o, ..." style="width:160px;padding:0.3rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;" title="Comma-separated model names to deny">
+            </div>
+            <div class="date-range-fields" style="display:none;gap:0.5rem;flex-wrap:wrap;">
+                <div>
+                    <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Start</label>
+                    <input type="date" name="window_start" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">End</label>
+                    <input type="date" name="window_end" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;">
+                </div>
             </div>
             <button type="submit" class="btn btn-primary" style="font-size:0.85rem;">Add Rule</button>
         </form>"##,
@@ -299,6 +317,8 @@ pub struct CreateBudgetForm {
     pub max_concurrent: Option<i64>,
     pub window_start: Option<String>,
     pub window_end: Option<String>,
+    pub model_allow: Option<String>,
+    pub model_deny: Option<String>,
 }
 
 pub async fn post_create_budget(
@@ -355,7 +375,20 @@ pub async fn post_create_budget(
     };
 
     let window_start = form.window_start.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
-    let window_end = form.window_end.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
+    let window_end = form.window_end.as_deref().map(|d| format!("{}T23:59:59+00:00", d));
+
+    let model_allow: Vec<String> = form.model_allow.as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let model_deny: Vec<String> = form.model_deny.as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     BudgetRepository::create(&*state.db, NewBudgetRule {
         user_id,
@@ -366,8 +399,8 @@ pub async fn post_create_budget(
         window: form.window.clone(),
         limit_usd: form.limit_usd,
         limit_tokens: form.limit_tokens,
-        model_allow: vec![],
-        model_deny: vec![],
+        model_allow,
+        model_deny,
         rate_rpm: form.rate_rpm,
         max_concurrent: form.max_concurrent,
         window_start,
@@ -377,12 +410,20 @@ pub async fn post_create_budget(
     render_scope_card(&state, &existing_scope).await
 }
 
+fn parse_opt_f64(s: &Option<String>) -> Option<f64> {
+    s.as_deref().filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
+}
+
+fn parse_opt_i64(s: &Option<String>) -> Option<i64> {
+    s.as_deref().filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
+}
+
 #[derive(Deserialize)]
 pub struct EditBudgetForm {
-    pub limit_usd: Option<f64>,
-    pub limit_tokens: Option<i64>,
-    pub rate_rpm: Option<i64>,
-    pub max_concurrent: Option<i64>,
+    pub limit_usd: Option<String>,
+    pub limit_tokens: Option<String>,
+    pub rate_rpm: Option<String>,
+    pub max_concurrent: Option<String>,
     pub window_start: Option<String>,
     pub window_end: Option<String>,
 }
@@ -393,16 +434,20 @@ pub async fn post_edit_budget(
     axum::extract::Path(id): axum::extract::Path<i64>,
     Form(form): Form<EditBudgetForm>,
 ) -> Result<Html<String>, DashboardError> {
-    let window_start = form.window_start.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
-    let window_end = form.window_end.as_deref().map(|d| format!("{}T00:00:00+00:00", d));
+    let window_start = form.window_start.as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|d| format!("{}T00:00:00+00:00", d));
+    let window_end = form.window_end.as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|d| format!("{}T23:59:59+00:00", d));
 
     BudgetRepository::update(&*state.db, id, &UpdateBudgetRule {
-        limit_usd: form.limit_usd,
-        limit_tokens: form.limit_tokens,
+        limit_usd: parse_opt_f64(&form.limit_usd),
+        limit_tokens: parse_opt_i64(&form.limit_tokens),
         model_allow: None,
         model_deny: None,
-        rate_rpm: form.rate_rpm,
-        max_concurrent: form.max_concurrent,
+        rate_rpm: parse_opt_i64(&form.rate_rpm),
+        max_concurrent: parse_opt_i64(&form.max_concurrent),
         window_start,
         window_end,
     }).await.map_err(|_| DashboardError::Internal)?;
