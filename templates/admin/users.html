@@ -39,7 +39,7 @@
                 <span class="tag tag-disabled">Disabled</span>
                 {% endif %}
             </td>
-            <td>{{ user.created_at | fmt_ts }}</td>
+            <td data-sort-value="{{ user.created_at }}">{{ user.created_at | fmt_ts }}</td>
             <td>
                 {% if user.enabled %}
                 <button class="btn btn-danger" hx-post="/admin/users/{{ user.id }}/disable" hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML">Disable</button>

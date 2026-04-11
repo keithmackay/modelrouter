@@ -5,7 +5,12 @@
 <form method="GET" action="/admin/cost" style="display:flex; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-end;">
     <div>
         <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">User</label>
-        <input type="text" name="user" value="{{ filter_user | default('') }}" placeholder="All users" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <select name="user" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="" {% if not filter_user %}selected{% endif %}>All users</option>
+            {% for name in user_names %}
+            <option value="{{ name }}" {% if filter_user == name %}selected{% endif %}>{{ name }}</option>
+            {% endfor %}
+        </select>
     </div>
     <div>
         <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Window</label>

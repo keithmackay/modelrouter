@@ -65,9 +65,33 @@
     {% block content %}{% endblock %}
 </div>
 <script>
+function cellValue(cell) {
+    return cell ? (cell.getAttribute('data-sort-value') || cell.textContent.trim()) : '';
+}
+
 function initSortable(root) {
     var tables = (root || document).querySelectorAll('table');
     tables.forEach(function(table) {
+        // Add filter input above table if not already present
+        if (!table._filterInit) {
+            table._filterInit = true;
+            var wrapper = document.createElement('div');
+            wrapper.style.cssText = 'margin-bottom:0.5rem;';
+            var input = document.createElement('input');
+            input.type = 'search';
+            input.placeholder = 'Filter rows…';
+            input.style.cssText = 'padding:0.35rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;width:220px;';
+            input.addEventListener('input', function() {
+                var q = input.value.toLowerCase();
+                table.querySelectorAll('tbody tr').forEach(function(row) {
+                    var text = row.textContent.toLowerCase();
+                    row.style.display = (!q || text.includes(q)) ? '' : 'none';
+                });
+            });
+            wrapper.appendChild(input);
+            table.parentNode.insertBefore(wrapper, table);
+        }
+
         var ths = table.querySelectorAll('thead th');
         ths.forEach(function(th, colIdx) {
             if (th._sortInit) return;
@@ -80,22 +104,30 @@ function initSortable(root) {
                 });
                 th.setAttribute('data-sort-dir', dir);
                 th.textContent = th.textContent + (dir === 'asc' ? ' ↑' : ' ↓');
-                var tbody = table.querySelector('tbody');
-                if (!tbody) return;
-                var rows = Array.from(tbody.querySelectorAll('tr'));
+
+                // Collect ALL rows from ALL tbodys, consolidate into first tbody
+                var tbodies = Array.from(table.querySelectorAll('tbody'));
+                if (!tbodies.length) return;
+                var rows = [];
+                tbodies.forEach(function(tb) {
+                    Array.from(tb.querySelectorAll('tr')).forEach(function(r) { rows.push(r); });
+                });
                 rows.sort(function(a, b) {
-                    var aCell = a.querySelectorAll('td')[colIdx];
-                    var bCell = b.querySelectorAll('td')[colIdx];
-                    var aText = aCell ? aCell.textContent.trim() : '';
-                    var bText = bCell ? bCell.textContent.trim() : '';
-                    var aNum = parseFloat(aText.replace(/[^0-9.\-]/g, ''));
-                    var bNum = parseFloat(bText.replace(/[^0-9.\-]/g, ''));
+                    var aVal = cellValue(a.querySelectorAll('td')[colIdx]);
+                    var bVal = cellValue(b.querySelectorAll('td')[colIdx]);
+                    var aNum = parseFloat(aVal.replace(/[^0-9.\-]/g, ''));
+                    var bNum = parseFloat(bVal.replace(/[^0-9.\-]/g, ''));
                     var cmp = (!isNaN(aNum) && !isNaN(bNum))
                         ? aNum - bNum
-                        : aText.localeCompare(bText);
+                        : aVal.localeCompare(bVal);
                     return dir === 'asc' ? cmp : -cmp;
                 });
-                rows.forEach(function(r) { tbody.appendChild(r); });
+                var primary = tbodies[0];
+                rows.forEach(function(r) { primary.appendChild(r); });
+                // Remove now-empty extra tbodys
+                tbodies.slice(1).forEach(function(tb) {
+                    if (!tb.querySelector('tr')) tb.remove();
+                });
             });
         });
     });
@@ -107,7 +139,7 @@ document.addEventListener('DOMContentLoaded', function() {
         var ths = table.querySelectorAll('thead th');
         ths.forEach(function(th) {
             if (/created/i.test(th.textContent)) {
-                th.setAttribute('data-sort-dir', 'asc'); // will be flipped to desc on click
+                th.setAttribute('data-sort-dir', 'asc');
                 th.click();
             }
         });

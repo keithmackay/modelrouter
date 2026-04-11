@@ -1093,12 +1093,16 @@ pub async fn get_cost(
         }
     }
 
+    let mut user_names: Vec<String> = users.iter().map(|u| u.name.clone()).collect();
+    user_names.sort();
+
     render(
         "cost.html",
         minijinja::context! {
             rows => rows,
             window => window,
             filter_user => filter_user,
+            user_names => user_names,
         },
     )
 }
