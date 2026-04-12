@@ -109,7 +109,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     };
     use crate::api::admin::groups::{
         get_groups, post_create_group, post_enable_group, post_disable_group,
-        post_add_member, post_disable_member,
+        post_add_member, post_disable_member, post_set_group_priority,
     };
     use crate::api::admin::budgets::{
         get_budgets, post_create_budget, post_edit_budget, post_delete_budget,
@@ -174,6 +174,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/groups/:id/disable", post(post_disable_group))
         .route("/admin/groups/:id/members", post(post_add_member))
         .route("/admin/groups/:id/members/:uid/disable", post(post_disable_member))
+        .route("/admin/groups/:id/priority", post(post_set_group_priority))
         .route("/admin/budgets", get(get_budgets).post(post_create_budget))
         .route("/admin/budgets/:id/edit", post(post_edit_budget))
         .route("/admin/budgets/:id/delete", post(post_delete_budget))

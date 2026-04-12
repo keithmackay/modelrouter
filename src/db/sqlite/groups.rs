@@ -186,6 +186,15 @@ impl GroupRepository for SqliteDb {
         .await?;
         Ok(())
     }
+
+    async fn set_group_priority(&self, id: i64, priority: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE groups SET priority = ? WHERE id = ?")
+            .bind(priority)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

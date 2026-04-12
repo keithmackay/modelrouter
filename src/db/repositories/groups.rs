@@ -18,4 +18,5 @@ pub trait GroupRepository: Send + Sync {
     ) -> anyhow::Result<Option<GroupMembership>>;
     async fn add_member(&self, group_id: i64, user_id: i64) -> anyhow::Result<GroupMembership>;
     async fn disable_membership(&self, membership_id: i64) -> anyhow::Result<()>;
+    async fn set_group_priority(&self, id: i64, priority: i64) -> anyhow::Result<()>;
 }

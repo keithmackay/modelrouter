@@ -104,7 +104,7 @@ pub fn group_card_html(
         String::new()
     };
 
-    let action_btn = if group.enabled {
+    let toggle_btn = if group.enabled {
         format!(
             r##"<button class="btn btn-danger" hx-post="/admin/groups/{}/disable" hx-target="#group-card-{}" hx-swap="outerHTML" hx-confirm="Disable group {}? All active memberships will be disabled.">Disable Group</button>"##,
             group.id, group.id, he(&group.name)
@@ -115,6 +115,15 @@ pub fn group_card_html(
             group.id, group.id
         )
     };
+    let priority_form = format!(
+        r##"<form hx-post="/admin/groups/{id}/priority" hx-target="#group-card-{id}" hx-swap="outerHTML" style="display:inline-flex;align-items:center;gap:0.3rem;">
+            <input type="number" name="priority" value="{pri}" style="width:5rem;padding:0.3rem 0.5rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;" title="Priority">
+            <button type="submit" class="btn btn-secondary" style="font-size:0.8rem;padding:0.3rem 0.6rem;">Save Priority</button>
+        </form>"##,
+        id = group.id,
+        pri = group.priority,
+    );
+    let action_btn = format!("{} {}", priority_form, toggle_btn);
 
     format!(
         r#"<div id="group-card-{id}" style="background:{bg};border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);padding:1.25rem;margin-bottom:1rem;">
@@ -385,5 +394,24 @@ pub async fn post_disable_member(
     .await;
 
     let (group, memberships, all_users) = fetch_card_parts(&state, group_id).await?;
+    Ok(Html(group_card_html(&group, &memberships, &all_users)))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetPriorityForm {
+    pub priority: i64,
+}
+
+pub async fn post_set_group_priority(
+    State(state): State<AppState>,
+    _session: SuperDashboardSession,
+    Path(id): Path<i64>,
+    Form(form): Form<SetPriorityForm>,
+) -> Result<Html<String>, DashboardError> {
+    GroupRepository::set_group_priority(&*state.db, id, form.priority)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let (group, memberships, all_users) = fetch_card_parts(&state, id).await?;
     Ok(Html(group_card_html(&group, &memberships, &all_users)))
 }
