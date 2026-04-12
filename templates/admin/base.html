@@ -65,6 +65,15 @@
     {% block content %}{% endblock %}
 </div>
 <script>
+function filterCards(containerId, q) {
+    q = q.toLowerCase();
+    document.querySelectorAll('#' + containerId + ' > [id]').forEach(function(card) {
+        var h = card.querySelector('h3');
+        var text = (h ? h.textContent : card.textContent).toLowerCase();
+        card.style.display = (!q || text.includes(q)) ? '' : 'none';
+    });
+}
+
 function cellValue(cell) {
     return cell ? (cell.getAttribute('data-sort-value') || cell.textContent.trim()) : '';
 }

@@ -21,7 +21,19 @@
     <div id="group-form-result" style="margin-top:0.75rem;"></div>
 </div>
 
+<input type="search" id="group-filter" placeholder="Filter groups…"
+    style="padding:0.35rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;width:220px;margin-bottom:0.75rem;"
+    oninput="filterCards('groups-list', this.value)">
+
 <div id="groups-list">
     {{ groups_html | safe }}
 </div>
+
+<script>
+// Re-apply filter after HTMX injects new cards
+document.addEventListener('htmx:afterSwap', function() {
+    var inp = document.getElementById('group-filter');
+    if (inp) filterCards('groups-list', inp.value);
+});
+</script>
 {% endblock %}

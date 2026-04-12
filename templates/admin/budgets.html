@@ -15,12 +15,18 @@
 </div>
 <div id="tab-projects" style="display:none;">
     {% if project_cards %}
+        <input type="search" placeholder="Filter projects…"
+            style="padding:0.35rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;width:220px;margin-bottom:0.75rem;"
+            oninput="filterCards('tab-projects', this.value)">
         {{ project_cards | safe }}
     {% else %}
         <p style="color:#999;">No project keys found. Create API keys with a project name to add project budgets.</p>
     {% endif %}
 </div>
 <div id="tab-users" style="display:none;">
+    <input type="search" placeholder="Filter users…"
+        style="padding:0.35rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;width:220px;margin-bottom:0.75rem;"
+        oninput="filterCards('tab-users', this.value)">
     {{ user_cards | safe }}
 </div>
 <div id="tab-groups" style="display:none;">
