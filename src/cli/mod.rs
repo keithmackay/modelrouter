@@ -763,21 +763,31 @@ pub async fn run(cli: Cli) -> Result<()> {
             use crate::cli::commands::ReportCommands;
 
             match report_args.command {
-                ReportCommands::Cost { user, project, window, format } => {
+                ReportCommands::Cost { user, group, project, model, key_id, window, format } => {
                     let rows = crate::report::cost_by_user_window(
-                        &db.pool, &window, user.as_deref(), project.as_deref(),
+                        &db.pool, &window,
+                        user.as_deref(),
+                        project.as_deref(),
+                        group.as_deref(),
+                        model.as_deref(),
+                        key_id,
                     ).await?;
                     print_rows(
                         &rows,
-                        &["User", "Model", "Cost (USD)", "Tokens In", "Tokens Out", "Requests"],
+                        &["User", "Model", "Window", "Group", "Project", "Key",
+                          "Cost (USD)", "Requests", "Tokens Out", "Tokens In"],
                         |r| {
                             vec![
                                 r.user_name.clone(),
                                 r.model.clone(),
+                                r.window.clone(),
+                                r.groups.clone(),
+                                r.project.clone(),
+                                r.key.clone(),
                                 format!("{:.6}", r.total_cost_usd),
-                                r.total_tokens_in.to_string(),
-                                r.total_tokens_out.to_string(),
                                 r.request_count.to_string(),
+                                r.total_tokens_out.to_string(),
+                                r.total_tokens_in.to_string(),
                             ]
                         },
                         format,

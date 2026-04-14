@@ -8,10 +8,14 @@ use std::collections::BTreeMap;
 pub struct CostRow {
     pub user_name: String,
     pub model: String,
+    pub window: String,
+    pub groups: String,
+    pub project: String,
+    pub key: String,
     pub total_cost_usd: f64,
-    pub total_tokens_in: i64,
-    pub total_tokens_out: i64,
     pub request_count: i64,
+    pub total_tokens_out: i64,
+    pub total_tokens_in: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,36 +65,112 @@ pub async fn cost_by_user_window(
     window: &str,
     user_name: Option<&str>,
     project: Option<&str>,
+    group: Option<&str>,
+    model: Option<&str>,
+    key_id: Option<i64>,
 ) -> Result<Vec<CostRow>> {
     let window_start = window_start_str(window)?;
 
-    let mut extras = String::new();
-    if user_name.is_some()  { extras.push_str(" AND u.name = ?"); }
-    if project.is_some()    { extras.push_str(" AND cl.project = ?"); }
+    // ── Resolve group → active member user_ids ────────────────────────────
+    let group_user_ids: Option<Vec<i64>> = if let Some(gname) = group {
+        let ids: Vec<(i64,)> = sqlx::query_as(
+            "SELECT gm.user_id FROM group_memberships gm
+             JOIN groups g ON gm.group_id = g.id
+             WHERE g.name = ? AND gm.disabled_at IS NULL",
+        )
+        .bind(gname)
+        .fetch_all(pool)
+        .await?;
+        Some(ids.into_iter().map(|(id,)| id).collect())
+    } else {
+        None
+    };
 
-    let sql = format!(
-        r#"SELECT u.name, cl.model,
-                  COALESCE(SUM(cl.cost_usd), 0.0) as total_cost,
-                  COALESCE(SUM(cl.tokens_in), 0) as tokens_in,
-                  COALESCE(SUM(cl.tokens_out), 0) as tokens_out,
-                  COUNT(*) as request_count
-           FROM cost_ledger cl
-           JOIN users u ON cl.user_id = u.id
-           WHERE cl.created_at >= ?{extras}
-           GROUP BY u.name, cl.model
-           ORDER BY total_cost DESC"#,
-    );
+    // Empty group → no results
+    if let Some(ref ids) = group_user_ids {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+    }
 
-    let mut q = sqlx::query_as::<_, (String, String, f64, i64, i64, i64)>(&sql);
+    // ── Pre-load user_id → groups map (active memberships) ────────────────
+    let membership_rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT gm.user_id, g.name
+         FROM group_memberships gm
+         JOIN groups g ON gm.group_id = g.id
+         WHERE gm.disabled_at IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut user_group_map: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for (uid, gname) in membership_rows {
+        user_group_map.entry(uid).or_default().push(gname);
+    }
+
+    // ── Build query ────────────────────────────────────────────────────────
+    let mut sql = "SELECT u.id, u.name, cl.model, \
+                          COALESCE(cl.project, '') as project, \
+                          cl.api_key_id, \
+                          COALESCE(ak.project, '') as key_project, \
+                          COALESCE(ak.label, '') as key_label, \
+                          COALESCE(SUM(cl.cost_usd), 0.0), \
+                          COALESCE(SUM(cl.tokens_in), 0), \
+                          COALESCE(SUM(cl.tokens_out), 0), \
+                          COUNT(*) \
+                   FROM cost_ledger cl \
+                   JOIN users u ON cl.user_id = u.id \
+                   LEFT JOIN api_keys ak ON cl.api_key_id = ak.id \
+                   WHERE cl.created_at >= ?"
+        .to_string();
+
+    if user_name.is_some() { sql.push_str(" AND u.name = ?"); }
+    if project.is_some()   { sql.push_str(" AND cl.project = ?"); }
+    if key_id.is_some()    { sql.push_str(" AND cl.api_key_id = ?"); }
+    if let Some(ref ids) = group_user_ids {
+        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        sql.push_str(&format!(" AND cl.user_id IN ({})", list));
+    }
+    if model.is_some() { sql.push_str(" AND cl.model = ?"); }
+
+    sql.push_str(" GROUP BY u.id, u.name, cl.model, cl.project, cl.api_key_id \
+                   ORDER BY SUM(cl.cost_usd) DESC");
+
+    type Row = (i64, String, String, String, Option<i64>, String, String, f64, i64, i64, i64);
+    let mut q = sqlx::query_as::<_, Row>(&sql);
     q = q.bind(&window_start);
-    if let Some(v) = user_name  { q = q.bind(v); }
-    if let Some(v) = project    { q = q.bind(v); }
+    if let Some(v) = user_name { q = q.bind(v); }
+    if let Some(v) = project   { q = q.bind(v); }
+    if let Some(v) = key_id    { q = q.bind(v); }
+    if let Some(v) = model     { q = q.bind(v); }
 
     let rows = q.fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .map(|(user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count)| {
-            CostRow { user_name, model, total_cost_usd, total_tokens_in, total_tokens_out, request_count }
+        .map(|(uid, uname, mdl, proj, _api_key_id, key_proj, key_lbl, cost, tin, tout, cnt)| {
+            let groups_str = user_group_map.get(&uid)
+                .map(|gs| gs.join(", "))
+                .unwrap_or_default();
+            let key_str = if key_lbl.is_empty() && key_proj.is_empty() {
+                String::new()
+            } else if key_lbl.is_empty() {
+                key_proj.clone()
+            } else {
+                format!("{} ({})", key_proj, key_lbl)
+            };
+            CostRow {
+                user_name: uname,
+                model: mdl,
+                window: window.to_string(),
+                groups: groups_str,
+                project: proj,
+                key: key_str,
+                total_cost_usd: cost,
+                request_count: cnt,
+                total_tokens_out: tout,
+                total_tokens_in: tin,
+            }
         })
         .collect())
 }
@@ -529,8 +609,9 @@ pub fn window_start_str(window: &str) -> Result<String> {
             .unwrap()
             .and_utc()
             .to_rfc3339()),
+        "alltime" => Ok("1970-01-01T00:00:00Z".to_string()),
         other => Err(anyhow::anyhow!(
-            "invalid window '{}': expected daily, weekly, or monthly",
+            "invalid window '{}': expected daily, weekly, monthly, or alltime",
             other
         )),
     }

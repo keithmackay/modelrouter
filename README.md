@@ -556,23 +556,58 @@ modelrouter budget delete --id 3
 **Cost reporting**
 
 ```bash
-modelrouter report cost --user alice --window monthly --format table
-modelrouter report cost --group team-alpha --window monthly
-modelrouter report cost --project myapp --window monthly --format csv > report.csv
+# Basic — all users, this month
+modelrouter report cost
+
+# Filter by one or more dimensions (all are optional and composable)
+modelrouter report cost --user alice
+modelrouter report cost --group team-alpha
+modelrouter report cost --project myapp
+modelrouter report cost --model claude-sonnet-4-6
+modelrouter report cost --key-id 7
+
+# Window (default: monthly)
+modelrouter report cost --window daily
+modelrouter report cost --window weekly
+modelrouter report cost --window monthly
+modelrouter report cost --window alltime
+
+# Output format (default: table)
+modelrouter report cost --window monthly --format csv > report.csv
+modelrouter report cost --window monthly --format json
+
+# Combine freely
+modelrouter report cost --group team-alpha --project myapp --window alltime --format csv
 ```
 
-**Cost report filter matrix** — `--user` and `--group` are mutually exclusive; `--project` composes freely with either:
+**Output columns** (one row per unique user + model + project + key combination):
 
-**Cost report filter matrix** — `--user` and `--group` are mutually exclusive; `--project` composes freely with either:
-
-| Command | What it shows |
+| Column | Description |
 |---|---|
-| `report cost` | All users, all projects |
-| `report cost --user alice` | Alice across all her projects |
-| `report cost --group team-alpha` | All users in group, all projects |
-| `report cost --project modelrouter` | All users on the `modelrouter` project |
-| `report cost --user alice --project modelrouter` | Alice on `modelrouter` only |
-| `report cost --group team-alpha --project modelrouter` | Entire group on `modelrouter` only |
+| User | User name |
+| Model | Model name as recorded in the cost ledger |
+| Window | Selected time window |
+| Group | User's active group memberships (comma-separated) |
+| Project | Project label on the API key used for the request |
+| Key | API key (shown as `project (label)`) |
+| Cost (USD) | Total spend |
+| Requests | Number of requests |
+| Tokens Out | Output tokens |
+| Tokens In | Input tokens |
+
+**Filter reference** — all filters are optional and AND-composed:
+
+| Flag | Description |
+|---|---|
+| `--user NAME` | Restrict to a single user |
+| `--group NAME` | Restrict to active members of a group |
+| `--project NAME` | Restrict to a specific project label |
+| `--model NAME` | Restrict to a specific model |
+| `--key-id ID` | Restrict to a specific API key (use `modelrouter key list` to find IDs) |
+| `--window W` | `daily` · `weekly` · `monthly` · `alltime` |
+| `--format F` | `table` (default) · `csv` · `json` |
+
+`--user` and `--group` can be combined — the result is the intersection (user must be an active member of the group).
 
 ### API
 

@@ -213,9 +213,19 @@ pub enum ReportCommands {
         /// Filter by user name
         #[arg(long)]
         user: Option<String>,
-        /// Filter by project (matches api_keys.project assigned at key creation)
+        /// Filter by group name (shows only active members of the group)
+        #[arg(long)]
+        group: Option<String>,
+        /// Filter by project
         #[arg(long)]
         project: Option<String>,
+        /// Filter by model name
+        #[arg(long)]
+        model: Option<String>,
+        /// Filter by API key ID
+        #[arg(long)]
+        key_id: Option<i64>,
+        /// Time window: daily | weekly | monthly | alltime  [default: monthly]
         #[arg(long, default_value = "monthly")]
         window: String,
         #[arg(long, default_value = "table")]
