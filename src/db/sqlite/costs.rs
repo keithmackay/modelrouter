@@ -226,6 +226,90 @@ impl CostRepository for SqliteDb {
         Ok(rows.into_iter().map(|(m,)| m).collect())
     }
 
+    async fn list_daily_spend(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+        let mut sql = "SELECT strftime('%Y-%m-%d', created_at) AS day, \
+                              COALESCE(SUM(cost_usd), 0.0) \
+                       FROM cost_ledger \
+                       WHERE created_at >= ? AND created_at < ?"
+            .to_string();
+        if filter_project.is_some() {
+            sql.push_str(" AND project = ?");
+        }
+        if filter_model.is_some() {
+            sql.push_str(" AND model = ?");
+        }
+        if let Some(ids) = filter_user_ids {
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        sql.push_str(" GROUP BY day ORDER BY day ASC");
+
+        let mut q = sqlx::query_as::<_, (String, f64)>(&sql);
+        q = q.bind(start).bind(end);
+        if let Some(p) = filter_project { q = q.bind(p.to_string()); }
+        if let Some(m) = filter_model { q = q.bind(m.to_string()); }
+        Ok(q.fetch_all(&self.pool).await?)
+    }
+
+    async fn summarize_by_model(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<crate::db::repositories::costs::ModelSummaryRow>> {
+        use crate::db::repositories::costs::ModelSummaryRow;
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+        let mut sql = "SELECT model, \
+                              COALESCE(SUM(cost_usd), 0.0), \
+                              COALESCE(SUM(tokens_in), 0), \
+                              COALESCE(SUM(tokens_out), 0), \
+                              COUNT(*) \
+                       FROM cost_ledger \
+                       WHERE created_at >= ?"
+            .to_string();
+        if filter_project.is_some() {
+            sql.push_str(" AND project = ?");
+        }
+        if filter_model.is_some() {
+            sql.push_str(" AND model = ?");
+        }
+        if let Some(ids) = filter_user_ids {
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        sql.push_str(" GROUP BY model HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0 ORDER BY SUM(cost_usd) DESC");
+
+        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64)>(&sql);
+        q = q.bind(since);
+        if let Some(p) = filter_project { q = q.bind(p.to_string()); }
+        if let Some(m) = filter_model { q = q.bind(m.to_string()); }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(model, cost, ti, to, rc)| ModelSummaryRow {
+            model,
+            total_cost_usd: cost,
+            tokens_in: ti,
+            tokens_out: to,
+            request_count: rc,
+        }).collect())
+    }
+
     async fn cost_rows_grouped(
         &self,
         filter_user_ids: Option<&[i64]>,

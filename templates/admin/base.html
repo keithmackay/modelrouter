@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}modelrouter Admin{% endblock %}</title>
     <script src="/static/htmx.js"></script>
+    <script src="/static/d3.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; }
@@ -56,6 +57,7 @@
     <a href="/admin/admins">Admins</a>
     <a href="/admin/groups">Groups</a>
     <a href="/admin/budgets">Budgets</a>
+    <a href="/admin/reports">Reports</a>
     <span style="flex:1"></span>
     <form action="/admin/logout" method="POST">
         <button class="btn btn-secondary" type="submit">Logout</button>

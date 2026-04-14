@@ -6,3 +6,4 @@ pub mod templates;
 pub mod dashboard;
 pub mod groups;
 pub mod budgets;
+pub mod reports;

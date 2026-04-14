@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Reports — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Reports</h1>
+
+<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem;padding:1rem;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">User</label>
+        <select name="user" id="rf-user"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_user %}selected{% endif %}>All users</option>
+            {% for u in user_opts %}
+            <option value="{{ u.id }}" {% if sel_user == u.id|string %}selected{% endif %}>{{ u.name }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Project</label>
+        <select name="project" id="rf-project"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_project %}selected{% endif %}>All projects</option>
+            {% for p in projects %}
+            <option value="{{ p }}" {% if sel_project == p %}selected{% endif %}>{{ p }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Model</label>
+        <select name="model" id="rf-model"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_model %}selected{% endif %}>All models</option>
+            {% for m in models %}
+            <option value="{{ m }}" {% if sel_model == m %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Group</label>
+        <select name="group" id="rf-group"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_group %}selected{% endif %}>All groups</option>
+            {% for g in group_names %}
+            <option value="{{ g }}" {% if sel_group == g %}selected{% endif %}>{{ g }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Window</label>
+        <select name="window" id="rf-window"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="daily"   {% if sel_window == "daily"   %}selected{% endif %}>Daily</option>
+            <option value="weekly"  {% if sel_window == "weekly"  %}selected{% endif %}>Weekly</option>
+            <option value="monthly" {% if sel_window == "monthly" %}selected{% endif %}>Monthly</option>
+        </select>
+    </div>
+</div>
+
+<div id="panels"
+    hx-get="/admin/reports/panels"
+    hx-trigger="load"
+    hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+    style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;">
+    <div style="grid-column:1/-1;text-align:center;padding:2rem;color:#999;">Loading…</div>
+</div>
+{% endblock %}

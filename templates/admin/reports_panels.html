@@ -1,0 +1,299 @@
+{% set has_user_data = by_user_rows | length > 0 %}
+{% set has_model_data = by_model_rows | length > 0 %}
+{% set has_project_data = by_project_rows | length > 0 %}
+
+<!-- Spend by User -->
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Spend by User</h3>
+    {% if has_user_data %}
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th>User</th><th>Cost (USD)</th><th>Tokens In</th><th>Tokens Out</th><th>Requests</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in by_user_rows %}
+            <tr>
+                <td>{{ row.name }}</td>
+                <td>${{ row.cost_usd }}</td>
+                <td>{{ row.tokens_in }}</td>
+                <td>{{ row.tokens_out }}</td>
+                <td>{{ row.requests }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color:#999;text-align:center;padding:1rem;">No data for this window.</p>
+    {% endif %}
+</div>
+
+<!-- Spend by Model -->
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Spend by Model</h3>
+    {% if has_model_data %}
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th>Model</th><th>Cost (USD)</th><th>Tokens In</th><th>Tokens Out</th><th>Requests</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in by_model_rows %}
+            <tr>
+                <td>{{ row.model }}</td>
+                <td>${{ row.cost_usd }}</td>
+                <td>{{ row.tokens_in }}</td>
+                <td>{{ row.tokens_out }}</td>
+                <td>{{ row.requests }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color:#999;text-align:center;padding:1rem;">No data for this window.</p>
+    {% endif %}
+</div>
+
+<!-- Spend by Project -->
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Spend by Project</h3>
+    {% if has_project_data %}
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th>Project</th><th>Cost (USD)</th><th>Tokens In</th><th>Tokens Out</th><th>Requests</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in by_project_rows %}
+            <tr>
+                <td>{{ row.project }}</td>
+                <td>${{ row.cost_usd }}</td>
+                <td>{{ row.tokens_in }}</td>
+                <td>{{ row.tokens_out }}</td>
+                <td>{{ row.requests }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color:#999;text-align:center;padding:1rem;">No project data for this window.</p>
+    {% endif %}
+</div>
+
+<!-- Burndown Chart -->
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Spend Burndown</h3>
+    <div id="burndown-chart" data-chart-data="{{ burndown_json }}" style="width:100%;height:220px;"></div>
+</div>
+
+<!-- Top Models Bar Chart -->
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Top Models by Cost</h3>
+    <div id="top-models-chart" data-chart-data="{{ top_models_json }}" style="width:100%;height:220px;"></div>
+</div>
+
+<!-- Token Usage Stacked Bar -->
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Token Usage by User</h3>
+    <div id="token-usage-chart" data-chart-data="{{ token_usage_json }}" style="width:100%;height:220px;"></div>
+</div>
+
+<script>
+(function() {
+    var BLUE = '#1a1a2e', TEAL = '#4ecdc4', ORANGE = '#e8703a', GRAY = '#999';
+
+    function clearSvg(el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+    }
+
+    function noData(el) {
+        clearSvg(el);
+        el.innerHTML = '<p style="color:#999;text-align:center;padding-top:2rem;font-size:0.85rem;">No data</p>';
+    }
+
+    function initBurndownChart() {
+        var el = document.getElementById('burndown-chart');
+        if (!el || typeof d3 === 'undefined') return;
+        clearSvg(el);
+        var raw = el.getAttribute('data-chart-data');
+        var data;
+        try { data = JSON.parse(raw); } catch(e) { return; }
+        var series = (data.series || []);
+        if (series.length === 0) { noData(el); return; }
+
+        var margin = {top:10, right:20, bottom:40, left:55};
+        var W = el.offsetWidth || 320;
+        var H = 220;
+        var w = W - margin.left - margin.right;
+        var h = H - margin.top - margin.bottom;
+
+        var svg = d3.select(el).append('svg')
+            .attr('width', W).attr('height', H)
+            .append('g').attr('transform', 'translate(' + margin.left + ',' + margin.top + ')');
+
+        var parseDate = d3.timeParse('%Y-%m-%d');
+        var pts = series.map(function(d) { return {date: parseDate(d[0]), v: d[1]}; })
+                        .filter(function(d) { return d.date; });
+
+        var xScale = d3.scaleTime()
+            .domain(d3.extent(pts, function(d) { return d.date; }))
+            .range([0, w]);
+        var maxV = d3.max(pts, function(d) { return d.v; }) || 1;
+        var yMax = data.limit ? Math.max(data.limit, maxV) * 1.05 : maxV * 1.1;
+        var yScale = d3.scaleLinear().domain([0, yMax]).range([h, 0]);
+
+        svg.append('g').attr('transform', 'translate(0,' + h + ')')
+            .call(d3.axisBottom(xScale).ticks(5).tickFormat(d3.timeFormat('%m/%d')))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        svg.append('g')
+            .call(d3.axisLeft(yScale).ticks(5).tickFormat(function(d) { return '$' + d.toFixed(2); }))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        var line = d3.line()
+            .x(function(d) { return xScale(d.date); })
+            .y(function(d) { return yScale(d.v); });
+
+        svg.append('path').datum(pts)
+            .attr('fill', 'none')
+            .attr('stroke', BLUE)
+            .attr('stroke-width', 2)
+            .attr('d', line);
+
+        // Budget limit line
+        if (data.limit != null) {
+            var ly = yScale(data.limit);
+            svg.append('line')
+                .attr('x1', 0).attr('x2', w)
+                .attr('y1', ly).attr('y2', ly)
+                .attr('stroke', ORANGE).attr('stroke-width', 1.5)
+                .attr('stroke-dasharray', '5,3');
+            svg.append('text')
+                .attr('x', w - 4).attr('y', ly - 4)
+                .attr('text-anchor', 'end')
+                .attr('fill', ORANGE)
+                .style('font-size', '0.7rem')
+                .text('Budget $' + data.limit.toFixed(2));
+        }
+    }
+
+    function initTopModelsChart() {
+        var el = document.getElementById('top-models-chart');
+        if (!el || typeof d3 === 'undefined') return;
+        clearSvg(el);
+        var raw = el.getAttribute('data-chart-data');
+        var data;
+        try { data = JSON.parse(raw); } catch(e) { return; }
+        if (!data || data.length === 0) { noData(el); return; }
+
+        var margin = {top:10, right:20, bottom:10, left:160};
+        var W = el.offsetWidth || 320;
+        var H = 220;
+        var w = W - margin.left - margin.right;
+        var h = H - margin.top - margin.bottom;
+
+        var svg = d3.select(el).append('svg')
+            .attr('width', W).attr('height', H)
+            .append('g').attr('transform', 'translate(' + margin.left + ',' + margin.top + ')');
+
+        var top = data.slice(0, 8);
+        var yScale = d3.scaleBand()
+            .domain(top.map(function(d) { return d.model; }))
+            .range([0, h]).padding(0.25);
+        var xScale = d3.scaleLinear()
+            .domain([0, d3.max(top, function(d) { return d.cost; }) || 1])
+            .range([0, w]);
+
+        svg.append('g').call(d3.axisLeft(yScale).tickSize(0))
+            .selectAll('text').style('font-size', '0.7rem');
+        svg.append('g').attr('transform', 'translate(0,' + h + ')')
+            .call(d3.axisBottom(xScale).ticks(4).tickFormat(function(d) { return '$' + d.toFixed(2); }))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        svg.selectAll('.bar').data(top).enter().append('rect')
+            .attr('class', 'bar')
+            .attr('y', function(d) { return yScale(d.model); })
+            .attr('height', yScale.bandwidth())
+            .attr('x', 0)
+            .attr('width', function(d) { return xScale(d.cost); })
+            .attr('fill', TEAL);
+    }
+
+    function initTokenUsageChart() {
+        var el = document.getElementById('token-usage-chart');
+        if (!el || typeof d3 === 'undefined') return;
+        clearSvg(el);
+        var raw = el.getAttribute('data-chart-data');
+        var data;
+        try { data = JSON.parse(raw); } catch(e) { return; }
+        if (!data || data.length === 0) { noData(el); return; }
+
+        var margin = {top:10, right:80, bottom:40, left:70};
+        var W = el.offsetWidth || 320;
+        var H = 220;
+        var w = W - margin.left - margin.right;
+        var h = H - margin.top - margin.bottom;
+
+        var svg = d3.select(el).append('svg')
+            .attr('width', W).attr('height', H)
+            .append('g').attr('transform', 'translate(' + margin.left + ',' + margin.top + ')');
+
+        var keys = ['tokens_in', 'tokens_out'];
+        var stack = d3.stack().keys(keys)(data);
+
+        var xScale = d3.scaleBand()
+            .domain(data.map(function(d) { return d.user; }))
+            .range([0, w]).padding(0.3);
+        var yMax = d3.max(data, function(d) { return d.tokens_in + d.tokens_out; }) || 1;
+        var yScale = d3.scaleLinear().domain([0, yMax]).range([h, 0]);
+        var color = d3.scaleOrdinal().domain(keys).range([BLUE, TEAL]);
+
+        svg.append('g').attr('transform', 'translate(0,' + h + ')')
+            .call(d3.axisBottom(xScale))
+            .selectAll('text').attr('transform', 'rotate(-25)').attr('text-anchor', 'end')
+            .style('font-size', '0.7rem');
+        svg.append('g')
+            .call(d3.axisLeft(yScale).ticks(5).tickFormat(d3.format('.2s')))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        svg.selectAll('.layer').data(stack).enter().append('g')
+            .attr('fill', function(d) { return color(d.key); })
+            .selectAll('rect').data(function(d) { return d; }).enter().append('rect')
+            .attr('x', function(d) { return xScale(d.data.user); })
+            .attr('y', function(d) { return yScale(d[1]); })
+            .attr('height', function(d) { return yScale(d[0]) - yScale(d[1]); })
+            .attr('width', xScale.bandwidth());
+
+        // Legend
+        var legend = svg.append('g').attr('transform', 'translate(' + (w + 8) + ',10)');
+        keys.forEach(function(k, i) {
+            var g = legend.append('g').attr('transform', 'translate(0,' + (i * 18) + ')');
+            g.append('rect').attr('width', 12).attr('height', 12).attr('fill', color(k));
+            g.append('text').attr('x', 16).attr('y', 10)
+                .text(k === 'tokens_in' ? 'In' : 'Out')
+                .style('font-size', '0.7rem');
+        });
+    }
+
+    function initCharts() {
+        initBurndownChart();
+        initTopModelsChart();
+        initTokenUsageChart();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initCharts);
+    } else {
+        initCharts();
+    }
+
+    document.addEventListener('htmx:afterSwap', function(e) {
+        if (e.detail && e.detail.target && e.detail.target.id === 'panels') {
+            initCharts();
+        }
+    });
+})();
+</script>

@@ -114,6 +114,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::admin::budgets::{
         get_budgets, post_create_budget, post_edit_budget, post_delete_budget,
     };
+    use crate::api::admin::reports::{get_reports, get_reports_panels};
 
     axum::Router::new()
         // Embedded static assets
@@ -121,6 +122,12 @@ pub fn build_router(state: AppState) -> axum::Router {
             (
                 [(axum::http::header::CONTENT_TYPE, "application/javascript")],
                 include_str!("admin/htmx.min.js"),
+            )
+        }))
+        .route("/static/d3.js", get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                include_str!("admin/d3.min.js"),
             )
         }))
         // Health + API routes
@@ -178,6 +185,8 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/budgets", get(get_budgets).post(post_create_budget))
         .route("/admin/budgets/:id/edit", post(post_edit_budget))
         .route("/admin/budgets/:id/delete", post(post_delete_budget))
+        .route("/admin/reports", get(get_reports))
+        .route("/admin/reports/panels", get(get_reports_panels))
         // MCP Server Registry
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))

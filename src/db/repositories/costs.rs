@@ -1,6 +1,15 @@
 use async_trait::async_trait;
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelSummaryRow {
+    pub model: String,
+    pub total_cost_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub request_count: i64,
+}
+
 #[async_trait]
 pub trait CostRepository: Send + Sync {
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry>;
@@ -39,6 +48,25 @@ pub trait CostRepository: Send + Sync {
     async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>>;
     /// Distinct non-null model values present in the cost ledger, sorted.
     async fn distinct_models_in_ledger(&self) -> anyhow::Result<Vec<String>>;
+    /// Daily spend series: returns (date_str, cost_usd) pairs grouped by calendar day.
+    /// `filter_user_ids`: None = all users; Some(&[]) = empty result.
+    /// `start`/`end`: ISO 8601 UTC timestamps (inclusive start, exclusive end).
+    async fn list_daily_spend(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<(String, f64)>>;
+    /// Aggregate cost stats grouped by model, with optional filters.
+    async fn summarize_by_model(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<ModelSummaryRow>>;
     /// Per-row cost stats grouped by (user_id, model, project, api_key_id).
     /// Returns Vec of (user_id, model, project, api_key_id, cost_usd, tokens_in, tokens_out, request_count).
     /// Filters mirror cost_stats_grouped; adds an optional model filter.
