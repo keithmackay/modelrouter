@@ -126,11 +126,20 @@ function initSortable(root) {
                 rows.sort(function(a, b) {
                     var aVal = cellValue(a.querySelectorAll('td')[colIdx]);
                     var bVal = cellValue(b.querySelectorAll('td')[colIdx]);
-                    var aNum = parseFloat(aVal.replace(/[^0-9.\-]/g, ''));
-                    var bNum = parseFloat(bVal.replace(/[^0-9.\-]/g, ''));
-                    var cmp = (!isNaN(aNum) && !isNaN(bNum))
-                        ? aNum - bNum
-                        : aVal.localeCompare(bVal);
+                    var cmp;
+                    // Try date parse first (handles "YYYY-MM-DD HH:MM:SS" timestamps)
+                    var aDate = Date.parse(aVal.replace(' ', 'T'));
+                    var bDate = Date.parse(bVal.replace(' ', 'T'));
+                    if (!isNaN(aDate) && !isNaN(bDate)) {
+                        cmp = aDate - bDate;
+                    } else {
+                        // Strip currency symbols then try numeric
+                        var aNum = parseFloat(aVal.replace(/[^0-9.]/g, ''));
+                        var bNum = parseFloat(bVal.replace(/[^0-9.]/g, ''));
+                        cmp = (!isNaN(aNum) && !isNaN(bNum))
+                            ? aNum - bNum
+                            : aVal.localeCompare(bVal);
+                    }
                     return dir === 'asc' ? cmp : -cmp;
                 });
                 var primary = tbodies[0];
