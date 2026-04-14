@@ -145,6 +145,15 @@ function initSortable(root) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+    // Highlight active nav link
+    var path = window.location.pathname;
+    document.querySelectorAll('nav a[href]').forEach(function(a) {
+        var href = a.getAttribute('href');
+        if (href === '/admin' ? path === '/admin' : path.startsWith(href)) {
+            a.classList.add('active');
+        }
+    });
+
     initSortable();
     document.querySelectorAll('table').forEach(function(table) {
         var ths = table.querySelectorAll('thead th');
