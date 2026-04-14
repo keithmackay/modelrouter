@@ -191,42 +191,57 @@ pub async fn get_reports_panels(
         }).collect::<Vec<_>>()
     ).unwrap_or_else(|_| "[]".to_string());
 
-    // ── Chart: Burndown (daily cumulative spend + budget limit) ───────────────
+    // ── Chart: Burndown (remaining budget per day) ───────────────────────────
     let daily = CostRepository::list_daily_spend(
         &*state.db, eff_user_ids_ref, filter_project, filter_model_opt, &start, &end,
     ).await.map_err(|_| DashboardError::Internal)?;
 
-    let mut cumul = 0.0f64;
-    let series: Vec<serde_json::Value> = daily.iter().map(|(date, cost)| {
-        cumul += cost;
-        serde_json::json!([date, cumul])
-    }).collect();
-
-    // Look up budget limit if single user or group is selected and window is monthly
-    let budget_limit: Option<f64> = if q.window == "monthly" {
-        if let Some(uid) = filter_uid {
-            let scope = crate::db::models::BudgetScope::User(uid);
-            BudgetRepository::list_for_scope(&*state.db, &scope)
-                .await.ok()
-                .and_then(|rules| rules.into_iter().find(|r| r.window == "monthly"))
-                .and_then(|r| r.limit_usd)
-        } else if !q.group.is_empty() {
-            let scope = crate::db::models::BudgetScope::Group(q.group.clone());
-            BudgetRepository::list_for_scope(&*state.db, &scope)
-                .await.ok()
-                .and_then(|rules| rules.into_iter().find(|r| r.window == "monthly"))
-                .and_then(|r| r.limit_usd)
-        } else {
-            None
-        }
+    // Look up budget limit — check all windows matching the selected window
+    let budget_window = match q.window.as_str() {
+        "daily" | "weekly" => q.window.as_str(),
+        _ => "monthly",
+    };
+    let budget_limit: Option<f64> = if let Some(uid) = filter_uid {
+        let scope = crate::db::models::BudgetScope::User(uid);
+        BudgetRepository::list_for_scope(&*state.db, &scope)
+            .await.ok()
+            .and_then(|rules| rules.into_iter().find(|r| r.window == budget_window))
+            .and_then(|r| r.limit_usd)
+    } else if !q.group.is_empty() {
+        let scope = crate::db::models::BudgetScope::Group(q.group.clone());
+        BudgetRepository::list_for_scope(&*state.db, &scope)
+            .await.ok()
+            .and_then(|rules| rules.into_iter().find(|r| r.window == budget_window))
+            .and_then(|r| r.limit_usd)
     } else {
-        None
+        // Global budget
+        let scope = crate::db::models::BudgetScope::Global;
+        BudgetRepository::list_for_scope(&*state.db, &scope)
+            .await.ok()
+            .and_then(|rules| rules.into_iter().find(|r| r.window == budget_window))
+            .and_then(|r| r.limit_usd)
+    };
+
+    // Series: remaining budget per day (limit - cumulative_spend).
+    // If no budget limit, fall back to cumulative spend so the chart still shows something.
+    let series: Vec<serde_json::Value> = {
+        let mut cumul = 0.0f64;
+        daily.iter().map(|(date, cost)| {
+            cumul += cost;
+            let value = if let Some(limit) = budget_limit {
+                limit - cumul
+            } else {
+                cumul
+            };
+            serde_json::json!([date, value])
+        }).collect()
     };
 
     let burndown_json = serde_json::to_string(&serde_json::json!({
         "series": series,
         "limit": budget_limit,
-    })).unwrap_or_else(|_| r#"{"series":[],"limit":null}"#.to_string());
+        "start": start.get(..10).unwrap_or(""),
+    })).unwrap_or_else(|_| r#"{"series":[],"limit":null,"start":""}"#.to_string());
 
     super::dashboard::render("reports_panels.html", minijinja::context! {
         by_user_rows => by_user_rows,
