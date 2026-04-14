@@ -2,7 +2,16 @@
 {% block title %}Cost Breakdown — modelrouter Admin{% endblock %}
 {% block content %}
 <h1>Cost Breakdown</h1>
-<form method="GET" action="/admin/cost" style="display:flex; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-end;">
+<form method="GET" action="/admin/cost" style="display:flex; flex-wrap:wrap; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-end;">
+    <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Window</label>
+        <select name="window" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="daily"   {% if window == "daily"   %}selected{% endif %}>Daily</option>
+            <option value="weekly"  {% if window == "weekly"  %}selected{% endif %}>Weekly</option>
+            <option value="monthly" {% if window == "monthly" %}selected{% endif %}>Monthly</option>
+            <option value="alltime" {% if window == "alltime" %}selected{% endif %}>All time</option>
+        </select>
+    </div>
     <div>
         <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">User</label>
         <select name="user" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
@@ -13,11 +22,30 @@
         </select>
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Window</label>
-        <select name="window" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
-            <option value="daily" {% if window == "daily" %}selected{% endif %}>Daily</option>
-            <option value="weekly" {% if window == "weekly" %}selected{% endif %}>Weekly</option>
-            <option value="monthly" {% if window == "monthly" %}selected{% endif %}>Monthly</option>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Group</label>
+        <select name="group" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="" {% if not filter_group %}selected{% endif %}>All groups</option>
+            {% for name in group_names %}
+            <option value="{{ name }}" {% if filter_group == name %}selected{% endif %}>{{ name }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Project</label>
+        <select name="project" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="" {% if not filter_project %}selected{% endif %}>All projects</option>
+            {% for p in projects %}
+            <option value="{{ p }}" {% if filter_project == p %}selected{% endif %}>{{ p }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Key</label>
+        <select name="key_id" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="0" {% if filter_key_id == 0 %}selected{% endif %}>All keys</option>
+            {% for k in key_options %}
+            <option value="{{ k.id }}" {% if filter_key_id == k.id %}selected{% endif %}>{{ k.display }}</option>
+            {% endfor %}
         </select>
     </div>
     <button type="submit" class="btn btn-primary">Filter</button>
@@ -44,7 +72,7 @@
             <td>{{ row.request_count }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="6" style="text-align:center; color:#777; padding: 2rem;">No data for selected window.</td></tr>
+        <tr><td colspan="6" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
         {% endfor %}
     </tbody>
 </table>

@@ -146,6 +146,61 @@ impl CostRepository for SqliteDb {
         Ok(row.0)
     }
 
+    async fn cost_stats_grouped(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_api_key_id: Option<i64>,
+        since: &str,
+    ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64)>> {
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+
+        let mut sql = "SELECT user_id, \
+                              COALESCE(SUM(cost_usd), 0.0), \
+                              COALESCE(SUM(tokens_in), 0), \
+                              COALESCE(SUM(tokens_out), 0), \
+                              COUNT(*) \
+                       FROM cost_ledger \
+                       WHERE created_at >= ?"
+            .to_string();
+
+        if filter_project.is_some() {
+            sql.push_str(" AND project = ?");
+        }
+        if filter_api_key_id.is_some() {
+            sql.push_str(" AND api_key_id = ?");
+        }
+        if let Some(ids) = filter_user_ids {
+            // i64 values from our own DB — safe to inline
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        sql.push_str(" GROUP BY user_id HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0");
+
+        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64)>(&sql);
+        q = q.bind(since);
+        if let Some(p) = filter_project {
+            q = q.bind(p.to_string());
+        }
+        if let Some(k) = filter_api_key_id {
+            q = q.bind(k);
+        }
+        Ok(q.fetch_all(&self.pool).await?)
+    }
+
+    async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT project FROM cost_ledger WHERE project IS NOT NULL ORDER BY project",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
     async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)> {
         let row: (f64, i64, i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(cost_usd), 0.0),

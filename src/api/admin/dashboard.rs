@@ -1044,6 +1044,9 @@ fn html_escape(s: &str) -> String {
 pub struct CostQuery {
     pub user: Option<String>,
     pub window: Option<String>,
+    pub project: Option<String>,
+    pub group: Option<String>,
+    pub key_id: Option<i64>,
 }
 
 pub async fn get_cost(
@@ -1051,51 +1054,143 @@ pub async fn get_cost(
     _session: DashboardSession,
     Query(q): Query<CostQuery>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::{costs::CostRepository, users::UserRepository};
+    use crate::db::repositories::{
+        costs::CostRepository,
+        groups::GroupRepository,
+        users::UserRepository,
+    };
+    use crate::db::repositories::api_keys::ApiKeyRepository;
 
     let window = q.window.as_deref().unwrap_or("monthly");
-    let valid_windows = ["daily", "weekly", "monthly"];
+    let valid_windows = ["daily", "weekly", "monthly", "alltime"];
     let window = if valid_windows.contains(&window) { window } else { "monthly" };
 
-    let window_since = crate::report::window_start_str(window)
-        .map_err(|_| DashboardError::Internal)?;
+    let window_since = if window == "alltime" {
+        "1970-01-01T00:00:00Z".to_string()
+    } else {
+        crate::report::window_start_str(window)
+            .map_err(|_| DashboardError::Internal)?
+    };
 
+    // ── Load reference data for dropdowns and name lookups ─────────────────
     let users = UserRepository::list(&*state.db)
         .await
         .map_err(|_| DashboardError::Internal)?;
+    let user_map: std::collections::HashMap<i64, String> =
+        users.iter().map(|u| (u.id, u.name.clone())).collect();
 
-    // Filter by user name if provided
+    let groups = GroupRepository::list_groups(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let all_keys = ApiKeyRepository::list_all_api_keys(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let projects = CostRepository::distinct_projects_in_ledger(&*state.db)
+        .await
+        .unwrap_or_default();
+
+    // ── Resolve user filter ─────────────────────────────────────────────────
     let filter_user = q.user.as_deref().unwrap_or("").to_string();
+    let user_filter_ids: Option<Vec<i64>> = if filter_user.is_empty() {
+        None
+    } else {
+        Some(users.iter().filter(|u| u.name == filter_user).map(|u| u.id).collect())
+    };
 
-    let mut rows: Vec<minijinja::Value> = Vec::new();
-
-    // Collect cost data per user, per model from cost ledger
-    // We'll aggregate simply: for each user fetch sum and build rows
-    // Use the report module for proper aggregation
-    // We need the pool — go through a direct query approach using the trait methods
-    // Since we only have sum_for_user_since, do a simple per-user approach
-    for user in &users {
-        if !filter_user.is_empty() && user.name != filter_user {
-            continue;
+    // ── Resolve group filter → active member user_ids ──────────────────────
+    let filter_group = q.group.as_deref().unwrap_or("").to_string();
+    let group_filter_ids: Option<Vec<i64>> = if filter_group.is_empty() {
+        None
+    } else {
+        match GroupRepository::find_group_by_name(&*state.db, &filter_group).await {
+            Ok(Some(g)) => {
+                let members = GroupRepository::list_memberships(&*state.db, g.id)
+                    .await
+                    .unwrap_or_default();
+                Some(
+                    members
+                        .into_iter()
+                        .filter(|m| m.disabled_at.is_none())
+                        .map(|m| m.user_id)
+                        .collect(),
+                )
+            }
+            _ => Some(vec![]), // unknown group → zero results
         }
-        let (cost, tokens_in, tokens_out, request_count) =
-            CostRepository::user_cost_stats_since(&*state.db, user.id, &window_since)
-                .await
-                .unwrap_or((0.0, 0, 0, 0));
-        if cost > 0.0 || request_count > 0 {
-            rows.push(minijinja::context! {
-                user_name => user.name.clone(),
+    };
+
+    // ── Intersect user + group filters ─────────────────────────────────────
+    let effective_user_ids: Option<Vec<i64>> = match (user_filter_ids, group_filter_ids) {
+        (Some(u), Some(g)) => {
+            let set: std::collections::HashSet<i64> = g.into_iter().collect();
+            Some(u.into_iter().filter(|id| set.contains(id)).collect())
+        }
+        (Some(u), None) => Some(u),
+        (None, Some(g)) => Some(g),
+        (None, None) => None,
+    };
+
+    let filter_project = q.project.as_deref().filter(|s| !s.is_empty());
+    let filter_key_id = q.key_id;
+
+    // ── Query ───────────────────────────────────────────────────────────────
+    let mut stats = CostRepository::cost_stats_grouped(
+        &*state.db,
+        effective_user_ids.as_deref(),
+        filter_project,
+        filter_key_id,
+        &window_since,
+    )
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    // Sort by cost descending before converting to Values
+    stats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let rows: Vec<minijinja::Value> = stats
+        .into_iter()
+        .map(|(user_id, cost, tokens_in, tokens_out, count)| {
+            let uname = user_map.get(&user_id).cloned()
+                .unwrap_or_else(|| format!("user#{}", user_id));
+            minijinja::context! {
+                user_name => uname,
                 model => "all".to_string(),
                 total_cost_usd => cost,
                 total_tokens_in => tokens_in,
                 total_tokens_out => tokens_out,
-                request_count => request_count,
-            });
-        }
-    }
+                request_count => count,
+            }
+        })
+        .collect();
 
+    // ── Build dropdown data ─────────────────────────────────────────────────
     let mut user_names: Vec<String> = users.iter().map(|u| u.name.clone()).collect();
     user_names.sort();
+    let mut group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+    group_names.sort();
+
+    let key_options: Vec<minijinja::Value> = {
+        let mut opts: Vec<(i64, String)> = all_keys
+            .iter()
+            .map(|k| {
+                let uname = user_map.get(&k.user_id).cloned().unwrap_or_default();
+                let proj = k.project.as_deref().unwrap_or("—");
+                let label = k.label.as_deref().unwrap_or("");
+                let display = if label.is_empty() {
+                    format!("{} / {}", uname, proj)
+                } else {
+                    format!("{} / {} ({})", uname, proj, label)
+                };
+                (k.id, display)
+            })
+            .collect();
+        opts.sort_by(|a, b| a.1.cmp(&b.1));
+        opts.into_iter()
+            .map(|(id, display)| minijinja::context! { id => id, display => display })
+            .collect()
+    };
 
     render(
         "cost.html",
@@ -1103,7 +1198,13 @@ pub async fn get_cost(
             rows => rows,
             window => window,
             filter_user => filter_user,
+            filter_project => q.project.as_deref().unwrap_or("").to_string(),
+            filter_group => filter_group,
+            filter_key_id => filter_key_id.unwrap_or(0i64),
             user_names => user_names,
+            group_names => group_names,
+            projects => projects,
+            key_options => key_options,
         },
     )
 }

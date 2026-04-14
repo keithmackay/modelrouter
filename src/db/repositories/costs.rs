@@ -24,4 +24,17 @@ pub trait CostRepository: Send + Sync {
     async fn sum_global_between(&self, start: &str, end: &str) -> anyhow::Result<f64>;
     /// Return (cost_usd, tokens_in, tokens_out, request_count) for a user since a timestamp.
     async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)>;
+    /// Aggregate cost stats grouped by user_id with optional filters.
+    /// Returns Vec of (user_id, cost_usd, tokens_in, tokens_out, request_count).
+    /// `filter_user_ids`: None = all users; Some(&[]) = no users (empty result).
+    /// `since`: ISO 8601 UTC; use "1970-01-01T00:00:00Z" for all-time.
+    async fn cost_stats_grouped(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_api_key_id: Option<i64>,
+        since: &str,
+    ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64)>>;
+    /// Distinct non-null project values present in the cost ledger, sorted.
+    async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>>;
 }
