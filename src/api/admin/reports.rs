@@ -122,7 +122,7 @@ pub async fn get_reports_panels(
     let by_user_rows: Vec<minijinja::Value> = user_stats.iter().map(|(uid, cost, ti, to, rc)| {
         minijinja::context! {
             name => user_name_map.get(uid).cloned().unwrap_or_else(|| format!("#{}", uid)),
-            cost_usd => format!("{:.4}", cost),
+            cost_usd => format!("{:.2}", cost),
             tokens_in => *ti,
             tokens_out => *to,
             requests => *rc,
@@ -137,7 +137,7 @@ pub async fn get_reports_panels(
     let by_model_rows: Vec<minijinja::Value> = model_rows.iter().map(|r| {
         minijinja::context! {
             model => r.model.clone(),
-            cost_usd => format!("{:.4}", r.total_cost_usd),
+            cost_usd => format!("{:.2}", r.total_cost_usd),
             tokens_in => r.tokens_in,
             tokens_out => r.tokens_out,
             requests => r.request_count,
@@ -160,7 +160,7 @@ pub async fn get_reports_panels(
     let mut by_project_rows: Vec<minijinja::Value> = project_map.iter().map(|(p, (cost, ti, to, rc))| {
         minijinja::context! {
             project => p.clone(),
-            cost_usd => format!("{:.4}", cost),
+            cost_usd => format!("{:.2}", cost),
             tokens_in => *ti,
             tokens_out => *to,
             requests => *rc,

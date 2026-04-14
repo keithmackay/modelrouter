@@ -784,7 +784,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.groups.clone(),
                                 r.project.clone(),
                                 r.key.clone(),
-                                format!("{:.6}", r.total_cost_usd),
+                                format!("{:.2}", r.total_cost_usd),
                                 r.request_count.to_string(),
                                 r.total_tokens_out.to_string(),
                                 r.total_tokens_in.to_string(),
@@ -864,7 +864,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         OutputFormat::Csv => {
                             println!("bucket,user,project,model,tokens_in,tokens_out,cost_usd");
                             for r in &rows {
-                                println!("{},{},{},{},{},{},{:.6}",
+                                println!("{},{},{},{},{},{},{:.2}",
                                     r.bucket.as_deref().unwrap_or(""),
                                     r.user_name.as_deref().unwrap_or(""),
                                     r.project.as_deref().unwrap_or(""),
@@ -1002,7 +1002,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.user_name.clone(),
                                 r.request_model.clone(),
                                 r.routed_model.clone(),
-                                format!("{:.6}", r.cost_usd),
+                                format!("{:.2}", r.cost_usd),
                                 r.created_at.clone(),
                             ]
                         },
