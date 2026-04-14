@@ -146,6 +146,22 @@ impl CostRepository for SqliteDb {
         Ok(row.0)
     }
 
+    async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)> {
+        let row: (f64, i64, i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(tokens_in), 0),
+                    COALESCE(SUM(tokens_out), 0),
+                    COUNT(*)
+             FROM cost_ledger
+             WHERE user_id = ? AND created_at >= ?",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn sum_global_between(&self, start: &str, end: &str) -> anyhow::Result<f64> {
         let row: (f64,) = sqlx::query_as(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger \

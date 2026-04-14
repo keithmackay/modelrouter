@@ -22,4 +22,6 @@ pub trait CostRepository: Send + Sync {
     async fn sum_global_since(&self, since: &str) -> anyhow::Result<f64>;
     /// Sum all spend across all users/projects in [start, end) (inclusive start, exclusive end).
     async fn sum_global_between(&self, start: &str, end: &str) -> anyhow::Result<f64>;
+    /// Return (cost_usd, tokens_in, tokens_out, request_count) for a user since a timestamp.
+    async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)>;
 }

@@ -134,4 +134,20 @@ impl CostRepository for PostgresDb {
         .fetch_one(&self.pool).await?;
         Ok(row.0)
     }
+
+    async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)> {
+        let row: (f64, i64, i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(tokens_in), 0),
+                    COALESCE(SUM(tokens_out), 0),
+                    COUNT(*)
+             FROM cost_ledger
+             WHERE user_id = $1 AND created_at >= $2",
+        )
+        .bind(user_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
 }

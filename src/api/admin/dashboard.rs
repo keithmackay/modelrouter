@@ -1078,17 +1078,18 @@ pub async fn get_cost(
         if !filter_user.is_empty() && user.name != filter_user {
             continue;
         }
-        let cost = CostRepository::sum_for_user_since(&*state.db, user.id, &window_since)
-            .await
-            .unwrap_or(0.0);
-        if cost > 0.0 {
+        let (cost, tokens_in, tokens_out, request_count) =
+            CostRepository::user_cost_stats_since(&*state.db, user.id, &window_since)
+                .await
+                .unwrap_or((0.0, 0, 0, 0));
+        if cost > 0.0 || request_count > 0 {
             rows.push(minijinja::context! {
                 user_name => user.name.clone(),
                 model => "all".to_string(),
                 total_cost_usd => cost,
-                total_tokens_in => 0i64,
-                total_tokens_out => 0i64,
-                request_count => 0i64,
+                total_tokens_in => tokens_in,
+                total_tokens_out => tokens_out,
+                request_count => request_count,
             });
         }
     }
