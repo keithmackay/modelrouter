@@ -9,7 +9,7 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>User</th><th>Cost (USD)</th><th>Tokens In</th><th>Tokens Out</th><th>Requests</th>
+                <th>User</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
             </tr>
         </thead>
         <tbody>
@@ -36,7 +36,7 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>Model</th><th>Cost (USD)</th><th>Tokens In</th><th>Tokens Out</th><th>Requests</th>
+                <th>Model</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
             </tr>
         </thead>
         <tbody>
@@ -63,7 +63,7 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>Project</th><th>Cost (USD)</th><th>Tokens In</th><th>Tokens Out</th><th>Requests</th>
+                <th>Project</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
             </tr>
         </thead>
         <tbody>
@@ -310,7 +310,7 @@
             var g = legend.append('g').attr('transform', 'translate(0,' + (i * 18) + ')');
             g.append('rect').attr('width', 12).attr('height', 12).attr('fill', color(k));
             g.append('text').attr('x', 16).attr('y', 10)
-                .text(k === 'tokens_in' ? 'In' : 'Out')
+                .text(k === 'tokens_in' ? 'Out (Compl.)' : 'In (Prompts)')
                 .style('font-size', '0.7rem');
         });
     }

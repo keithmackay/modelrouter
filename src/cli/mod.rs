@@ -775,7 +775,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     print_rows(
                         &rows,
                         &["User", "Model", "Window", "Group", "Project", "Key",
-                          "Cost (USD)", "Requests", "Tokens Out", "Tokens In"],
+                          "Cost (USD)", "Requests", "Tokens In (Prompts)", "Tokens Out (Completions)"],
                         |r| {
                             vec![
                                 r.user_name.clone(),
@@ -889,7 +889,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             }
 
                             let header = format!("{:<20} {:<20} {:<28} {:>12} {:>12} {:>10}",
-                                "User", "Project", "Model", "Tokens In", "Tokens Out", "Cost USD");
+                                "User", "Project", "Model", "Tokens Out (Completions)", "Tokens In (Prompts)", "Cost USD");
 
                             let mut grand_in: i64 = 0;
                             let mut grand_out: i64 = 0;
