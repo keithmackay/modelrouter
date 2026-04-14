@@ -186,6 +186,77 @@ impl CostRepository for PostgresDb {
         Ok(q.fetch_all(&self.pool).await?)
     }
 
+    async fn distinct_models_in_ledger(&self) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT model FROM cost_ledger WHERE model IS NOT NULL ORDER BY model",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(m,)| m).collect())
+    }
+
+    async fn cost_rows_grouped(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_api_key_id: Option<i64>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<(i64, String, Option<String>, Option<i64>, f64, i64, i64, i64)>> {
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+
+        let mut param = 1usize;
+        let mut sql = format!(
+            "SELECT user_id, model, project, api_key_id, \
+                    COALESCE(SUM(cost_usd), 0.0), \
+                    COALESCE(SUM(tokens_in), 0), \
+                    COALESCE(SUM(tokens_out), 0), \
+                    COUNT(*) \
+             FROM cost_ledger \
+             WHERE created_at >= ${}", param
+        );
+        param += 1;
+
+        if filter_project.is_some() {
+            sql.push_str(&format!(" AND project = ${}", param));
+            param += 1;
+        }
+        if filter_api_key_id.is_some() {
+            sql.push_str(&format!(" AND api_key_id = ${}", param));
+            param += 1;
+        }
+        if let Some(ids) = filter_user_ids {
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        if filter_model.is_some() {
+            sql.push_str(&format!(" AND model = ${}", param));
+            param += 1;
+        }
+        let _ = param;
+        sql.push_str(" GROUP BY user_id, model, project, api_key_id \
+                       HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0 \
+                       ORDER BY SUM(cost_usd) DESC");
+
+        type Row = (i64, String, Option<String>, Option<i64>, f64, i64, i64, i64);
+        let mut q = sqlx::query_as::<_, Row>(&sql);
+        q = q.bind(since);
+        if let Some(p) = filter_project {
+            q = q.bind(p.to_string());
+        }
+        if let Some(k) = filter_api_key_id {
+            q = q.bind(k);
+        }
+        if let Some(m) = filter_model {
+            q = q.bind(m.to_string());
+        }
+        Ok(q.fetch_all(&self.pool).await?)
+    }
+
     async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT project FROM cost_ledger WHERE project IS NOT NULL ORDER BY project",

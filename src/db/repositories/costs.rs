@@ -37,4 +37,17 @@ pub trait CostRepository: Send + Sync {
     ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64)>>;
     /// Distinct non-null project values present in the cost ledger, sorted.
     async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>>;
+    /// Distinct non-null model values present in the cost ledger, sorted.
+    async fn distinct_models_in_ledger(&self) -> anyhow::Result<Vec<String>>;
+    /// Per-row cost stats grouped by (user_id, model, project, api_key_id).
+    /// Returns Vec of (user_id, model, project, api_key_id, cost_usd, tokens_in, tokens_out, request_count).
+    /// Filters mirror cost_stats_grouped; adds an optional model filter.
+    async fn cost_rows_grouped(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_api_key_id: Option<i64>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<(i64, String, Option<String>, Option<i64>, f64, i64, i64, i64)>>;
 }

@@ -1047,6 +1047,7 @@ pub struct CostQuery {
     pub project: Option<String>,
     pub group: Option<String>,
     pub key_id: Option<i64>,
+    pub model: Option<String>,
 }
 
 pub async fn get_cost(
@@ -1134,33 +1135,74 @@ pub async fn get_cost(
 
     let filter_project = q.project.as_deref().filter(|s| !s.is_empty());
     let filter_key_id = q.key_id;
+    let filter_model = q.model.as_deref().filter(|s| !s.is_empty());
+
+    // ── Build lookup maps ───────────────────────────────────────────────────
+    // user_id → comma-separated group names (active memberships only)
+    let mut user_groups: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for group in &groups {
+        let members = GroupRepository::list_memberships(&*state.db, group.id)
+            .await
+            .unwrap_or_default();
+        for m in members {
+            if m.disabled_at.is_none() {
+                user_groups.entry(m.user_id).or_default().push(group.name.clone());
+            }
+        }
+    }
+
+    // api_key_id → display string
+    let key_display: std::collections::HashMap<i64, String> = all_keys
+        .iter()
+        .map(|k| {
+            let uname = user_map.get(&k.user_id).cloned().unwrap_or_default();
+            let proj = k.project.as_deref().unwrap_or("—");
+            let label = k.label.as_deref().unwrap_or("");
+            let display = if label.is_empty() {
+                format!("{} / {}", uname, proj)
+            } else {
+                format!("{} / {} ({})", uname, proj, label)
+            };
+            (k.id, display)
+        })
+        .collect();
 
     // ── Query ───────────────────────────────────────────────────────────────
-    let mut stats = CostRepository::cost_stats_grouped(
+    let raw_rows = CostRepository::cost_rows_grouped(
         &*state.db,
         effective_user_ids.as_deref(),
         filter_project,
         filter_key_id,
+        filter_model,
         &window_since,
     )
     .await
     .map_err(|_| DashboardError::Internal)?;
 
-    // Sort by cost descending before converting to Values
-    stats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let rows: Vec<minijinja::Value> = stats
+    let rows: Vec<minijinja::Value> = raw_rows
         .into_iter()
-        .map(|(user_id, cost, tokens_in, tokens_out, count)| {
+        .map(|(user_id, model, project, api_key_id, cost, tokens_in, tokens_out, count)| {
             let uname = user_map.get(&user_id).cloned()
                 .unwrap_or_else(|| format!("user#{}", user_id));
+            let groups_str = user_groups.get(&user_id)
+                .map(|gs| gs.join(", "))
+                .unwrap_or_default();
+            let key_str = api_key_id
+                .and_then(|kid| key_display.get(&kid).cloned())
+                .unwrap_or_default();
+            let project_str = project.unwrap_or_default();
             minijinja::context! {
-                user_name => uname,
-                model => "all".to_string(),
-                total_cost_usd => cost,
-                total_tokens_in => tokens_in,
+                user_name    => uname,
+                model        => model,
+                window       => window.to_string(),
+                groups       => groups_str,
+                project      => project_str,
+                key          => key_str,
+                request_count  => count,
+                total_tokens_in  => tokens_in,
                 total_tokens_out => tokens_out,
-                request_count => count,
+                total_cost_usd   => cost,
             }
         })
         .collect();
@@ -1170,6 +1212,9 @@ pub async fn get_cost(
     user_names.sort();
     let mut group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
     group_names.sort();
+    let models = CostRepository::distinct_models_in_ledger(&*state.db)
+        .await
+        .unwrap_or_default();
 
     let key_options: Vec<minijinja::Value> = {
         let mut opts: Vec<(i64, String)> = all_keys
@@ -1195,16 +1240,18 @@ pub async fn get_cost(
     render(
         "cost.html",
         minijinja::context! {
-            rows => rows,
-            window => window,
-            filter_user => filter_user,
+            rows         => rows,
+            window       => window,
+            filter_user  => filter_user,
             filter_project => q.project.as_deref().unwrap_or("").to_string(),
             filter_group => filter_group,
             filter_key_id => filter_key_id.unwrap_or(0i64),
-            user_names => user_names,
-            group_names => group_names,
-            projects => projects,
-            key_options => key_options,
+            filter_model => q.model.as_deref().unwrap_or("").to_string(),
+            user_names   => user_names,
+            group_names  => group_names,
+            projects     => projects,
+            models       => models,
+            key_options  => key_options,
         },
     )
 }

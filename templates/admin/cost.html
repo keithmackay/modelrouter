@@ -40,6 +40,15 @@
         </select>
     </div>
     <div>
+        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Model</label>
+        <select name="model" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="" {% if not filter_model %}selected{% endif %}>All models</option>
+            {% for m in models %}
+            <option value="{{ m }}" {% if filter_model == m %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
         <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Key</label>
         <select name="key_id" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="0" {% if filter_key_id == 0 %}selected{% endif %}>All keys</option>
@@ -55,10 +64,14 @@
         <tr>
             <th>User</th>
             <th>Model</th>
+            <th>Window</th>
+            <th>Group</th>
+            <th>Project</th>
+            <th>Key</th>
             <th>Cost (USD)</th>
-            <th>Tokens In</th>
-            <th>Tokens Out</th>
             <th>Requests</th>
+            <th>Tokens Out</th>
+            <th>Tokens In</th>
         </tr>
     </thead>
     <tbody>
@@ -66,13 +79,17 @@
         <tr>
             <td>{{ row.user_name }}</td>
             <td>{{ row.model }}</td>
+            <td>{{ row.window }}</td>
+            <td>{{ row.groups }}</td>
+            <td>{{ row.project }}</td>
+            <td>{{ row.key }}</td>
             <td>${{ row.total_cost_usd | round(6) }}</td>
-            <td>{{ row.total_tokens_in }}</td>
-            <td>{{ row.total_tokens_out }}</td>
             <td>{{ row.request_count }}</td>
+            <td>{{ row.total_tokens_out }}</td>
+            <td>{{ row.total_tokens_in }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="6" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
+        <tr><td colspan="10" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
         {% endfor %}
     </tbody>
 </table>
