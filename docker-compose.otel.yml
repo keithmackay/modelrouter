@@ -18,9 +18,7 @@ services:
     image: modelrouter:otel
     build:
       context: .
-      dockerfile: Dockerfile
-      args:
-        FEATURES: "otel"
+      dockerfile: Dockerfile.local
     ports:
       - "8080:8080"
     volumes:

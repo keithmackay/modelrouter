@@ -23,5 +23,6 @@ services:
     environment:
       MODELROUTER_CONFIG: /config/config.toml
       MODELROUTER_DATABASE__PATH: /data/router.db
+      RUST_LOG: warn
     restart: unless-stopped
     command: ["serve", "--host", "0.0.0.0"]

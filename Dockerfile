@@ -39,6 +39,11 @@ FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
+# Optional: inject a custom CA (e.g. corporate SSL inspection proxy like Zscaler).
+# Place the PEM file at config/zscaler-root-ca.pem before building.
+COPY --chown=root:root certs/zscaler-root-ca.pem /usr/local/share/ca-certificates/zscaler-root-ca.crt
+RUN update-ca-certificates
+
 COPY --from=builder /build/target/release/modelrouter /modelrouter
 
 ENTRYPOINT ["/modelrouter"]

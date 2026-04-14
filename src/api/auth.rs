@@ -34,6 +34,12 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
+            .or_else(|| {
+                parts
+                    .headers
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+            })
             .ok_or(ApiError::Unauthorized)?;
 
         let key_hash = hash_token(auth_header);

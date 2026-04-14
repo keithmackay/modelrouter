@@ -1156,6 +1156,82 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::CheckTls => {
+            let settings = crate::config::load(cli.config)?;
+            let mut any_failed = false;
+
+            // Default base URLs for known providers when no api_base is configured.
+            let default_bases: std::collections::HashMap<&str, &str> = [
+                ("anthropic", "https://api.anthropic.com"),
+                ("openai",    "https://api.openai.com"),
+                ("gemini",    "https://generativelanguage.googleapis.com"),
+            ].iter().cloned().collect();
+
+            for (name, provider) in &settings.providers {
+                // Skip providers with no API key configured (likely not in use).
+                if provider.api_key.is_empty() {
+                    println!("[{}] skipped — no api_key configured", name);
+                    continue;
+                }
+
+                let base = provider.api_base
+                    .as_deref()
+                    .or_else(|| default_bases.get(name.as_str()).copied())
+                    .unwrap_or_else(|| "https://localhost");
+
+                // Build a client that does NOT follow redirects so we get the TLS
+                // handshake result directly, and with a short connect timeout.
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .expect("failed to build reqwest client");
+
+                // Only test HTTPS endpoints — plain HTTP has no TLS to check.
+                if !base.starts_with("https://") {
+                    println!("[{}] skipped — non-HTTPS endpoint ({})", name, base);
+                    continue;
+                }
+
+                // A HEAD to the base URL is enough to test TLS; we expect a 4xx/5xx
+                // (no auth) or 200, either way the handshake succeeded.
+                match client.head(base).send().await {
+                    Ok(_) => {
+                        println!("[{}] OK — TLS handshake succeeded ({})", name, base);
+                    }
+                    Err(e) => {
+                        any_failed = true;
+                        let msg = e.to_string().to_lowercase();
+                        // reqwest surfaces certificate errors via the connect error chain.
+                        // Distinguish cert errors from plain connection refused / DNS errors.
+                        let is_cert_error = msg.contains("certificate")
+                            || msg.contains("cert")
+                            || msg.contains("tls")
+                            || msg.contains("ssl")
+                            || msg.contains("handshake");
+
+                        if is_cert_error {
+                            eprintln!(
+                                "[{}] FAIL — TLS certificate verification failed ({})\n\
+                                 \n\
+                                 Your network may use SSL/TLS inspection (e.g. Zscaler, Netskope).\n\
+                                 The proxy re-signs certificates with a private CA that the container\n\
+                                 does not trust by default.\n\
+                                 \n\
+                                 See README.md § \"If required: adding a corporate CA certificate\"\n\
+                                 for step-by-step instructions on extracting and injecting the CA cert.\n",
+                                name, base
+                            );
+                        } else {
+                            eprintln!("[{}] FAIL — connection error ({}): {}", name, base, e);
+                        }
+                    }
+                }
+            }
+
+            if any_failed {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }

@@ -96,6 +96,66 @@ cargo build --release --features otel
 cargo build --release --features postgres
 ```
 
+### If required: adding a corporate CA certificate (Zscaler, Netskope, etc.)
+
+If your network uses SSL/TLS inspection (common with Zscaler, Netskope, Palo Alto GlobalProtect, or other corporate security proxies), outbound HTTPS from the modelrouter container will be intercepted and re-signed with your organisation's private CA certificate. The container's default trust store does not include that CA, so TLS verification fails and every provider call returns a 502.
+
+**Symptoms:**
+- `502 Bad Gateway` on every request
+- Container logs show `Failed to send request to Anthropic` (or similar) with ~150–300ms latency
+- `curl -sk https://api.anthropic.com/` works from inside the container (bypassing cert check), but `curl -s` fails with exit code 60
+
+**Fix: extract the CA cert and inject it into the image at build time.**
+
+1. **Export the CA certificate from your machine's trust store.**
+
+   *macOS* — find and export the cert:
+   ```bash
+   # List candidates (look for your proxy vendor name)
+   security find-certificate -a /Library/Keychains/System.keychain | grep "labl\|alis" | grep -i "zscaler\|netskope\|palo"
+
+   # Export the one you find (adjust the name)
+   security find-certificate -c "Zscaler Root CA" -p /Library/Keychains/System.keychain \
+     > certs/zscaler-root-ca.pem
+   ```
+
+   *Linux* — typically found in `/etc/ssl/certs/` or exported via your MDM. Copy the `.pem` file to `certs/`.
+
+   *Windows* — export from `certmgr.msc` (Trusted Root Certification Authorities → your proxy cert → Export → Base-64 encoded X.509).
+
+2. **Place the PEM file at `certs/<name>.pem`** in the repository root. The `Dockerfile` copies everything from `certs/` into the image's CA bundle:
+
+   ```dockerfile
+   COPY --chown=root:root certs/zscaler-root-ca.pem /usr/local/share/ca-certificates/zscaler-root-ca.crt
+   RUN update-ca-certificates
+   ```
+
+   Add additional files to `certs/` if your network has more than one inspection CA. Each file must have a `.pem` extension and contain a valid PEM-encoded certificate.
+
+3. **Rebuild the image:**
+
+   ```bash
+   # Standard build
+   docker build -t modelrouter:latest .
+
+   # With OTel support (recommended)
+   docker build --build-arg FEATURES="otel" -t modelrouter:otel -t modelrouter:latest .
+   ```
+
+4. **Restart the stack:**
+
+   ```bash
+   docker-compose -f docker-compose.otel.yml up -d --no-build
+   ```
+
+If TLS is still failing after adding the cert, run the built-in connectivity check:
+
+```bash
+docker-compose exec modelrouter ./modelrouter check-tls
+```
+
+This tests TLS connectivity to each configured provider and prints exactly which certificate in the chain is not trusted, so you know which CA to add.
+
 ---
 
 ## Admin Setup Walkthrough
@@ -542,25 +602,36 @@ curl http://localhost:8080/health
 
 Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
 
-### OTel / Arize Phoenix
+### OTel observability stack
 
-[Arize Phoenix](https://docs.arize.com/phoenix) is an open-source LLM observability platform. Start it locally:
+modelrouter emits OpenTelemetry traces, metrics, and logs when built with `--features otel`. The recommended local setup uses the bundled `docker-compose.otel.yml`, which wires together modelrouter, an OpenTelemetry Collector, [Arize Phoenix](https://docs.arize.com/phoenix) (traces + LLM spans), and Prometheus (metrics) on a shared Docker network.
+
+**Start the full observability stack:**
 
 ```bash
-pip install arize-phoenix && phoenix serve
-# Phoenix UI: http://localhost:6006   OTLP gRPC: localhost:4317
+docker-compose -f docker-compose.otel.yml up -d
 ```
 
-Add to `config.toml` (requires `--features otel` build):
+| Service | URL | Purpose |
+|---|---|---|
+| modelrouter | http://localhost:8080 | LLM proxy |
+| Arize Phoenix | http://localhost:6006 | Trace viewer, LLM span analysis |
+| Prometheus | http://localhost:9090 | Metrics graphs |
 
-```toml
-[telemetry]
-enabled = true
-endpoint = "http://localhost:4317"
-service_name = "modelrouter"
-sample_ratio = 1.0        # trace everything during initial setup
-slow_threshold_ms = 2000  # always trace slow requests
+> **Note:** Use `docker-compose -f docker-compose.otel.yml` — not plain `docker-compose up`. The plain `docker-compose.yml` starts modelrouter without the collector, so `otel-collector` will not resolve and telemetry will fail silently.
+
+The `otel-collector` service in `docker-compose.otel.yml` receives OTLP on port 4317 and fans out:
+- Traces → Phoenix (at `phoenix:4317`)
+- Metrics → Prometheus scrape endpoint (port 8889)
+- Logs → stdout of the collector container
+
+**Bring the stack down:**
+
+```bash
+docker-compose -f docker-compose.otel.yml down
 ```
+
+**Using a different OTLP backend** (Grafana, Honeycomb, Datadog, etc.): edit `otel-collector/config.yml` to add or replace exporters, or point `telemetry.endpoint` in `config.toml` directly at your collector's gRPC endpoint and omit the otel-collector service entirely.
 
 Each trace includes `user.id`, `model.canonical`, `provider.name`, `tokens.prompt`, `tokens.completion`, and `cost.usd` attributes.
 

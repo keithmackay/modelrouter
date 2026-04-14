@@ -49,6 +49,8 @@ pub enum Commands {
     Admin(AdminArgs),
     /// Manage API keys
     Key(KeyArgs),
+    /// Test TLS connectivity to each configured provider
+    CheckTls,
 }
 
 #[derive(Args)]

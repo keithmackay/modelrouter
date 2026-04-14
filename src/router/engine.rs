@@ -38,10 +38,14 @@ impl RequestRouter {
             return (current[..pos].to_string(), current[pos + 1..].to_string());
         }
 
-        // 3. Default provider + default model
-        (
-            self.settings.routing.default_provider.clone(),
-            self.settings.routing.default_model.clone(),
-        )
+        // 3. Default provider + default model.
+        // default_model may be "provider/model" — strip the prefix so callers
+        // always receive a bare model name as the second element of the tuple.
+        let default = &self.settings.routing.default_model;
+        if let Some(pos) = default.find('/') {
+            (default[..pos].to_string(), default[pos + 1..].to_string())
+        } else {
+            (self.settings.routing.default_provider.clone(), default.clone())
+        }
     }
 }
