@@ -126,7 +126,7 @@
 
         // Update the panel title
         var titleEl = el.closest('.stat-card') && el.closest('.stat-card').querySelector('h3');
-        if (titleEl) titleEl.textContent = hasBudget ? 'Budget Remaining' : 'Cumulative Spend';
+        if (titleEl) titleEl.textContent = 'Budget Remaining';
 
         if (series.length === 0 && !hasBudget) { noData(el); return; }
 
@@ -142,16 +142,23 @@
 
         var parseDate = d3.timeParse('%Y-%m-%d');
 
-        // Build full series: prepend the period start at full budget (or 0 for cumulative),
-        // then the daily remaining points.
+        // Compute cumulative spend, then remaining = limit - cumulative.
+        // If no budget limit, use total spend as the ceiling so the line still burns down.
+        var totalSpend = series.reduce(function(s, d) { return s + d[1]; }, 0);
+        var ceiling = hasBudget ? data.limit : totalSpend;
+
         var pts = [];
         if (data.start) {
             var startDate = parseDate(data.start);
-            if (startDate) pts.push({ date: startDate, v: hasBudget ? data.limit : 0 });
+            if (startDate) pts.push({ date: startDate, v: ceiling });
         }
+        var cumul = 0;
         series.forEach(function(d) {
             var dt = parseDate(d[0]);
-            if (dt) pts.push({ date: dt, v: d[1] });
+            if (dt) {
+                cumul += d[1];
+                pts.push({ date: dt, v: ceiling - cumul });
+            }
         });
 
         if (pts.length === 0) { noData(el); return; }
@@ -162,15 +169,9 @@
         var xDomain = [pts[0].date, d3.max([pts[pts.length-1].date, today])];
         var xScale = d3.scaleTime().domain(xDomain).range([0, w]);
 
-        // y domain: for remaining, 0 to limit (allow slight negative); for cumulative, 0 to max
-        var yMin, yMax;
-        if (hasBudget) {
-            yMin = Math.min(0, d3.min(pts, function(d) { return d.v; }) - 1);
-            yMax = data.limit * 1.05;
-        } else {
-            yMin = 0;
-            yMax = (d3.max(pts, function(d) { return d.v; }) || 1) * 1.1;
-        }
+        // y domain: 0 to ceiling (allow slight negative for over-budget)
+        var yMin = Math.min(0, d3.min(pts, function(d) { return d.v; }) - 1);
+        var yMax = ceiling * 1.05;
         var yScale = d3.scaleLinear().domain([yMin, yMax]).range([h, 0]);
 
         svg.append('g').attr('transform', 'translate(0,' + h + ')')
@@ -182,18 +183,16 @@
             .selectAll('text').style('font-size', '0.7rem');
 
         // Zero line (budget exhausted)
-        if (hasBudget) {
-            var zy = yScale(0);
-            svg.append('line')
-                .attr('x1', 0).attr('x2', w)
-                .attr('y1', zy).attr('y2', zy)
-                .attr('stroke', ORANGE).attr('stroke-width', 1)
-                .attr('stroke-dasharray', '4,3');
-        }
+        var zy = yScale(0);
+        svg.append('line')
+            .attr('x1', 0).attr('x2', w)
+            .attr('y1', zy).attr('y2', zy)
+            .attr('stroke', ORANGE).attr('stroke-width', 1)
+            .attr('stroke-dasharray', '4,3');
 
-        // Line colour: red if last remaining < 20% of limit, else blue
+        // Line colour: red if last remaining < 20% of ceiling, else blue
         var lastV = pts.length ? pts[pts.length-1].v : yMax;
-        var lineColor = (hasBudget && lastV < data.limit * 0.2) ? '#c0392b' : BLUE;
+        var lineColor = (lastV < ceiling * 0.2) ? '#c0392b' : BLUE;
 
         var line = d3.line()
             .x(function(d) { return xScale(d.date); })
@@ -206,7 +205,7 @@
             .attr('d', line);
 
         // Label current remaining
-        if (hasBudget && pts.length > 1) {
+        if (pts.length > 1) {
             var last = pts[pts.length - 1];
             svg.append('text')
                 .attr('x', xScale(last.date) + 4)

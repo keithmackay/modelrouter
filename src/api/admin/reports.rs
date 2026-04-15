@@ -222,20 +222,10 @@ pub async fn get_reports_panels(
             .and_then(|r| r.limit_usd)
     };
 
-    // Series: remaining budget per day (limit - cumulative_spend).
-    // If no budget limit, fall back to cumulative spend so the chart still shows something.
-    let series: Vec<serde_json::Value> = {
-        let mut cumul = 0.0f64;
-        daily.iter().map(|(date, cost)| {
-            cumul += cost;
-            let value = if let Some(limit) = budget_limit {
-                limit - cumul
-            } else {
-                cumul
-            };
-            serde_json::json!([date, value])
-        }).collect()
-    };
+    // Series: raw daily spend values. Frontend computes remaining = limit - cumulative.
+    let series: Vec<serde_json::Value> = daily.iter()
+        .map(|(date, cost)| serde_json::json!([date, cost]))
+        .collect();
 
     let burndown_json = serde_json::to_string(&serde_json::json!({
         "series": series,
