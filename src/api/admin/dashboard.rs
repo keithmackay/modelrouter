@@ -755,13 +755,15 @@ pub async fn post_create_key(
 
     let user_name = form.user_name.trim().to_string();
 
+    let form_email = form.email.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+
     // Find or create user
     let user = match UserRepository::find_by_name(&*state.db, &user_name).await {
         Ok(Some(u)) => u,
         Ok(None) => {
             match UserRepository::create(&*state.db, NewUser {
                 name: user_name.clone(),
-                email: None,
+                email: form_email.clone(),
             }).await {
                 Ok(u) => u,
                 Err(_) => {
@@ -844,6 +846,38 @@ pub async fn post_create_key(
     // Show the one-time raw key in the message area, inject the group into the table via script
     let proj_str = project.as_ref().map(|p| format!(" / {p}")).unwrap_or_default();
     let raw_e = he(&raw_key);
+
+    // Build optional mailto button
+    let effective_email = form_email.or_else(|| user.email.clone());
+    let mailto_btn = if let Some(ref email) = effective_email {
+        let subject = urlencoding::encode("Your ModelRouter API Key");
+        let body_plain = format!(
+            "Hi {name},\n\nYour ModelRouter API key has been created. \
+            Please keep it safe — it will not be shown again.\n\n\
+            API Key: {key}\n\n\
+            Usage:\n  Authorization: Bearer {key}\n\n\
+            Example (curl):\n  \
+            curl -H \"Authorization: Bearer {key}\" \\\n  \
+                 -H \"Content-Type: application/json\" \\\n  \
+                 -d '{{\"model\":\"your-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}' \\\n  \
+                 http://your-modelrouter-host/v1/chat/completions\n\n\
+            If you have any questions, reply to this email.\n",
+            name = user.name,
+            key = raw_key,
+        );
+        let body_enc = urlencoding::encode(&body_plain);
+        let email_e = he(email);
+        format!(
+            "<a href=\"mailto:{email_e}?subject={subject}&body={body_enc}\" \
+            class=\"btn btn-secondary\" style=\"text-decoration:none;\">✉ Email Key to User</a>",
+            email_e = email_e,
+            subject = subject,
+            body_enc = body_enc,
+        )
+    } else {
+        String::new()
+    };
+
     let html = format!(
         "<div class=\"alert\" style=\"background:#d4edda;border:1px solid #c3e6cb;color:#155724;\
         display:flex;align-items:center;gap:1rem;flex-wrap:wrap;\">\
@@ -853,6 +887,7 @@ pub async fn post_create_key(
         <button type=\"button\" onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{\
         var b=this;b.textContent='✓ Copied';setTimeout(function(){{b.textContent='⧉ Copy'}},1500)\
         }}.bind(this))\" class=\"btn btn-secondary\">⧉ Copy</button>\
+        {mailto_btn}\
         </div>\
         <template id=\"__new_group__\">{tbody}</template>\
         <script>(function(){{\
@@ -867,6 +902,7 @@ pub async fn post_create_key(
         user = he(&user.name),
         proj_str = proj_str,
         raw_e = raw_e,
+        mailto_btn = mailto_btn,
         tbody = tbody,
     );
     Ok(Html(html))
