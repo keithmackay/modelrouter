@@ -61,8 +61,8 @@ fn test_fallback_chain_next_model() {
 
     let chain = FallbackChain::new(chains);
 
-    assert_eq!(chain.next_after("gpt-4o"), Some("gpt-4o-mini"));
-    assert_eq!(chain.next_after("gpt-4o-mini"), Some("gpt-3.5-turbo"));
+    assert_eq!(chain.next_after("gpt-4o"), Some("gpt-4o-mini".to_string()));
+    assert_eq!(chain.next_after("gpt-4o-mini"), Some("gpt-3.5-turbo".to_string()));
     assert_eq!(chain.next_after("gpt-3.5-turbo"), None);
     assert_eq!(chain.next_after("unknown-model"), None);
 }

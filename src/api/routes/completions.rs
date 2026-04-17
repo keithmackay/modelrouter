@@ -254,7 +254,7 @@ async fn chat_completions_inner(
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
             let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
             if let Some(next_model) = state.fallback.next_after(&current_model) {
-                let (next_provider, next_canonical) = state.router.resolve(next_model);
+                let (next_provider, next_canonical) = state.router.resolve(&next_model);
                 current_model = next_canonical;
                 current_provider = next_provider;
                 continue;
@@ -311,7 +311,7 @@ async fn chat_completions_inner(
                     "Provider call failed, checking fallback chain"
                 );
                 if let Some(next_model) = state.fallback.next_after(&current_model) {
-                    let (next_provider, next_canonical) = state.router.resolve(next_model);
+                    let (next_provider, next_canonical) = state.router.resolve(&next_model);
                     current_model = next_canonical;
                     current_provider = next_provider;
                     tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");

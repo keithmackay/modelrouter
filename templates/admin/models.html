@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% block title %}Models — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Models</h1>
+
+<form hx-post="/admin/models" hx-target="#models-tbody" hx-swap="afterbegin"
+      hx-on::after-request="this.reset()"
+      style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;flex-wrap:wrap;">
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Provider *</label>
+    <input type="text" name="provider" required placeholder="anthropic"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+  </div>
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Model Name *</label>
+    <input type="text" name="name" required placeholder="claude-opus-4-6"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:240px;">
+  </div>
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias</label>
+    <input type="text" name="alias" placeholder="opus"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+  </div>
+  <button type="submit" class="btn btn-success">Add Model</button>
+</form>
+<div id="model-form-message" style="margin-bottom:1rem;"></div>
+
+<table style="margin-bottom:2rem;">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Provider</th>
+      <th>Name</th>
+      <th>Alias</th>
+      <th>Status</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="models-tbody">
+    {% for m in models %}
+    <tr id="model-row-{{ m.id }}">
+      <td>{{ m.id }}</td>
+      <td>{{ m.provider }}</td>
+      <td>{{ m.name }}</td>
+      <td>{{ m.alias | default(value="—") }}</td>
+      <td>
+        {% if m.enabled %}
+          <span class="tag tag-enabled">Enabled</span>
+        {% else %}
+          <span class="tag tag-disabled">Disabled</span>
+        {% endif %}
+      </td>
+      <td>
+        <button class="btn btn-danger" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+          hx-post="/admin/models/{{ m.id }}/delete"
+          hx-target="#model-row-{{ m.id }}" hx-swap="outerHTML"
+          hx-confirm="Delete this model?">Delete</button>
+        {% if m.enabled %}
+          <button class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+            hx-post="/admin/models/{{ m.id }}/disable"
+            hx-target="#model-row-{{ m.id }}" hx-swap="outerHTML">Disable</button>
+        {% else %}
+          <button class="btn btn-success" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+            hx-post="/admin/models/{{ m.id }}/enable"
+            hx-target="#model-row-{{ m.id }}" hx-swap="outerHTML">Enable</button>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" style="color:#999;font-style:italic;">No models registered yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2 style="margin-bottom:1rem;">Failover Chains</h2>
+<p style="color:#555;font-size:0.9rem;margin-bottom:1rem;">
+  Configure ordered fallback models. When a primary model fails, these are tried in order.
+  Enter the primary model identifier (alias or <code>provider/name</code>), then the ordered
+  fallbacks (one per line or comma-separated).
+</p>
+
+<div style="display:flex;gap:2rem;flex-wrap:wrap;align-items:flex-start;">
+  <div style="flex:0 0 380px;">
+    <form id="failover-form" style="background:#fff;border-radius:6px;padding:1rem;
+          box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+      <div style="margin-bottom:0.75rem;">
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Primary Model *</label>
+        <input type="text" id="failover-primary" placeholder="opus or anthropic/claude-opus-4-6"
+               style="width:100%;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+      </div>
+      <div style="margin-bottom:0.75rem;">
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">
+          Fallbacks (ordered, one per line or comma-separated)
+        </label>
+        <textarea id="failover-fallbacks" rows="4" placeholder="sonnet&#10;haiku"
+          style="width:100%;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-family:monospace;"></textarea>
+      </div>
+      <button type="button" class="btn btn-primary" onclick="submitFailover()">Save Chain</button>
+      <div id="failover-result" style="margin-top:0.75rem;"></div>
+    </form>
+  </div>
+
+  <div style="flex:1;min-width:280px;">
+    <table id="failover-table">
+      <thead>
+        <tr>
+          <th>Primary Model</th>
+          <th>Failover Chain</th>
+          <th>Edit</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in failover_rows %}
+        <tr>
+          <td><code>{{ row.primary }}</code></td>
+          <td>{{ row.chain | join(sep=" → ") }}</td>
+          <td>
+            <button class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+              onclick="editFailover('{{ row.primary }}', '{{ row.chain | join(sep=&quot;\n&quot;) }}')">Edit</button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" style="color:#999;font-style:italic;">No failover chains configured.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function submitFailover() {
+  var primary = document.getElementById('failover-primary').value.trim();
+  var fallbacks = document.getElementById('failover-fallbacks').value.trim();
+  if (!primary) { alert('Primary model is required.'); return; }
+
+  var formData = new FormData();
+  formData.append('fallbacks', fallbacks);
+
+  fetch('/admin/models/' + encodeURIComponent(primary) + '/failovers', {
+    method: 'POST',
+    body: new URLSearchParams(formData),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  })
+  .then(function(r) { return r.text(); })
+  .then(function(html) {
+    document.getElementById('failover-result').innerHTML = html;
+    setTimeout(function() { window.location.reload(); }, 800);
+  });
+}
+
+function editFailover(primary, chain) {
+  document.getElementById('failover-primary').value = primary;
+  document.getElementById('failover-fallbacks').value = chain;
+  document.getElementById('failover-primary').focus();
+  document.getElementById('failover-form').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+</script>
+{% endblock %}

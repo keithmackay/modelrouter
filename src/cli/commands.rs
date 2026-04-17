@@ -51,6 +51,72 @@ pub enum Commands {
     Key(KeyArgs),
     /// Test TLS connectivity to each configured provider
     CheckTls,
+    /// Manage models and failover chains
+    Model(ModelArgs),
+}
+
+#[derive(Args)]
+pub struct ModelArgs {
+    #[command(subcommand)]
+    pub command: ModelCommands,
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommands {
+    /// Register a new model
+    Add {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        name: String,
+        /// Optional short alias (e.g. "opus")
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// List all registered models
+    List,
+    /// Enable a model by ID
+    Enable {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Disable a model by ID
+    Disable {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Delete a model by ID
+    Delete {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Manage failover chains
+    Failover(FailoverArgs),
+}
+
+#[derive(Args)]
+pub struct FailoverArgs {
+    #[command(subcommand)]
+    pub command: FailoverCommands,
+}
+
+#[derive(Subcommand)]
+pub enum FailoverCommands {
+    /// Set ordered failover chain for a model (replaces existing)
+    Set {
+        /// Primary model (alias or provider/name)
+        #[arg(long)]
+        model: String,
+        /// Comma-separated ordered fallback models
+        #[arg(long)]
+        fallback: String,
+    },
+    /// List failover chains
+    List {
+        /// Filter to a specific primary model
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Args)]

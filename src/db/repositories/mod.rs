@@ -1,4 +1,5 @@
 pub mod groups;
+pub mod models;
 pub mod admin_users;
 pub mod api_keys;
 pub mod audit;
@@ -12,6 +13,7 @@ pub mod sessions;
 pub mod users;
 
 pub use groups::GroupRepository;
+pub use models::ModelRepository;
 pub use admin_users::AdminUserRepository;
 pub use api_keys::ApiKeyRepository;
 pub use audit::AuditRepository;

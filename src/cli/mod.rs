@@ -4,7 +4,7 @@ pub mod admin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands};
+use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands, ModelCommands, FailoverCommands};
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
@@ -241,6 +241,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Sync hook permissions from config into DB
             crate::hooks::permissions::sync_hook_permissions(&db, &settings.hooks).await?;
 
+
             // Build app components
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
@@ -334,6 +335,32 @@ pub async fn run(cli: Cli) -> Result<()> {
                 app_metrics,
                 oidc_state,
             };
+            // Seed DB model aliases and failover chains into live router/fallback
+            {
+                use crate::db::repositories::models::ModelRepository;
+                if let Ok(models) = state.db.list_models().await {
+                    let db_aliases: std::collections::HashMap<String, String> = models
+                        .iter()
+                        .filter(|m| m.enabled)
+                        .filter_map(|m| m.alias.as_ref().map(|a| (a.clone(), format!("{}/{}", m.provider, m.name))))
+                        .collect();
+                    if !db_aliases.is_empty() {
+                        tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
+                    }
+                    state.router.update_db_aliases(db_aliases);
+                }
+                if let Ok(rows) = state.db.list_all_failovers().await {
+                    let mut db_chains: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                    for r in rows {
+                        db_chains.entry(r.primary_model).or_default().push(r.fallback_model);
+                    }
+                    if !db_chains.is_empty() {
+                        tracing::info!(count = db_chains.len(), "loaded DB failover chains");
+                    }
+                    state.fallback.update_db_chains(db_chains);
+                }
+            }
+
             #[cfg(feature = "s3-archival")]
             if settings.archival.enabled {
                 let job = crate::archival::ArchivalJob::new(
@@ -1163,6 +1190,89 @@ pub async fn run(cli: Cli) -> Result<()> {
                         db.disable_key(k.id).await?;
                     }
                     println!("Disabled key(s) for '{}' / project '{}'", user, project);
+                }
+            }
+        }
+        Commands::Model(model_args) => {
+            use crate::db::repositories::models::ModelRepository;
+            use crate::db::models::NewModel;
+
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            match model_args.command {
+                ModelCommands::Add { provider, name, alias } => {
+                    let m = db.create_model(NewModel { provider, name, alias }).await?;
+                    println!("Created model id={} provider={} name={} alias={}",
+                        m.id, m.provider, m.name,
+                        m.alias.as_deref().unwrap_or("—"));
+                }
+                ModelCommands::List => {
+                    let models = db.list_models().await?;
+                    if models.is_empty() {
+                        println!("No models registered.");
+                        return Ok(());
+                    }
+                    println!("{:>4}  {:16}  {:36}  {:16}  {}",
+                        "ID", "Provider", "Name", "Alias", "Status");
+                    println!("{}", "─".repeat(82));
+                    for m in models {
+                        println!("{:>4}  {:16}  {:36}  {:16}  {}",
+                            m.id, m.provider, m.name,
+                            m.alias.as_deref().unwrap_or("—"),
+                            if m.enabled { "enabled" } else { "disabled" });
+                    }
+                }
+                ModelCommands::Enable { id } => {
+                    db.set_model_enabled(id, true).await?;
+                    println!("Enabled model id={}", id);
+                }
+                ModelCommands::Disable { id } => {
+                    db.set_model_enabled(id, false).await?;
+                    println!("Disabled model id={}", id);
+                }
+                ModelCommands::Delete { id } => {
+                    if db.delete_model(id).await? {
+                        println!("Deleted model id={}", id);
+                    } else {
+                        anyhow::bail!("Model id={} not found", id);
+                    }
+                }
+                ModelCommands::Failover(failover_args) => {
+                    match failover_args.command {
+                        FailoverCommands::Set { model, fallback } => {
+                            let fallbacks: Vec<String> = fallback
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            db.set_failovers(&model, &fallbacks).await?;
+                            println!("Set failover chain for '{}': {}", model, fallbacks.join(" → "));
+                        }
+                        FailoverCommands::List { model } => {
+                            let rows = if let Some(ref m) = model {
+                                db.list_failovers(m).await?
+                            } else {
+                                db.list_all_failovers().await?
+                            };
+                            if rows.is_empty() {
+                                println!("No failover chains configured.");
+                                return Ok(());
+                            }
+                            let mut current_primary = String::new();
+                            for r in rows {
+                                if r.primary_model != current_primary {
+                                    current_primary = r.primary_model.clone();
+                                    print!("  {} → ", current_primary);
+                                } else {
+                                    print!(", ");
+                                }
+                                print!("{}", r.fallback_model);
+                            }
+                            println!();
+                        }
+                    }
                 }
             }
         }

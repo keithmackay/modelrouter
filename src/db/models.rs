@@ -324,6 +324,31 @@ pub struct NewMcpServer {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Model {
+    pub id: i64,
+    pub provider: String,
+    pub name: String,
+    pub alias: Option<String>,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug)]
+pub struct NewModel {
+    pub provider: String,
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelFailover {
+    pub id: i64,
+    pub primary_model: String,
+    pub fallback_model: String,
+    pub priority: i64,
+}
+
 #[cfg(test)]
 mod group_tests {
     use super::*;

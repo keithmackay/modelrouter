@@ -8,8 +8,9 @@ use crate::{
     db::repositories::{
         admin_users::AdminUserRepository, api_keys::ApiKeyRepository, audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, hooks::HookRepository,
-        groups::GroupRepository, mcp_servers::McpServerRepository, prompts::PromptRepository,
-        rate_limits::RateLimitRepository, sessions::SessionRepository, users::UserRepository,
+        groups::GroupRepository, mcp_servers::McpServerRepository, models::ModelRepository,
+        prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
+        users::UserRepository,
     },
     providers::{embed_registry::EmbeddingRegistry, registry::ProviderRegistry},
     router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine},
@@ -28,6 +29,7 @@ pub trait DatabaseProvider:
     + RateLimitRepository
     + ApiKeyRepository
     + McpServerRepository
+    + ModelRepository
     + GroupRepository
     + Send
     + Sync
@@ -47,6 +49,7 @@ impl<T> DatabaseProvider for T where
         + RateLimitRepository
         + ApiKeyRepository
         + McpServerRepository
+        + ModelRepository
         + GroupRepository
         + Send
         + Sync
@@ -115,6 +118,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_budgets, post_create_budget, post_edit_budget, post_delete_budget,
     };
     use crate::api::admin::reports::{get_reports, get_reports_panels};
+    use crate::api::admin::models::{
+        get_models, post_create_model, post_disable_model, post_enable_model,
+        post_delete_model, post_set_failovers,
+    };
 
     axum::Router::new()
         // Embedded static assets
@@ -187,6 +194,11 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/budgets/:id/delete", post(post_delete_budget))
         .route("/admin/reports", get(get_reports))
         .route("/admin/reports/panels", get(get_reports_panels))
+        .route("/admin/models", get(get_models).post(post_create_model))
+        .route("/admin/models/:id/disable", post(post_disable_model))
+        .route("/admin/models/:id/enable", post(post_enable_model))
+        .route("/admin/models/:id/delete", post(post_delete_model))
+        .route("/admin/models/:primary/failovers", post(post_set_failovers))
         // MCP Server Registry
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))

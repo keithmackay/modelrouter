@@ -12,6 +12,7 @@ mod hooks;
 mod rate_limits;
 mod api_keys;
 mod mcp_servers;
+mod models;
 
 use sqlx::PgPool;
 
