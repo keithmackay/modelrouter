@@ -318,7 +318,9 @@ pub struct ProviderConfig {
     /// Defaults to the AWS standard chain (AWS_REGION env var / ~/.aws/config).
     #[serde(default)]
     pub region: Option<String>,
-    /// GCP project ID. Used only by the Vertex adapter.
+    /// GCP project ID for Vertex AI requests. Used only by the Vertex adapter.
+    /// If None, falls back to the project embedded in the service-account JSON
+    /// or the ADC quota project.
     #[serde(default)]
     pub project: Option<String>,
     /// Path to GCP service-account JSON. If None, uses Application Default Credentials.
