@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::config::schema::ProviderConfig;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
@@ -146,7 +146,7 @@ impl ProviderAdapter for VertexAdapter {
             anyhow::bail!("Vertex AI streaming returned {}: {}", status, text);
         }
 
-        let stream = resp
+        let translated = resp
             .bytes_stream()
             .map_err(|e| anyhow::anyhow!("stream error: {}", e))
             .map_ok(move |chunk| {
@@ -163,6 +163,22 @@ impl ProviderAdapter for VertexAdapter {
                 }
                 Bytes::from(out)
             });
-        Ok(Box::pin(stream))
+
+        // Gemini's SSE has no terminal event — its final frame carries only
+        // `usageMetadata` with no candidates, which `gemini::translate_sse_line`
+        // deliberately drops. Append `data: [DONE]\n\n` here so the downstream
+        // SSE consumer (log_streaming_request) can detect stream end and commit
+        // cost ledger rows, audit entries, and lifecycle hooks. Claude-on-Vertex
+        // emits DONE on `message_delta` inside the translator already.
+        let stream = if matches!(publisher, Publisher::Google) {
+            translated
+                .chain(futures::stream::once(async {
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n"))
+                }))
+                .boxed()
+        } else {
+            translated.boxed()
+        };
+        Ok(stream)
     }
 }
