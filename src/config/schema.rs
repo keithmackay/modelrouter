@@ -318,6 +318,13 @@ pub struct ProviderConfig {
     /// Defaults to the AWS standard chain (AWS_REGION env var / ~/.aws/config).
     #[serde(default)]
     pub region: Option<String>,
+    /// GCP project ID. Used only by the Vertex adapter.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Path to GCP service-account JSON. If None, uses Application Default Credentials.
+    /// Used only by the Vertex adapter.
+    #[serde(default)]
+    pub credentials_path: Option<String>,
 }
 
 fn default_timeout_secs() -> u64 { 60 }
