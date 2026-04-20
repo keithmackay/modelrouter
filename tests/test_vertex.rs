@@ -164,3 +164,81 @@ mod gemini_tests {
         assert!(translate_sse_line("event: ping").is_none());
     }
 }
+
+#[cfg(feature = "vertex")]
+mod claude_tests {
+    use modelrouter::providers::adapter::NormalizedRequest;
+    use modelrouter::providers::vertex::claude::{
+        translate_request, parse_response, translate_sse_line,
+    };
+    use serde_json::json;
+
+    fn req(messages: serde_json::Value) -> NormalizedRequest {
+        NormalizedRequest {
+            model: "claude-sonnet-4-6@20250514".into(),
+            messages: messages.as_array().unwrap().clone(),
+            stream: false,
+            temperature: Some(0.5),
+            max_tokens: Some(2048),
+            extra_params: json!({}),
+        }
+    }
+
+    #[test]
+    fn translate_request_includes_anthropic_version_and_omits_model() {
+        let r = req(json!([{"role": "user", "content": "Hi"}]));
+        let body = translate_request(&r);
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert!(body.get("model").is_none(), "model must live in URL, not body");
+        assert_eq!(body["max_tokens"], 2048);
+    }
+
+    #[test]
+    fn translate_request_extracts_system_text() {
+        let r = req(json!([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hi"}
+        ]));
+        let body = translate_request(&r);
+        assert_eq!(body["system"], "Be brief.");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn translate_request_defaults_max_tokens_when_missing() {
+        let mut r = req(json!([{"role": "user", "content": "Hi"}]));
+        r.max_tokens = None;
+        let body = translate_request(&r);
+        assert!(body["max_tokens"].as_u64().unwrap() > 0, "Anthropic requires max_tokens");
+    }
+
+    #[test]
+    fn parse_response_extracts_text_and_usage() {
+        let resp = json!({
+            "content": [{"type": "text", "text": "Hello!"}],
+            "usage": {"input_tokens": 9, "output_tokens": 2},
+            "stop_reason": "end_turn"
+        });
+        let cr = parse_response(resp).unwrap();
+        assert_eq!(cr.content, "Hello!");
+        assert_eq!(cr.prompt_tokens, 9);
+        assert_eq!(cr.completion_tokens, 2);
+        assert_eq!(cr.finish_reason, "end_turn");
+    }
+
+    #[test]
+    fn translate_sse_content_delta_becomes_openai_chunk() {
+        let line = r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#;
+        let out = translate_sse_line(line).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(r#""delta":{"content":"Hi"}"#));
+    }
+
+    #[test]
+    fn translate_sse_message_stop_emits_done() {
+        let line = r#"data: {"type":"message_stop"}"#;
+        let out = translate_sse_line(line).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("[DONE]"));
+    }
+}
