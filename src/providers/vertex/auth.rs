@@ -4,6 +4,7 @@
 //! Real auth is wrapped around `google-cloud-auth` 1.9's
 //! `AccessTokenCredentials`, which caches and auto-refreshes tokens.
 
+use anyhow::Context;
 use async_trait::async_trait;
 
 /// Fetches a Google Cloud OAuth2 Bearer access token.
@@ -51,9 +52,9 @@ impl GoogleCloudAuthProvider {
         let credentials = match credentials_path {
             Some(path) => {
                 let raw = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))?;
+                    .with_context(|| format!("failed to read {path}"))?;
                 let json: serde_json::Value = serde_json::from_str(&raw)
-                    .map_err(|e| anyhow::anyhow!("{path} is not valid JSON: {e}"))?;
+                    .with_context(|| format!("{path} is not valid JSON"))?;
                 google_cloud_auth::credentials::service_account::Builder::new(json)
                     .with_access_specifier(
                         google_cloud_auth::credentials::service_account::AccessSpecifier::from_scopes(
@@ -61,12 +62,14 @@ impl GoogleCloudAuthProvider {
                         ),
                     )
                     .build_access_token_credentials()
-                    .map_err(|e| anyhow::anyhow!("failed to build service-account credentials: {e}"))?
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .context("failed to build service-account credentials")?
             }
             None => google_cloud_auth::credentials::Builder::default()
                 .with_scopes([CLOUD_PLATFORM_SCOPE])
                 .build_access_token_credentials()
-                .map_err(|e| anyhow::anyhow!("failed to build ADC credentials: {e}"))?,
+                .map_err(|e| anyhow::Error::msg(e.to_string()))
+                .context("failed to build ADC credentials")?,
         };
         Ok(Self { credentials })
     }
@@ -79,7 +82,8 @@ impl TokenProvider for GoogleCloudAuthProvider {
             .credentials
             .access_token()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to fetch GCP access token: {e}"))?;
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+            .context("failed to fetch GCP access token")?;
         Ok(access.token)
     }
 }
