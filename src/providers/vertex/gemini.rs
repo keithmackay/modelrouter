@@ -1,3 +1,10 @@
+//! Pure JSON translation between OpenAI chat format and Vertex Gemini
+//! `generateContent`. No HTTP, no async, no state — consumed by `VertexAdapter`.
+//!
+//! MVP scope: string-only message content. Messages with array-shaped
+//! `content` (e.g. `[{"type":"text","text":"..."}]`) silently serialize as
+//! an empty string; multimodal support is a follow-up.
+
 use bytes::Bytes;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest};
 
@@ -43,6 +50,10 @@ pub fn translate_request(req: &NormalizedRequest) -> serde_json::Value {
     body
 }
 
+/// Map a Gemini `finishReason` to OpenAI's vocabulary. Safety-class reasons
+/// (`SAFETY`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`) all collapse to
+/// `content_filter`. `RECITATION` (copyright-block truncation) maps to `stop`
+/// since the client sees a clean termination. Unknown reasons default to `stop`.
 fn map_finish_reason(r: &str) -> &'static str {
     match r {
         "STOP" => "stop",
@@ -81,7 +92,11 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
 }
 
 /// Translate a single Gemini SSE line to an OpenAI `chat.completion.chunk` line.
-/// Returns `None` for comments, blank lines, or non-data events.
+/// Returns `None` for comments, blank lines, non-data events, and the final
+/// usage-only chunk (which has `usageMetadata` but no `candidates`). The
+/// adapter layer is responsible for emitting the trailing `data: [DONE]\n\n`
+/// sentinel and for harvesting final usage separately — there is no Gemini
+/// stream-end event analogous to Anthropic's `message_stop`.
 pub fn translate_sse_line(line: &str) -> Option<Bytes> {
     let payload = line.strip_prefix("data: ")?;
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
