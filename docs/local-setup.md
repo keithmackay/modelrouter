@@ -132,6 +132,60 @@ modelrouter report cost --user keith --window monthly --format table
 
 ---
 
+## (Optional) Use GCP Vertex AI (Gemini + Claude on Vertex)
+
+To route through Vertex instead of (or alongside) Anthropic direct, rebuild with the `vertex` feature:
+
+```bash
+cargo build --release --features vertex
+# or combined with OTel: cargo build --release --features "vertex,otel"
+```
+
+**1. Create a service account with the `roles/aiplatform.user` role** and download its JSON key. In a production environment, prefer Application Default Credentials (ADC) — a Compute Engine / Cloud Run / GKE workload identity needs no JSON key at all.
+
+**2. Add to `~/.modelrouter/config.toml`:**
+
+```toml
+[providers.vertex]
+project          = "my-gcp-project"
+region           = "us-east5"                # Claude availability is region-restricted
+credentials_path = "/secrets/vertex-sa.json" # omit to use ADC
+timeout_secs     = 120
+
+[routing.model_aliases]
+# Claude-on-Vertex models must be versioned. Confirm current IDs in the GCP Console.
+"claude-sonnet-4-6"  = "vertex/anthropic/claude-sonnet-4-6@20250514"
+"claude-opus-4-5"    = "vertex/anthropic/claude-opus-4-5@20250101"
+"gemini-2.5-pro"     = "vertex/google/gemini-2.5-pro"
+"gemini-2.5-flash"   = "vertex/google/gemini-2.5-flash"
+```
+
+Supported regions vary per model. Gemini is available broadly (including `global`); Claude-on-Vertex is limited (e.g. `us-east5`, `europe-west1`). Check the GCP console before pinning.
+
+**3. If running in Docker**, mount the SA JSON into the container and reference its in-container path:
+
+```yaml
+volumes:
+  - ./secrets/vertex-sa.json:/secrets/vertex-sa.json:ro
+environment:
+  MODELROUTER__PROVIDERS__VERTEX__CREDENTIALS_PATH: /secrets/vertex-sa.json
+```
+
+Alternatively, set `GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex-sa.json` and leave `credentials_path` unset — `google-cloud-auth` will pick it up via ADC.
+
+**4. Test:**
+
+```bash
+curl -sS http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}' | jq
+```
+
+Tokens are OAuth2 access tokens with scope `cloud-platform`; `google-cloud-auth` caches and refreshes them automatically, so per-request overhead is negligible after the first call.
+
+---
+
 ## Step 6: (Optional) Connect Arize Phoenix for tracing
 
 If you built with `--features otel`, you can send traces and metrics to [Arize Phoenix](https://docs.arize.com/phoenix).
