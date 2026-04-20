@@ -235,10 +235,17 @@ mod claude_tests {
     }
 
     #[test]
-    fn translate_sse_message_stop_emits_done() {
-        let line = r#"data: {"type":"message_stop"}"#;
+    fn translate_sse_message_delta_emits_done() {
+        let line = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#;
         let out = translate_sse_line(line).unwrap();
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("[DONE]"));
+    }
+
+    #[test]
+    fn translate_sse_message_stop_returns_none() {
+        let line = r#"data: {"type":"message_stop"}"#;
+        assert!(translate_sse_line(line).is_none(),
+            "message_stop is a trailing no-op; finalization happens on message_delta");
     }
 }

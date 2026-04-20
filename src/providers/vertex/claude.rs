@@ -65,8 +65,12 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
 ///
 /// Emits:
 ///   - `data: {...}\n\n` on `content_block_delta` with `text_delta` content.
-///   - A trailing `data: {...}\n\ndata: [DONE]\n\n` on `message_stop`.
-/// Returns `None` for all other event types (e.g. `message_start`, `ping`).
+///   - A single `Bytes` containing both the finalization chunk and the
+///     `data: [DONE]\n\n` sentinel on `message_delta` (the Anthropic event
+///     that carries `stop_reason` and final `usage.output_tokens`). This
+///     matches the direct Anthropic adapter's termination point.
+/// Returns `None` for all other event types (`message_start`, `message_stop`,
+/// `ping`, etc.).
 pub fn translate_sse_line(line: &str) -> Option<Bytes> {
     let payload = line.strip_prefix("data: ")?;
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
@@ -80,7 +84,7 @@ pub fn translate_sse_line(line: &str) -> Option<Bytes> {
             });
             Some(Bytes::from(format!("data: {}\n\n", chunk)))
         }
-        "message_stop" => {
+        "message_delta" => {
             let chunk = serde_json::json!({
                 "id": "chatcmpl-vertex-stream",
                 "object": "chat.completion.chunk",
