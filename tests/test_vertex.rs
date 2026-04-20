@@ -21,29 +21,29 @@ mod dispatch_tests {
 
     #[test]
     fn gemini_prefix_parses_to_google() {
-        let (pub_, id) = parse_model_id("google/gemini-2.5-pro").unwrap();
-        assert_eq!(pub_, Publisher::Google);
+        let (publisher, id) = parse_model_id("google/gemini-2.5-pro").unwrap();
+        assert_eq!(publisher, Publisher::Google);
         assert_eq!(id, "gemini-2.5-pro");
     }
 
     #[test]
     fn anthropic_prefix_with_version_parses() {
-        let (pub_, id) = parse_model_id("anthropic/claude-sonnet-4-6@20250514").unwrap();
-        assert_eq!(pub_, Publisher::Anthropic);
+        let (publisher, id) = parse_model_id("anthropic/claude-sonnet-4-6@20250514").unwrap();
+        assert_eq!(publisher, Publisher::Anthropic);
         assert_eq!(id, "claude-sonnet-4-6@20250514");
     }
 
     #[test]
     fn bare_gemini_name_defaults_to_google() {
-        let (pub_, id) = parse_model_id("gemini-2.5-flash").unwrap();
-        assert_eq!(pub_, Publisher::Google);
+        let (publisher, id) = parse_model_id("gemini-2.5-flash").unwrap();
+        assert_eq!(publisher, Publisher::Google);
         assert_eq!(id, "gemini-2.5-flash");
     }
 
     #[test]
     fn bare_claude_name_defaults_to_anthropic() {
-        let (pub_, id) = parse_model_id("claude-opus-4-5@20250101").unwrap();
-        assert_eq!(pub_, Publisher::Anthropic);
+        let (publisher, id) = parse_model_id("claude-opus-4-5@20250101").unwrap();
+        assert_eq!(publisher, Publisher::Anthropic);
         assert_eq!(id, "claude-opus-4-5@20250101");
     }
 

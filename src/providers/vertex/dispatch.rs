@@ -11,12 +11,12 @@ pub enum Publisher {
 /// disambiguates the publisher (`gemini-*` → Google, `claude-*` → Anthropic).
 pub fn parse_model_id(model: &str) -> anyhow::Result<(Publisher, String)> {
     if let Some((prefix, rest)) = model.split_once('/') {
-        let pub_ = match prefix {
+        let publisher = match prefix {
             "google" => Publisher::Google,
             "anthropic" => Publisher::Anthropic,
             other => anyhow::bail!("Unsupported Vertex publisher '{}'", other),
         };
-        return Ok((pub_, rest.to_string()));
+        return Ok((publisher, rest.to_string()));
     }
     if model.starts_with("gemini-") {
         return Ok((Publisher::Google, model.to_string()));
