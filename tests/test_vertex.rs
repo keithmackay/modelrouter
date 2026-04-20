@@ -249,3 +249,14 @@ mod claude_tests {
             "message_stop is a trailing no-op; finalization happens on message_delta");
     }
 }
+
+#[cfg(feature = "vertex")]
+mod auth_tests {
+    use modelrouter::providers::vertex::auth::{StaticTokenProvider, TokenProvider};
+
+    #[tokio::test]
+    async fn static_provider_returns_configured_token() {
+        let p = StaticTokenProvider::new("ya29.abc".into());
+        assert_eq!(p.token().await.unwrap(), "ya29.abc");
+    }
+}
