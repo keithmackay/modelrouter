@@ -290,3 +290,21 @@ mod adapter_tests {
         assert!(url.ends_with(":streamRawPredict"));
     }
 }
+
+mod pricing_tests {
+    use modelrouter::router::cost::CostCalculator;
+
+    #[test]
+    fn gemini_25_pro_has_pricing() {
+        let calc = CostCalculator::new();
+        let cost = calc.calculate("gemini-2.5-pro", 1_000_000, 1_000_000);
+        assert!(cost > 0.0, "gemini-2.5-pro must have non-zero pricing (got {cost})");
+    }
+
+    #[test]
+    fn claude_sonnet_4_6_vertex_versioned_has_pricing() {
+        let calc = CostCalculator::new();
+        let cost = calc.calculate("claude-sonnet-4-6@20250514", 1_000_000, 1_000_000);
+        assert!(cost > 0.0, "claude-sonnet-4-6@20250514 must have non-zero pricing (got {cost})");
+    }
+}
