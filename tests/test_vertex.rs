@@ -260,3 +260,33 @@ mod auth_tests {
         assert_eq!(p.token().await.unwrap(), "ya29.abc");
     }
 }
+
+#[cfg(feature = "vertex")]
+mod adapter_tests {
+    use modelrouter::providers::vertex::adapter::build_endpoint_url;
+    use modelrouter::providers::vertex::dispatch::Publisher;
+
+    #[test]
+    fn gemini_non_streaming_url() {
+        let url = build_endpoint_url("my-proj", "us-central1", Publisher::Google, "gemini-2.5-pro", false);
+        assert_eq!(url, "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent");
+    }
+
+    #[test]
+    fn gemini_streaming_url_uses_sse_alt() {
+        let url = build_endpoint_url("p", "us-central1", Publisher::Google, "gemini-2.5-flash", true);
+        assert!(url.ends_with(":streamGenerateContent?alt=sse"));
+    }
+
+    #[test]
+    fn anthropic_non_streaming_url_with_version_pin() {
+        let url = build_endpoint_url("p", "us-east5", Publisher::Anthropic, "claude-sonnet-4-6@20250514", false);
+        assert!(url.ends_with("/publishers/anthropic/models/claude-sonnet-4-6@20250514:rawPredict"));
+    }
+
+    #[test]
+    fn anthropic_streaming_url() {
+        let url = build_endpoint_url("p", "us-east5", Publisher::Anthropic, "claude-opus-4-5@20250101", true);
+        assert!(url.ends_with(":streamRawPredict"));
+    }
+}
