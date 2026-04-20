@@ -53,3 +53,114 @@ mod dispatch_tests {
         assert!(err.contains("Unsupported Vertex publisher"), "got: {err}");
     }
 }
+
+#[cfg(feature = "vertex")]
+mod gemini_tests {
+    use modelrouter::providers::adapter::NormalizedRequest;
+    use modelrouter::providers::vertex::gemini::{
+        translate_request, parse_response, translate_sse_line,
+    };
+    use serde_json::json;
+
+    fn req(messages: serde_json::Value) -> NormalizedRequest {
+        NormalizedRequest {
+            model: "gemini-2.5-pro".into(),
+            messages: messages.as_array().unwrap().clone(),
+            stream: false,
+            temperature: Some(0.7),
+            max_tokens: Some(1024),
+            extra_params: json!({}),
+        }
+    }
+
+    #[test]
+    fn translate_request_extracts_system_instruction() {
+        let r = req(json!([
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "Hi"}
+        ]));
+        let body = translate_request(&r);
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be helpful.");
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "Hi");
+    }
+
+    #[test]
+    fn translate_request_maps_assistant_to_model_role() {
+        let r = req(json!([
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"}
+        ]));
+        let body = translate_request(&r);
+        assert_eq!(body["contents"][1]["role"], "model");
+    }
+
+    #[test]
+    fn translate_request_emits_generation_config() {
+        let r = req(json!([{"role": "user", "content": "Hi"}]));
+        let body = translate_request(&r);
+        assert_eq!(body["generationConfig"]["temperature"], 0.7);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1024);
+    }
+
+    #[test]
+    fn parse_response_extracts_text_and_usage() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Hi there!"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 16
+            }
+        });
+        let cr = parse_response(resp).unwrap();
+        assert_eq!(cr.content, "Hi there!");
+        assert_eq!(cr.prompt_tokens, 12);
+        assert_eq!(cr.completion_tokens, 4);
+        assert_eq!(cr.finish_reason, "stop");
+    }
+
+    #[test]
+    fn parse_response_maps_max_tokens_finish_reason() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "..."}]},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+        });
+        let cr = parse_response(resp).unwrap();
+        assert_eq!(cr.finish_reason, "length");
+    }
+
+    #[test]
+    fn parse_response_maps_safety_finish_reason() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": ""}]},
+                "finishReason": "SAFETY"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 0, "totalTokenCount": 1}
+        });
+        assert_eq!(parse_response(resp).unwrap().finish_reason, "content_filter");
+    }
+
+    #[test]
+    fn translate_sse_line_emits_openai_chunk() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#;
+        let out = translate_sse_line(line).unwrap();
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(out_str.contains(r#""delta":{"content":"Hi"}"#));
+        assert!(out_str.contains(r#""object":"chat.completion.chunk""#));
+    }
+
+    #[test]
+    fn translate_sse_line_skips_empty_lines() {
+        assert!(translate_sse_line("").is_none());
+        assert!(translate_sse_line("\n").is_none());
+        assert!(translate_sse_line("event: ping").is_none());
+    }
+}
