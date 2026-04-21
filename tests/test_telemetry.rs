@@ -267,6 +267,8 @@ async fn completions_span_has_required_attributes() {
         timeout_secs: 10,
         api_version: None,
         region: None,
+        project: None,
+        credentials_path: None,
     });
     let settings = Arc::new(modelrouter::config::schema::Settings {
         routing: modelrouter::config::schema::RoutingConfig {

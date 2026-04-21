@@ -17,6 +17,7 @@ default = []
 postgres = ["sqlx/postgres"]
 prometheus = ["dep:prometheus"]
 bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]
+vertex = ["dep:google-cloud-auth"]
 s3-archival = []
 otel = [
     "dep:opentelemetry",
@@ -69,6 +70,9 @@ prometheus = { version = "0.13", optional = true }
 # ── AWS Bedrock (--features bedrock) ───────────────────────────────────
 aws-sdk-bedrockruntime = { version = "1", optional = true }
 aws-config             = { version = "1", optional = true }
+
+# ── GCP Vertex (--features vertex) ─────────────────────────────────────
+google-cloud-auth = { version = "1", optional = true }
 
 # ── OpenTelemetry (--features otel) ────────────────────────────────────
 opentelemetry                  = { version = "0.27", features = ["logs"], optional = true }

@@ -40,6 +40,15 @@ impl ProviderRegistry {
         } else if provider_name == "azure" {
             Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(config))
         } else {
+            #[cfg(feature = "vertex")]
+            if provider_name == "vertex" {
+                let adapter = crate::providers::vertex::VertexAdapter::new(config)?;
+                let entry = self
+                    .adapters
+                    .entry(provider_name.to_string())
+                    .or_insert(Arc::new(adapter));
+                return Ok(entry.clone());
+            }
             #[cfg(feature = "bedrock")]
             if provider_name == "bedrock" {
                 let bedrock = tokio::task::block_in_place(|| {

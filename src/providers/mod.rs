@@ -9,3 +9,5 @@ pub mod openai_compat;
 pub mod openai_embed;
 pub mod openai_images;
 pub mod registry;
+#[cfg(feature = "vertex")]
+pub mod vertex;

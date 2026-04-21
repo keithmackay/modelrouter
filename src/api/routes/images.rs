@@ -81,6 +81,8 @@ async fn image_generations_inner(
             timeout_secs: 60,
             api_version: None,
             region: None,
+            project: None,
+            credentials_path: None,
         });
 
     // Check circuit breaker before calling provider

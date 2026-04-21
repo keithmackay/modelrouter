@@ -9,6 +9,8 @@ fn azure_adapter_builds_correct_url() {
         api_version: Some("2024-02-01".to_string()),
         timeout_secs: 60,
         region: None,
+        project: None,
+        credentials_path: None,
     };
     let adapter = AzureOpenAIAdapter::new(&config);
     assert_eq!(
@@ -25,6 +27,8 @@ fn azure_adapter_defaults_api_version() {
         api_version: None,
         timeout_secs: 60,
         region: None,
+        project: None,
+        credentials_path: None,
     };
     let adapter = AzureOpenAIAdapter::new(&config);
     assert!(adapter.chat_url().contains("api-version=2024-02-01"));
@@ -38,6 +42,8 @@ fn azure_adapter_with_both_fields_set() {
         api_version: Some("2025-01-01".to_string()),
         timeout_secs: 30,
         region: None,
+        project: None,
+        credentials_path: None,
     };
     let adapter = AzureOpenAIAdapter::new(&config);
     let url = adapter.chat_url();

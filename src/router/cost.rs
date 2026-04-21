@@ -67,6 +67,37 @@ impl CostCalculator {
             "gemini-1.5-flash".to_string(),
             ModelPricing { input_per_million: 0.075, output_per_million: 0.30 },
         );
+        // Gemini 2.5 on Vertex — prompts ≤ 200K tier. Long-context tier is higher.
+        // Reference: https://cloud.google.com/vertex-ai/generative-ai/pricing
+        pricing.insert(
+            "gemini-2.5-pro".to_string(),
+            ModelPricing { input_per_million: 1.25, output_per_million: 10.0 },
+        );
+        pricing.insert(
+            "gemini-2.5-flash".to_string(),
+            ModelPricing { input_per_million: 0.30, output_per_million: 2.50 },
+        );
+        pricing.insert(
+            "gemini-2.5-flash-lite".to_string(),
+            ModelPricing { input_per_million: 0.10, output_per_million: 0.40 },
+        );
+        // Claude on Vertex — versioned IDs (@YYYYMMDD). Same rates as Anthropic direct.
+        pricing.insert(
+            "claude-opus-4-5@20250101".to_string(),
+            ModelPricing { input_per_million: 15.0, output_per_million: 75.0 },
+        );
+        pricing.insert(
+            "claude-sonnet-4-6@20250514".to_string(),
+            ModelPricing { input_per_million: 3.0, output_per_million: 15.0 },
+        );
+        pricing.insert(
+            "claude-sonnet-4-5@20250929".to_string(),
+            ModelPricing { input_per_million: 3.0, output_per_million: 15.0 },
+        );
+        pricing.insert(
+            "claude-haiku-4-5@20251001".to_string(),
+            ModelPricing { input_per_million: 0.80, output_per_million: 4.0 },
+        );
         // Unknown models return 0 (Ollama etc)
         Self { pricing }
     }
