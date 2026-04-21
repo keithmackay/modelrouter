@@ -91,6 +91,10 @@ impl CostCalculator {
             ModelPricing { input_per_million: 3.0, output_per_million: 15.0 },
         );
         pricing.insert(
+            "claude-sonnet-4-5@20250929".to_string(),
+            ModelPricing { input_per_million: 3.0, output_per_million: 15.0 },
+        );
+        pricing.insert(
             "claude-haiku-4-5@20251001".to_string(),
             ModelPricing { input_per_million: 0.80, output_per_million: 4.0 },
         );
