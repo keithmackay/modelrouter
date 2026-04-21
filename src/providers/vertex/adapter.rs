@@ -15,6 +15,10 @@ use crate::providers::vertex::{claude, gemini};
 
 /// Build the full Vertex REST URL for a given (project, region, publisher, model).
 /// For Gemini streaming, appends `?alt=sse` so the server emits line-framed SSE.
+///
+/// The `global` location uses the un-prefixed hostname `aiplatform.googleapis.com`
+/// while regional locations use `{region}-aiplatform.googleapis.com`. The path
+/// segment `locations/{region}` is always included, even for `global`.
 pub fn build_endpoint_url(
     project: &str,
     region: &str,
@@ -28,8 +32,13 @@ pub fn build_endpoint_url(
         (Publisher::Anthropic, false) => ("anthropic", "rawPredict"),
         (Publisher::Anthropic, true) => ("anthropic", "streamRawPredict"),
     };
+    let host = if region == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    };
     let mut url = format!(
-        "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/{pub_segment}/models/{model}:{method}"
+        "https://{host}/v1/projects/{project}/locations/{region}/publishers/{pub_segment}/models/{model}:{method}"
     );
     if matches!(publisher, Publisher::Google) && streaming {
         url.push_str("?alt=sse");

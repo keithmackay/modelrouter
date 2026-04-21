@@ -289,6 +289,26 @@ mod adapter_tests {
         let url = build_endpoint_url("p", "us-east5", Publisher::Anthropic, "claude-opus-4-5@20250101", true);
         assert!(url.ends_with(":streamRawPredict"));
     }
+
+    #[test]
+    fn global_region_uses_unprefixed_hostname() {
+        let url = build_endpoint_url("p", "global", Publisher::Anthropic, "claude-sonnet-4-5@20250929", false);
+        assert!(
+            url.starts_with("https://aiplatform.googleapis.com/"),
+            "global must use un-prefixed host, got: {url}"
+        );
+        assert!(
+            url.contains("/locations/global/"),
+            "path must still contain locations/global, got: {url}"
+        );
+    }
+
+    #[test]
+    fn global_region_gemini_streaming() {
+        let url = build_endpoint_url("p", "global", Publisher::Google, "gemini-2.5-pro", true);
+        assert!(url.starts_with("https://aiplatform.googleapis.com/"));
+        assert!(url.ends_with(":streamGenerateContent?alt=sse"));
+    }
 }
 
 mod pricing_tests {
