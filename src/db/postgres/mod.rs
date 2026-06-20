@@ -13,6 +13,7 @@ mod rate_limits;
 mod api_keys;
 mod mcp_servers;
 mod models;
+mod webhook_callbacks;
 
 use sqlx::PgPool;
 
