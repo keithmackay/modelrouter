@@ -465,6 +465,28 @@ Models resolve in this order:
 2. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
 3. Fall back to `routing.default_provider`
 
+#### Routing Shortcuts
+
+Use `:fastest` or `:cheapest` as the `model` value in any request to route to your configured fastest or cheapest target without changing client code.
+
+Configure targets in `config.toml`:
+
+```toml
+[routing.shortcuts]
+fastest  = "anthropic/claude-haiku-4-5"   # low-latency model
+cheapest = "deepseek/deepseek-chat"        # lowest cost/token
+```
+
+Then use in requests:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer mr-yourkey" \
+  -d '{"model":":cheapest","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+If a shortcut is not configured, the request falls through to normal default routing. Shortcuts are resolved before model aliases, so they cannot be overridden by alias config.
+
 ### OIDC SSO for admin login
 
 By default, admins log in with username and password at `/admin/login`. To use an identity provider instead:

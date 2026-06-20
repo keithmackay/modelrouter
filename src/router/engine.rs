@@ -25,7 +25,17 @@ impl RequestRouter {
 
     pub fn resolve(&self, requested_model: &str) -> (String, String) {
         let db_map = self.db_aliases.load();
-        let mut current = requested_model.to_string();
+        // Shortcut keywords — resolved first so they cannot be shadowed by user aliases
+        let after_shortcut = match requested_model {
+            ":fastest" => self.settings.routing.shortcuts.fastest
+                .as_deref()
+                .unwrap_or(requested_model),
+            ":cheapest" => self.settings.routing.shortcuts.cheapest
+                .as_deref()
+                .unwrap_or(requested_model),
+            other => other,
+        };
+        let mut current = after_shortcut.to_string();
         let mut depth = 0;
         const MAX_ALIAS_DEPTH: usize = 10;
 
@@ -64,5 +74,53 @@ impl RequestRouter {
         } else {
             (self.settings.routing.default_provider.clone(), default.clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::config::schema::{Settings, RoutingShortcutsConfig};
+
+    fn router_with_shortcuts(fastest: Option<&str>, cheapest: Option<&str>) -> RequestRouter {
+        let mut s = Settings::default();
+        s.routing.shortcuts = RoutingShortcutsConfig {
+            fastest: fastest.map(str::to_string),
+            cheapest: cheapest.map(str::to_string),
+        };
+        RequestRouter::new(Arc::new(s))
+    }
+
+    #[test]
+    fn fastest_resolves_configured_model() {
+        let r = router_with_shortcuts(Some("anthropic/claude-haiku-4-5"), None);
+        let (provider, model) = r.resolve(":fastest");
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn cheapest_resolves_configured_model() {
+        let r = router_with_shortcuts(None, Some("deepseek/deepseek-chat"));
+        let (provider, model) = r.resolve(":cheapest");
+        assert_eq!(provider, "deepseek");
+        assert_eq!(model, "deepseek-chat");
+    }
+
+    #[test]
+    fn shortcut_not_configured_falls_through() {
+        let r = router_with_shortcuts(None, None);
+        // Without config, :fastest resolves like any unknown model → default
+        let (provider, _) = r.resolve(":fastest");
+        assert_eq!(provider, "openai"); // default_provider
+    }
+
+    #[test]
+    fn normal_model_unaffected_by_shortcuts() {
+        let r = router_with_shortcuts(Some("x/y"), Some("a/b"));
+        let (provider, model) = r.resolve("anthropic/claude-opus-4-5");
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-opus-4-5");
     }
 }

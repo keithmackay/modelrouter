@@ -3,6 +3,25 @@
 {% block content %}
 <h1>Models</h1>
 
+<section class="card">
+  <h2>Routing Shortcuts</h2>
+  <p>Use <code>:fastest</code> or <code>:cheapest</code> as the <code>model</code> in any API request.
+     Configure targets in <code>config.toml</code> under <code>[routing.shortcuts]</code>. Changes require a server restart.</p>
+  <table>
+    <thead><tr><th>Keyword</th><th>Resolves To</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>:fastest</code></td>
+        <td>{% if shortcuts_fastest %}<code>{{ shortcuts_fastest }}</code>{% else %}<em>not configured — falls back to default model</em>{% endif %}</td>
+      </tr>
+      <tr>
+        <td><code>:cheapest</code></td>
+        <td>{% if shortcuts_cheapest %}<code>{{ shortcuts_cheapest }}</code>{% else %}<em>not configured — falls back to default model</em>{% endif %}</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
 <form hx-post="/admin/models" hx-target="#models-tbody" hx-swap="afterbegin"
       hx-on::after-request="this.reset()"
       style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;flex-wrap:wrap;">

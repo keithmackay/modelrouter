@@ -70,11 +70,16 @@ pub async fn get_models(
         a["primary"].as_str().unwrap_or("").cmp(b["primary"].as_str().unwrap_or(""))
     });
 
+    let shortcuts_fastest = state.settings.routing.shortcuts.fastest.clone();
+    let shortcuts_cheapest = state.settings.routing.shortcuts.cheapest.clone();
+
     render(
         "models.html",
         minijinja::context! {
             models => minijinja::Value::from_serialize(&model_list),
             failover_rows => minijinja::Value::from_serialize(&failover_rows),
+            shortcuts_fastest => shortcuts_fastest,
+            shortcuts_cheapest => shortcuts_cheapest,
         },
     )
 }

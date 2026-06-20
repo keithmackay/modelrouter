@@ -238,6 +238,8 @@ pub struct RoutingConfig {
     /// Named load balancer pools. Key is the virtual pool name used as `model` in requests.
     #[serde(default)]
     pub load_balancer: HashMap<String, LoadBalancerConfig>,
+    #[serde(default)]
+    pub shortcuts: RoutingShortcutsConfig,
 }
 
 impl Default for RoutingConfig {
@@ -249,6 +251,7 @@ impl Default for RoutingConfig {
             fallback_chains: HashMap::new(),
             complexity_routing: None,
             load_balancer: HashMap::new(),
+            shortcuts: RoutingShortcutsConfig::default(),
         }
     }
 }
@@ -268,6 +271,17 @@ pub struct ComplexityRoutingConfig {
 
 fn default_complexity_threshold() -> u32 { 500 }
 fn default_cheap_model() -> String { "gpt-4o-mini".to_string() }
+
+/// Reserved model name shortcuts resolved before alias lookup.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RoutingShortcutsConfig {
+    /// Model string `:fastest` resolves to (e.g. "anthropic/claude-haiku-4-5").
+    /// If None, `:fastest` falls through to default routing.
+    pub fastest: Option<String>,
+    /// Model string `:cheapest` resolves to (e.g. "deepseek/deepseek-chat").
+    /// If None, `:cheapest` falls through to default routing.
+    pub cheapest: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -515,6 +529,29 @@ pub struct PolicyRuleConfig {
     /// Sort order — higher priority rules are evaluated first. Default 0.
     #[serde(default)]
     pub priority: i32,
+}
+
+#[cfg(test)]
+mod shortcuts_tests {
+    use super::*;
+
+    #[test]
+    fn shortcuts_parse() {
+        let s: Settings = toml::from_str(r#"
+            [routing.shortcuts]
+            fastest  = "anthropic/claude-haiku-4-5"
+            cheapest = "deepseek/deepseek-chat"
+        "#).unwrap();
+        assert_eq!(s.routing.shortcuts.fastest.as_deref(), Some("anthropic/claude-haiku-4-5"));
+        assert_eq!(s.routing.shortcuts.cheapest.as_deref(), Some("deepseek/deepseek-chat"));
+    }
+
+    #[test]
+    fn shortcuts_default_is_none() {
+        let s: Settings = toml::from_str("").unwrap();
+        assert!(s.routing.shortcuts.fastest.is_none());
+        assert!(s.routing.shortcuts.cheapest.is_none());
+    }
 }
 
 #[cfg(test)]
