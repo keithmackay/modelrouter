@@ -16,6 +16,7 @@ use crate::{
 pub async fn chat_completions(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -27,7 +28,7 @@ pub async fn chat_completions(
         "cost.usd" = tracing::field::Empty,
         "tokens.prompt" = tracing::field::Empty,
     );
-    chat_completions_inner(State(state), user, Json(body))
+    chat_completions_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -35,10 +36,12 @@ pub async fn chat_completions(
 async fn chat_completions_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    let skip_log = should_skip_logging(&headers);
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
     let requested_model = body["model"]
@@ -238,6 +241,7 @@ async fn chat_completions_inner(
                 provider: provider_name.clone(),
                 messages_json,
                 start,
+                skip_log,
             },
         );
 
@@ -383,53 +387,72 @@ async fn chat_completions_inner(
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
 
+    let skip_log_clone = skip_log;
     tokio::spawn(async move {
-        let prompt = NewPrompt {
-            user_id,
-            session_id: None,
-            request_model: model_clone.clone(),
-            routed_model: canonical_clone.clone(),
-            provider: provider_clone.clone(),
-            messages: messages_json.clone(),
-            response: Some(response_clone.clone()),
-            finish_reason: Some(finish_clone),
-            prompt_tokens: prompt_tokens as i64,
-            completion_tokens: completion_tokens as i64,
-            cost_usd: cost,
-            latency_ms: Some(latency_ms),
-            tags: "[]".to_string(),
-            project: user_project.clone(),
-        };
-        match PromptRepository::create(&*state_clone.db, prompt).await {
-            Ok(saved_prompt) => {
-                let ledger = NewCostLedgerEntry {
-                    user_id,
-                    prompt_id: saved_prompt.id,
-                    model: canonical_clone.clone(),
-                    provider: provider_clone.clone(),
-                    project: user_project.clone(),
-                    tokens_in: prompt_tokens as i64,
-                    tokens_out: completion_tokens as i64,
-                    cost_usd: cost,
-                    api_key_id,
-                };
-                if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
-                    tracing::error!("Failed to record cost: {}", e);
+        if !skip_log_clone {
+            let prompt = NewPrompt {
+                user_id,
+                session_id: None,
+                request_model: model_clone.clone(),
+                routed_model: canonical_clone.clone(),
+                provider: provider_clone.clone(),
+                messages: messages_json.clone(),
+                response: Some(response_clone.clone()),
+                finish_reason: Some(finish_clone),
+                prompt_tokens: prompt_tokens as i64,
+                completion_tokens: completion_tokens as i64,
+                cost_usd: cost,
+                latency_ms: Some(latency_ms),
+                tags: "[]".to_string(),
+                project: user_project.clone(),
+            };
+            match PromptRepository::create(&*state_clone.db, prompt).await {
+                Ok(saved_prompt) => {
+                    let ledger = NewCostLedgerEntry {
+                        user_id,
+                        prompt_id: Some(saved_prompt.id),
+                        model: canonical_clone.clone(),
+                        provider: provider_clone.clone(),
+                        project: user_project.clone(),
+                        tokens_in: prompt_tokens as i64,
+                        tokens_out: completion_tokens as i64,
+                        cost_usd: cost,
+                        api_key_id,
+                    };
+                    if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
+                        tracing::error!("Failed to record cost: {}", e);
+                    }
+                    state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
+                        trace_id: format!("{}", saved_prompt.id),
+                        user_id,
+                        model: canonical_clone.clone(),
+                        provider: provider_clone.clone(),
+                        input: serde_json::from_str(&messages_json).unwrap_or(serde_json::Value::Null),
+                        output: response_clone.clone(),
+                        prompt_tokens,
+                        completion_tokens,
+                        cost_usd: cost,
+                        latency_ms,
+                    });
                 }
-                state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
-                    trace_id: format!("{}", saved_prompt.id),
-                    user_id,
-                    model: canonical_clone.clone(),
-                    provider: provider_clone.clone(),
-                    input: serde_json::from_str(&messages_json).unwrap_or(serde_json::Value::Null),
-                    output: response_clone.clone(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cost_usd: cost,
-                    latency_ms,
-                });
+                Err(e) => tracing::error!("Failed to record prompt: {}", e),
             }
-            Err(e) => tracing::error!("Failed to record prompt: {}", e),
+        } else {
+            // Skip logging but still record cost for budget enforcement
+            let ledger = NewCostLedgerEntry {
+                user_id,
+                prompt_id: None,
+                model: canonical_clone.clone(),
+                provider: provider_clone.clone(),
+                project: user_project.clone(),
+                tokens_in: prompt_tokens as i64,
+                tokens_out: completion_tokens as i64,
+                cost_usd: cost,
+                api_key_id,
+            };
+            if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
+                tracing::error!("Failed to record cost: {}", e);
+            }
         }
 
         // Fire on_response_sent lifecycle hooks
@@ -466,6 +489,7 @@ struct StreamLogCtx {
     provider: String,
     messages_json: String,
     start: Instant,
+    skip_log: bool,
 }
 
 /// Wraps an SSE stream so that, when the terminal `[DONE]` chunk passes through,
@@ -491,6 +515,7 @@ fn log_streaming_request(
     let provider = ctx.provider;
     let messages_json = ctx.messages_json;
     let start = ctx.start;
+    let skip_log = ctx.skip_log;
 
     stream.map(move |chunk_result| {
         if let Ok(ref chunk) = chunk_result {
@@ -530,40 +555,58 @@ fn log_streaming_request(
                     };
 
                     let model_c_ref = model_c.clone();
-                    let prompt = NewPrompt {
-                        user_id,
-                        session_id: None,
-                        request_model: model_c,
-                        routed_model: canonical_c.clone(),
-                        provider: provider_c.clone(),
-                        messages: messages_c,
-                        response: Some(content),
-                        finish_reason: Some("stop".to_string()),
-                        prompt_tokens: prompt_tokens as i64,
-                        completion_tokens: completion_tokens as i64,
-                        cost_usd: cost,
-                        latency_ms: Some(latency_ms),
-                        tags: "[]".to_string(),
-                        project: user_project_c.clone(),
-                    };
-                    match PromptRepository::create(&*db_c, prompt).await {
-                        Ok(saved) => {
-                            let entry = NewCostLedgerEntry {
-                                user_id,
-                                prompt_id: saved.id,
-                                model: canonical_c.clone(),
-                                provider: provider_c,
-                                project: user_project_c.clone(),
-                                tokens_in: prompt_tokens as i64,
-                                tokens_out: completion_tokens as i64,
-                                cost_usd: cost,
-                                api_key_id,
-                            };
-                            if let Err(e) = CostRepository::create(&*db_c, entry).await {
-                                tracing::error!("Failed to log streaming cost: {}", e);
+                    if !skip_log {
+                        let prompt = NewPrompt {
+                            user_id,
+                            session_id: None,
+                            request_model: model_c,
+                            routed_model: canonical_c.clone(),
+                            provider: provider_c.clone(),
+                            messages: messages_c,
+                            response: Some(content),
+                            finish_reason: Some("stop".to_string()),
+                            prompt_tokens: prompt_tokens as i64,
+                            completion_tokens: completion_tokens as i64,
+                            cost_usd: cost,
+                            latency_ms: Some(latency_ms),
+                            tags: "[]".to_string(),
+                            project: user_project_c.clone(),
+                        };
+                        match PromptRepository::create(&*db_c, prompt).await {
+                            Ok(saved) => {
+                                let entry = NewCostLedgerEntry {
+                                    user_id,
+                                    prompt_id: Some(saved.id),
+                                    model: canonical_c.clone(),
+                                    provider: provider_c,
+                                    project: user_project_c.clone(),
+                                    tokens_in: prompt_tokens as i64,
+                                    tokens_out: completion_tokens as i64,
+                                    cost_usd: cost,
+                                    api_key_id,
+                                };
+                                if let Err(e) = CostRepository::create(&*db_c, entry).await {
+                                    tracing::error!("Failed to log streaming cost: {}", e);
+                                }
                             }
+                            Err(e) => tracing::error!("Failed to log streaming prompt: {}", e),
                         }
-                        Err(e) => tracing::error!("Failed to log streaming prompt: {}", e),
+                    } else {
+                        // Skip logging but still record cost for budget enforcement
+                        let entry = NewCostLedgerEntry {
+                            user_id,
+                            prompt_id: None,
+                            model: canonical_c.clone(),
+                            provider: provider_c,
+                            project: user_project_c.clone(),
+                            tokens_in: prompt_tokens as i64,
+                            tokens_out: completion_tokens as i64,
+                            cost_usd: cost,
+                            api_key_id,
+                        };
+                        if let Err(e) = CostRepository::create(&*db_c, entry).await {
+                            tracing::error!("Failed to log streaming cost: {}", e);
+                        }
                     }
 
                     // Fire on_response_sent lifecycle hooks
@@ -645,6 +688,14 @@ fn streaming_response(
         .unwrap()
 }
 
+pub fn should_skip_logging(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-no-log")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Extract text content from an SSE chunk for token estimation.
 /// Returns Some(text) for data chunks, None for [DONE] or invalid.
 pub fn extract_text_from_sse(chunk: &[u8]) -> Option<String> {
@@ -661,4 +712,33 @@ pub fn extract_text_from_sse(chunk: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod no_log_tests {
+    use super::should_skip_logging;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn detects_true_value() {
+        let mut h = HeaderMap::new();
+        h.insert("x-no-log", "true".parse().unwrap());
+        assert!(should_skip_logging(&h));
+    }
+    #[test]
+    fn ignores_false_value() {
+        let mut h = HeaderMap::new();
+        h.insert("x-no-log", "false".parse().unwrap());
+        assert!(!should_skip_logging(&h));
+    }
+    #[test]
+    fn absent_header_is_false() {
+        assert!(!should_skip_logging(&HeaderMap::new()));
+    }
+    #[test]
+    fn case_insensitive() {
+        let mut h = HeaderMap::new();
+        h.insert("x-no-log", "TRUE".parse().unwrap());
+        assert!(should_skip_logging(&h));
+    }
 }

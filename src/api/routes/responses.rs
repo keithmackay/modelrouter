@@ -160,7 +160,7 @@ async fn responses_inner(
             Ok(saved_prompt) => {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: saved_prompt.id,
+                    prompt_id: Some(saved_prompt.id),
                     model: canonical_clone,
                     provider: provider_clone,
                     project: user_project.clone(),

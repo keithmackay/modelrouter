@@ -218,7 +218,7 @@ async fn budget_exceeded_returns_deny() {
         &db,
         NewCostLedgerEntry {
             user_id: user.id,
-            prompt_id: prompt.id,
+            prompt_id: Some(prompt.id),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
             project: None,
@@ -307,7 +307,7 @@ async fn test_policy_token_limit_under_budget() {
         &db,
         NewCostLedgerEntry {
             user_id: user.id,
-            prompt_id: prompt.id,
+            prompt_id: Some(prompt.id),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
             project: None,
@@ -396,7 +396,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
         &db,
         NewCostLedgerEntry {
             user_id: user.id,
-            prompt_id: prompt.id,
+            prompt_id: Some(prompt.id),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
             project: None,

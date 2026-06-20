@@ -45,7 +45,7 @@ async fn log_messages_cost(
         Ok(saved_prompt) => {
             let ledger = NewCostLedgerEntry {
                 user_id,
-                prompt_id: saved_prompt.id,
+                prompt_id: Some(saved_prompt.id),
                 model: canonical_model.to_string(),
                 provider: provider.to_string(),
                 project: project.clone(),
@@ -373,7 +373,7 @@ async fn anthropic_messages_inner(
             Ok(saved_prompt) => {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: saved_prompt.id,
+                    prompt_id: Some(saved_prompt.id),
                     model: canonical_c.clone(),
                     provider: "anthropic".to_string(),
                     project: project.clone(),

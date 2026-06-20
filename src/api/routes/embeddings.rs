@@ -157,7 +157,7 @@ async fn embeddings_inner(
             Ok(saved) => {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: saved.id,
+                    prompt_id: Some(saved.id),
                     model: canonical_clone,
                     provider: provider_clone,
                     project: user_project.clone(),

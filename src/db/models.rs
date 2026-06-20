@@ -187,7 +187,7 @@ pub struct CostLedgerEntry {
 #[derive(Debug)]
 pub struct NewCostLedgerEntry {
     pub user_id: i64,
-    pub prompt_id: i64,
+    pub prompt_id: Option<i64>,
     pub model: String,
     pub provider: String,
     pub project: Option<String>,
