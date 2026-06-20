@@ -495,6 +495,55 @@ auto_provision_role = "admin"
 
 Restart modelrouter. Navigate to `/admin/auth/oidc/login` to authenticate via your IdP. Password-based login remains available alongside OIDC.
 
+### Chinese Model Providers
+
+All major Chinese LLM providers expose an OpenAI-compatible API and work with modelrouter's generic provider type. Configure them as named providers in your `config.toml`:
+
+```toml
+[providers.deepseek]
+api_key  = "sk-..."
+api_base = "https://api.deepseek.com/v1"
+
+[providers.qwen]
+api_key  = "sk-..."
+api_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[providers.doubao]
+api_key  = "..."
+api_base = "https://ark.cn-beijing.volces.com/api/v3"
+```
+
+Route to them using the `provider/model` syntax:
+
+```toml
+[routing.model_aliases]
+deepseek = "deepseek/deepseek-chat"
+qwen     = "qwen/qwen-max"
+doubao   = "doubao/doubao-pro-32k"
+```
+
+Or reference them directly in requests:
+
+```
+deepseek/deepseek-chat
+qwen/qwen-max
+doubao/doubao-pro-32k
+```
+
+**Built-in pricing** is included for:
+- **DeepSeek:** deepseek-chat, deepseek-coder, deepseek-reasoner
+- **Alibaba Qwen:** qwen-max, qwen-plus, qwen-turbo
+- **ByteDance Doubao:** doubao-lite-4k, doubao-lite-32k, doubao-pro-4k, doubao-pro-32k
+
+Override any rate with a `[[pricing]]` entry in `config.toml`:
+
+```toml
+[[pricing]]
+model = "deepseek-chat"
+input_per_million = 0.14
+output_per_million = 0.28
+```
+
 ---
 
 ## Usage

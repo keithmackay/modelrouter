@@ -81,6 +81,49 @@ impl CostCalculator {
             "gemini-2.5-flash-lite".to_string(),
             ModelPricing { input_per_million: 0.10, output_per_million: 0.40 },
         );
+        // DeepSeek models
+        pricing.insert(
+            "deepseek-chat".to_string(),
+            ModelPricing { input_per_million: 0.14, output_per_million: 0.28 },
+        );
+        pricing.insert(
+            "deepseek-coder".to_string(),
+            ModelPricing { input_per_million: 0.14, output_per_million: 0.28 },
+        );
+        pricing.insert(
+            "deepseek-reasoner".to_string(),
+            ModelPricing { input_per_million: 0.55, output_per_million: 2.19 },
+        );
+        // Alibaba Qwen (Tongyi)
+        pricing.insert(
+            "qwen-max".to_string(),
+            ModelPricing { input_per_million: 0.40, output_per_million: 1.20 },
+        );
+        pricing.insert(
+            "qwen-plus".to_string(),
+            ModelPricing { input_per_million: 0.07, output_per_million: 0.21 },
+        );
+        pricing.insert(
+            "qwen-turbo".to_string(),
+            ModelPricing { input_per_million: 0.05, output_per_million: 0.10 },
+        );
+        // ByteDance Doubao
+        pricing.insert(
+            "doubao-lite-4k".to_string(),
+            ModelPricing { input_per_million: 0.10, output_per_million: 0.10 },
+        );
+        pricing.insert(
+            "doubao-lite-32k".to_string(),
+            ModelPricing { input_per_million: 0.10, output_per_million: 0.10 },
+        );
+        pricing.insert(
+            "doubao-pro-4k".to_string(),
+            ModelPricing { input_per_million: 0.80, output_per_million: 0.80 },
+        );
+        pricing.insert(
+            "doubao-pro-32k".to_string(),
+            ModelPricing { input_per_million: 0.80, output_per_million: 0.80 },
+        );
         // Claude on Vertex — versioned IDs (@YYYYMMDD). Same rates as Anthropic direct.
         pricing.insert(
             "claude-opus-4-5@20250101".to_string(),
@@ -137,5 +180,24 @@ impl CostCalculator {
 impl Default for CostCalculator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chinese_model_pricing() {
+        let calc = CostCalculator::default();
+        // DeepSeek: 0.14/M input
+        let cost = calc.calculate("deepseek-chat", 1_000_000, 0);
+        assert!((cost - 0.14).abs() < 0.001, "deepseek-chat input: {cost}");
+        // Qwen: 0.40/M input
+        let cost = calc.calculate("qwen-max", 1_000_000, 0);
+        assert!((cost - 0.40).abs() < 0.001, "qwen-max input: {cost}");
+        // Doubao: 0.80/M input
+        let cost = calc.calculate("doubao-pro-32k", 1_000_000, 0);
+        assert!((cost - 0.80).abs() < 0.001, "doubao-pro-32k input: {cost}");
     }
 }
