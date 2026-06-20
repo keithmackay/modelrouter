@@ -8,7 +8,8 @@ use crate::{
     db::repositories::{
         admin_users::AdminUserRepository, api_keys::ApiKeyRepository, audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, hooks::HookRepository,
-        groups::GroupRepository, mcp_servers::McpServerRepository, models::ModelRepository,
+        groups::GroupRepository,
+        webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
         users::UserRepository,
     },
@@ -31,6 +32,7 @@ pub trait DatabaseProvider:
     + McpServerRepository
     + ModelRepository
     + GroupRepository
+    + WebhookCallbackRepository
     + Send
     + Sync
 {
@@ -51,6 +53,7 @@ impl<T> DatabaseProvider for T where
         + McpServerRepository
         + ModelRepository
         + GroupRepository
+        + WebhookCallbackRepository
         + Send
         + Sync
 {
@@ -121,6 +124,11 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::admin::models::{
         get_models, post_create_model, post_disable_model, post_enable_model,
         post_delete_model, post_set_failovers,
+    };
+    use crate::api::admin::webhooks::{
+        list_webhooks_api, create_webhook_api, delete_webhook_api, enable_webhook_api, disable_webhook_api,
+        get_webhooks_page, post_create_webhook_page, post_delete_webhook_page,
+        post_enable_webhook_page_dash, post_disable_webhook_page_dash,
     };
 
     axum::Router::new()
@@ -199,6 +207,16 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/models/:id/enable", post(post_enable_model))
         .route("/admin/models/:id/delete", post(post_delete_model))
         .route("/admin/models/:primary/failovers", post(post_set_failovers))
+        // Webhook REST API
+        .route("/admin/api/webhooks", get(list_webhooks_api).post(create_webhook_api))
+        .route("/admin/api/webhooks/:id", delete(delete_webhook_api))
+        .route("/admin/api/webhooks/:id/enable", post(enable_webhook_api))
+        .route("/admin/api/webhooks/:id/disable", post(disable_webhook_api))
+        // Webhook Dashboard
+        .route("/admin/webhooks", get(get_webhooks_page).post(post_create_webhook_page))
+        .route("/admin/webhooks/:id/delete", post(post_delete_webhook_page))
+        .route("/admin/webhooks/:id/enable", post(post_enable_webhook_page_dash))
+        .route("/admin/webhooks/:id/disable", post(post_disable_webhook_page_dash))
         // MCP Server Registry
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))

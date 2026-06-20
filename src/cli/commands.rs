@@ -53,6 +53,8 @@ pub enum Commands {
     CheckTls,
     /// Manage models and failover chains
     Model(ModelArgs),
+    /// Manage outbound webhook callbacks
+    Webhook(WebhookArgs),
 }
 
 #[derive(Args)]
@@ -472,6 +474,48 @@ pub enum AdminCommands {
     /// Disable an admin user
     Disable {
         name: String,
+    },
+}
+
+// ── Webhook subcommands ───────────────────────────────────────────────────────
+
+#[derive(Args)]
+pub struct WebhookArgs {
+    #[command(subcommand)]
+    pub command: WebhookCommands,
+}
+
+#[derive(Subcommand)]
+pub enum WebhookCommands {
+    /// List all configured webhooks
+    List,
+    /// Add a new webhook
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = "completion")]
+        events: String,
+        #[arg(long)]
+        secret_header_name: Option<String>,
+        #[arg(long)]
+        secret_header_value: Option<String>,
+    },
+    /// Delete a webhook by ID
+    Delete {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Enable a webhook by ID
+    Enable {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Disable a webhook by ID
+    Disable {
+        #[arg(long)]
+        id: i64,
     },
 }
 

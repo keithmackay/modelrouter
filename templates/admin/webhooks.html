@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Webhooks — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Webhook Callbacks</h1>
+
+<div class="alert alert-warning" style="margin-bottom:1.5rem;">
+  <strong>Note:</strong> Webhook changes (add, delete, enable/disable) take effect after a server restart.
+</div>
+
+<form action="/admin/webhooks" method="POST"
+      style="background:#fff;border-radius:6px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:2rem;">
+  <h2 style="font-size:1.1rem;margin-bottom:1rem;">Add Webhook</h2>
+  <div style="display:flex;gap:0.75rem;align-items:flex-end;flex-wrap:wrap;">
+    <div>
+      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name *</label>
+      <input type="text" name="name" required placeholder="my-webhook"
+             style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:160px;">
+    </div>
+    <div>
+      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">URL *</label>
+      <input type="url" name="url" required placeholder="https://example.com/hook"
+             style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
+    </div>
+    <div>
+      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Events</label>
+      <input type="text" name="events" placeholder="completion"
+             style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:140px;">
+      <div style="font-size:0.75rem;color:#777;margin-top:0.2rem;">comma-separated or * for all</div>
+    </div>
+    <div>
+      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Secret Header Name</label>
+      <input type="text" name="secret_header_name" placeholder="X-Webhook-Secret"
+             style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:180px;">
+    </div>
+    <div>
+      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Secret Header Value</label>
+      <input type="password" name="secret_header_value" placeholder=""
+             style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:180px;">
+    </div>
+    <button type="submit" class="btn btn-success">Add Webhook</button>
+  </div>
+</form>
+
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Name</th>
+      <th>URL</th>
+      <th>Events</th>
+      <th>Secret Header</th>
+      <th>Status</th>
+      <th>Created</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for w in webhooks %}
+    <tr id="webhook-row-{{ w.id }}">
+      <td>{{ w.id }}</td>
+      <td>{{ w.name }}</td>
+      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+        <a href="{{ w.url }}" target="_blank" rel="noopener">{{ w.url }}</a>
+      </td>
+      <td><code>{{ w.events }}</code></td>
+      <td>{{ w.secret_header_name | default(value="—") }}</td>
+      <td>
+        {% if w.enabled %}
+          <span class="tag tag-enabled">Enabled</span>
+        {% else %}
+          <span class="tag tag-disabled">Disabled</span>
+        {% endif %}
+      </td>
+      <td>{{ w.created_at }}</td>
+      <td style="white-space:nowrap;">
+        <form action="/admin/webhooks/{{ w.id }}/delete" method="POST" style="display:inline;">
+          <button type="submit" class="btn btn-danger" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+            onclick="return confirm('Delete this webhook?')">Delete</button>
+        </form>
+        {% if w.enabled %}
+          <form action="/admin/webhooks/{{ w.id }}/disable" method="POST" style="display:inline;">
+            <button type="submit" class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem">Disable</button>
+          </form>
+        {% else %}
+          <form action="/admin/webhooks/{{ w.id }}/enable" method="POST" style="display:inline;">
+            <button type="submit" class="btn btn-success" style="font-size:0.8rem;padding:0.25rem 0.5rem">Enable</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" style="color:#999;font-style:italic;">No webhooks registered yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

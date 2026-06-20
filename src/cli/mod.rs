@@ -281,6 +281,12 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             let oidc_state = Arc::new(crate::api::admin::oidc::OidcStateStore::new());
 
+            // Load DB webhooks before moving `db` into AppState
+            let db_webhooks: Vec<crate::db::repositories::webhook_callbacks::WebhookCallback> = {
+                use crate::db::repositories::webhook_callbacks::WebhookCallbackRepository;
+                db.list_enabled_webhooks().await.unwrap_or_default()
+            };
+
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
                 live_settings: live_settings.clone(),
@@ -311,6 +317,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     if let Some(cfg) = settings.callbacks.langsmith.clone() {
                         backends.push(Box::new(crate::callbacks::langsmith::LangSmithBackend::new(cfg)));
+                    }
+                    // Load DB-registered webhooks
+                    for row in db_webhooks {
+                        let events: Vec<String> = serde_json::from_str(&row.events).unwrap_or_default();
+                        backends.push(Box::new(crate::callbacks::webhook::WebhookBackend::new(
+                            crate::callbacks::webhook::WebhookBackendConfig {
+                                name: row.name,
+                                url: row.url,
+                                events,
+                                secret_header_name: row.secret_header_name,
+                                secret_header_value: row.secret_header_value,
+                            },
+                        )));
                     }
                     Arc::new(crate::callbacks::CallbackDispatcher::new(backends))
                 },
@@ -1350,6 +1369,65 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             if any_failed {
                 std::process::exit(1);
+            }
+        }
+        Commands::Webhook(webhook_args) => {
+            use crate::db::repositories::webhook_callbacks::{NewWebhookCallback, WebhookCallbackRepository};
+            use commands::WebhookCommands;
+
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            match webhook_args.command {
+                WebhookCommands::List => {
+                    let rows = db.list_webhooks().await?;
+                    println!("{:>4}  {:20}  {:8}  {:50}  {}",
+                        "ID", "Name", "Status", "URL", "Events");
+                    for w in rows {
+                        println!("{:>4}  {:20}  {:8}  {:50}  {}",
+                            w.id,
+                            w.name,
+                            if w.enabled { "enabled" } else { "disabled" },
+                            w.url,
+                            w.events,
+                        );
+                    }
+                }
+                WebhookCommands::Add { name, url, events, secret_header_name, secret_header_value } => {
+                    let events_json = if events.starts_with('[') {
+                        events
+                    } else {
+                        let parts: Vec<String> = events.split(',')
+                            .map(|e| format!("\"{}\"", e.trim()))
+                            .collect();
+                        format!("[{}]", parts.join(","))
+                    };
+                    let w = db.create_webhook(NewWebhookCallback {
+                        name,
+                        url,
+                        events: events_json,
+                        secret_header_name,
+                        secret_header_value,
+                    }).await?;
+                    println!("Created webhook id={} name={} url={}", w.id, w.name, w.url);
+                    println!("Restart the server for this webhook to take effect.");
+                }
+                WebhookCommands::Delete { id } => {
+                    db.delete_webhook(id).await?;
+                    println!("Deleted webhook id={}", id);
+                    println!("Restart the server for this change to take effect.");
+                }
+                WebhookCommands::Enable { id } => {
+                    db.set_webhook_enabled(id, true).await?;
+                    println!("Enabled webhook id={}", id);
+                    println!("Restart the server for this change to take effect.");
+                }
+                WebhookCommands::Disable { id } => {
+                    db.set_webhook_enabled(id, false).await?;
+                    println!("Disabled webhook id={}", id);
+                    println!("Restart the server for this change to take effect.");
+                }
             }
         }
     }
