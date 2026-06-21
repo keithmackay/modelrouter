@@ -389,6 +389,10 @@ pub enum KeyCommands {
         /// Email address (reserved for future use — key will be printed to stdout)
         #[arg(long)]
         email: Option<String>,
+        /// Synthetic session ID window in seconds (default: 28800 = 8 hours).
+        /// Used by request.pre hooks to bucket opaque clients like Claude Code.
+        #[arg(long)]
+        session_window: Option<i64>,
     },
     /// List API keys
     List {

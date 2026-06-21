@@ -517,6 +517,7 @@ pub struct CreateKeyForm {
     pub project: String,
     pub label: String,
     pub email: Option<String>,
+    pub session_window_secs: Option<i64>,
 }
 
 fn he(s: &str) -> String {
@@ -825,6 +826,7 @@ pub async fn post_create_key(
         label: label.clone(),
         expires_at: None,
         project: project.clone(),
+        session_window_secs: form.session_window_secs,
     })
     .await.map_err(|_| DashboardError::Internal)?;
 
@@ -944,7 +946,7 @@ pub async fn post_rotate_key(
     let all = state.db.list_all_api_keys().await.map_err(|_| DashboardError::Internal)?;
     let old_key = all.iter().find(|k| k.id == id)
         .ok_or_else(|| DashboardError::NotFound(format!("key {id} not found")))?;
-    let (user_id, project, label) = (old_key.user_id, old_key.project.clone(), old_key.label.clone());
+    let (user_id, project, label, session_window_secs) = (old_key.user_id, old_key.project.clone(), old_key.label.clone(), old_key.session_window_secs);
 
     // Disable all currently active keys for this group, then create a new one
     let group_keys = state.db.list_keys_for_group(user_id, project.as_deref())
@@ -956,7 +958,7 @@ pub async fn post_rotate_key(
     let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let key_hash = hash_token(&raw_key);
     let new_key = state.db.create_api_key(NewApiKey {
-        user_id, key_hash, label, expires_at: None, project: project.clone(),
+        user_id, key_hash, label, expires_at: None, project: project.clone(), session_window_secs,
     }).await.map_err(|_| DashboardError::Internal)?;
 
     audit(&state.db, Some(session.0.sub), &session.0.name, "key.rotate",

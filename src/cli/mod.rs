@@ -459,6 +459,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         label: Some("initial".to_string()),
                         expires_at: None,
                         project: None,
+                        session_window_secs: None,
                     }).await?;
 
                     println!("Created user '{}' (id={})", user.name, user.id);
@@ -509,6 +510,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         label: Some("cli-rotate".to_string()),
                         expires_at: None,
                         project: None,
+                        session_window_secs: None,
                     }).await?;
                     println!("New key for {}: {}", user.name, new_key);
                 }
@@ -1120,7 +1122,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::db::migrations::run_migrations(&db.pool).await?;
 
             match key_args.command {
-                KeyCommands::Create { user, project, label, email: _ } => {
+                KeyCommands::Create { user, project, label, email: _, session_window } => {
                     use crate::api::auth::hash_token;
 
                     // Find or create user
@@ -1144,6 +1146,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         label,
                         expires_at: None,
                         project: Some(project.clone()),
+                        session_window_secs: session_window,
                     }).await?;
 
                     println!("Created key for '{}' / project '{}'", user, project);
@@ -1191,6 +1194,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         anyhow::bail!("No key found for user '{}' / project '{}'", user, project);
                     }
                     let label = group_keys.first().and_then(|k| k.label.clone());
+                    let session_window_secs = group_keys.first().and_then(|k| k.session_window_secs);
 
                     // Disable all active keys in this group
                     for k in group_keys.iter().filter(|k| k.enabled) {
@@ -1204,6 +1208,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         label,
                         expires_at: None,
                         project: Some(project.clone()),
+                        session_window_secs,
                     }).await?;
 
                     println!("Rotated key for '{}' / project '{}'", user, project);

@@ -170,6 +170,14 @@ async fn chat_completions_inner(
         }
     }
 
+    // Inject per-key metadata for pipeline hooks before running them
+    let mut body = body;
+    let session_window = user.session_window_secs.unwrap_or(28800);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("_mr_session_window_secs".to_string(), serde_json::json!(session_window));
+    }
+    let body = body;
+
     // Run pre_request pipeline hooks (may mutate body)
     let body = crate::hooks::pipeline::run_pre_request(
         &state.settings.hooks.pipeline,

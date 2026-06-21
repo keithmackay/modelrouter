@@ -27,6 +27,10 @@
         <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Email</label>
         <input type="email" name="email" placeholder="user@example.com" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
     </div>
+    <div>
+        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Session Window (secs)</label>
+        <input type="number" name="session_window_secs" placeholder="28800" min="60" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:8rem;" title="Synthetic session ID window for opaque clients (e.g. Claude Code). Default: 28800 = 8 hrs.">
+    </div>
     <button type="submit" class="btn btn-success">Create Key</button>
 </form>
 <div id="key-form-message" style="margin-bottom:1rem;"></div>

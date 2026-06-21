@@ -465,6 +465,7 @@ pub async fn list_user_api_keys(
 pub struct CreateApiKeyRequest {
     pub label: Option<String>,
     pub project: Option<String>,
+    pub session_window_secs: Option<i64>,
 }
 
 pub async fn create_user_api_key(
@@ -485,6 +486,7 @@ pub async fn create_user_api_key(
         label: body.label,
         expires_at: None,
         project: body.project,
+        session_window_secs: body.session_window_secs,
     })
     .await
     .map_err(|_| ApiError::Internal)?;

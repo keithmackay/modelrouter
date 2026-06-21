@@ -29,6 +29,7 @@ impl From<UserRow> for User {
             api_key_id: None,
             spend_reset_at: r.spend_reset_at,
             api_key_project: None,
+            session_window_secs: None,
         }
     }
 }

@@ -59,6 +59,7 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             }
             user.api_key_id = Some(api_key.id);
             user.api_key_project = api_key.project.clone();
+            user.session_window_secs = api_key.session_window_secs;
             return Ok(AuthenticatedUser(user));
         }
 

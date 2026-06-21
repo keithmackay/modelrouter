@@ -50,6 +50,7 @@ mod tests {
             api_key_id: None,
             spend_reset_at: None,
             api_key_project: tag.map(str::to_string),
+            session_window_secs: None,
         }
     }
 

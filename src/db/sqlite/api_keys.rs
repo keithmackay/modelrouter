@@ -3,7 +3,7 @@ use crate::db::models::{ApiKey, NewApiKey};
 use crate::db::repositories::api_keys::ApiKeyRepository;
 use super::{SqliteDb, now_utc};
 
-const SELECT: &str = "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at FROM api_keys";
+const SELECT: &str = "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at, session_window_secs FROM api_keys";
 
 #[derive(sqlx::FromRow)]
 struct ApiKeyRow {
@@ -19,6 +19,8 @@ struct ApiKeyRow {
     project: Option<String>,
     #[sqlx(default)]
     disabled_at: Option<String>,
+    #[sqlx(default)]
+    session_window_secs: Option<i64>,
 }
 
 impl From<ApiKeyRow> for ApiKey {
@@ -33,6 +35,7 @@ impl From<ApiKeyRow> for ApiKey {
             expires_at: r.expires_at,
             project: r.project,
             disabled_at: r.disabled_at,
+            session_window_secs: r.session_window_secs,
         }
     }
 }
@@ -62,7 +65,7 @@ impl ApiKeyRepository for SqliteDb {
     async fn create_api_key(&self, key: NewApiKey) -> anyhow::Result<ApiKey> {
         let now = now_utc();
         let result = sqlx::query(
-            "INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, project) VALUES (?, ?, ?, 1, ?, ?, ?)"
+            "INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, project, session_window_secs) VALUES (?, ?, ?, 1, ?, ?, ?, ?)"
         )
         .bind(key.user_id)
         .bind(&key.key_hash)
@@ -70,6 +73,7 @@ impl ApiKeyRepository for SqliteDb {
         .bind(&now)
         .bind(&key.expires_at)
         .bind(&key.project)
+        .bind(key.session_window_secs)
         .execute(&self.pool)
         .await?;
 

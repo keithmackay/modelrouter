@@ -5,7 +5,7 @@ use crate::db::models::{ApiKey, NewApiKey};
 use crate::db::repositories::api_keys::ApiKeyRepository;
 use super::{PostgresDb, now_utc};
 
-const SELECT: &str = "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at FROM api_keys";
+const SELECT: &str = "SELECT id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at, session_window_secs FROM api_keys";
 
 /// Intermediate row type for Postgres BOOLEAN → bool mapping
 #[derive(sqlx::FromRow)]
@@ -19,6 +19,8 @@ struct ApiKeyRow {
     expires_at: Option<String>,
     project: Option<String>,
     disabled_at: Option<String>,
+    #[sqlx(default)]
+    session_window_secs: Option<i64>,
 }
 
 impl From<ApiKeyRow> for ApiKey {
@@ -33,6 +35,7 @@ impl From<ApiKeyRow> for ApiKey {
             expires_at: r.expires_at,
             project: r.project,
             disabled_at: r.disabled_at,
+            session_window_secs: r.session_window_secs,
         }
     }
 }
@@ -62,9 +65,9 @@ impl ApiKeyRepository for PostgresDb {
     async fn create_api_key(&self, key: NewApiKey) -> anyhow::Result<ApiKey> {
         let now = now_utc();
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            r#"INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, project)
-               VALUES ($1, $2, $3, true, $4, $5, $6)
-               RETURNING id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at"#
+            r#"INSERT INTO api_keys (user_id, key_hash, label, enabled, created_at, expires_at, project, session_window_secs)
+               VALUES ($1, $2, $3, true, $4, $5, $6, $7)
+               RETURNING id, user_id, key_hash, label, enabled, created_at, expires_at, project, disabled_at, session_window_secs"#
         )
         .bind(key.user_id)
         .bind(&key.key_hash)
@@ -72,6 +75,7 @@ impl ApiKeyRepository for PostgresDb {
         .bind(&now)
         .bind(&key.expires_at)
         .bind(&key.project)
+        .bind(key.session_window_secs)
         .fetch_one(&self.pool)
         .await?;
         Ok(ApiKey::from(row))

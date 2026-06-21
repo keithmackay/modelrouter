@@ -17,6 +17,9 @@ pub struct User {
     /// Project from the authenticating API key. Set in memory by auth extractor.
     #[sqlx(default)]
     pub api_key_project: Option<String>,
+    /// Per-key synthetic session window in seconds. Set in memory by auth extractor.
+    #[sqlx(default)]
+    pub session_window_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +36,8 @@ pub struct ApiKey {
     pub project: Option<String>,
     /// RFC3339 UTC timestamp of when the key was explicitly disabled via admin UI.
     pub disabled_at: Option<String>,
+    /// Synthetic session ID window in seconds. None = server default (28800 = 8 hours).
+    pub session_window_secs: Option<i64>,
 }
 
 impl ApiKey {
@@ -56,6 +61,8 @@ pub struct NewApiKey {
     pub label: Option<String>,
     pub expires_at: Option<String>,
     pub project: Option<String>,
+    /// Synthetic session ID window in seconds. None = server default (28800 = 8 hours).
+    pub session_window_secs: Option<i64>,
 }
 
 #[derive(Debug)]
