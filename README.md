@@ -119,7 +119,10 @@ Tools like Claude Code or Codex do not include `session_id` in their requests. T
 import json, sys, time, hashlib
 
 body = json.load(sys.stdin)
-bucket = int(time.time()) // 28800  # 8-hour window — controls max session ID age, not TTL
+# _mr_session_window_secs is injected by modelrouter from the key's configured value.
+# Default is 28800 (8 hours). Override per key via CLI or admin UI.
+window = body.get("_mr_session_window_secs", 28800)
+bucket = int(time.time()) // window
 api_key_id = body.get("_mr_api_key_id", "default")
 body.setdefault("session_id", hashlib.sha256(f"{api_key_id}:{bucket}".encode()).hexdigest()[:16])
 json.dump(body, sys.stdout)
@@ -136,6 +139,23 @@ capabilities = ["mutate_request"]
 timeout_secs = 1
 fail_open    = true
 ```
+
+The window controls the maximum age of a synthetic session ID — not the affinity TTL, which refreshes on every request. Choose a window that matches the typical session duration for each project:
+
+| Use case | Recommended window |
+|---|---|
+| Raw Python / notebook sessions | `1800` (30 min) |
+| Claude Code / Codex agentic loops | `28800` (8 hours, default) |
+| Long-running overnight jobs | `86400` (24 hours) |
+
+Set the window when creating a key:
+
+```bash
+modelrouter key create --user alice --project codex-agent --session-window 28800
+modelrouter key create --user alice --project notebook-dev --session-window 1800
+```
+
+Or in the admin dashboard under **Keys → Session Window (secs)**. The value is preserved when a key is rotated.
 
 ---
 
