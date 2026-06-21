@@ -503,6 +503,7 @@ struct KeyView {
     id: i64,
     user_id: i64,
     user_name: String,
+    user_email: Option<String>,
     project: Option<String>,
     label: Option<String>,
     enabled: bool,
@@ -586,6 +587,33 @@ fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_h
 
     let raw_key_html = if let Some(raw) = &view.raw_key {
         let raw_e = he(raw);
+        let mailto_html = if let Some(ref email) = view.user_email {
+            let subject = urlencoding::encode("Your ModelRouter API Key");
+            let body_plain = format!(
+                "Hi {name},\n\nYour ModelRouter API key has been issued. \
+                Please keep it safe — it will not be shown again.\n\n\
+                API Key: {key}\n\n\
+                Usage:\n  Authorization: Bearer {key}\n\n\
+                Example (curl):\n  \
+                curl -H \"Authorization: Bearer {key}\" \\\n  \
+                     -H \"Content-Type: application/json\" \\\n  \
+                     -d '{{\"model\":\"your-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}' \\\n  \
+                     http://your-modelrouter-host/v1/chat/completions\n\n\
+                If you have any questions, reply to this email.\n",
+                name = view.user_name,
+                key = raw,
+            );
+            let body_enc = urlencoding::encode(&body_plain);
+            let email_e = he(email);
+            format!(
+                "<a href=\"mailto:{email_e}?subject={subject}&body={body_enc}\" \
+                style=\"background:none;border:1px solid #aaa;border-radius:3px;\
+                padding:0.1rem 0.4rem;cursor:pointer;font-size:0.85rem;color:#555;\
+                text-decoration:none;\" title=\"Email key to {email_e}\">✉</a>",
+            )
+        } else {
+            String::new()
+        };
         format!(
             "<br><span style=\"display:inline-flex;align-items:center;gap:0.4rem;margin-top:0.4rem;\">\
             <code style=\"color:green;font-family:monospace;font-size:0.85rem;background:#f0fff0;\
@@ -594,7 +622,7 @@ fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_h
             onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{var b=this;\
             b.textContent='✓';setTimeout(function(){{b.textContent='⧉'}},1500)}}.bind(this))\" \
             style=\"background:none;border:1px solid #aaa;border-radius:3px;padding:0.1rem 0.35rem;\
-            cursor:pointer;font-size:0.85rem;color:#555;\">⧉</button></span>"
+            cursor:pointer;font-size:0.85rem;color:#555;\">⧉</button>{mailto_html}</span>"
         )
     } else {
         String::new()
@@ -637,12 +665,13 @@ fn key_sub_row_html(view: &KeyView, group_id: &str, display: &str) -> String {
     )
 }
 
-/// Build a KeyView from an ApiKey + user_name.
-fn to_key_view(k: &crate::db::models::ApiKey, user_name: String) -> KeyView {
+/// Build a KeyView from an ApiKey + user_name + user_email.
+fn to_key_view(k: &crate::db::models::ApiKey, user_name: String, user_email: Option<String>) -> KeyView {
     KeyView {
         id: k.id,
         user_id: k.user_id,
         user_name,
+        user_email,
         project: k.project.clone(),
         label: k.label.clone(),
         enabled: k.enabled,
@@ -666,15 +695,18 @@ async fn render_group(
         return Ok(String::new());
     }
     let users = UserRepository::list(db).await.map_err(|_| DashboardError::Internal)?;
-    let user_map: std::collections::HashMap<i64, String> =
+    let user_name_map: std::collections::HashMap<i64, String> =
         users.iter().map(|u| (u.id, u.name.clone())).collect();
-    let get_name = |uid: i64| user_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+    let user_email_map: std::collections::HashMap<i64, Option<String>> =
+        users.iter().map(|u| (u.id, u.email.clone())).collect();
+    let get_name = |uid: i64| user_name_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+    let get_email = |uid: i64| user_email_map.get(&uid).cloned().flatten();
 
     let active = group_keys.iter().find(|k| k.enabled)
-        .map(|k| to_key_view(k, get_name(k.user_id)));
+        .map(|k| to_key_view(k, get_name(k.user_id), get_email(k.user_id)));
     let disabled_views: Vec<KeyView> = group_keys.iter()
         .filter(|k| !k.enabled)
-        .map(|k| to_key_view(k, get_name(k.user_id)))
+        .map(|k| to_key_view(k, get_name(k.user_id), get_email(k.user_id)))
         .collect();
 
     let group_id = active.as_ref().map(|k| k.id)
@@ -695,8 +727,10 @@ pub async fn get_keys(
     let users = UserRepository::list(&*state.db)
         .await.map_err(|_| DashboardError::Internal)?;
 
-    let user_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
-    let get_name = |uid: i64| user_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+    let user_name_map: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let user_email_map: HashMap<i64, Option<String>> = users.iter().map(|u| (u.id, u.email.clone())).collect();
+    let get_name = |uid: i64| user_name_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+    let get_email = |uid: i64| user_email_map.get(&uid).cloned().flatten();
 
     // Collect datalist values
     let mut user_names: Vec<String> = users.iter().map(|u| u.name.clone()).collect();
@@ -717,10 +751,10 @@ pub async fn get_keys(
     let groups_html: String = seen_groups.iter().filter_map(|gk| {
         let group_keys = &group_map[gk];
         let active = group_keys.iter().find(|k| k.enabled)
-            .map(|k| to_key_view(k, get_name(k.user_id)));
+            .map(|k| to_key_view(k, get_name(k.user_id), get_email(k.user_id)));
         let disabled_views: Vec<KeyView> = group_keys.iter()
             .filter(|k| !k.enabled)
-            .map(|k| to_key_view(k, get_name(k.user_id)))
+            .map(|k| to_key_view(k, get_name(k.user_id), get_email(k.user_id)))
             .collect();
         let group_id = active.as_ref().map(|k| k.id)
             .or_else(|| disabled_views.first().map(|k| k.id))?;
@@ -842,7 +876,7 @@ pub async fn post_create_key(
     .await;
 
     // Render the new group tbody (no raw_key in table row)
-    let view = to_key_view(&new_key, user.name.clone());
+    let view = to_key_view(&new_key, user.name.clone(), user.email.clone());
     let tbody = key_group_html(view.id, Some(&view), &[], false);
 
     // Show the one-time raw key in the message area, inject the group into the table via script
@@ -971,19 +1005,22 @@ pub async fn post_rotate_key(
         .await.map_err(|_| DashboardError::Internal)?;
     use crate::db::repositories::users::UserRepository;
     let users = UserRepository::list(&*state.db).await.map_err(|_| DashboardError::Internal)?;
-    let user_map: std::collections::HashMap<i64, String> =
+    let user_name_map: std::collections::HashMap<i64, String> =
         users.iter().map(|u| (u.id, u.name.clone())).collect();
-    let get_name = |uid: i64| user_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+    let user_email_map: std::collections::HashMap<i64, Option<String>> =
+        users.iter().map(|u| (u.id, u.email.clone())).collect();
+    let get_name = |uid: i64| user_name_map.get(&uid).cloned().unwrap_or_else(|| format!("user:{uid}"));
+    let get_email = |uid: i64| user_email_map.get(&uid).cloned().flatten();
 
     let active_view = group_keys.iter().find(|k| k.enabled).map(|k| {
-        let mut v = to_key_view(k, get_name(k.user_id));
-        // Show raw key on the new active row
+        let mut v = to_key_view(k, get_name(k.user_id), get_email(k.user_id));
+        // Show raw key on the new active row so the mailto link can be built
         v.raw_key = Some(raw_key.clone());
         v
     });
     let disabled_views: Vec<KeyView> = group_keys.iter()
         .filter(|k| !k.enabled)
-        .map(|k| to_key_view(k, get_name(k.user_id)))
+        .map(|k| to_key_view(k, get_name(k.user_id), get_email(k.user_id)))
         .collect();
 
     let group_id = active_view.as_ref().map(|k| k.id).unwrap_or(disabled_views[0].id);
