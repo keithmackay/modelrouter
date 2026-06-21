@@ -527,8 +527,7 @@ Tools like Claude Code or Codex do not include `session_id` in their requests. T
 import json, sys, time, hashlib
 
 body = json.load(sys.stdin)
-# 30-minute bucket keyed by API key tag (injected by modelrouter as x-api-key-id)
-bucket = int(time.time()) // 1800
+bucket = int(time.time()) // 28800  # 8-hour window
 api_key_id = body.get("_mr_api_key_id", "default")  # set by pre-request hook context
 body.setdefault("session_id", hashlib.sha256(f"{api_key_id}:{bucket}".encode()).hexdigest()[:16])
 json.dump(body, sys.stdout)

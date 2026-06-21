@@ -119,7 +119,7 @@ Tools like Claude Code or Codex do not include `session_id` in their requests. T
 import json, sys, time, hashlib
 
 body = json.load(sys.stdin)
-bucket = int(time.time()) // 1800  # 30-minute window
+bucket = int(time.time()) // 28800  # 8-hour window — controls max session ID age, not TTL
 api_key_id = body.get("_mr_api_key_id", "default")
 body.setdefault("session_id", hashlib.sha256(f"{api_key_id}:{bucket}".encode()).hexdigest()[:16])
 json.dump(body, sys.stdout)
