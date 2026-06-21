@@ -12,6 +12,7 @@ modelrouter has two hook systems: **lifecycle hooks** for fire-and-forget observ
 - [Security Model](#security-model)
 - [Configuration Reference](#configuration-reference)
 - [Example: Headroom Context Compression](#example-headroom-context-compression)
+  - [Why CCR is disabled — and what it would take to enable it](#why-ccr-is-disabled--and-what-it-would-take-to-enable-it)
 - [Example: Not Diamond ML Router](#example-not-diamond-ml-router)
 - [Example: Synthetic Session IDs for Opaque Clients](#example-synthetic-session-ids-for-opaque-clients)
 
