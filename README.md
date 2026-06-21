@@ -34,6 +34,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Multi-scope budget enforcement** — set monthly or fixed date-range limits at the global (org-wide), project, user, or group level; any limit hit blocks the request before it reaches the upstream
 - **Admin dashboard** — web UI at `/admin` with usage stats, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
 - **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion; wire Datadog, Slack, or any HTTP endpoint; takes effect on next restart
+- **Session stickiness** — include `session_id` in any request to pin the session to the winning provider; automatically re-pins on model change; opt out per-request with `X-Session-Lb: true`
 - **Prompt logging control** — set `X-No-Log: true` on any request to skip prompt history and callback dispatch while preserving cost tracking for budget enforcement
 - **Chinese model providers** — built-in pricing for DeepSeek, Qwen (Tongyi), and Doubao; all are OpenAI-compatible and configured as standard providers
 - **Declarative policy engine** — TOML-configured rules that match users by project, group, or ID and enforce model allow-lists and budgets without touching the database
@@ -43,6 +44,98 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Hook system** — run shell scripts or HTTP webhooks at lifecycle events and in the request pipeline; grant capabilities per-user via `hook_permissions`
 - **Feature-flagged optional components** — `--features postgres` for Postgres backend, `--features otel` for full OpenTelemetry observability (traces, metrics, logs via OTLP)
 - **Single static binary** — SQLite bundled, no runtime dependencies; ships as a distroless Docker image
+
+---
+
+## Session Stickiness
+
+When a request includes a `session_id` field, modelrouter pins that session to the upstream provider selected on the first request. Every subsequent request with the same `session_id` goes to the same provider — even if a load balancer pool is configured that would otherwise distribute traffic.
+
+```json
+{
+  "model": "claude-opus-4-5",
+  "session_id": "user-42-conv-891",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+Pins expire after 30 minutes of inactivity and are stored in memory (not persisted across restarts).
+
+### Why stickiness matters
+
+Many providers offer prompt caching: if the same long prefix (system prompt, document, conversation history) appears in consecutive requests, the provider reuses its cached computation and charges a fraction of the normal input rate. Caches are local to a specific provider endpoint. Routing turn 3 of a conversation to a different provider than turns 1 and 2 produces a cache miss and charges full price.
+
+Stickiness ensures that a session's accumulated context always lands on the same provider, keeping the cache warm.
+
+### Model changes mid-session
+
+If a request in a pinned session specifies a different model, modelrouter updates the pin rather than ignoring the change:
+
+| Change | Behaviour |
+|---|---|
+| Same model, same provider | Use pin, refresh TTL |
+| Different model, **same provider** | Keep provider pin, use new model, update pin |
+| Different model, **different provider** | Clear old pin, route normally, store new pin |
+
+Switching between two Anthropic models mid-session keeps traffic on Anthropic (preserving the provider relationship and any cached prefix), while switching from Claude to GPT-4o routes to OpenAI and starts a fresh pin.
+
+Model comparisons use the **resolved** canonical model after alias and shortcut expansion — switching from `"opus"` to `"anthropic/claude-opus-4-5"` where `opus` is an alias is recognised as the same model and does not update the pin.
+
+### For Developers
+
+**When to include `session_id`:**
+- Multi-turn conversations where context accumulates across turns
+- Any use case with a long system prompt or document that benefits from provider-side caching
+- Agentic loops where the same task context is reused across many tool calls
+
+**When to omit `session_id`:**
+- Single-shot requests with no shared context
+- Batch jobs where each request is independent and load distribution matters more than caching
+- High-throughput pipelines where you want the load balancer to spread traffic freely
+
+**Opting out of stickiness for one request:**
+
+If you have a session open but a specific request is stateless and you want the load balancer to choose freely for that request, set `X-Session-Lb: true`:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer mr-yourkey" \
+  -H "X-Session-Lb: true" \
+  -d '{
+    "model": "gpt-4o",
+    "session_id": "user-42-conv-891",
+    "messages": [{"role": "user", "content": "What is 2+2?"}]
+  }'
+```
+
+The load balancer picks freely for that request, and the result becomes the new pin for the session going forward.
+
+**Synthetic session IDs for opaque clients:**
+
+Tools like Claude Code or Codex do not include `session_id` in their requests. To enable stickiness for these clients, use a `request.pre` pipeline hook to inject a synthetic `session_id` derived from the API key and a rolling time window:
+
+```python
+#!/usr/bin/env python3
+import json, sys, time, hashlib
+
+body = json.load(sys.stdin)
+bucket = int(time.time()) // 1800  # 30-minute window
+api_key_id = body.get("_mr_api_key_id", "default")
+body.setdefault("session_id", hashlib.sha256(f"{api_key_id}:{bucket}".encode()).hexdigest()[:16])
+json.dump(body, sys.stdout)
+```
+
+Configure the hook in `config.toml`:
+
+```toml
+[[hooks.pipeline]]
+name         = "synthetic-session-id"
+event        = "request.pre"
+exec         = "/usr/local/bin/mr-synthetic-session.py"
+capabilities = ["mutate_request"]
+timeout_secs = 1
+fail_open    = true
+```
 
 ---
 

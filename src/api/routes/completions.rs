@@ -194,6 +194,25 @@ async fn chat_completions_inner(
         state.router.resolve(&model)
     };
 
+    // Session stickiness — pin this session to the resolved provider
+    let (provider_name, canonical_model) = if let Some(session_id) = body["session_id"].as_str() {
+        use crate::router::session_affinity::resolve_with_pin;
+        let skip_affinity = should_skip_affinity(&headers);
+        let pin = if skip_affinity {
+            None
+        } else {
+            state.session_affinity.get(session_id)
+        };
+        let (pinned_provider, pinned_model, should_update) =
+            resolve_with_pin(pin.as_ref(), &provider_name, &canonical_model);
+        if should_update {
+            state.session_affinity.set(session_id, &pinned_provider, &pinned_model);
+        }
+        (pinned_provider, pinned_model)
+    } else {
+        (provider_name, canonical_model)
+    };
+
     let span = tracing::Span::current();
     span.record("model", canonical_model.as_str());
     span.record("provider", provider_name.as_str());
@@ -688,6 +707,14 @@ fn streaming_response(
         .unwrap()
 }
 
+pub fn should_skip_affinity(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-session-lb")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub fn should_skip_logging(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get("x-no-log")
@@ -712,6 +739,38 @@ pub fn extract_text_from_sse(chunk: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::should_skip_affinity;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn detects_x_session_lb_true() {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-lb", "true".parse().unwrap());
+        assert!(should_skip_affinity(&h));
+    }
+
+    #[test]
+    fn x_session_lb_false_is_not_skipped() {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-lb", "false".parse().unwrap());
+        assert!(!should_skip_affinity(&h));
+    }
+
+    #[test]
+    fn absent_x_session_lb_is_false() {
+        assert!(!should_skip_affinity(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn case_insensitive_true() {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-lb", "TRUE".parse().unwrap());
+        assert!(should_skip_affinity(&h));
+    }
 }
 
 #[cfg(test)]

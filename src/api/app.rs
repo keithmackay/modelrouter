@@ -78,6 +78,7 @@ pub struct AppState {
     pub circuit_breaker: Arc<crate::router::circuit_breaker::CircuitBreaker>,
     pub ip_rate_limiter: Arc<crate::api::middleware::ip_rate_limit::IpRateLimiter>,
     pub session_limiter: Arc<crate::router::session_limits::SessionLimiter>,
+    pub session_affinity: Arc<crate::router::session_affinity::SessionAffinityMap>,
     pub callbacks: Arc<crate::callbacks::CallbackDispatcher>,
     pub guardrails: Arc<crate::guardrails::GuardrailChain>,
     #[cfg(feature = "prometheus")]

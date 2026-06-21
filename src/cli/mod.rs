@@ -310,6 +310,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     settings.session_limits.tpm,
                     settings.session_limits.rpm,
                 )),
+                session_affinity: Arc::new(crate::router::session_affinity::SessionAffinityMap::new(30 * 60)),
                 callbacks: {
                     let mut backends: Vec<Box<dyn crate::callbacks::CallbackBackend>> = vec![];
                     if let Some(cfg) = settings.callbacks.langfuse.clone() {
@@ -378,6 +379,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     state.fallback.update_db_chains(db_chains);
                 }
+            }
+
+            // Background sweeper for session affinity TTL eviction
+            {
+                let affinity = state.session_affinity.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5 * 60));
+                    loop {
+                        interval.tick().await;
+                        affinity.evict_expired();
+                        tracing::debug!(active_sessions = affinity.len(), "session affinity sweep complete");
+                    }
+                });
             }
 
             #[cfg(feature = "s3-archival")]
