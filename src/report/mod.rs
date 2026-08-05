@@ -37,6 +37,10 @@ pub struct PromptRow {
     pub cost_usd: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// True when any tokens were served from the provider's prompt cache.
+    pub cached: bool,
     pub created_at: String,
 }
 
@@ -241,10 +245,12 @@ pub async fn recent_prompts(
     since: Option<&str>,
 ) -> Result<Vec<PromptRow>> {
     let since = since.unwrap_or("1970-01-01T00:00:00Z");
-    if let Some(name) = user_name {
-        let rows = sqlx::query_as::<_, (i64, String, String, String, f64, i64, i64, String)>(
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, String, String, String, f64, i64, i64, i64, i64, String)> = if let Some(name) = user_name {
+        sqlx::query_as(
             r#"SELECT p.id, u.name, p.request_model, p.routed_model,
-                      p.cost_usd, p.prompt_tokens, p.completion_tokens, p.created_at
+                      p.cost_usd, p.prompt_tokens, p.completion_tokens,
+                      p.cache_read_tokens, p.cache_write_tokens, p.created_at
                FROM prompts p
                JOIN users u ON p.user_id = u.id
                WHERE u.name = ? AND p.created_at >= ?
@@ -255,28 +261,12 @@ pub async fn recent_prompts(
         .bind(since)
         .bind(limit as i64)
         .fetch_all(pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, user_name, request_model, routed_model, cost_usd, prompt_tokens, completion_tokens, created_at)| {
-                    PromptRow {
-                        id,
-                        user_name,
-                        request_model,
-                        routed_model,
-                        cost_usd,
-                        prompt_tokens,
-                        completion_tokens,
-                        created_at,
-                    }
-                },
-            )
-            .collect())
+        .await?
     } else {
-        let rows = sqlx::query_as::<_, (i64, String, String, String, f64, i64, i64, String)>(
+        sqlx::query_as(
             r#"SELECT p.id, u.name, p.request_model, p.routed_model,
-                      p.cost_usd, p.prompt_tokens, p.completion_tokens, p.created_at
+                      p.cost_usd, p.prompt_tokens, p.completion_tokens,
+                      p.cache_read_tokens, p.cache_write_tokens, p.created_at
                FROM prompts p
                JOIN users u ON p.user_id = u.id
                WHERE p.created_at >= ?
@@ -286,25 +276,28 @@ pub async fn recent_prompts(
         .bind(since)
         .bind(limit as i64)
         .fetch_all(pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, user_name, request_model, routed_model, cost_usd, prompt_tokens, completion_tokens, created_at)| {
-                    PromptRow {
-                        id,
-                        user_name,
-                        request_model,
-                        routed_model,
-                        cost_usd,
-                        prompt_tokens,
-                        completion_tokens,
-                        created_at,
-                    }
-                },
-            )
-            .collect())
-    }
+        .await?
+    };
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, user_name, request_model, routed_model, cost_usd, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, created_at)| {
+                PromptRow {
+                    id,
+                    user_name,
+                    request_model,
+                    routed_model,
+                    cost_usd,
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    cached: cache_read_tokens > 0,
+                    created_at,
+                }
+            },
+        )
+        .collect())
 }
 
 pub async fn recent_audit(

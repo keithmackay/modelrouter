@@ -54,6 +54,8 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         content,
         prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
         finish_reason: v["stop_reason"]
             .as_str()
             .unwrap_or("end_turn")

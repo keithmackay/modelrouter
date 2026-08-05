@@ -1,0 +1,2 @@
+ALTER TABLE prompts ADD COLUMN cache_read_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE prompts ADD COLUMN cache_write_tokens BIGINT NOT NULL DEFAULT 0;

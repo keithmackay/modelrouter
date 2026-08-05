@@ -118,9 +118,13 @@ async fn responses_inner(
 
     let latency_ms = start.elapsed().as_millis() as i64;
 
-    let cost = state
-        .cost_calc
-        .calculate(&canonical_model, result.prompt_tokens, result.completion_tokens);
+    let cost = state.cost_calc.calculate_with_cache(
+        &canonical_model,
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cache_read_tokens,
+        result.cache_write_tokens,
+    );
 
     // Fire-and-forget cost logging
     let db = state.db.clone();
@@ -138,6 +142,8 @@ async fn responses_inner(
     let finish_clone = result.finish_reason.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
+    let cache_read_tokens = result.cache_read_tokens;
+    let cache_write_tokens = result.cache_write_tokens;
 
     tokio::spawn(async move {
         let prompt = NewPrompt {
@@ -151,6 +157,8 @@ async fn responses_inner(
             finish_reason: Some(finish_clone),
             prompt_tokens: prompt_tokens as i64,
             completion_tokens: completion_tokens as i64,
+            cache_read_tokens: cache_read_tokens as i64,
+            cache_write_tokens: cache_write_tokens as i64,
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),

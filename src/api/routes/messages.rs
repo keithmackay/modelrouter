@@ -20,6 +20,8 @@ async fn log_messages_cost(
     messages_json: &str,
     prompt_tokens: u32,
     completion_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
     cost: f64,
     latency_ms: i64,
 ) {
@@ -36,6 +38,8 @@ async fn log_messages_cost(
         finish_reason: None,
         prompt_tokens: prompt_tokens as i64,
         completion_tokens: completion_tokens as i64,
+        cache_read_tokens: cache_read_tokens as i64,
+        cache_write_tokens: cache_write_tokens as i64,
         cost_usd: cost,
         latency_ms: Some(latency_ms),
         tags: "[]".to_string(),
@@ -266,7 +270,7 @@ async fn anthropic_messages_inner(
             let cost = state_c.cost_calc.calculate(&canonical_s, prompt_tokens, 0);
             let latency_ms = start_s.elapsed().as_millis() as i64;
             log_messages_cost(&state_c, user_id, api_key_id_s, user_project_s, &user_name_s, &model_s, &canonical_s, &provider_s,
-                               &messages_json_s, prompt_tokens, 0, cost, latency_ms).await;
+                               &messages_json_s, prompt_tokens, 0, 0, 0, cost, latency_ms).await;
         });
 
         let response = Response::builder()
@@ -327,14 +331,24 @@ async fn anthropic_messages_inner(
     let completion_tokens = resp_json["usage"]["output_tokens"]
         .as_u64()
         .unwrap_or(0) as u32;
+    let cache_read_tokens = resp_json["usage"]["cache_read_input_tokens"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+    let cache_write_tokens = resp_json["usage"]["cache_creation_input_tokens"]
+        .as_u64()
+        .unwrap_or(0) as u32;
     let stop_reason = resp_json["stop_reason"]
         .as_str()
         .unwrap_or("end_turn")
         .to_string();
 
-    let cost = state
-        .cost_calc
-        .calculate(&canonical_model, prompt_tokens, completion_tokens);
+    let cost = state.cost_calc.calculate_with_cache(
+        &canonical_model,
+        prompt_tokens,
+        completion_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    );
 
     // Fix 1 & Fix 4: Capture user_name before spawn; use model_clone consistently (no model_c)
     let state_clone = state.clone();
@@ -364,6 +378,8 @@ async fn anthropic_messages_inner(
             finish_reason: Some(stop_reason),
             prompt_tokens: prompt_tokens as i64,
             completion_tokens: completion_tokens as i64,
+            cache_read_tokens: cache_read_tokens as i64,
+            cache_write_tokens: cache_write_tokens as i64,
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),

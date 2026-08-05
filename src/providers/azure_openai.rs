@@ -87,6 +87,14 @@ struct AzureMessage {
 struct AzureUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: AzurePromptTokensDetails,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AzurePromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[async_trait::async_trait]
@@ -125,6 +133,8 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             prompt_tokens: parsed.usage.prompt_tokens,
             completion_tokens: parsed.usage.completion_tokens,
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
+            cache_write_tokens: 0,
         })
     }
 

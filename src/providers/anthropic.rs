@@ -86,6 +86,10 @@ struct AnthropicContent {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -150,6 +154,8 @@ impl ProviderAdapter for AnthropicAdapter {
             prompt_tokens: parsed.usage.input_tokens,
             completion_tokens: parsed.usage.output_tokens,
             finish_reason: parsed.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+            cache_read_tokens: parsed.usage.cache_read_input_tokens,
+            cache_write_tokens: parsed.usage.cache_creation_input_tokens,
         })
     }
 

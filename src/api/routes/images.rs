@@ -136,6 +136,8 @@ async fn image_generations_inner(
             finish_reason: None,
             prompt_tokens: n_images,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             cost_usd: cost,
             latency_ms: None,
             tags: "[]".to_string(),

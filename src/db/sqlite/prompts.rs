@@ -12,8 +12,9 @@ impl PromptRepository for SqliteDb {
             r#"INSERT INTO prompts (
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
+                cache_read_tokens, cache_write_tokens,
                 cost_usd, latency_ms, tags, project, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -25,6 +26,8 @@ impl PromptRepository for SqliteDb {
         .bind(&prompt.finish_reason)
         .bind(prompt.prompt_tokens)
         .bind(prompt.completion_tokens)
+        .bind(prompt.cache_read_tokens)
+        .bind(prompt.cache_write_tokens)
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
         .bind(&prompt.tags)
@@ -37,6 +40,7 @@ impl PromptRepository for SqliteDb {
         let row = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts WHERE id = ?"#,
         )
@@ -50,6 +54,7 @@ impl PromptRepository for SqliteDb {
         let row = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts WHERE id = ?"#,
         )
@@ -63,6 +68,7 @@ impl PromptRepository for SqliteDb {
         let rows = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"#,
         )
@@ -77,6 +83,7 @@ impl PromptRepository for SqliteDb {
         let rows = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
         )
@@ -92,5 +99,87 @@ impl PromptRepository for SqliteDb {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::sqlite::SqliteDb;
+
+    async fn make_db() -> SqliteDb {
+        let db = SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO users (id, name, created_at) VALUES (1, 'test', '2025-01-01T00:00:00Z')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn cache_tokens_round_trip_and_flag_cached() {
+        let db = make_db().await;
+        let saved = PromptRepository::create(
+            &db,
+            NewPrompt {
+                user_id: 1,
+                session_id: None,
+                request_model: "claude-sonnet-4-6".to_string(),
+                routed_model: "anthropic/claude-sonnet-4-6".to_string(),
+                provider: "anthropic".to_string(),
+                messages: "[]".to_string(),
+                response: None,
+                finish_reason: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cache_read_tokens: 900,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                latency_ms: None,
+                tags: "[]".to_string(),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(saved.cache_read_tokens, 900);
+        assert_eq!(saved.cache_write_tokens, 0);
+        assert!(saved.is_cached());
+
+        let fetched = PromptRepository::find_by_id(&db, saved.id).await.unwrap().unwrap();
+        assert_eq!(fetched.cache_read_tokens, 900);
+        assert!(fetched.is_cached());
+    }
+
+    #[tokio::test]
+    async fn no_cache_tokens_means_not_cached() {
+        let db = make_db().await;
+        let saved = PromptRepository::create(
+            &db,
+            NewPrompt {
+                user_id: 1,
+                session_id: None,
+                request_model: "gpt-4o".to_string(),
+                routed_model: "openai/gpt-4o".to_string(),
+                provider: "openai".to_string(),
+                messages: "[]".to_string(),
+                response: None,
+                finish_reason: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                latency_ms: None,
+                tags: "[]".to_string(),
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!saved.is_cached());
     }
 }

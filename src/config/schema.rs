@@ -7,6 +7,12 @@ pub struct PricingEntry {
     pub model: String,
     pub input_per_million: f64,
     pub output_per_million: f64,
+    /// Rate for prompt-cache reads. Defaults to 10% of `input_per_million` if unset.
+    #[serde(default)]
+    pub cache_read_per_million: Option<f64>,
+    /// Rate for prompt-cache writes. Defaults to 125% of `input_per_million` if unset.
+    #[serde(default)]
+    pub cache_write_per_million: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -1057,7 +1057,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .await?;
                     print_rows(
                         &rows,
-                        &["ID", "User", "Request Model", "Routed Model", "Cost", "Created At"],
+                        &["ID", "User", "Request Model", "Routed Model", "Cost", "Cached", "Created At"],
                         |r| {
                             vec![
                                 r.id.to_string(),
@@ -1065,6 +1065,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.request_model.clone(),
                                 r.routed_model.clone(),
                                 format!("{:.2}", r.cost_usd),
+                                if r.cached { "yes".to_string() } else { "no".to_string() },
                                 r.created_at.clone(),
                             ]
                         },

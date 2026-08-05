@@ -367,9 +367,13 @@ async fn chat_completions_inner(
     };
 
     let latency_ms = start.elapsed().as_millis() as i64;
-    let cost = state
-        .cost_calc
-        .calculate(&canonical_model, result.prompt_tokens, result.completion_tokens);
+    let cost = state.cost_calc.calculate_with_cache(
+        &canonical_model,
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cache_read_tokens,
+        result.cache_write_tokens,
+    );
 
     span.record("cost.usd", cost);
     span.record("tokens.prompt", result.prompt_tokens as u64);
@@ -413,6 +417,8 @@ async fn chat_completions_inner(
     let user_name_clone = user.name.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
+    let cache_read_tokens = result.cache_read_tokens;
+    let cache_write_tokens = result.cache_write_tokens;
 
     let skip_log_clone = skip_log;
     tokio::spawn(async move {
@@ -428,6 +434,8 @@ async fn chat_completions_inner(
                 finish_reason: Some(finish_clone),
                 prompt_tokens: prompt_tokens as i64,
                 completion_tokens: completion_tokens as i64,
+                cache_read_tokens: cache_read_tokens as i64,
+                cache_write_tokens: cache_write_tokens as i64,
                 cost_usd: cost,
                 latency_ms: Some(latency_ms),
                 tags: "[]".to_string(),
@@ -594,6 +602,8 @@ fn log_streaming_request(
                             finish_reason: Some("stop".to_string()),
                             prompt_tokens: prompt_tokens as i64,
                             completion_tokens: completion_tokens as i64,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
                             cost_usd: cost,
                             latency_ms: Some(latency_ms),
                             tags: "[]".to_string(),

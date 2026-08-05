@@ -83,11 +83,14 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
     let usage = &v["usageMetadata"];
     let prompt = usage["promptTokenCount"].as_u64().unwrap_or(0) as u32;
     let completion = usage["candidatesTokenCount"].as_u64().unwrap_or(0) as u32;
+    let cache_read = usage["cachedContentTokenCount"].as_u64().unwrap_or(0) as u32;
     Ok(CompletionResult {
         content,
         prompt_tokens: prompt,
         completion_tokens: completion,
         finish_reason: map_finish_reason(finish).to_string(),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: 0,
     })
 }
 

@@ -50,6 +50,14 @@ struct OpenAIMessage {
 struct OpenAIUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: OpenAIPromptTokensDetails,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct OpenAIPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[async_trait::async_trait]
@@ -99,6 +107,8 @@ impl ProviderAdapter for OpenAICompatAdapter {
             prompt_tokens: parsed.usage.prompt_tokens,
             completion_tokens: parsed.usage.completion_tokens,
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
+            cache_write_tokens: 0,
         })
     }
 

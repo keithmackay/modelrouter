@@ -150,11 +150,22 @@ pub struct Prompt {
     pub finish_reason: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Tokens served from the provider's prompt cache (billed at a reduced rate).
+    pub cache_read_tokens: i64,
+    /// Tokens written to the provider's prompt cache on this request.
+    pub cache_write_tokens: i64,
     pub cost_usd: f64,
     pub latency_ms: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     pub created_at: String,
+}
+
+impl Prompt {
+    /// A prompt is considered "cached" if any tokens were served from cache.
+    pub fn is_cached(&self) -> bool {
+        self.cache_read_tokens > 0
+    }
 }
 
 #[derive(Debug)]
@@ -169,6 +180,8 @@ pub struct NewPrompt {
     pub finish_reason: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub cost_usd: f64,
     pub latency_ms: Option<i64>,
     pub tags: String,

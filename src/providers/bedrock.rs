@@ -185,6 +185,8 @@ impl ProviderAdapter for BedrockAdapter {
             prompt_tokens,
             completion_tokens,
             finish_reason,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         })
     }
 

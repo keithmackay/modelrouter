@@ -14,10 +14,12 @@ impl PromptRepository for PostgresDb {
             r#"INSERT INTO prompts (
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
+                cache_read_tokens, cache_write_tokens,
                 cost_usd, latency_ms, tags, project, created_at
-               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                RETURNING id, user_id, session_id, request_model, routed_model, provider,
                          messages, response, finish_reason, prompt_tokens, completion_tokens,
+                         cache_read_tokens, cache_write_tokens,
                          cost_usd, latency_ms, tags, project, created_at"#,
         )
         .bind(prompt.user_id)
@@ -30,6 +32,8 @@ impl PromptRepository for PostgresDb {
         .bind(&prompt.finish_reason)
         .bind(prompt.prompt_tokens)
         .bind(prompt.completion_tokens)
+        .bind(prompt.cache_read_tokens)
+        .bind(prompt.cache_write_tokens)
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
         .bind(&prompt.tags)
@@ -44,6 +48,7 @@ impl PromptRepository for PostgresDb {
         let row = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts WHERE id = $1"#,
         )
@@ -57,6 +62,7 @@ impl PromptRepository for PostgresDb {
         let rows = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2"#,
         )
@@ -71,6 +77,7 @@ impl PromptRepository for PostgresDb {
         let rows = sqlx::query_as::<_, Prompt>(
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
+                      cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project, created_at
                FROM prompts ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
         )

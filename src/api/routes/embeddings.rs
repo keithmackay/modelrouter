@@ -148,6 +148,8 @@ async fn embeddings_inner(
             finish_reason: None,
             prompt_tokens: prompt_tokens as i64,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),

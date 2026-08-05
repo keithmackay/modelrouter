@@ -12,12 +12,23 @@ pub struct NormalizedRequest {
     pub extra_params: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionResult {
     pub content: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub finish_reason: String,
+    /// Tokens served from the provider's prompt cache (billed at a reduced rate).
+    pub cache_read_tokens: u32,
+    /// Tokens written to the provider's prompt cache on this request (billed at a premium rate).
+    pub cache_write_tokens: u32,
+}
+
+impl CompletionResult {
+    /// A prompt is considered "cached" if any tokens were served from cache.
+    pub fn is_cached(&self) -> bool {
+        self.cache_read_tokens > 0
+    }
 }
 
 pub type SseStream = Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send>>;
