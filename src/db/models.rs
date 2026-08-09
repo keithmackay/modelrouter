@@ -158,7 +158,19 @@ pub struct Prompt {
     pub latency_ms: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
+    /// Caller-supplied correlation id for this request. See `api::attribution`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub attribution_correlation_id: Option<String>,
+    /// Caller-supplied attribution tags as a JSON object; `{}` when absent.
+    #[sqlx(default)]
+    #[serde(default = "empty_json_object")]
+    pub attribution_tags: String,
     pub created_at: String,
+}
+
+pub(crate) fn empty_json_object() -> String {
+    "{}".to_string()
 }
 
 impl Prompt {
@@ -186,6 +198,8 @@ pub struct NewPrompt {
     pub latency_ms: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
+    pub attribution_correlation_id: Option<String>,
+    pub attribution_tags: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -211,9 +225,19 @@ pub struct CostLedgerEntry {
     #[sqlx(default)]
     #[serde(default)]
     pub saved_usd: f64,
+    /// Caller-supplied correlation id, denormalised from the request so cost
+    /// queries never need to join back through `prompts` — which matters
+    /// because skip-log and cache-hit rows have `prompt_id IS NULL`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub attribution_correlation_id: Option<String>,
+    /// Caller-supplied attribution tags as a JSON object; `{}` when absent.
+    #[sqlx(default)]
+    #[serde(default = "empty_json_object")]
+    pub attribution_tags: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NewCostLedgerEntry {
     pub user_id: i64,
     pub prompt_id: Option<i64>,
@@ -224,6 +248,8 @@ pub struct NewCostLedgerEntry {
     pub tokens_out: i64,
     pub cost_usd: f64,
     pub api_key_id: Option<i64>,
+    pub attribution_correlation_id: Option<String>,
+    pub attribution_tags: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
