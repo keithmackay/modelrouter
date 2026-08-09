@@ -21,6 +21,12 @@ pub struct ReportsQuery {
     pub group: String,
     #[serde(default = "default_window")]
     pub window: String,
+    /// Attribution tag key; empty means the correlation id. Paired with `value`.
+    #[serde(default)]
+    pub key: String,
+    /// Attribution value to filter on; empty means "no attribution filter".
+    #[serde(default)]
+    pub value: String,
 }
 
 fn default_window() -> String { "monthly".to_string() }
@@ -60,6 +66,14 @@ pub async fn get_reports(
         .collect();
     let group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
 
+    // Attribution pickers: tag keys, plus the values available for whichever
+    // dimension is selected (correlation ids when no tag key is chosen).
+    let attr_keys = CostRepository::distinct_attribution_tag_keys(&*state.db)
+        .await.map_err(|_| DashboardError::Internal)?;
+    let attr_key_opt = if q.key.is_empty() { None } else { Some(q.key.as_str()) };
+    let attr_values = CostRepository::distinct_attribution_values(&*state.db, attr_key_opt, 500)
+        .await.map_err(|_| DashboardError::Internal)?;
+
     super::dashboard::render("reports.html", minijinja::context! {
         user_opts => user_opts,
         projects => projects,
@@ -70,6 +84,10 @@ pub async fn get_reports(
         sel_model => q.model,
         sel_group => q.group,
         sel_window => q.window,
+        attr_keys => attr_keys,
+        attr_values => attr_values,
+        sel_attr_key => q.key,
+        sel_attr_value => q.value,
     })
 }
 
@@ -78,6 +96,13 @@ pub async fn get_reports_panels(
     _session: DashboardSession,
     Query(q): Query<ReportsQuery>,
 ) -> Result<Html<String>, DashboardError> {
+    // An attribution filter replaces the panel body: the user/model/project
+    // aggregates below cannot express it, and showing both would invite reading
+    // unfiltered numbers as if they were attributed.
+    if let Some(filter) = attribution_filter(&q)? {
+        return attribution_panels(&state, &filter, &q.window).await;
+    }
+
     let (start, end) = window_range(&q.window);
 
     // Resolve group filter → member user IDs
@@ -242,4 +267,60 @@ pub async fn get_reports_panels(
         burndown_json => burndown_json,
         window => q.window,
     })
+}
+
+// ── Attribution filter (issue #13) ────────────────────────────────────────────
+
+/// The attribution filter this query selects, if any.
+fn attribution_filter(
+    q: &ReportsQuery,
+) -> Result<Option<crate::db::repositories::costs::AttributionFilter>, DashboardError> {
+    let aq = crate::api::admin::attribution::AttributionQuery {
+        key: q.key.clone(),
+        value: q.value.clone(),
+        window: q.window.clone(),
+    };
+    aq.filter()
+        .map_err(|e| DashboardError::BadRequest(e.to_string()))
+}
+
+/// Render the attributed-usage panel body.
+async fn attribution_panels(
+    state: &AppState,
+    filter: &crate::db::repositories::costs::AttributionFilter,
+    window: &str,
+) -> Result<Html<String>, DashboardError> {
+    let report = crate::api::admin::attribution::build_report(state, filter, window)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    let rows = |src: &[crate::db::repositories::costs::AttributionBreakdownRow]| {
+        src.iter()
+            .map(|r| {
+                minijinja::context! {
+                    key => r.key.clone(),
+                    cost_usd => format!("{:.4}", r.totals.cost_usd),
+                    saved_usd => format!("{:.4}", r.totals.saved_usd),
+                    requests => r.totals.requests,
+                    cache_hits => r.totals.cache_hits,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    super::dashboard::render(
+        "attribution_panels.html",
+        minijinja::context! {
+            filter_label => report.filter,
+            cost_usd => format!("{:.4}", report.totals.cost_usd),
+            saved_usd => format!("{:.4}", report.totals.saved_usd),
+            requests => report.totals.requests,
+            cache_hits => report.totals.cache_hits,
+            hit_rate => format!("{:.0}%", report.hit_rate * 100.0),
+            tokens_in => report.totals.tokens_in,
+            tokens_out => report.totals.tokens_out,
+            by_model_rows => rows(&report.by_model),
+            by_day_rows => rows(&report.by_day),
+        },
+    )
 }

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod attribution;
 pub mod audit;
 pub mod oidc;
 pub mod routes;

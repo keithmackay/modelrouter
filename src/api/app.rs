@@ -173,6 +173,14 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
         .route("/admin/api/users/:id/reset-spend", post(reset_user_spend))
         // Response cache REST API
+        .route(
+            "/admin/api/usage/attribution",
+            get(crate::api::admin::attribution::get_attribution_usage),
+        )
+        .route(
+            "/admin/api/usage/attribution/facets",
+            get(crate::api::admin::attribution::get_attribution_facets),
+        )
         .route("/admin/api/cache/stats", get(crate::api::admin::cache::get_cache_stats))
         .route("/admin/api/cache/purge", post(crate::api::admin::cache::post_cache_purge))
         .route(
