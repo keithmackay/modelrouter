@@ -8,7 +8,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">User</label>
         <select name="user" id="rf-user"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
-            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
             <option value="" {% if not sel_user %}selected{% endif %}>All users</option>
             {% for u in user_opts %}
@@ -20,7 +20,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Project</label>
         <select name="project" id="rf-project"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
-            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
             <option value="" {% if not sel_project %}selected{% endif %}>All projects</option>
             {% for p in projects %}
@@ -32,7 +32,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Model</label>
         <select name="model" id="rf-model"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
-            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
             <option value="" {% if not sel_model %}selected{% endif %}>All models</option>
             {% for m in models %}
@@ -44,7 +44,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Group</label>
         <select name="group" id="rf-group"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
-            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
             <option value="" {% if not sel_group %}selected{% endif %}>All groups</option>
             {% for g in group_names %}
@@ -56,11 +56,35 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Window</label>
         <select name="window" id="rf-window"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
-            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
             <option value="daily"   {% if sel_window == "daily"   %}selected{% endif %}>Daily</option>
             <option value="weekly"  {% if sel_window == "weekly"  %}selected{% endif %}>Weekly</option>
             <option value="monthly" {% if sel_window == "monthly" %}selected{% endif %}>Monthly</option>
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Attribution</label>
+        <select name="key" id="rf-attr-key"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_attr_key %}selected{% endif %}>Correlation ID</option>
+            {% for k in attr_keys %}
+            <option value="{{ k }}" {% if sel_attr_key == k %}selected{% endif %}>tag: {{ k }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Value</label>
+        <select name="value" id="rf-attr-value"
+            hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;min-width:14rem;">
+            <option value="" {% if not sel_attr_value %}selected{% endif %}>Not filtered</option>
+            {% for v in attr_values %}
+            <option value="{{ v }}" {% if sel_attr_value == v %}selected{% endif %}>{{ v }}</option>
+            {% endfor %}
         </select>
     </div>
 </div>
@@ -68,7 +92,7 @@
 <div id="panels"
     hx-get="/admin/reports/panels"
     hx-trigger="load"
-    hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window"
+    hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
     style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;">
     <div style="grid-column:1/-1;text-align:center;padding:2rem;color:#999;">Loading…</div>
 </div>

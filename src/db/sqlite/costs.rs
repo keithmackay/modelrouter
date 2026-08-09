@@ -1,13 +1,17 @@
 use async_trait::async_trait;
 
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
-use crate::db::repositories::costs::{CacheUsageSummary, CostRepository};
+use crate::db::repositories::costs::{
+    AttributionBreakdownRow, AttributionFilter, AttributionTotals, CacheUsageSummary,
+    CostRepository,
+};
 use super::{SqliteDb, now_utc};
 
 /// Columns selected when reading a ledger row back.
 const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, \
                               tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
-                              cache_hit, saved_usd";
+                              cache_hit, saved_usd, attribution_correlation_id, \
+                              attribution_tags";
 
 #[async_trait]
 impl CostRepository for SqliteDb {
@@ -15,8 +19,9 @@ impl CostRepository for SqliteDb {
         let now = now_utc();
         let result = sqlx::query(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
-                                        tokens_in, tokens_out, cost_usd, api_key_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        tokens_in, tokens_out, cost_usd, api_key_id, created_at,
+                                        attribution_correlation_id, attribution_tags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -28,6 +33,8 @@ impl CostRepository for SqliteDb {
         .bind(entry.cost_usd)
         .bind(entry.api_key_id)
         .bind(&now)
+        .bind(&entry.attribution_correlation_id)
+        .bind(&entry.attribution_tags)
         .execute(&self.pool)
         .await?;
 
@@ -49,8 +56,9 @@ impl CostRepository for SqliteDb {
         let result = sqlx::query(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
-                                        cache_hit, saved_usd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?)"#,
+                                        cache_hit, saved_usd,
+                                        attribution_correlation_id, attribution_tags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -62,6 +70,8 @@ impl CostRepository for SqliteDb {
         .bind(entry.api_key_id)
         .bind(&now)
         .bind(entry.cost_usd)
+        .bind(&entry.attribution_correlation_id)
+        .bind(&entry.attribution_tags)
         .execute(&self.pool)
         .await?;
 
@@ -527,6 +537,157 @@ impl CostRepository for SqliteDb {
         .bind(start).bind(end)
         .fetch_one(&self.pool).await?;
         Ok(row.0)
+    }
+
+    // ── Attribution-filtered usage ────────────────────────────────────────────
+
+    async fn attribution_totals(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals> {
+        let (predicate, value) = attribution_predicate(filter);
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ? AND created_at < ?",
+            TOTALS_SELECT, predicate
+        );
+        let row = sqlx::query_as::<_, TotalsRow>(&sql)
+            .bind(value)
+            .bind(start)
+            .bind(end)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(totals_from_row(row))
+    }
+
+    async fn attribution_by_model(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, value) = attribution_predicate(filter);
+        let sql = format!(
+            "SELECT model, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ? AND created_at < ? \
+             GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
+            TOTALS_SELECT, predicate
+        );
+        let rows = sqlx::query_as::<_, (String, f64, f64, i64, i64, i64, i64)>(&sql)
+            .bind(value)
+            .bind(start)
+            .bind(end)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(breakdown_from_row).collect())
+    }
+
+    async fn attribution_by_day(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, value) = attribution_predicate(filter);
+        let sql = format!(
+            "SELECT strftime('%Y-%m-%d', created_at) AS day, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ? AND created_at < ? \
+             GROUP BY day ORDER BY day ASC",
+            TOTALS_SELECT, predicate
+        );
+        let rows = sqlx::query_as::<_, (String, f64, f64, i64, i64, i64, i64)>(&sql)
+            .bind(value)
+            .bind(start)
+            .bind(end)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(breakdown_from_row).collect())
+    }
+
+    async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT j.key FROM cost_ledger, json_each(cost_ledger.attribution_tags) AS j \
+             WHERE cost_ledger.attribution_tags != '{}' ORDER BY j.key ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    async fn distinct_attribution_values(
+        &self,
+        key: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows = match key {
+            None => {
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT DISTINCT attribution_correlation_id FROM cost_ledger \
+                     WHERE attribution_correlation_id IS NOT NULL \
+                     ORDER BY attribution_correlation_id ASC LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(k) => {
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT DISTINCT json_extract(attribution_tags, ?) AS v FROM cost_ledger \
+                     WHERE json_extract(attribution_tags, ?) IS NOT NULL \
+                     ORDER BY v ASC LIMIT ?",
+                )
+                .bind(AttributionFilter::tag_json_path(k))
+                .bind(AttributionFilter::tag_json_path(k))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().map(|(v,)| v).collect())
+    }
+}
+
+/// Aggregate expression shared by every attribution query. Order matches
+/// [`TotalsRow`].
+const TOTALS_SELECT: &str = "COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(saved_usd), 0.0), \
+                             COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0), \
+                             COUNT(*), COALESCE(SUM(cache_hit), 0)";
+
+type TotalsRow = (f64, f64, i64, i64, i64, i64);
+
+fn totals_from_row(row: TotalsRow) -> AttributionTotals {
+    let (cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits) = row;
+    AttributionTotals { cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits }
+}
+
+fn breakdown_from_row(row: (String, f64, f64, i64, i64, i64, i64)) -> AttributionBreakdownRow {
+    let (key, cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits) = row;
+    AttributionBreakdownRow {
+        key,
+        totals: AttributionTotals {
+            cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits,
+        },
+    }
+}
+
+/// SQL predicate plus its single bound value for an attribution filter.
+///
+/// The tag key is interpolated into a JSON *path*, never into the predicate as
+/// a value; ingest validation (`api::attribution::is_safe_tag_key`) restricts
+/// keys to `[A-Za-z0-9_.:-]`, so the path cannot be escaped.
+fn attribution_predicate(filter: &AttributionFilter) -> (String, String) {
+    match filter {
+        AttributionFilter::CorrelationId(v) => {
+            ("attribution_correlation_id = ?".to_string(), v.clone())
+        }
+        AttributionFilter::Tag { key, value } => (
+            format!(
+                "json_extract(attribution_tags, '{}') = ?",
+                AttributionFilter::tag_json_path(key)
+            ),
+            value.clone(),
+        ),
     }
 }
 

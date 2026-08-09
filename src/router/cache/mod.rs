@@ -40,12 +40,16 @@ use store::{CacheStore, CachedEntry};
 /// Request-body fields that describe *transport*, not the answer. Excluded from
 /// the key so a streamed and a non-streamed ask for the same thing share an
 /// entry, and so per-caller identifiers never fragment the cache.
-const VOLATILE_FIELDS: &[&str] = &[
+pub const VOLATILE_FIELDS: &[&str] = &[
     "stream",
     "stream_options",
     "user",
     "session_id",
     "metadata",
+    // Caller-supplied cost attribution: metadata about *whose* work this is,
+    // never about what the answer should be. Excluding it here is what stops
+    // per-engagement tagging from fragmenting the cache into one entry per tag.
+    "attribution",
 ];
 
 /// Cache class, used as the first key segment and recorded on entries.

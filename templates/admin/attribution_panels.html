@@ -1,0 +1,68 @@
+{# Reports panel body shown when an attribution value is selected. #}
+<div class="stat-card" style="grid-column:1/-1;">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">Attributed usage — {{ filter_label }}</h3>
+    <div style="display:flex;gap:2rem;flex-wrap:wrap;">
+        <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Spend</div>
+             <div style="font-size:1.5rem;font-weight:600;">${{ cost_usd }}</div></div>
+        <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Saved by cache</div>
+             <div style="font-size:1.5rem;font-weight:600;">${{ saved_usd }}</div></div>
+        <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Requests</div>
+             <div style="font-size:1.5rem;font-weight:600;">{{ requests }}</div></div>
+        <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Cache hits</div>
+             <div style="font-size:1.5rem;font-weight:600;">{{ cache_hits }} ({{ hit_rate }})</div></div>
+        <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Tokens in / out</div>
+             <div style="font-size:1.5rem;font-weight:600;">{{ tokens_in }} / {{ tokens_out }}</div></div>
+    </div>
+</div>
+
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">By Model</h3>
+    {% if by_model_rows %}
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th>Model</th><th>Cost (USD)</th><th>Saved (USD)</th><th>Requests</th><th>Cache Hits</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in by_model_rows %}
+            <tr>
+                <td>{{ row.key }}</td>
+                <td>${{ row.cost_usd }}</td>
+                <td>${{ row.saved_usd }}</td>
+                <td>{{ row.requests }}</td>
+                <td>{{ row.cache_hits }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color:#999;text-align:center;padding:1rem;">No data for this window.</p>
+    {% endif %}
+</div>
+
+<div class="stat-card">
+    <h3 style="margin-bottom:0.75rem;font-size:1rem;">By Day</h3>
+    {% if by_day_rows %}
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th>Day</th><th>Cost (USD)</th><th>Saved (USD)</th><th>Requests</th><th>Cache Hits</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in by_day_rows %}
+            <tr>
+                <td>{{ row.key }}</td>
+                <td>${{ row.cost_usd }}</td>
+                <td>${{ row.saved_usd }}</td>
+                <td>{{ row.requests }}</td>
+                <td>{{ row.cache_hits }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color:#999;text-align:center;padding:1rem;">No data for this window.</p>
+    {% endif %}
+</div>

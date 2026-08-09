@@ -35,6 +35,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Admin dashboard** — web UI at `/admin` with usage stats, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
 - **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion; wire Datadog, Slack, or any HTTP endpoint; takes effect on next restart
 - **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
+- **Request cost attribution** — tag any metered call with your own correlation id and free-form tags (`attribution` in the request body, or `X-Attribution-*` headers); the router persists them on the prompt and cost-ledger rows and reports spend *and* cache savings per tag, so a consuming app can drop its own cost accounting. Attribution never affects routing or the cache key
 - **Session stickiness** — include `session_id` in any request to pin the session to the winning provider; automatically re-pins on model change; opt out per-request with `X-Session-Lb: true`
 - **Prompt logging control** — set `X-No-Log: true` on any request to skip prompt history and callback dispatch while preserving cost tracking for budget enforcement
 - **Chinese model providers** — built-in pricing for DeepSeek, Qwen (Tongyi), and Doubao; all are OpenAI-compatible and configured as standard providers
@@ -929,6 +930,62 @@ Response:
 
 Out of scope for this endpoint: result caching, re-ranking, and fetching full
 page content (only the engine's own snippet is returned).
+
+#### Request cost attribution
+
+Every metered endpoint (`/v1/chat/completions`, `/v1/search`, `/v1/messages`,
+`/v1/responses`, `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/*`)
+accepts an optional `attribution` block describing the **caller's** unit of
+work — an engagement, a job, a run. The router already knows who paid (user,
+API key, key project); attribution is what lets an app ask "what did *this*
+piece of my own work cost", instead of maintaining a parallel cost ledger.
+
+```json
+{
+  "model": "gpt-4o-mini",
+  "messages": [{ "role": "user", "content": "hi" }],
+  "attribution": {
+    "correlation_id": "eng-4711-run-3",
+    "tags": { "engagement": "eng-4711", "phase": "research" }
+  }
+}
+```
+
+The body field is the primary channel (SDKs expose it through `extra_body`).
+Headers are the fallback, and the only channel for the multipart
+`/v1/audio/transcriptions`:
+
+```text
+X-Attribution-Correlation-Id: eng-4711-run-3
+X-Attribution-Tags: {"engagement":"eng-4711","phase":"research"}
+```
+
+Bounds, enforced with a `400` on violation: correlation id ≤ 128 characters;
+at most 8 tags; keys ≤ 64 characters and restricted to `[A-Za-z0-9_-.:]`;
+values ≤ 128 characters; the encoded tag map ≤ 1 KB. Number and boolean tag
+values are coerced to strings; nested values are rejected.
+
+**Attribution never changes routing, pricing, or the response-cache key.** Two
+requests that differ only in attribution share one cache entry — the saving is
+metered against whoever made the call that hit.
+
+Read it back three ways:
+
+```bash
+# CLI — spend and cache savings for one unit of work
+modelrouter report cost --tag engagement=eng-4711 --window monthly
+modelrouter report cost --correlation-id eng-4711-run-3 --by day
+```
+
+```text
+GET /admin/api/usage/attribution?key=engagement&value=eng-4711&window=monthly
+GET /admin/api/usage/attribution/facets            # tag keys + correlation ids
+GET /admin/api/usage/attribution/facets?key=engagement   # values for one key
+```
+
+and on `/admin/reports`, where picking an attribution value swaps the panels
+for an attributed-usage view (spend, savings, cache-hit rate, per-model and
+per-day breakdowns).
 
 Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
 

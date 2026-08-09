@@ -834,7 +834,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             use crate::cli::commands::ReportCommands;
 
             match report_args.command {
-                ReportCommands::Cost { user, group, project, model, key_id, window, format } => {
+                ReportCommands::Cost {
+                    user, group, project, model, key_id, tag, correlation_id, by, window, format,
+                } => {
+                    // Attribution short-circuits the per-user report: it answers
+                    // a different question (what did *this* unit of work cost)
+                    // and the other filters do not compose with it.
+                    if tag.is_some() || correlation_id.is_some() {
+                        let filter = parse_attribution_filter(tag.as_deref(), correlation_id)?;
+                        report_attribution(&db, &filter, by, &window, format).await?;
+                        return Ok(());
+                    }
                     let rows = crate::report::cost_by_user_window(
                         &db.pool, &window,
                         user.as_deref(),
@@ -1461,6 +1471,232 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Attribution cost report (issue #13) ───────────────────────────────────────
+
+/// One row of an attribution cost report. `scope` is the model, the day, or
+/// `TOTAL` for the trailing aggregate.
+#[derive(Debug, serde::Serialize)]
+struct AttributionReportRow {
+    scope: String,
+    cost_usd: f64,
+    saved_usd: f64,
+    requests: i64,
+    cache_hits: i64,
+    tokens_in: i64,
+    tokens_out: i64,
+}
+
+/// Parse `--tag key=value` / `--correlation-id id` into a repository filter.
+fn parse_attribution_filter(
+    tag: Option<&str>,
+    correlation_id: Option<String>,
+) -> anyhow::Result<crate::db::repositories::costs::AttributionFilter> {
+    use crate::db::repositories::costs::AttributionFilter;
+    if let Some(id) = correlation_id {
+        if id.trim().is_empty() {
+            anyhow::bail!("--correlation-id must not be empty");
+        }
+        return Ok(AttributionFilter::CorrelationId(id.trim().to_string()));
+    }
+    let raw = tag.unwrap_or_default();
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--tag must be in KEY=VALUE form, got '{}'", raw))?;
+    let (key, value) = (key.trim(), value.trim());
+    if value.is_empty() {
+        anyhow::bail!("--tag value must not be empty");
+    }
+    if !crate::api::attribution::is_safe_tag_key(key) {
+        anyhow::bail!(
+            "--tag key must contain only letters, digits, '_', '-', '.' or ':', got '{}'",
+            key
+        );
+    }
+    Ok(AttributionFilter::Tag {
+        key: key.to_string(),
+        value: value.to_string(),
+    })
+}
+
+async fn report_attribution(
+    db: &crate::db::sqlite::SqliteDb,
+    filter: &crate::db::repositories::costs::AttributionFilter,
+    by: crate::cli::commands::AttributionBreakdown,
+    window: &str,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::cli::commands::AttributionBreakdown;
+    use crate::db::repositories::costs::CostRepository;
+
+    // `alltime` is the CLI's spelling of the same window the admin API calls
+    // `all`; everything else maps straight through.
+    let window = if window == "alltime" { "all" } else { window };
+    let (start, end) = crate::api::admin::attribution::window_range(window);
+
+    let totals = CostRepository::attribution_totals(db, filter, &start, &end).await?;
+    let breakdown = match by {
+        AttributionBreakdown::Model => {
+            CostRepository::attribution_by_model(db, filter, &start, &end).await?
+        }
+        AttributionBreakdown::Day => {
+            CostRepository::attribution_by_day(db, filter, &start, &end).await?
+        }
+    };
+
+    let mut rows: Vec<AttributionReportRow> = breakdown
+        .into_iter()
+        .map(|r| AttributionReportRow {
+            scope: r.key,
+            cost_usd: r.totals.cost_usd,
+            saved_usd: r.totals.saved_usd,
+            requests: r.totals.requests,
+            cache_hits: r.totals.cache_hits,
+            tokens_in: r.totals.tokens_in,
+            tokens_out: r.totals.tokens_out,
+        })
+        .collect();
+    rows.push(AttributionReportRow {
+        scope: "TOTAL".to_string(),
+        cost_usd: totals.cost_usd,
+        saved_usd: totals.saved_usd,
+        requests: totals.requests,
+        cache_hits: totals.cache_hits,
+        tokens_in: totals.tokens_in,
+        tokens_out: totals.tokens_out,
+    });
+
+    if matches!(format, OutputFormat::Table) {
+        println!("Attribution: {}  (window: {})", filter.label(), window);
+    }
+    print_rows(
+        &rows,
+        &[
+            match by {
+                AttributionBreakdown::Model => "Model",
+                AttributionBreakdown::Day => "Day",
+            },
+            "Cost (USD)",
+            "Saved (USD)",
+            "Requests",
+            "Cache Hits",
+            "Tokens In (Prompts)",
+            "Tokens Out (Completions)",
+        ],
+        |r| {
+            vec![
+                r.scope.clone(),
+                format!("{:.4}", r.cost_usd),
+                format!("{:.4}", r.saved_usd),
+                r.requests.to_string(),
+                r.cache_hits.to_string(),
+                r.tokens_in.to_string(),
+                r.tokens_out.to_string(),
+            ]
+        },
+        format,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod attribution_cli_tests {
+    use super::*;
+    use crate::db::repositories::costs::AttributionFilter;
+
+    #[test]
+    fn parses_tag_pair() {
+        let f = parse_attribution_filter(Some("engagement=eng-4711"), None).unwrap();
+        assert_eq!(
+            f,
+            AttributionFilter::Tag {
+                key: "engagement".to_string(),
+                value: "eng-4711".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_correlation_id() {
+        let f = parse_attribution_filter(None, Some("run-3".to_string())).unwrap();
+        assert_eq!(f, AttributionFilter::CorrelationId("run-3".to_string()));
+    }
+
+    #[test]
+    fn rejects_tag_without_equals() {
+        assert!(parse_attribution_filter(Some("engagement"), None).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_tag_value() {
+        assert!(parse_attribution_filter(Some("engagement="), None).is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_tag_key() {
+        assert!(parse_attribution_filter(Some("bad key=v"), None).is_err());
+    }
+
+    /// End-to-end CLI path: a tagged ledger row in, a rendered report out.
+    #[tokio::test]
+    async fn reports_attribution_from_the_database() {
+        use crate::cli::commands::AttributionBreakdown;
+        use crate::db::models::NewCostLedgerEntry;
+        use crate::db::repositories::costs::CostRepository;
+
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        crate::db::migrations::run_migrations(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, name, created_at) VALUES (1, 'cli', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        CostRepository::create(
+            &db,
+            NewCostLedgerEntry {
+                user_id: 1,
+                prompt_id: None,
+                model: "gpt-4o".to_string(),
+                provider: "openai".to_string(),
+                project: None,
+                tokens_in: 10,
+                tokens_out: 20,
+                cost_usd: 0.25,
+                api_key_id: None,
+                attribution_correlation_id: Some("run-7".to_string()),
+                attribution_tags: r#"{"engagement":"eng-1"}"#.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let filter = parse_attribution_filter(Some("engagement=eng-1"), None).unwrap();
+        report_attribution(&db, &filter, AttributionBreakdown::Model, "alltime", OutputFormat::Json)
+            .await
+            .unwrap();
+
+        // The same rows must be reachable by correlation id.
+        let by_corr = parse_attribution_filter(None, Some("run-7".to_string())).unwrap();
+        let totals = CostRepository::attribution_totals(
+            &db, &by_corr, "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(totals.requests, 1);
+        assert!((totals.cost_usd - 0.25).abs() < 1e-9);
+
+        // A tag nobody used reports nothing rather than everything.
+        let empty = parse_attribution_filter(Some("engagement=nope"), None).unwrap();
+        let none = CostRepository::attribution_totals(
+            &db, &empty, "1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(none.requests, 0);
+    }
 }
 
 #[cfg(test)]

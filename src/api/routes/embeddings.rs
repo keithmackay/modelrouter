@@ -18,6 +18,7 @@ use crate::{
 pub async fn embeddings(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -28,7 +29,7 @@ pub async fn embeddings(
         "cost.usd" = tracing::field::Empty,
         "tokens.prompt" = tracing::field::Empty,
     );
-    embeddings_inner(State(state), user, Json(body))
+    embeddings_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -36,11 +37,15 @@ pub async fn embeddings(
 async fn embeddings_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
     let model = body["model"]
         .as_str()
         .unwrap_or("text-embedding-3-small")
@@ -154,6 +159,8 @@ async fn embeddings_inner(
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
             project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*state_clone.db, prompt).await {
             Ok(saved) => {
@@ -167,6 +174,8 @@ async fn embeddings_inner(
                     tokens_out: 0,
                     cost_usd: cost,
                     api_key_id,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record embedding cost: {}", e);

@@ -4,6 +4,12 @@ use crate::db::models::{NewPrompt, Prompt};
 use crate::db::repositories::prompts::PromptRepository;
 use super::{SqliteDb, now_utc};
 
+/// Columns selected when reading a prompt row back.
+const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
+                              messages, response, finish_reason, prompt_tokens, completion_tokens, \
+                              cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, tags, \
+                              project, attribution_correlation_id, attribution_tags, created_at";
+
 #[async_trait]
 impl PromptRepository for SqliteDb {
     async fn create(&self, prompt: NewPrompt) -> anyhow::Result<Prompt> {
@@ -13,8 +19,9 @@ impl PromptRepository for SqliteDb {
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
-                cost_usd, latency_ms, tags, project, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                cost_usd, latency_ms, tags, project,
+                attribution_correlation_id, attribution_tags, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -32,18 +39,17 @@ impl PromptRepository for SqliteDb {
         .bind(prompt.latency_ms)
         .bind(&prompt.tags)
         .bind(&prompt.project)
+        .bind(&prompt.attribution_correlation_id)
+        .bind(&prompt.attribution_tags)
         .bind(&now)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, Prompt>(
-            r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
-                      messages, response, finish_reason, prompt_tokens, completion_tokens,
-                      cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project, created_at
-               FROM prompts WHERE id = ?"#,
-        )
+        let row = sqlx::query_as::<_, Prompt>(&format!(
+            "SELECT {} FROM prompts WHERE id = ?",
+            PROMPT_COLUMNS
+        ))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -51,13 +57,10 @@ impl PromptRepository for SqliteDb {
     }
 
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<Prompt>> {
-        let row = sqlx::query_as::<_, Prompt>(
-            r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
-                      messages, response, finish_reason, prompt_tokens, completion_tokens,
-                      cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project, created_at
-               FROM prompts WHERE id = ?"#,
-        )
+        let row = sqlx::query_as::<_, Prompt>(&format!(
+            "SELECT {} FROM prompts WHERE id = ?",
+            PROMPT_COLUMNS
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -65,13 +68,10 @@ impl PromptRepository for SqliteDb {
     }
 
     async fn list_by_user(&self, user_id: i64, limit: i64) -> anyhow::Result<Vec<Prompt>> {
-        let rows = sqlx::query_as::<_, Prompt>(
-            r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
-                      messages, response, finish_reason, prompt_tokens, completion_tokens,
-                      cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project, created_at
-               FROM prompts WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"#,
-        )
+        let rows = sqlx::query_as::<_, Prompt>(&format!(
+            "SELECT {} FROM prompts WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            PROMPT_COLUMNS
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -80,13 +80,10 @@ impl PromptRepository for SqliteDb {
     }
 
     async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<Prompt>> {
-        let rows = sqlx::query_as::<_, Prompt>(
-            r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
-                      messages, response, finish_reason, prompt_tokens, completion_tokens,
-                      cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project, created_at
-               FROM prompts ORDER BY created_at DESC LIMIT ? OFFSET ?"#,
-        )
+        let rows = sqlx::query_as::<_, Prompt>(&format!(
+            "SELECT {} FROM prompts ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            PROMPT_COLUMNS
+        ))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -139,6 +136,8 @@ mod tests {
                 latency_ms: None,
                 tags: "[]".to_string(),
                 project: None,
+                attribution_correlation_id: None,
+                attribution_tags: "{}".to_string(),
             },
         )
         .await
@@ -175,6 +174,8 @@ mod tests {
                 latency_ms: None,
                 tags: "[]".to_string(),
                 project: None,
+                attribution_correlation_id: None,
+                attribution_tags: "{}".to_string(),
             },
         )
         .await

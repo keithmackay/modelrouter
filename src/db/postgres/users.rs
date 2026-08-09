@@ -30,6 +30,8 @@ impl From<UserRow> for User {
             api_key_id: None,
             spend_reset_at: r.spend_reset_at,
             api_key_project: None,
+            // Set in memory by the auth extractor, like api_key_id/api_key_project.
+            session_window_secs: None,
         }
     }
 }

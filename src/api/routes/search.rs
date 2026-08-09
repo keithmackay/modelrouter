@@ -26,6 +26,7 @@ const MAX_RESULTS_LIMIT: u32 = 20;
 pub async fn search(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -35,7 +36,7 @@ pub async fn search(
         "cost.usd" = tracing::field::Empty,
         "results.count" = tracing::field::Empty,
     );
-    search_inner(State(state), user, Json(body))
+    search_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -43,12 +44,15 @@ pub async fn search(
 async fn search_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
+
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
 
     let query = body["query"].as_str().unwrap_or("").to_string();
     if query.trim().is_empty() {
@@ -133,6 +137,7 @@ async fn search_inner(
                 &engine,
                 results_returned,
                 cost,
+                &attribution,
             );
             let mut body = payload;
             body["usage"] = serde_json::json!({
@@ -198,6 +203,8 @@ async fn search_inner(
     let user_id = user.id;
     let api_key_id = user.api_key_id;
     let user_project = user.api_key_project.clone();
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
 
     tokio::spawn(async move {
         let prompt = NewPrompt {
@@ -217,6 +224,8 @@ async fn search_inner(
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
             project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*state_clone.db, prompt).await {
             Ok(saved) => {
@@ -230,6 +239,8 @@ async fn search_inner(
                     tokens_out: 0,
                     cost_usd: cost,
                     api_key_id,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record search cost: {}", e);
@@ -272,6 +283,7 @@ fn record_search_cache_hit(
     engine: &str,
     results_returned: i64,
     avoided_cost: f64,
+    attribution: &crate::api::attribution::Attribution,
 ) {
     use crate::db::repositories::costs::CostRepository;
 
@@ -287,6 +299,8 @@ fn record_search_cache_hit(
         // Interpreted as the avoided cost by `create_cache_hit`.
         cost_usd: avoided_cost,
         api_key_id: user.api_key_id,
+        attribution_correlation_id: attribution.correlation_id.clone(),
+        attribution_tags: attribution.tags_json(),
     };
     tokio::spawn(async move {
         if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {

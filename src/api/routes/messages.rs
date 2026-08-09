@@ -24,6 +24,7 @@ async fn log_messages_cost(
     cache_write_tokens: u32,
     cost: f64,
     latency_ms: i64,
+    attribution: crate::api::attribution::Attribution,
 ) {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
@@ -44,6 +45,8 @@ async fn log_messages_cost(
         latency_ms: Some(latency_ms),
         tags: "[]".to_string(),
         project: project.clone(),
+        attribution_correlation_id: attribution.correlation_id.clone(),
+        attribution_tags: attribution.tags_json(),
     };
     match PromptRepository::create(&*state.db, prompt).await {
         Ok(saved_prompt) => {
@@ -57,6 +60,8 @@ async fn log_messages_cost(
                 tokens_out: completion_tokens as i64,
                 cost_usd: cost,
                 api_key_id,
+                attribution_correlation_id: attribution.correlation_id.clone(),
+                attribution_tags: attribution.tags_json(),
             };
             if let Err(e) = CostRepository::create(&*state.db, ledger).await {
                 tracing::error!("Failed to record cost: {}", e);
@@ -83,6 +88,7 @@ async fn log_messages_cost(
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -91,7 +97,7 @@ pub async fn anthropic_messages(
         model = tracing::field::Empty,
         streaming = tracing::field::Empty,
     );
-    anthropic_messages_inner(State(state), user, Json(body))
+    anthropic_messages_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -99,11 +105,13 @@ pub async fn anthropic_messages(
 async fn anthropic_messages_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use std::time::Instant;
 
     let user = user.0;
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
@@ -264,13 +272,15 @@ async fn anthropic_messages_inner(
             &body["messages"].as_array().cloned().unwrap_or_default()
         ).unwrap_or_default();
         let start_s = start;
+        let attribution_s = attribution.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let stream initiate
             let prompt_tokens = (messages_json_s.chars().count() / 4) as u32;
             let cost = state_c.cost_calc.calculate(&canonical_s, prompt_tokens, 0);
             let latency_ms = start_s.elapsed().as_millis() as i64;
             log_messages_cost(&state_c, user_id, api_key_id_s, user_project_s, &user_name_s, &model_s, &canonical_s, &provider_s,
-                               &messages_json_s, prompt_tokens, 0, 0, 0, cost, latency_ms).await;
+                               &messages_json_s, prompt_tokens, 0, 0, 0, cost, latency_ms,
+                               attribution_s).await;
         });
 
         let response = Response::builder()
@@ -363,6 +373,8 @@ async fn anthropic_messages_inner(
     .unwrap_or_default();
     let response_content = serde_json::to_string(&resp_json).unwrap_or_default();
     let user_id = user.id;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
 
     tokio::spawn(async move {
         use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
@@ -384,6 +396,8 @@ async fn anthropic_messages_inner(
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
             project: project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*state_clone.db, prompt).await {
             Ok(saved_prompt) => {
@@ -397,6 +411,8 @@ async fn anthropic_messages_inner(
                     tokens_out: completion_tokens as i64,
                     cost_usd: cost,
                     api_key_id: api_key_id_c,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
