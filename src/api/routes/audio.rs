@@ -16,6 +16,7 @@ use crate::{
 pub async fn speech(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -23,7 +24,7 @@ pub async fn speech(
         user_id = tracing::field::Empty,
         model = tracing::field::Empty,
     );
-    speech_inner(State(state), user, Json(body))
+    speech_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -31,12 +32,17 @@ pub async fn speech(
 async fn speech_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
+
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
 
     let model = body["model"].as_str().unwrap_or("tts-1").to_string();
     tracing::Span::current().record("model", model.as_str());
@@ -163,6 +169,8 @@ async fn speech_inner(
             latency_ms: None,
             tags: "[]".to_string(),
             project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*db, prompt).await {
             Ok(saved_prompt) => {
@@ -176,6 +184,8 @@ async fn speech_inner(
                     tokens_out: 0,
                     cost_usd: cost,
                     api_key_id,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record speech cost: {e}");
@@ -191,6 +201,7 @@ async fn speech_inner(
 pub async fn transcriptions(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -198,7 +209,7 @@ pub async fn transcriptions(
         user_id = tracing::field::Empty,
         model = tracing::field::Empty,
     );
-    transcriptions_inner(State(state), user, multipart)
+    transcriptions_inner(State(state), user, headers, multipart)
         .instrument(span)
         .await
 }
@@ -206,12 +217,18 @@ pub async fn transcriptions(
 async fn transcriptions_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
+
+    // Multipart request: attribution can only arrive on headers here.
+    let attribution = crate::api::attribution::Attribution::from_headers(&headers)?;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
 
     let model = "whisper-1".to_string();
     tracing::Span::current().record("model", model.as_str());
@@ -357,6 +374,8 @@ async fn transcriptions_inner(
             latency_ms: None,
             tags: "[]".to_string(),
             project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*db, prompt).await {
             Ok(saved_prompt) => {
@@ -370,6 +389,8 @@ async fn transcriptions_inner(
                     tokens_out: 0,
                     cost_usd: cost,
                     api_key_id,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record transcription cost: {e}");

@@ -14,6 +14,7 @@ use crate::{
 pub async fn responses_handler(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -21,7 +22,7 @@ pub async fn responses_handler(
         user_id = tracing::field::Empty,
         model = tracing::field::Empty,
     );
-    responses_inner(State(state), user, Json(body))
+    responses_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -29,12 +30,16 @@ pub async fn responses_handler(
 async fn responses_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
 
     let model = body["model"]
         .as_str()
@@ -163,6 +168,8 @@ async fn responses_inner(
             latency_ms: Some(latency_ms),
             tags: "[]".to_string(),
             project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*db, prompt).await {
             Ok(saved_prompt) => {
@@ -176,6 +183,8 @@ async fn responses_inner(
                     tokens_out: completion_tokens as i64,
                     cost_usd: cost,
                     api_key_id,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 let _ = CostRepository::create(&*db, ledger).await;
             }

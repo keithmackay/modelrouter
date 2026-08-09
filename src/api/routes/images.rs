@@ -8,6 +8,7 @@ use crate::db::models::{NewCostLedgerEntry, NewPrompt};
 pub async fn image_generations(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let span = tracing::info_span!(
@@ -15,7 +16,7 @@ pub async fn image_generations(
         user_id = tracing::field::Empty,
         model = tracing::field::Empty,
     );
-    image_generations_inner(State(state), user, Json(body))
+    image_generations_inner(State(state), user, headers, Json(body))
         .instrument(span)
         .await
 }
@@ -23,12 +24,16 @@ pub async fn image_generations(
 async fn image_generations_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
 
     let model = body["model"]
         .as_str()
@@ -142,6 +147,8 @@ async fn image_generations_inner(
             latency_ms: None,
             tags: "[]".to_string(),
             project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
         };
         match PromptRepository::create(&*state_clone.db, prompt).await {
             Ok(saved_prompt) => {
@@ -155,6 +162,8 @@ async fn image_generations_inner(
                     tokens_out: 0,
                     cost_usd: cost,
                     api_key_id,
+                    attribution_correlation_id: attr_correlation.clone(),
+                    attribution_tags: attr_tags.clone(),
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record image cost: {}", e);

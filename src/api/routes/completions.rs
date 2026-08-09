@@ -44,6 +44,10 @@ async fn chat_completions_inner(
     let skip_log = should_skip_logging(&headers);
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
+    // Read attribution from the request as it arrived: pipeline hooks may
+    // rewrite the body, and attribution describes the caller's intent, not the
+    // rewritten request.
+    let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
@@ -257,6 +261,7 @@ async fn chat_completions_inner(
                     .unwrap_or_default(),
                     avoided_cost,
                     skip_log,
+                    attribution: attribution.clone(),
                 },
                 &cached,
             );
@@ -312,6 +317,7 @@ async fn chat_completions_inner(
                 messages_json,
                 start,
                 skip_log,
+                attribution: attribution.clone(),
             },
         );
 
@@ -464,6 +470,8 @@ async fn chat_completions_inner(
     let cache_write_tokens = result.cache_write_tokens;
 
     let skip_log_clone = skip_log;
+    let attr_correlation = attribution.correlation_id.clone();
+    let attr_tags = attribution.tags_json();
     tokio::spawn(async move {
         if !skip_log_clone {
             let prompt = NewPrompt {
@@ -483,6 +491,8 @@ async fn chat_completions_inner(
                 latency_ms: Some(latency_ms),
                 tags: "[]".to_string(),
                 project: user_project.clone(),
+                attribution_correlation_id: attr_correlation.clone(),
+                attribution_tags: attr_tags.clone(),
             };
             match PromptRepository::create(&*state_clone.db, prompt).await {
                 Ok(saved_prompt) => {
@@ -496,6 +506,8 @@ async fn chat_completions_inner(
                         tokens_out: completion_tokens as i64,
                         cost_usd: cost,
                         api_key_id,
+                        attribution_correlation_id: attr_correlation.clone(),
+                        attribution_tags: attr_tags.clone(),
                     };
                     if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                         tracing::error!("Failed to record cost: {}", e);
@@ -527,6 +539,8 @@ async fn chat_completions_inner(
                 tokens_out: completion_tokens as i64,
                 cost_usd: cost,
                 api_key_id,
+                attribution_correlation_id: attr_correlation.clone(),
+                attribution_tags: attr_tags.clone(),
             };
             if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                 tracing::error!("Failed to record cost: {}", e);
@@ -579,6 +593,7 @@ struct CacheHitCtx {
     messages_json: String,
     avoided_cost: f64,
     skip_log: bool,
+    attribution: crate::api::attribution::Attribution,
 }
 
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
@@ -615,6 +630,8 @@ fn record_cache_hit(
             tokens_out: result.completion_tokens as i64,
             cost_usd: ctx.avoided_cost,
             api_key_id: ctx.api_key_id,
+            attribution_correlation_id: ctx.attribution.correlation_id.clone(),
+            attribution_tags: ctx.attribution.tags_json(),
         };
 
         let prompt_id = if ctx.skip_log {
@@ -638,6 +655,8 @@ fn record_cache_hit(
                 latency_ms: Some(0),
                 tags: "[]".to_string(),
                 project: ctx.user_project.clone(),
+                attribution_correlation_id: ctx.attribution.correlation_id.clone(),
+                attribution_tags: ctx.attribution.tags_json(),
             };
             match PromptRepository::create(&*state.db, prompt).await {
                 Ok(saved) => Some(saved.id),
@@ -667,6 +686,7 @@ struct StreamLogCtx {
     messages_json: String,
     start: Instant,
     skip_log: bool,
+    attribution: crate::api::attribution::Attribution,
 }
 
 /// Wraps an SSE stream so that, when the terminal `[DONE]` chunk passes through,
@@ -693,6 +713,8 @@ fn log_streaming_request(
     let messages_json = ctx.messages_json;
     let start = ctx.start;
     let skip_log = ctx.skip_log;
+    let attr_correlation = ctx.attribution.correlation_id.clone();
+    let attr_tags = ctx.attribution.tags_json();
 
     stream.map(move |chunk_result| {
         if let Ok(ref chunk) = chunk_result {
@@ -725,6 +747,8 @@ fn log_streaming_request(
                 let user_name_c = user_name.clone();
                 let lifecycle_hooks_c = lifecycle_hooks.clone();
                 let user_project_c = user_project.clone();
+                let attr_correlation_c = attr_correlation.clone();
+                let attr_tags_c = attr_tags.clone();
 
                 tokio::spawn(async move {
                     use crate::db::repositories::{
@@ -750,6 +774,8 @@ fn log_streaming_request(
                             latency_ms: Some(latency_ms),
                             tags: "[]".to_string(),
                             project: user_project_c.clone(),
+                            attribution_correlation_id: attr_correlation_c.clone(),
+                            attribution_tags: attr_tags_c.clone(),
                         };
                         match PromptRepository::create(&*db_c, prompt).await {
                             Ok(saved) => {
@@ -763,6 +789,8 @@ fn log_streaming_request(
                                     tokens_out: completion_tokens as i64,
                                     cost_usd: cost,
                                     api_key_id,
+                                    attribution_correlation_id: attr_correlation_c.clone(),
+                                    attribution_tags: attr_tags_c.clone(),
                                 };
                                 if let Err(e) = CostRepository::create(&*db_c, entry).await {
                                     tracing::error!("Failed to log streaming cost: {}", e);
@@ -782,6 +810,8 @@ fn log_streaming_request(
                             tokens_out: completion_tokens as i64,
                             cost_usd: cost,
                             api_key_id,
+                            attribution_correlation_id: attr_correlation_c.clone(),
+                            attribution_tags: attr_tags_c.clone(),
                         };
                         if let Err(e) = CostRepository::create(&*db_c, entry).await {
                             tracing::error!("Failed to log streaming cost: {}", e);
