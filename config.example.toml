@@ -62,6 +62,14 @@ api_key  = "ollama"    # Ollama doesn't require a real key
 api_base = "http://localhost:11434/v1"
 timeout_secs = 120
 
+# Web search proxying (POST /v1/search). Tavily is the only engine today;
+# additional engines can be added to src/providers/search_registry.rs and
+# configured the same way under [providers.<engine>].
+# [providers.tavily]
+# api_key  = ""          # or set MODELROUTER__PROVIDERS__TAVILY__API_KEY
+# api_base = "https://api.tavily.com"
+# timeout_secs = 30
+
 # GCP Vertex AI (requires build with `--features vertex`).
 # Supports Gemini (publisher "google") and Claude-on-Vertex (publisher "anthropic").
 # Authentication uses Application Default Credentials by default; point
@@ -145,6 +153,18 @@ fail_open    = true
 # model = "my-private-llama"
 # input_per_million = 0.10
 # output_per_million = 0.30
+#
+# Search pricing is a flat rate, not a per-token rate: for a "search/{engine}"
+# entry, `input_per_million` is read as dollars PER QUERY (one row is always
+# one query), mirroring how image pricing reuses the same field as
+# dollars-per-image (see [[pricing]] "dall-e-3/standard" precedent in code).
+# `output_per_million` is unused for search and should be left at 0.0.
+# Falls back to a built-in default (~$0.005/query) if no entry matches.
+#
+# [[pricing]]
+# model = "search/tavily"
+# input_per_million = 0.005
+# output_per_million = 0.0
 
 # ---------------------------------------------------------------------------
 # Declarative Policy Rules

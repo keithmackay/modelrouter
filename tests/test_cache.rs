@@ -27,6 +27,7 @@ async fn cache_hit_returns_value() {
         prompt_tokens: 5,
         completion_tokens: 3,
         finish_reason: "stop".to_string(),
+        ..Default::default()
     };
     cache.insert("key-1".to_string(), result.clone()).await;
     let hit = cache.get("key-1").await.unwrap();
@@ -46,6 +47,7 @@ async fn disabled_cache_always_misses() {
         prompt_tokens: 1,
         completion_tokens: 1,
         finish_reason: "stop".to_string(),
+        ..Default::default()
     };
     cache.insert("key".to_string(), result).await;
     assert!(cache.get("key").await.is_none());
@@ -125,6 +127,7 @@ async fn test_app_with_cache() -> TestServer {
         label: Some("test".to_string()),
         expires_at: None,
         project: None,
+        session_window_secs: None,
     })
     .await
     .unwrap();
@@ -161,6 +164,7 @@ async fn test_app_with_cache() -> TestServer {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),
@@ -168,6 +172,7 @@ async fn test_app_with_cache() -> TestServer {
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
+        session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),

@@ -10,6 +10,7 @@ fn api_key_project_field_compiles() {
         label: None,
         expires_at: None,
         project: Some("my-project".to_string()),
+        session_window_secs: None,
     };
 }
 
@@ -45,6 +46,7 @@ fn user_has_api_key_project_field() {
         api_key_id: None,
         spend_reset_at: None,
         api_key_project: None,
+        session_window_secs: None,
     };
     assert!(user.api_key_project.is_none());
 }

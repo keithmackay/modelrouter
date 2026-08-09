@@ -30,6 +30,7 @@ fn test_user(tag: Option<&str>) -> User {
         api_key_id: None,
         spend_reset_at: None,
         api_key_project: tag.map(|s| s.to_string()),
+        session_window_secs: None,
     }
 }
 

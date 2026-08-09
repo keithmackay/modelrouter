@@ -59,11 +59,13 @@ async fn test_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer,
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
+        session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
@@ -85,6 +87,7 @@ async fn api_key_auth_works() {
         label: Some("test-key".to_string()),
         expires_at: None,
         project: None,
+        session_window_secs: None,
     })
     .await
     .unwrap();
@@ -133,6 +136,7 @@ async fn revoked_api_key_returns_401() {
         label: None,
         expires_at: None,
         project: None,
+        session_window_secs: None,
     })
     .await
     .unwrap();

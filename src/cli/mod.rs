@@ -261,6 +261,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             let embedding_registry = Arc::new(crate::providers::embed_registry::EmbeddingRegistry::new(
                 settings.providers.clone(),
             ));
+            let search_registry = Arc::new(crate::providers::search_registry::SearchRegistry::new(
+                settings.providers.clone(),
+            ));
             let load_balancer = Arc::new(crate::router::load_balancer::LoadBalancer::new(
                 settings.routing.load_balancer.clone(),
             ));
@@ -300,6 +303,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 complexity_router,
                 response_cache,
                 embedding_registry,
+                search_registry,
                 load_balancer,
                 concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::new()),
                 circuit_breaker: Arc::new(crate::router::circuit_breaker::CircuitBreaker::default()),

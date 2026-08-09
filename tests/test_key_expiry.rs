@@ -12,6 +12,7 @@ fn make_key(expires_at: Option<String>) -> ApiKey {
         expires_at,
         project: None,
         disabled_at: None,
+        session_window_secs: None,
     }
 }
 

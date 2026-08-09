@@ -17,6 +17,7 @@ fn router_with_aliases() -> RequestRouter {
         fallback_chains: HashMap::new(),
         complexity_routing: None,
         load_balancer: HashMap::new(),
+        shortcuts: Default::default(),
     };
     RequestRouter::new(Arc::new(settings))
 }

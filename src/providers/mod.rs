@@ -9,5 +9,8 @@ pub mod openai_compat;
 pub mod openai_embed;
 pub mod openai_images;
 pub mod registry;
+pub mod search;
+pub mod search_registry;
+pub mod tavily;
 #[cfg(feature = "vertex")]
 pub mod vertex;

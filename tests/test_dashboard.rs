@@ -49,6 +49,7 @@ async fn build_test_server() -> TestServer {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),
@@ -56,6 +57,7 @@ async fn build_test_server() -> TestServer {
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
+        session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
@@ -152,6 +154,7 @@ async fn login_success_sets_cookie() {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),
@@ -159,6 +162,7 @@ async fn login_success_sets_cookie() {
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
+        session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
@@ -218,6 +222,7 @@ async fn superadmin_only_admins_page() {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),
@@ -225,6 +230,7 @@ async fn superadmin_only_admins_page() {
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
+        session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
