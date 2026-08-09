@@ -48,6 +48,14 @@ pub const BODY_FIELD: &str = "attribution";
 pub const CORRELATION_HEADER: &str = "x-attribution-correlation-id";
 /// Header carrying the tag map as a JSON object (fallback channel).
 pub const TAGS_HEADER: &str = "x-attribution-tags";
+/// Header carrying a per-request project override (fallback channel).
+///
+/// Without this, a request's `project` comes from the API key, so attributing
+/// spend to a unit of work finer than a key (an engagement, a job, a tenant)
+/// would need one key per unit. This header lets one key report many projects.
+pub const PROJECT_HEADER: &str = "x-project";
+/// Maximum length of a project name, in characters.
+pub const MAX_PROJECT_LEN: usize = 128;
 
 /// Maximum length of a correlation id, in characters.
 pub const MAX_CORRELATION_LEN: usize = 128;
@@ -74,12 +82,23 @@ pub struct Attribution {
     /// Free-form key/value tags, e.g. `{"engagement": "eng-4711"}`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
+    /// Per-request project override. `None` falls back to the API key's project,
+    /// preserving existing behaviour for callers that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 impl Attribution {
     /// True when nothing was supplied.
     pub fn is_empty(&self) -> bool {
-        self.correlation_id.is_none() && self.tags.is_empty()
+        self.correlation_id.is_none() && self.tags.is_empty() && self.project.is_none()
+    }
+
+    /// The project this request's spend belongs to: the per-request override
+    /// when supplied, otherwise the API key's own project. Every ledger write
+    /// goes through this so one key can report many projects.
+    pub fn project_or(&self, key_project: Option<String>) -> Option<String> {
+        self.project.clone().or(key_project)
     }
 
     /// Tags as the JSON object stored in `attribution_tags`. `{}` when empty,
@@ -113,6 +132,11 @@ impl Attribution {
                 out.tags = validate_tags(&parsed)?;
             }
         }
+        if out.project.is_none() {
+            if let Some(raw) = header_str(headers, PROJECT_HEADER) {
+                out.project = Some(validate_project(&raw)?);
+            }
+        }
         Ok(out)
     }
 
@@ -129,7 +153,7 @@ impl Attribution {
         })?;
 
         for key in obj.keys() {
-            if key != "correlation_id" && key != "tags" {
+            if key != "correlation_id" && key != "tags" && key != "project" {
                 return Err(AttributionError(format!(
                     "unknown attribution field: {}",
                     key
@@ -152,7 +176,17 @@ impl Attribution {
             Some(v) => validate_tags(v)?,
         };
 
-        Ok(Attribution { correlation_id, tags })
+        let project = match obj.get("project") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(validate_project(s)?),
+            Some(_) => {
+                return Err(AttributionError(
+                    "attribution.project must be a string".to_string(),
+                ))
+            }
+        };
+
+        Ok(Attribution { correlation_id, tags, project })
     }
 }
 
@@ -194,6 +228,25 @@ pub fn is_safe_tag_key(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Validate a per-request project override. Same shape rules as a correlation
+/// id: non-empty after trimming, bounded length. Kept permissive on content so
+/// callers can use their own identifiers (an engagement UUID, a tenant slug).
+fn validate_project(raw: &str) -> Result<String, AttributionError> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Err(AttributionError(
+            "attribution.project must not be empty".to_string(),
+        ));
+    }
+    if v.chars().count() > MAX_PROJECT_LEN {
+        return Err(AttributionError(format!(
+            "attribution.project must be at most {} characters",
+            MAX_PROJECT_LEN
+        )));
+    }
+    Ok(v.to_string())
 }
 
 fn validate_correlation_id(raw: &str) -> Result<String, AttributionError> {
@@ -419,5 +472,59 @@ mod tests {
         h.insert(CORRELATION_HEADER, HeaderValue::from_static("multipart-1"));
         let a = Attribution::from_headers(&h).unwrap();
         assert_eq!(a.correlation_id.as_deref(), Some("multipart-1"));
+    }
+}
+
+#[cfg(test)]
+mod project_override_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn header_supplies_the_project() {
+        let a = Attribution::extract(&json!({}), &headers_with(PROJECT_HEADER, "eng-4711")).unwrap();
+        assert_eq!(a.project.as_deref(), Some("eng-4711"));
+    }
+
+    #[test]
+    fn body_wins_over_header() {
+        let a = Attribution::extract(
+            &json!({"attribution": {"project": "from-body"}}),
+            &headers_with(PROJECT_HEADER, "from-header"),
+        )
+        .unwrap();
+        assert_eq!(a.project.as_deref(), Some("from-body"));
+    }
+
+    #[test]
+    fn falls_back_to_the_key_project_when_absent() {
+        let a = Attribution::extract(&json!({}), &HeaderMap::new()).unwrap();
+        assert_eq!(a.project, None);
+        assert_eq!(a.project_or(Some("key-proj".into())).as_deref(), Some("key-proj"));
+    }
+
+    #[test]
+    fn override_beats_the_key_project() {
+        let a = Attribution::extract(&json!({}), &headers_with(PROJECT_HEADER, "eng-1")).unwrap();
+        assert_eq!(a.project_or(Some("key-proj".into())).as_deref(), Some("eng-1"));
+    }
+
+    #[test]
+    fn blank_header_is_ignored_overlong_is_rejected() {
+        // A whitespace-only header is treated as absent, matching how
+        // header_str already handles the correlation-id header — not an error.
+        let blank = Attribution::extract(&json!({}), &headers_with(PROJECT_HEADER, "   ")).unwrap();
+        assert_eq!(blank.project, None);
+        // An empty project in the BODY is still an error: it was stated explicitly.
+        assert!(Attribution::extract(&json!({"attribution": {"project": "  "}}), &HeaderMap::new()).is_err());
+        let long = "x".repeat(MAX_PROJECT_LEN + 1);
+        assert!(Attribution::extract(&json!({}), &headers_with(PROJECT_HEADER, &long)).is_err());
     }
 }
