@@ -340,6 +340,15 @@ pub enum GroupCommands {
     },
 }
 
+/// Breakdown dimension for an attribution cost report.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum AttributionBreakdown {
+    /// One row per model, plus a totals row
+    Model,
+    /// One row per calendar day, plus a totals row
+    Day,
+}
+
 #[derive(Args)]
 pub struct ReportArgs {
     #[command(subcommand)]
@@ -365,6 +374,18 @@ pub enum ReportCommands {
         /// Filter by API key ID
         #[arg(long)]
         key_id: Option<i64>,
+        /// Report on one caller-supplied attribution tag, as `key=value`
+        /// (e.g. `--tag engagement=eng-4711`). Reports spend *and* cache
+        /// savings for that unit of work; other filters do not apply.
+        #[arg(long, value_name = "KEY=VALUE")]
+        tag: Option<String>,
+        /// Report on one caller-supplied correlation id. Mutually exclusive
+        /// with --tag.
+        #[arg(long, conflicts_with = "tag")]
+        correlation_id: Option<String>,
+        /// Break the attribution report down by `model` or `day`
+        #[arg(long, default_value = "model")]
+        by: AttributionBreakdown,
         /// Time window: daily | weekly | monthly | alltime  [default: monthly]
         #[arg(long, default_value = "monthly")]
         window: String,
