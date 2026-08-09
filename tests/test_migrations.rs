@@ -46,6 +46,7 @@ async fn create_and_find_user() {
         label: None,
         expires_at: None,
         project: None,
+        session_window_secs: None,
     }).await.unwrap();
 
     let found = db.find_api_key_by_hash("abc123hash").await.unwrap();
@@ -70,6 +71,7 @@ async fn token_rotation_overlap_window() {
         label: None,
         expires_at: None,
         project: None,
+        session_window_secs: None,
     }).await.unwrap();
 
     // Rotate: disable all old keys, then create new key with future expiry
@@ -80,6 +82,7 @@ async fn token_rotation_overlap_window() {
         label: None,
         expires_at: Some("2099-12-31T23:59:59Z".to_string()),
         project: None,
+        session_window_secs: None,
     }).await.unwrap();
 
     // Old key should be disabled (not found as valid)
@@ -111,6 +114,7 @@ async fn old_key_disabled_after_rotation() {
         label: None,
         expires_at: None,
         project: None,
+        session_window_secs: None,
     }).await.unwrap();
 
     // Rotate: disable old keys, create new key
@@ -121,6 +125,7 @@ async fn old_key_disabled_after_rotation() {
         label: None,
         expires_at: None,
         project: None,
+        session_window_secs: None,
     }).await.unwrap();
 
     // Old key should be disabled

@@ -37,6 +37,8 @@ fn test_config_pricing_overrides_default() {
         model: "my-custom-model".to_string(),
         input_per_million: 1.0,
         output_per_million: 2.0,
+        cache_read_per_million: None,
+        cache_write_per_million: None,
     }];
 
     let calc = CostCalculator::new_with_config(&custom);
@@ -57,6 +59,8 @@ fn test_config_pricing_overrides_default_price() {
         model: "gpt-4o".to_string(),
         input_per_million: 99.0,
         output_per_million: 99.0,
+        cache_read_per_million: None,
+        cache_write_per_million: None,
     }];
 
     let calc = CostCalculator::new_with_config(&custom);

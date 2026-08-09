@@ -135,7 +135,7 @@
           <td>{{ row.chain | join(sep=" → ") }}</td>
           <td>
             <button class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
-              onclick="editFailover('{{ row.primary }}', '{{ row.chain | join(sep=&quot;\n&quot;) }}')">Edit</button>
+              onclick='editFailover(&quot;{{ row.primary }}&quot;, &quot;{{ row.chain | join(sep="\n") }}&quot;)'>Edit</button>
           </td>
         </tr>
         {% else %}

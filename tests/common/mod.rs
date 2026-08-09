@@ -19,6 +19,7 @@ impl ProviderAdapter for MockAdapter {
             prompt_tokens: 10,
             completion_tokens: 20,
             finish_reason: "stop".to_string(),
+            ..Default::default()
         })
     }
 
