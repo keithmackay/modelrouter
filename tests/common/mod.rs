@@ -1,5 +1,7 @@
 use modelrouter::db::{migrations::run_migrations, sqlite::SqliteDb};
-use modelrouter::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use modelrouter::providers::adapter::{
+    CompletionResult, NormalizedRequest, ProviderAdapter, SseStream,
+};
 
 pub async fn in_memory_db() -> SqliteDb {
     let db = SqliteDb::connect(":memory:").await.unwrap();
@@ -30,8 +32,7 @@ impl ProviderAdapter for MockAdapter {
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n",
             self.response
         );
-        let stream =
-            stream::once(async move { Ok::<Bytes, anyhow::Error>(Bytes::from(data)) });
+        let stream = stream::once(async move { Ok::<Bytes, anyhow::Error>(Bytes::from(data)) });
         Ok(Box::pin(stream))
     }
 }
@@ -49,6 +50,23 @@ impl modelrouter::providers::embedding::EmbeddingAdapter for MockEmbeddingAdapte
         Ok(modelrouter::providers::embedding::EmbeddingResult {
             embeddings: vec![self.embedding.clone(); req.input.len()],
             prompt_tokens: req.input.iter().map(|s| s.len() as u32 / 4).sum(),
+        })
+    }
+}
+
+pub struct MockSearchAdapter {
+    pub results: Vec<modelrouter::providers::search::SearchResultItem>,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for MockSearchAdapter {
+    async fn search(
+        &self,
+        _req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        Ok(modelrouter::providers::search::SearchResponse {
+            results: self.results.clone(),
+            engine: "tavily".to_string(),
         })
     }
 }

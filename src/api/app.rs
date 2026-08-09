@@ -13,7 +13,7 @@ use crate::{
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
         users::UserRepository,
     },
-    providers::{embed_registry::EmbeddingRegistry, registry::ProviderRegistry},
+    providers::{embed_registry::EmbeddingRegistry, registry::ProviderRegistry, search_registry::SearchRegistry},
     router::{cost::CostCalculator, engine::RequestRouter, fallback::FallbackChain, policy::PolicyEngine},
 };
 
@@ -73,6 +73,7 @@ pub struct AppState {
     pub complexity_router: Arc<crate::router::complexity::ComplexityRouter>,
     pub response_cache: Arc<crate::router::cache::ResponseCache>,
     pub embedding_registry: Arc<EmbeddingRegistry>,
+    pub search_registry: Arc<SearchRegistry>,
     pub load_balancer: Arc<crate::router::load_balancer::LoadBalancer>,
     pub concurrency: Arc<crate::router::concurrency::ConcurrencyLimiter>,
     pub circuit_breaker: Arc<crate::router::circuit_breaker::CircuitBreaker>,
@@ -94,7 +95,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         audio::{speech, transcriptions},
         completions::chat_completions, embeddings::embeddings, health::health_check,
         images::image_generations, messages::anthropic_messages, models::list_models,
-        prometheus::metrics_handler, responses::responses_handler,
+        prometheus::metrics_handler, responses::responses_handler, search::search,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
     };
     use crate::api::admin::routes::{
@@ -157,6 +158,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route("/v1/search", post(search))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))

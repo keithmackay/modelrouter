@@ -164,6 +164,7 @@ async fn test_app_with_cache() -> TestServer {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),

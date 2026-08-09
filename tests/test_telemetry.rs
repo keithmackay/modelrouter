@@ -308,6 +308,7 @@ async fn completions_span_has_required_attributes() {
         complexity_router: Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None)),
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             std::collections::HashMap::new(),
         )),

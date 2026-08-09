@@ -819,9 +819,56 @@ curl http://localhost:8080/v1/chat/completions \
 curl "http://localhost:8080/v1/mcp/servers/discover?q=code+review+tools" \
   -H "Authorization: Bearer <api-key>"
 
+# Web search — proxies to a configured search engine (Tavily by default)
+curl http://localhost:8080/v1/search \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "rust programming language", "max_results": 5}'
+
 # Health check
 curl http://localhost:8080/health
 ```
+
+#### Web search (`POST /v1/search`)
+
+Proxies web search calls the same way `/v1/chat/completions` proxies LLM calls:
+API-key auth, per-request logging, usage metering, pricing, and inclusion in
+cost reports and OTel/Prometheus metrics. Tavily is the only engine today;
+`src/providers/search_registry.rs` documents how to add another.
+
+Request body:
+
+```json
+{
+  "query": "rust programming language",
+  "max_results": 5,
+  "engine": "tavily"
+}
+```
+
+`query` is required and non-empty. `max_results` is optional (1-20, defaults
+to the engine's own default). `engine` is optional and defaults to `"tavily"`.
+
+Response:
+
+```json
+{
+  "engine": "tavily",
+  "results": [
+    {
+      "title": "Rust (programming language) - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+      "snippet": "Rust is a multi-paradigm, general-purpose programming language...",
+      "score": 0.95,
+      "published_date": null
+    }
+  ],
+  "usage": { "results": 1, "cost_usd": 0.005 }
+}
+```
+
+Out of scope for this endpoint: result caching, re-ranking, and fetching full
+page content (only the engine's own snippet is returned).
 
 Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
 

@@ -55,6 +55,7 @@ async fn test_app() -> TestServer {
         complexity_router,
         response_cache,
         embedding_registry,
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(std::collections::HashMap::new())),
         load_balancer,
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
