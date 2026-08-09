@@ -243,6 +243,20 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/models/:id/enable", post(post_enable_model))
         .route("/admin/models/:id/delete", post(post_delete_model))
         .route("/admin/models/:primary/failovers", post(post_set_failovers))
+        // Model / provider enable-disable (issue #5)
+        .route("/admin/api/models", get(crate::api::admin::models::list_models_api))
+        .route(
+            "/admin/api/models/:id/enabled",
+            patch(crate::api::admin::models::set_model_enabled_api),
+        )
+        .route("/admin/api/providers", get(crate::api::admin::models::list_providers_api))
+        .route(
+            "/admin/api/providers/:provider/enabled",
+            patch(crate::api::admin::models::set_provider_enabled_api),
+        )
+        .route("/admin/providers/rows", get(crate::api::admin::models::get_provider_rows))
+        .route("/admin/providers/:provider/disable", post(crate::api::admin::models::post_disable_provider))
+        .route("/admin/providers/:provider/enable", post(crate::api::admin::models::post_enable_provider))
         .route("/admin/aliases", post(crate::api::admin::aliases::post_set_alias))
         .route("/admin/aliases/rows", get(crate::api::admin::aliases::get_alias_rows))
         .route("/admin/aliases/:alias/delete", post(crate::api::admin::aliases::post_delete_alias))

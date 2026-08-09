@@ -17,6 +17,10 @@ pub enum ApiError {
     InvalidRequest(String),
     #[error("policy denied: {reason}")]
     PolicyDenied { reason: String, status: u16 },
+    /// A model or provider an operator has taken out of rotation (issue #5).
+    /// Deliberately *not* a `ProviderError`: nothing was called upstream.
+    #[error("{0}")]
+    Disabled(String),
     #[error("internal error")]
     Internal,
 }
@@ -45,6 +49,11 @@ impl IntoResponse for ApiError {
                     .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
                 (sc, reason.clone(), "policy_denied")
             }
+            ApiError::Disabled(msg) => (
+                StatusCode::FORBIDDEN,
+                msg.clone(),
+                "model_disabled",
+            ),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error".to_string(),
@@ -59,6 +68,12 @@ impl IntoResponse for ApiError {
             }
         });
         (status, Json(body)).into_response()
+    }
+}
+
+impl From<crate::router::availability::Unavailable> for ApiError {
+    fn from(u: crate::router::availability::Unavailable) -> Self {
+        ApiError::Disabled(u.message())
     }
 }
 

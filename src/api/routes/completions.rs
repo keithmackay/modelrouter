@@ -179,10 +179,12 @@ async fn chat_completions_inner(
     .await
     .map_err(|_| ApiError::Internal)?;
 
-    // Check load balancer: if `model` is a named pool, override provider + model
-    let (provider_name, canonical_model) = if let Some((lb_provider, lb_model)) =
-        state.load_balancer.resolve(&model)
-    {
+    // Check load balancer: if `model` is a named pool, override provider + model.
+    // Operator-disabled entries are skipped when selecting (issue #5).
+    let lb_choice = state
+        .load_balancer
+        .resolve_available(&model, |p, m| state.router.is_available(p, m));
+    let (provider_name, canonical_model) = if let Some((lb_provider, lb_model)) = lb_choice {
         tracing::info!(
             pool = model.as_str(),
             provider = lb_provider.as_str(),
@@ -190,6 +192,12 @@ async fn chat_completions_inner(
             "load balancer selected provider"
         );
         (lb_provider, lb_model)
+    } else if state.load_balancer.is_pool(&model) {
+        // A pool exists but every member is disabled — say so rather than
+        // silently falling through to the default model.
+        return Err(ApiError::Disabled(format!(
+            "every model in load balancer pool '{model}' has been disabled by an administrator"
+        )));
     } else {
         state.router.resolve(&model)
     };
@@ -212,6 +220,14 @@ async fn chat_completions_inner(
     } else {
         (provider_name, canonical_model)
     };
+
+    // Operator disable gate (issue #5). Checked before the cache, the circuit
+    // breaker and any provider dispatch, so a disabled model or provider is
+    // never called and the caller gets a 403 naming the reason rather than a
+    // provider error or a silent reroute.
+    state
+        .router
+        .check_available(&provider_name, &canonical_model)?;
 
     let span = tracing::Span::current();
     span.record("model", canonical_model.as_str());
@@ -333,8 +349,9 @@ async fn chat_completions_inner(
         if state.circuit_breaker.is_open(&current_provider) {
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
             let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
-            if let Some(next_model) = state.fallback.next_after(&current_model) {
-                let (next_provider, next_canonical) = state.router.resolve(&next_model);
+            if let Some((next_provider, next_canonical)) =
+                next_available_fallback(&state, &current_model)
+            {
                 current_model = next_canonical;
                 current_provider = next_provider;
                 continue;
@@ -390,8 +407,9 @@ async fn chat_completions_inner(
                     error = %e,
                     "Provider call failed, checking fallback chain"
                 );
-                if let Some(next_model) = state.fallback.next_after(&current_model) {
-                    let (next_provider, next_canonical) = state.router.resolve(&next_model);
+                if let Some((next_provider, next_canonical)) =
+                    next_available_fallback(&state, &current_model)
+                {
                     current_model = next_canonical;
                     current_provider = next_provider;
                     tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
@@ -599,6 +617,33 @@ struct CacheHitCtx {
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
 /// cost-ledger row with `cache_hit = true`, `cost_usd = 0`, and the avoided cost
 /// in `saved_usd`. Fire-and-forget, matching the live-call logging path.
+/// Next fallback candidate after `current_model` that an operator has not disabled.
+///
+/// Operator-disabled entries are *skipped*, not fatal: the chain exists to find a
+/// working alternative, and a disable means "do not use this one". Bounded by the
+/// chain length so a chain that loops back on itself terminates.
+fn next_available_fallback(
+    state: &AppState,
+    current_model: &str,
+) -> Option<(String, String)> {
+    const MAX_FALLBACK_HOPS: usize = 16;
+
+    let mut cursor = current_model.to_string();
+    for _ in 0..MAX_FALLBACK_HOPS {
+        let next_model = state.fallback.next_after(&cursor)?;
+        let (next_provider, next_canonical) = state.router.resolve(&next_model);
+        if state.router.is_available(&next_provider, &next_canonical) {
+            return Some((next_provider, next_canonical));
+        }
+        tracing::info!(
+            skipped_model = next_model.as_str(),
+            "fallback candidate is disabled by an administrator, trying the next one"
+        );
+        cursor = next_model;
+    }
+    None
+}
+
 fn record_cache_hit(
     state: &AppState,
     ctx: CacheHitCtx,

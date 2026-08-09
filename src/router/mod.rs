@@ -1,3 +1,4 @@
+pub mod availability;
 pub mod cache;
 pub mod session_affinity;
 pub mod session_limits;

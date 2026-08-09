@@ -3,11 +3,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crate::config::Settings;
+use crate::router::availability::{AvailabilityMap, Unavailable};
 
 pub struct RequestRouter {
     settings: Arc<Settings>,
     /// DB-sourced alias overrides. DB wins over config on conflict.
     db_aliases: Arc<ArcSwap<HashMap<String, String>>>,
+    /// Models and providers an operator has taken out of rotation (issue #5).
+    availability: Arc<ArcSwap<AvailabilityMap>>,
 }
 
 impl RequestRouter {
@@ -15,12 +18,35 @@ impl RequestRouter {
         Self {
             settings,
             db_aliases: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            availability: Arc::new(ArcSwap::from_pointee(AvailabilityMap::default())),
         }
     }
 
     /// Replace the live DB alias map (called after DB model writes).
     pub fn update_db_aliases(&self, aliases: HashMap<String, String>) {
         self.db_aliases.store(Arc::new(aliases));
+    }
+
+    /// Replace the live operator-disable snapshot (called after any enable/disable write).
+    pub fn update_availability(&self, map: AvailabilityMap) {
+        self.availability.store(Arc::new(map));
+    }
+
+    /// Current operator-disable snapshot.
+    pub fn availability(&self) -> Arc<AvailabilityMap> {
+        self.availability.load_full()
+    }
+
+    /// `Err` when an operator has disabled this model or its provider.
+    ///
+    /// Distinct from a circuit-breaker trip: this is sticky and only an explicit
+    /// re-enable clears it. See [`crate::router::availability`].
+    pub fn check_available(&self, provider: &str, model: &str) -> Result<(), Unavailable> {
+        self.availability.load().check(provider, model)
+    }
+
+    pub fn is_available(&self, provider: &str, model: &str) -> bool {
+        self.check_available(provider, model).is_ok()
     }
 
     pub fn resolve(&self, requested_model: &str) -> (String, String) {

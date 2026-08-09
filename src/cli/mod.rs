@@ -5,7 +5,7 @@ pub mod cache;
 use std::sync::Arc;
 
 use anyhow::Result;
-use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands, ModelCommands, FailoverCommands, AliasCommands};
+use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands, ModelCommands, FailoverCommands, AliasCommands, ProviderCommands};
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
@@ -369,6 +369,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                     tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
                 }
                 state.router.update_db_aliases(db_aliases);
+                let availability =
+                    crate::api::admin::aliases::build_availability_map(&state.db).await;
+                if !availability.is_empty() {
+                    tracing::info!(
+                        count = availability.len(),
+                        "loaded operator-disabled models/providers"
+                    );
+                }
+                state.router.update_availability(availability);
                 if let Ok(rows) = state.db.list_all_failovers().await {
                     let mut db_chains: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
                     for r in rows {
@@ -1246,6 +1255,60 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Provider(provider_args) => {
+            use crate::db::repositories::models::ModelRepository;
+
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            match provider_args.command {
+                ProviderCommands::List => {
+                    let states = db.list_provider_states().await?;
+                    let mut names: Vec<String> = settings.providers.keys().cloned().collect();
+                    for s in &states {
+                        if !names.contains(&s.provider) {
+                            names.push(s.provider.clone());
+                        }
+                    }
+                    names.sort();
+                    if names.is_empty() {
+                        println!("No providers configured.");
+                        return Ok(());
+                    }
+                    println!("{:20}  {}", "PROVIDER", "STATUS");
+                    println!("{}", "─".repeat(72));
+                    for name in names {
+                        let row = states.iter().find(|s| s.provider == name);
+                        let status = match row {
+                            Some(r) if !r.enabled => format!(
+                                "disabled ({} — {})",
+                                r.disabled_reason.as_deref().unwrap_or("no reason recorded"),
+                                r.disabled_by.as_deref().unwrap_or("unknown"),
+                            ),
+                            _ => "enabled".to_string(),
+                        };
+                        println!("{:20}  {}", name, status);
+                    }
+                }
+                ProviderCommands::Disable { provider, reason } => {
+                    if !settings.providers.contains_key(&provider) {
+                        anyhow::bail!("Unknown provider: {}", provider);
+                    }
+                    db.set_provider_enabled(&provider, false, reason.as_deref(), Some("cli"))
+                        .await?;
+                    println!(
+                        "Disabled provider '{}' ({}). It stays disabled until explicitly enabled.",
+                        provider,
+                        reason.as_deref().unwrap_or("no reason given")
+                    );
+                }
+                ProviderCommands::Enable { provider } => {
+                    db.set_provider_enabled(&provider, true, None, Some("cli")).await?;
+                    println!("Enabled provider '{}'.", provider);
+                }
+            }
+        }
         Commands::Alias(alias_args) => {
             use crate::db::models::NewModelAlias;
             use crate::db::repositories::aliases::AliasRepository;
@@ -1357,21 +1420,35 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     println!("{:>4}  {:16}  {:36}  {:16}  {}",
                         "ID", "Provider", "Name", "Alias", "Status");
-                    println!("{}", "─".repeat(82));
+                    println!("{}", "─".repeat(96));
                     for m in models {
+                        let status = if m.enabled {
+                            "enabled".to_string()
+                        } else {
+                            format!(
+                                "disabled ({} — {})",
+                                m.disabled_reason.as_deref().unwrap_or("no reason recorded"),
+                                m.disabled_by.as_deref().unwrap_or("unknown"),
+                            )
+                        };
                         println!("{:>4}  {:16}  {:36}  {:16}  {}",
                             m.id, m.provider, m.name,
                             m.alias.as_deref().unwrap_or("—"),
-                            if m.enabled { "enabled" } else { "disabled" });
+                            status);
                     }
                 }
                 ModelCommands::Enable { id } => {
-                    db.set_model_enabled(id, true).await?;
+                    db.set_model_enabled_with_reason(id, true, None, Some("cli")).await?;
                     println!("Enabled model id={}", id);
                 }
-                ModelCommands::Disable { id } => {
-                    db.set_model_enabled(id, false).await?;
-                    println!("Disabled model id={}", id);
+                ModelCommands::Disable { id, reason } => {
+                    db.set_model_enabled_with_reason(id, false, reason.as_deref(), Some("cli"))
+                        .await?;
+                    println!(
+                        "Disabled model id={} ({}). It stays disabled until explicitly enabled.",
+                        id,
+                        reason.as_deref().unwrap_or("no reason given")
+                    );
                 }
                 ModelCommands::Delete { id } => {
                     if db.delete_model(id).await? {

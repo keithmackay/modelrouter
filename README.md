@@ -699,6 +699,54 @@ curl http://localhost:8080/v1/chat/completions \
 
 If a shortcut is not configured, the request falls through to normal default routing. Shortcuts are resolved before model aliases, so they cannot be overridden by alias config.
 
+### Disabling a model or a provider
+
+When a model or a whole provider should not be used — an outage, a cost spike, a security
+issue — an operator can take it out of rotation at runtime and put it back later. The change
+persists, applies to the next request without a restart, and is recorded in the audit log
+with who did it and why.
+
+```bash
+# CLI
+modelrouter model list
+modelrouter model disable --id 3 --reason "cost spike"
+modelrouter model enable --id 3
+modelrouter provider list
+modelrouter provider disable anthropic --reason "vendor incident"
+modelrouter provider enable anthropic
+```
+
+```bash
+# Admin API (superadmin for writes, any admin role to read)
+curl -X PATCH http://localhost:8080/admin/api/models/3/enabled \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"enabled":false,"reason":"cost spike"}'
+
+curl -X PATCH http://localhost:8080/admin/api/providers/anthropic/enabled \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"enabled":false,"reason":"vendor incident"}'
+```
+
+The dashboard equivalent is the **Providers** and **Models** sections of `/admin/models`,
+which show the reason, the actor and the timestamp next to anything disabled.
+
+A disabled entity is excluded everywhere it could be reached:
+
+- direct requests return **403** with `"type": "model_disabled"` and a message naming the
+  reason — not a provider error, because nothing is called upstream;
+- disabling a provider disables every model behind it;
+- load-balancer pools skip disabled members (and report a 403 if every member is disabled);
+- fallback chains skip disabled candidates and continue down the chain;
+- aliases resolving onto a disabled target produce the same 403;
+- `/v1/models` omits it.
+
+**Disable vs. the circuit breaker.** These are separate mechanisms. The circuit breaker
+reacts automatically to observed provider failures, is in-memory, and **auto-recovers**
+after a cooldown. An operator disable is a deliberate decision: it is **sticky** — it never
+auto-recovers, it survives a restart, and only an explicit enable clears it. The disable
+check runs before the breaker and before any provider dispatch, so a disabled entity is
+never called and can neither trip nor reset a breaker.
+
 ### OIDC SSO for admin login
 
 By default, admins log in with username and password at `/admin/login`. To use an identity provider instead:

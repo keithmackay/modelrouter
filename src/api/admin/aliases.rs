@@ -59,6 +59,50 @@ pub async fn refresh_router_aliases(state: &AppState) {
     state.router.update_db_aliases(map);
 }
 
+/// Build the operator-disable snapshot from the database (issue #5).
+pub async fn build_availability_map(
+    db: &Arc<dyn DatabaseProvider>,
+) -> crate::router::availability::AvailabilityMap {
+    use crate::router::availability::DisableInfo;
+
+    let mut models: HashMap<String, DisableInfo> = HashMap::new();
+    if let Ok(rows) = db.list_models().await {
+        for m in rows.iter().filter(|m| !m.enabled) {
+            models.insert(
+                format!("{}/{}", m.provider, m.name),
+                DisableInfo {
+                    reason: m.disabled_reason.clone(),
+                    by: m.disabled_by.clone(),
+                    at: m.disabled_at.clone(),
+                },
+            );
+        }
+    }
+    let mut providers: HashMap<String, DisableInfo> = HashMap::new();
+    if let Ok(rows) = db.list_provider_states().await {
+        for p in rows.iter().filter(|p| !p.enabled) {
+            providers.insert(
+                p.provider.clone(),
+                DisableInfo {
+                    reason: p.disabled_reason.clone(),
+                    by: p.disabled_by.clone(),
+                    at: p.disabled_at.clone(),
+                },
+            );
+        }
+    }
+    crate::router::availability::AvailabilityMap::new(models, providers)
+}
+
+/// Reload both the alias map and the disable snapshot into the live router.
+/// Called after any model, provider or alias write so changes need no restart.
+pub async fn refresh_router_state(state: &AppState) {
+    refresh_router_aliases(state).await;
+    state
+        .router
+        .update_availability(build_availability_map(&state.db).await);
+}
+
 /// Returns `true` if adding `alias -> target` to `map` would create a resolution cycle.
 fn would_cycle(map: &HashMap<String, String>, alias: &str, target: &str) -> bool {
     let mut current = target.to_string();

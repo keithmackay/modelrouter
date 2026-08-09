@@ -83,6 +83,10 @@ async fn embeddings_inner(
     }
 
     let (provider_name, canonical_model) = state.router.resolve(&model);
+
+    // Operator disable gate (issue #5) — 403 naming the reason, never a provider call.
+    state.router.check_available(&provider_name, &canonical_model)?;
+
     let adapter = state
         .embedding_registry
         .get(&provider_name)

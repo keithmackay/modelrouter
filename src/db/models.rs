@@ -387,6 +387,21 @@ pub struct Model {
     pub alias: Option<String>,
     pub enabled: bool,
     pub created_at: String,
+    /// Why an operator disabled this model (issue #5). `None` while enabled.
+    pub disabled_reason: Option<String>,
+    pub disabled_by: Option<String>,
+    pub disabled_at: Option<String>,
+}
+
+/// Whole-provider enable/disable state (issue #5). Absence of a row means enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderState {
+    pub provider: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub disabled_by: Option<String>,
+    pub disabled_at: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug)]

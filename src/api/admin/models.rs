@@ -59,6 +59,9 @@ pub async fn get_models(
             "alias": m.alias,
             "enabled": m.enabled,
             "created_at": m.created_at,
+            "disabled_reason": m.disabled_reason,
+            "disabled_by": m.disabled_by,
+            "disabled_at": m.disabled_at,
             "failovers": chain,
         })
     }).collect();
@@ -166,28 +169,50 @@ pub async fn post_create_model(
 
 pub async fn post_disable_model(
     State(state): State<AppState>,
-    _session: SuperDashboardSession,
+    session: SuperDashboardSession,
     Path(id): Path<i64>,
+    Form(form): Form<DisableReasonForm>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
-
-    state.db.set_model_enabled(id, false).await.map_err(|_| DashboardError::Internal)?;
-    refresh_router_aliases(&state).await;
-
-    let model = state.db.get_model(id).await.map_err(|_| DashboardError::Internal)?
-        .ok_or_else(|| DashboardError::NotFound(format!("model {id}")))?;
-    Ok(Html(model_row_html(&model)))
+    set_model_from_dashboard(state, session, id, false, clean_reason(form.reason.as_deref())).await
 }
 
 pub async fn post_enable_model(
     State(state): State<AppState>,
-    _session: SuperDashboardSession,
+    session: SuperDashboardSession,
     Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    set_model_from_dashboard(state, session, id, true, None).await
+}
+
+async fn set_model_from_dashboard(
+    state: AppState,
+    session: SuperDashboardSession,
+    id: i64,
+    enabled: bool,
+    reason: Option<String>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::models::ModelRepository;
 
-    state.db.set_model_enabled(id, true).await.map_err(|_| DashboardError::Internal)?;
-    refresh_router_aliases(&state).await;
+    let before = state.db.get_model(id).await.map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("model {id}")))?;
+
+    state
+        .db
+        .set_model_enabled_with_reason(id, enabled, reason.as_deref(), Some(&session.0.name))
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    refresh_router_state(&state).await;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        if enabled { "model.enable" } else { "model.disable" },
+        Some(format!("model:{}/{}", before.provider, before.name)),
+        Some(serde_json::json!({ "enabled": before.enabled }).to_string()),
+        Some(serde_json::json!({ "enabled": enabled, "reason": reason }).to_string()),
+    )
+    .await;
 
     let model = state.db.get_model(id).await.map_err(|_| DashboardError::Internal)?
         .ok_or_else(|| DashboardError::NotFound(format!("model {id}")))?;
@@ -254,14 +279,23 @@ pub async fn post_set_failovers(
 fn model_row_html(m: &crate::db::models::Model) -> String {
     let id = m.id;
     let status_tag = if m.enabled {
-        "<span class=\"tag tag-enabled\">Enabled</span>"
+        "<span class=\"tag tag-enabled\">Enabled</span>".to_string()
     } else {
-        "<span class=\"tag tag-disabled\">Disabled</span>"
+        format!(
+            "<span class=\"tag tag-disabled\">Disabled</span><br>\
+             <small style=\"color:#666\">{reason} — {by}{at}</small>",
+            reason = he(m.disabled_reason.as_deref().unwrap_or("no reason recorded")),
+            by = he(m.disabled_by.as_deref().unwrap_or("unknown")),
+            at = m.disabled_at.as_deref().map(|a| format!(", {}", he(a))).unwrap_or_default(),
+        )
     };
     let toggle_btn = if m.enabled {
         format!(
-            "<button class=\"btn btn-secondary\" style=\"font-size:0.8rem;padding:0.25rem 0.5rem\" \
-              hx-post=\"/admin/models/{id}/disable\" hx-target=\"#model-row-{id}\" hx-swap=\"outerHTML\">Disable</button>"
+            "<input type=\"text\" name=\"reason\" placeholder=\"reason\" id=\"model-reason-{id}\" \
+              style=\"padding:0.2rem 0.4rem;border:1px solid #ccc;border-radius:4px;width:150px\">\
+             <button class=\"btn btn-secondary\" style=\"font-size:0.8rem;padding:0.25rem 0.5rem\" \
+              hx-post=\"/admin/models/{id}/disable\" hx-include=\"#model-reason-{id}\" \
+              hx-target=\"#model-row-{id}\" hx-swap=\"outerHTML\">Disable</button>"
         )
     } else {
         format!(
@@ -303,4 +337,320 @@ async fn refresh_router_failovers(state: &AppState) {
         }
         state.fallback.update_db_chains(map);
     }
+}
+
+// ── Operator disable / enable (issue #5) ──────────────────────────────────────
+//
+// An operator disable is deliberately *sticky*: unlike a circuit-breaker trip it
+// never auto-recovers, it is persisted so it survives a restart, and only an
+// explicit enable clears it. See `crate::router::availability` for the full
+// comparison and for how disabled entities are excluded from routing.
+
+use axum::response::IntoResponse;
+use crate::api::admin::auth::{AdminSession, SuperAdminSession};
+use crate::api::error::ApiError;
+use super::aliases::refresh_router_state;
+
+#[derive(Deserialize)]
+pub struct SetEnabledRequest {
+    pub enabled: bool,
+    /// Required in spirit when disabling — recorded verbatim and shown to callers.
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DisableReasonForm {
+    pub reason: Option<String>,
+}
+
+fn clean_reason(reason: Option<&str>) -> Option<String> {
+    reason.map(str::trim).filter(|r| !r.is_empty()).map(String::from)
+}
+
+/// GET /admin/api/models — models with their disable metadata.
+pub async fn list_models_api(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::models::ModelRepository;
+
+    let models = state.db.list_models().await.map_err(|_| ApiError::Internal)?;
+    Ok(axum::Json(serde_json::json!({ "models": models })))
+}
+
+/// PATCH /admin/api/models/:id/enabled
+pub async fn set_model_enabled_api(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Path(id): Path<i64>,
+    axum::Json(body): axum::Json<SetEnabledRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::models::ModelRepository;
+
+    let before = state
+        .db
+        .get_model(id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or_else(|| ApiError::InvalidRequest(format!("no such model: {id}")))?;
+
+    let reason = clean_reason(body.reason.as_deref());
+    state
+        .db
+        .set_model_enabled_with_reason(id, body.enabled, reason.as_deref(), Some(&session.0.name))
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    refresh_router_state(&state).await;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        if body.enabled { "model.enable" } else { "model.disable" },
+        Some(format!("model:{}/{}", before.provider, before.name)),
+        Some(serde_json::json!({ "enabled": before.enabled }).to_string()),
+        Some(serde_json::json!({ "enabled": body.enabled, "reason": reason }).to_string()),
+    )
+    .await;
+
+    let after = state
+        .db
+        .get_model(id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Internal)?;
+    Ok(axum::Json(after))
+}
+
+/// GET /admin/api/providers — configured providers with their enable state.
+pub async fn list_providers_api(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(axum::Json(serde_json::json!({
+        "providers": provider_views(&state).await.map_err(|_| ApiError::Internal)?,
+    })))
+}
+
+/// PATCH /admin/api/providers/:provider/enabled
+pub async fn set_provider_enabled_api(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Path(provider): Path<String>,
+    axum::Json(body): axum::Json<SetEnabledRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::db::repositories::models::ModelRepository;
+
+    // Only providers this router actually knows about can be toggled, so a typo
+    // cannot create a phantom "disabled" entry that silently does nothing.
+    if !state.settings.providers.contains_key(&provider) {
+        return Err(ApiError::InvalidRequest(format!(
+            "unknown provider: {provider}"
+        )));
+    }
+
+    let reason = clean_reason(body.reason.as_deref());
+    state
+        .db
+        .set_provider_enabled(&provider, body.enabled, reason.as_deref(), Some(&session.0.name))
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    refresh_router_state(&state).await;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        if body.enabled { "provider.enable" } else { "provider.disable" },
+        Some(format!("provider:{provider}")),
+        None,
+        Some(serde_json::json!({ "enabled": body.enabled, "reason": reason }).to_string()),
+    )
+    .await;
+
+    let state_row = state
+        .db
+        .get_provider_state(&provider)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(axum::Json(serde_json::json!({
+        "provider": provider,
+        "enabled": body.enabled,
+        "state": state_row,
+    })))
+}
+
+/// Configured providers joined with any persisted disable state.
+async fn provider_views(state: &AppState) -> anyhow::Result<Vec<serde_json::Value>> {
+    use crate::db::repositories::models::ModelRepository;
+
+    let states = state.db.list_provider_states().await?;
+    let mut names: Vec<String> = state.settings.providers.keys().cloned().collect();
+    for s in &states {
+        if !names.contains(&s.provider) {
+            names.push(s.provider.clone());
+        }
+    }
+    names.sort();
+
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let row = states.iter().find(|s| s.provider == name);
+            serde_json::json!({
+                "provider": name,
+                "enabled": row.map(|r| r.enabled).unwrap_or(true),
+                "disabled_reason": row.and_then(|r| r.disabled_reason.clone()),
+                "disabled_by": row.and_then(|r| r.disabled_by.clone()),
+                "disabled_at": row.and_then(|r| r.disabled_at.clone()),
+            })
+        })
+        .collect())
+}
+
+/// POST /admin/providers/:provider/disable — dashboard toggle.
+pub async fn post_disable_provider(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(provider): Path<String>,
+    Form(form): Form<DisableReasonForm>,
+) -> Result<Html<String>, DashboardError> {
+    set_provider_from_dashboard(state, session, provider, false, clean_reason(form.reason.as_deref())).await
+}
+
+/// POST /admin/providers/:provider/enable — dashboard toggle.
+pub async fn post_enable_provider(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(provider): Path<String>,
+) -> Result<Html<String>, DashboardError> {
+    set_provider_from_dashboard(state, session, provider, true, None).await
+}
+
+async fn set_provider_from_dashboard(
+    state: AppState,
+    session: SuperDashboardSession,
+    provider: String,
+    enabled: bool,
+    reason: Option<String>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::models::ModelRepository;
+
+    if !state.settings.providers.contains_key(&provider) {
+        return Err(DashboardError::NotFound(format!("provider {provider}")));
+    }
+
+    state
+        .db
+        .set_provider_enabled(&provider, enabled, reason.as_deref(), Some(&session.0.name))
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+
+    refresh_router_state(&state).await;
+
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        if enabled { "provider.enable" } else { "provider.disable" },
+        Some(format!("provider:{provider}")),
+        None,
+        Some(serde_json::json!({ "enabled": enabled, "reason": reason }).to_string()),
+    )
+    .await;
+
+    let row = state
+        .db
+        .get_provider_state(&provider)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    Ok(Html(provider_row_html(
+        &provider,
+        enabled,
+        row.as_ref().and_then(|r| r.disabled_reason.as_deref()),
+        row.as_ref().and_then(|r| r.disabled_by.as_deref()),
+        row.as_ref().and_then(|r| r.disabled_at.as_deref()),
+    )))
+}
+
+pub(crate) fn provider_row_html(
+    provider: &str,
+    enabled: bool,
+    reason: Option<&str>,
+    by: Option<&str>,
+    at: Option<&str>,
+) -> String {
+    let id = provider
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let status = if enabled {
+        "<span class=\"tag tag-enabled\">Enabled</span>".to_string()
+    } else {
+        format!(
+            "<span class=\"tag tag-disabled\">Disabled</span><br>\
+             <small style=\"color:#666\">{reason} — {by}{at}</small>",
+            reason = he(reason.unwrap_or("no reason recorded")),
+            by = he(by.unwrap_or("unknown")),
+            at = at.map(|a| format!(", {}", he(a))).unwrap_or_default(),
+        )
+    };
+    let action = if enabled {
+        format!(
+            "<input type=\"text\" name=\"reason\" placeholder=\"reason\" \
+               style=\"padding:0.2rem 0.4rem;border:1px solid #ccc;border-radius:4px;width:150px\" \
+               id=\"provider-reason-{id}\">\
+             <button class=\"btn btn-secondary\" style=\"font-size:0.8rem;padding:0.25rem 0.5rem\" \
+               hx-post=\"/admin/providers/{purl}/disable\" hx-include=\"#provider-reason-{id}\" \
+               hx-target=\"#provider-row-{id}\" hx-swap=\"outerHTML\">Disable</button>",
+            id = id,
+            purl = urlencoding::encode(provider),
+        )
+    } else {
+        format!(
+            "<button class=\"btn btn-success\" style=\"font-size:0.8rem;padding:0.25rem 0.5rem\" \
+               hx-post=\"/admin/providers/{purl}/enable\" \
+               hx-target=\"#provider-row-{id}\" hx-swap=\"outerHTML\">Enable</button>",
+            id = id,
+            purl = urlencoding::encode(provider),
+        )
+    };
+    format!(
+        "<tr id=\"provider-row-{id}\"><td><code>{name}</code></td><td>{status}</td><td>{action}</td></tr>",
+        id = id,
+        name = he(provider),
+        status = status,
+        action = action,
+    )
+}
+
+/// GET /admin/providers/rows — htmx fragment for the provider table body.
+pub async fn get_provider_rows(
+    State(state): State<AppState>,
+    _session: SuperDashboardSession,
+) -> Result<Html<String>, DashboardError> {
+    let views = provider_views(&state).await.map_err(|_| DashboardError::Internal)?;
+    if views.is_empty() {
+        return Ok(Html(
+            "<tr><td colspan=\"3\" style=\"color:#999;font-style:italic;\">\
+             No providers configured.</td></tr>"
+                .to_string(),
+        ));
+    }
+    Ok(Html(
+        views
+            .iter()
+            .map(|v| {
+                provider_row_html(
+                    v["provider"].as_str().unwrap_or(""),
+                    v["enabled"].as_bool().unwrap_or(true),
+                    v["disabled_reason"].as_str(),
+                    v["disabled_by"].as_str(),
+                    v["disabled_at"].as_str(),
+                )
+            })
+            .collect::<String>(),
+    ))
 }

@@ -39,6 +39,21 @@ impl Pool {
         }
     }
 
+    /// Next entry satisfying `accept`. Scans at most one full cycle of the expanded
+    /// ring so a pool whose entries are all disabled terminates instead of spinning.
+    fn next_where(&self, accept: &dyn Fn(&str, &str) -> bool) -> Option<(String, String)> {
+        if self.expanded.is_empty() {
+            return None;
+        }
+        for _ in 0..self.expanded.len() {
+            let candidate = self.next()?;
+            if accept(&candidate.0, &candidate.1) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     fn next(&self) -> Option<(String, String)> {
         if self.expanded.is_empty() {
             return None;
@@ -70,5 +85,23 @@ impl LoadBalancer {
     /// Returns `None` if `model` is not a load balancer pool name — caller uses normal routing.
     pub fn resolve(&self, model: &str) -> Option<(String, String)> {
         self.pools.get(model)?.next()
+    }
+
+    /// Like [`LoadBalancer::resolve`], but skips entries `accept` rejects — used to
+    /// keep operator-disabled models and providers out of the pool (issue #5).
+    ///
+    /// Returns `None` both when `model` is not a pool and when every entry in the
+    /// pool is rejected; callers distinguish the two with [`LoadBalancer::is_pool`].
+    pub fn resolve_available(
+        &self,
+        model: &str,
+        accept: impl Fn(&str, &str) -> bool,
+    ) -> Option<(String, String)> {
+        self.pools.get(model)?.next_where(&accept)
+    }
+
+    /// Whether `model` names a configured pool.
+    pub fn is_pool(&self, model: &str) -> bool {
+        self.pools.contains_key(model)
     }
 }
