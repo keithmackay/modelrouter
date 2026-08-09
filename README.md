@@ -34,6 +34,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Multi-scope budget enforcement** — set monthly or fixed date-range limits at the global (org-wide), project, user, or group level; any limit hit blocks the request before it reaches the upstream
 - **Admin dashboard** — web UI at `/admin` with usage stats, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
 - **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion; wire Datadog, Slack, or any HTTP endpoint; takes effect on next restart
+- **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
 - **Session stickiness** — include `session_id` in any request to pin the session to the winning provider; automatically re-pins on model change; opt out per-request with `X-Session-Lb: true`
 - **Prompt logging control** — set `X-No-Log: true` on any request to skip prompt history and callback dispatch while preserving cost tracking for budget enforcement
 - **Chinese model providers** — built-in pricing for DeepSeek, Qwen (Tongyi), and Doubao; all are OpenAI-compatible and configured as standard providers
@@ -569,10 +570,69 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 | `[[guardrails]]` | Content safety rules (type, fail_open, api_key, endpoint) | — |
 | `[[policy_rules]]` | Declarative access rules matched by project/group/user/model | — |
 | `[oidc]` | OIDC SSO for admin login (issuer_url, client_id, client_secret, …) | disabled |
+| `cache.enabled` | Turn the response cache on | `false` |
+| `cache.backend` | `memory` (per-process) or `redis` (shared) | `memory` |
+| `cache.completions.max_temperature` | Cache completions only at or below this temperature | `0.0` |
+| `cache.search.ttl_seconds` | TTL for cached search results | `900` |
 | `telemetry.endpoint` | OTLP gRPC endpoint (`--features otel`) | disabled |
 | `telemetry.sample_ratio` | Fraction of normal requests to trace | `0.1` |
 
 See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration.
+
+### Response cache
+
+The router can serve identical requests from a cache instead of calling the
+provider, so every app behind it saves money without implementing its own cache.
+Disabled by default; enable with `cache.enabled = true`.
+
+**What is cached.** `POST /v1/chat/completions` and `POST /v1/search`.
+
+**Cache key.** The resolved (post-alias, post-load-balancer) model, plus a
+SHA-256 of the request body with only transport-level fields removed (`stream`,
+`stream_options`, `user`, `session_id`, `metadata`). Every field that can change
+the answer — messages, tools, `temperature`, `top_p`, `max_tokens`, `seed`,
+`response_format` — is part of the key. For search the key is engine + query +
+options. Exact-match only; there is no semantic or fuzzy matching.
+
+**Eligibility (the default is conservative).** A completion is cached only when
+its `temperature` is explicitly at or below `cache.completions.max_temperature`,
+which defaults to `0.0`. A request that omits `temperature` is scored using
+`cache.completions.assumed_temperature` (default `1.0`, the OpenAI default), so
+**omitting `temperature` means the request is not cached**. Streaming requests
+are never cached. Search queries are cached by default with a shorter TTL
+(15 minutes vs. 1 hour). Raise `max_temperature` deliberately if you want
+creative sampling replayed.
+
+**Metering.** A cache hit is recorded as a usage row with `cache_hit = true`,
+`cost_usd = 0`, and the avoided provider cost in `saved_usd`. Hits therefore
+never inflate spend, and cache-hit percentage is reported alongside cost.
+Responses carry an `x-modelrouter-cache: HIT|MISS` header.
+
+**Backends.** `memory` (moka, bounded by `cache.max_entries`, per-process — each
+replica warms its own copy) or `redis` (shared across stateless replicas, keys
+namespaced by `cache.namespace`). Backends sit behind the `CacheStore` trait in
+`src/router/cache/store.rs`; adding another one touches no call sites.
+
+**Operator surfaces.**
+
+```bash
+# CLI (talks to the running router's admin API)
+modelrouter cache stats --admin alice
+modelrouter cache purge --model gpt-4o-mini --admin alice
+modelrouter cache policy get --admin alice
+modelrouter cache policy set --max-temperature 0.2 --admin alice
+
+# REST (admin JWT)
+GET  /admin/api/cache/stats
+POST /admin/api/cache/purge     {"scope":"all"|"model"|"key", "model":…, "key":…}
+GET  /admin/api/cache/policy
+PUT  /admin/api/cache/policy    {"completions_max_temperature": 0.2, …}
+```
+
+The dashboard page at `/admin/cache` shows hit rate over time, cache size, top
+cached models, purge controls, and the policy form; `/admin/cost` shows cache-hit
+% and dollars saved next to spend. Policy changes made at runtime are **not**
+written back to the config file — a restart returns to the configured policy.
 
 ### Model routing
 
