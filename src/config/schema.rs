@@ -15,28 +15,109 @@ pub struct PricingEntry {
     pub cache_write_per_million: Option<f64>,
 }
 
+/// Response cache configuration.
+///
+/// The cache is exact-match only: identical eligible requests are served from
+/// the store at zero provider cost. Eligibility is deliberately conservative by
+/// default — see [`CompletionCachePolicy`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CacheConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Store backend: `memory` (per-process, default) or `redis` (shared).
+    #[serde(default = "default_cache_backend")]
+    pub backend: String,
+    /// Redis connection URL, used when `backend = "redis"`.
+    #[serde(default)]
+    pub redis_url: String,
+    /// Key namespace. Keeps environments from sharing entries in one Redis.
+    #[serde(default = "default_cache_namespace")]
+    pub namespace: String,
+    /// Max entries held by the in-memory backend. Ignored by Redis.
     #[serde(default = "default_cache_max_entries")]
     pub max_entries: u64,
+    /// Fallback TTL for any class that does not set its own.
     #[serde(default = "default_cache_ttl")]
     pub ttl_seconds: u64,
+    #[serde(default)]
+    pub completions: CompletionCachePolicy,
+    #[serde(default)]
+    pub search: SearchCachePolicy,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: default_cache_backend(),
+            redis_url: String::new(),
+            namespace: default_cache_namespace(),
             max_entries: default_cache_max_entries(),
             ttl_seconds: default_cache_ttl(),
+            completions: CompletionCachePolicy::default(),
+            search: SearchCachePolicy::default(),
+        }
+    }
+}
+
+/// Eligibility policy for `/v1/chat/completions`.
+///
+/// Default is conservative: only requests whose `temperature` is explicitly at
+/// or below `max_temperature` (0.0) are cached. A request that omits
+/// `temperature` is scored using `assumed_temperature` (1.0, the OpenAI
+/// default), so omitting it means *not cached* — creative sampling never
+/// silently replays a stored answer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompletionCachePolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_temperature: f64,
+    #[serde(default = "default_assumed_temperature")]
+    pub assumed_temperature: f64,
+    /// TTL override for completion entries. Falls back to `cache.ttl_seconds`.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+impl Default for CompletionCachePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_temperature: 0.0,
+            assumed_temperature: default_assumed_temperature(),
+            ttl_seconds: None,
+        }
+    }
+}
+
+/// Eligibility policy for `/v1/search`. Search results are deterministic enough
+/// to cache by default, but go stale faster than completions, hence the shorter
+/// default TTL.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SearchCachePolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_search_cache_ttl")]
+    pub ttl_seconds: u64,
+}
+
+impl Default for SearchCachePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: default_search_cache_ttl(),
         }
     }
 }
 
 fn default_cache_max_entries() -> u64 { 1000 }
 fn default_cache_ttl() -> u64 { 3600 }
+fn default_cache_backend() -> String { "memory".to_string() }
+fn default_cache_namespace() -> String { "modelrouter".to_string() }
+fn default_assumed_temperature() -> f64 { 1.0 }
+fn default_search_cache_ttl() -> u64 { 900 }
+fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {

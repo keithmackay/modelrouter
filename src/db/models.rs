@@ -202,6 +202,15 @@ pub struct CostLedgerEntry {
     pub created_at: String,
     #[sqlx(default)]
     pub api_key_id: Option<i64>,
+    /// True when this usage record was served from the response cache. Such a
+    /// row always has `cost_usd = 0` — it is usage, not spend.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub cache_hit: bool,
+    /// Provider cost avoided by serving this row from cache. Zero on real calls.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub saved_usd: f64,
 }
 
 #[derive(Debug)]

@@ -1,8 +1,13 @@
 use async_trait::async_trait;
 
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
-use crate::db::repositories::costs::CostRepository;
+use crate::db::repositories::costs::{CacheUsageSummary, CostRepository};
 use super::{SqliteDb, now_utc};
+
+/// Columns selected when reading a ledger row back.
+const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, \
+                              tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
+                              cache_hit, saved_usd";
 
 #[async_trait]
 impl CostRepository for SqliteDb {
@@ -27,15 +32,165 @@ impl CostRepository for SqliteDb {
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, CostLedgerEntry>(
-            "SELECT id, user_id, prompt_id, model, provider, project,
-                    tokens_in, tokens_out, cost_usd, created_at, api_key_id
-             FROM cost_ledger WHERE id = ?",
-        )
+        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+            "SELECT {} FROM cost_ledger WHERE id = ?",
+            LEDGER_COLUMNS
+        ))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn create_cache_hit(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
+        let now = now_utc();
+        // cost_usd is hard-coded to 0 here: a cache hit is usage, never spend.
+        // The would-be cost travels in `saved_usd`.
+        let result = sqlx::query(
+            r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
+                                        tokens_in, tokens_out, cost_usd, api_key_id, created_at,
+                                        cache_hit, saved_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?)"#,
+        )
+        .bind(entry.user_id)
+        .bind(entry.prompt_id)
+        .bind(&entry.model)
+        .bind(&entry.provider)
+        .bind(&entry.project)
+        .bind(entry.tokens_in)
+        .bind(entry.tokens_out)
+        .bind(entry.api_key_id)
+        .bind(&now)
+        .bind(entry.cost_usd)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid();
+        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+            "SELECT {} FROM cost_ledger WHERE id = ?",
+            LEDGER_COLUMNS
+        ))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn cache_summary_since(
+        &self,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<CacheUsageSummary> {
+        let mut sql = "SELECT COALESCE(SUM(cache_hit), 0), COUNT(*), COALESCE(SUM(saved_usd), 0.0) \
+                       FROM cost_ledger WHERE created_at >= ?"
+            .to_string();
+        if filter_model.is_some() {
+            sql.push_str(" AND model = ?");
+        }
+        let mut q = sqlx::query_as::<_, (i64, i64, f64)>(&sql).bind(since);
+        if let Some(m) = filter_model {
+            q = q.bind(m.to_string());
+        }
+        let (hits, requests, saved_usd) = q.fetch_one(&self.pool).await?;
+        Ok(CacheUsageSummary { hits, requests, saved_usd })
+    }
+
+    async fn cache_daily_series(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<(String, i64, i64)>> {
+        Ok(sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT strftime('%Y-%m-%d', created_at) AS day, \
+                    COALESCE(SUM(cache_hit), 0), COUNT(*) \
+             FROM cost_ledger WHERE created_at >= ? AND created_at < ? \
+             GROUP BY day ORDER BY day ASC",
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn cache_summary_by_model_since(
+        &self,
+        since: &str,
+    ) -> anyhow::Result<Vec<(String, CacheUsageSummary)>> {
+        let rows = sqlx::query_as::<_, (String, i64, i64, f64)>(
+            "SELECT model, COALESCE(SUM(cache_hit), 0), COUNT(*), COALESCE(SUM(saved_usd), 0.0) \
+             FROM cost_ledger WHERE created_at >= ? \
+             GROUP BY model ORDER BY SUM(cache_hit) DESC, model ASC",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(model, hits, requests, saved_usd)| {
+                (model, CacheUsageSummary { hits, requests, saved_usd })
+            })
+            .collect())
+    }
+
+    async fn cache_rows_grouped(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_api_key_id: Option<i64>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<(i64, String, Option<String>, Option<i64>, CacheUsageSummary)>> {
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+
+        let mut sql = "SELECT user_id, model, project, api_key_id, \
+                              COALESCE(SUM(cache_hit), 0), COUNT(*), \
+                              COALESCE(SUM(saved_usd), 0.0) \
+                       FROM cost_ledger WHERE created_at >= ?"
+            .to_string();
+        if filter_project.is_some() {
+            sql.push_str(" AND project = ?");
+        }
+        if filter_api_key_id.is_some() {
+            sql.push_str(" AND api_key_id = ?");
+        }
+        if let Some(ids) = filter_user_ids {
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        if filter_model.is_some() {
+            sql.push_str(" AND model = ?");
+        }
+        sql.push_str(" GROUP BY user_id, model, project, api_key_id");
+
+        type Row = (i64, String, Option<String>, Option<i64>, i64, i64, f64);
+        let mut q = sqlx::query_as::<_, Row>(&sql).bind(since);
+        if let Some(p) = filter_project {
+            q = q.bind(p.to_string());
+        }
+        if let Some(k) = filter_api_key_id {
+            q = q.bind(k);
+        }
+        if let Some(m) = filter_model {
+            q = q.bind(m.to_string());
+        }
+        Ok(q
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|(user_id, model, project, key_id, hits, requests, saved_usd)| {
+                (
+                    user_id,
+                    model,
+                    project,
+                    key_id,
+                    CacheUsageSummary { hits, requests, saved_usd },
+                )
+            })
+            .collect())
     }
 
     async fn sum_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<f64> {
@@ -85,11 +240,10 @@ impl CostRepository for SqliteDb {
     }
 
     async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
-        let rows = sqlx::query_as::<_, CostLedgerEntry>(
-            r#"SELECT id, user_id, prompt_id, model, provider, project,
-                      tokens_in, tokens_out, cost_usd, created_at, api_key_id
-               FROM cost_ledger WHERE created_at < ? ORDER BY created_at ASC LIMIT 10000"#,
-        )
+        let rows = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+            "SELECT {} FROM cost_ledger WHERE created_at < ? ORDER BY created_at ASC LIMIT 10000",
+            LEDGER_COLUMNS
+        ))
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await?;

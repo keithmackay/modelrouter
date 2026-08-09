@@ -10,14 +10,14 @@ fn rows_to_ndjson_produces_one_line_per_row() {
             model: "gpt-4o".to_string(), provider: "openai".to_string(),
             project: None, tokens_in: 100, tokens_out: 50,
             cost_usd: 0.01, created_at: "2024-01-01T00:00:00+00:00".to_string(),
-            api_key_id: None,
+            api_key_id: None, cache_hit: false, saved_usd: 0.0,
         },
         CostLedgerEntry {
             id: 2, user_id: 42, prompt_id: 8,
             model: "gpt-4o".to_string(), provider: "openai".to_string(),
             project: None, tokens_in: 200, tokens_out: 100,
             cost_usd: 0.02, created_at: "2024-01-02T00:00:00+00:00".to_string(),
-            api_key_id: None,
+            api_key_id: None, cache_hit: false, saved_usd: 0.0,
         },
     ];
     let ndjson = rows_to_ndjson(&rows);
