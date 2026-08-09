@@ -29,6 +29,67 @@ impl CacheUsageSummary {
     }
 }
 
+/// Selects ledger rows by caller-supplied attribution (see `api::attribution`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributionFilter {
+    /// Exact match on `attribution_correlation_id`.
+    CorrelationId(String),
+    /// Rows whose `attribution_tags` JSON object has `key` equal to `value`.
+    Tag { key: String, value: String },
+}
+
+impl AttributionFilter {
+    /// JSON path for the tag key, e.g. `$."engagement"`. Tag keys are validated
+    /// on ingest to exclude quotes, backslashes and whitespace, so this cannot
+    /// escape the path expression.
+    pub fn tag_json_path(key: &str) -> String {
+        format!("$.\"{}\"", key)
+    }
+
+    /// Human-readable label, used by the CLI and dashboard.
+    pub fn label(&self) -> String {
+        match self {
+            AttributionFilter::CorrelationId(v) => format!("correlation_id={}", v),
+            AttributionFilter::Tag { key, value } => format!("{}={}", key, value),
+        }
+    }
+}
+
+/// Spend *and* savings for one slice of attributed usage.
+///
+/// `cost_usd` is what was actually paid; `saved_usd` is what the response cache
+/// avoided. Cache-hit rows always contribute to the second and never the first,
+/// so the two never double-count.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct AttributionTotals {
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub requests: i64,
+    pub cache_hits: i64,
+}
+
+impl AttributionTotals {
+    /// Fraction of requests served from cache, 0.0 when there were none.
+    pub fn hit_rate(&self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.cache_hits as f64 / self.requests as f64
+        }
+    }
+}
+
+/// One breakdown row: `key` is a model name or a calendar day depending on which
+/// breakdown produced it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AttributionBreakdownRow {
+    pub key: String,
+    #[serde(flatten)]
+    pub totals: AttributionTotals,
+}
+
 #[async_trait]
 pub trait CostRepository: Send + Sync {
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry>;
@@ -133,4 +194,41 @@ pub trait CostRepository: Send + Sync {
         filter_model: Option<&str>,
         since: &str,
     ) -> anyhow::Result<Vec<(i64, String, Option<String>, Option<i64>, f64, i64, i64, i64)>>;
+
+    // ── Attribution-filtered usage (issue #13) ────────────────────────────────
+    //
+    // These let a consuming app ask "what did *my* unit of work cost, and what
+    // did the router save me on it" without keeping a parallel cost model.
+    // `start`/`end` are ISO 8601 UTC (inclusive start, exclusive end).
+
+    /// Spend, savings, tokens, requests and cache hits for one attribution value.
+    async fn attribution_totals(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals>;
+    /// Same aggregates broken down by model, largest spend first.
+    async fn attribution_by_model(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    /// Same aggregates broken down by calendar day, ascending.
+    async fn attribution_by_day(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    /// Distinct tag keys present in the ledger, sorted — populates the pickers.
+    async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>>;
+    /// Distinct values in the ledger for one tag key (or, when `key` is None,
+    /// distinct correlation ids), sorted, capped at `limit`.
+    async fn distinct_attribution_values(
+        &self,
+        key: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<String>>;
 }

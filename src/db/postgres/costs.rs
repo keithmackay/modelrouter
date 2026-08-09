@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
-use crate::db::repositories::costs::{CacheUsageSummary, CostRepository};
+use crate::db::repositories::costs::{
+    AttributionBreakdownRow, AttributionFilter, AttributionTotals, CacheUsageSummary,
+    CostRepository,
+};
 use super::{PostgresDb, now_utc};
 
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
@@ -15,11 +18,13 @@ impl CostRepository for PostgresDb {
         let now = now_utc();
         let row = sqlx::query_as::<_, CostLedgerEntry>(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
-                                        tokens_in, tokens_out, cost_usd, api_key_id, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                        tokens_in, tokens_out, cost_usd, api_key_id, created_at,
+                                        attribution_correlation_id, attribution_tags)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
-                         cache_hit, saved_usd"#,
+                         cache_hit, saved_usd,
+                         attribution_correlation_id, attribution_tags"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -31,6 +36,8 @@ impl CostRepository for PostgresDb {
         .bind(entry.cost_usd)
         .bind(entry.api_key_id)
         .bind(&now)
+        .bind(&entry.attribution_correlation_id)
+        .bind(&entry.attribution_tags)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -42,11 +49,13 @@ impl CostRepository for PostgresDb {
         let row = sqlx::query_as::<_, CostLedgerEntry>(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
-                                        cache_hit, saved_usd)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10)
+                                        cache_hit, saved_usd,
+                                        attribution_correlation_id, attribution_tags)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
-                         cache_hit, saved_usd"#,
+                         cache_hit, saved_usd,
+                         attribution_correlation_id, attribution_tags"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -58,6 +67,8 @@ impl CostRepository for PostgresDb {
         .bind(entry.api_key_id)
         .bind(&now)
         .bind(entry.cost_usd)
+        .bind(&entry.attribution_correlation_id)
+        .bind(&entry.attribution_tags)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -532,5 +543,164 @@ impl CostRepository for PostgresDb {
             tokens_out: to,
             request_count: rc,
         }).collect())
+    }
+
+    // ── Attribution-filtered usage ────────────────────────────────────────────
+
+    async fn attribution_totals(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals> {
+        let (predicate, binds) = attribution_predicate(filter);
+        let n = binds.len();
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ${} AND created_at < ${}",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        let mut q = sqlx::query_as::<_, TotalsRow>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let row = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(totals_from_row(row))
+    }
+
+    async fn attribution_by_model(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = attribution_predicate(filter);
+        let n = binds.len();
+        let sql = format!(
+            "SELECT model, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        let mut q = sqlx::query_as::<_, BreakdownRow>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(breakdown_from_row).collect())
+    }
+
+    async fn attribution_by_day(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = attribution_predicate(filter);
+        let n = binds.len();
+        // created_at is an ISO 8601 string column, so the first ten characters
+        // are the calendar day — no timestamp cast needed.
+        let sql = format!(
+            "SELECT substring(created_at from 1 for 10) AS day, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY day ORDER BY day ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        let mut q = sqlx::query_as::<_, BreakdownRow>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(breakdown_from_row).collect())
+    }
+
+    async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT jsonb_object_keys(attribution_tags::jsonb) AS k \
+             FROM cost_ledger WHERE attribution_tags <> '{}' ORDER BY k ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    async fn distinct_attribution_values(
+        &self,
+        key: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows = match key {
+            None => {
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT DISTINCT attribution_correlation_id AS v FROM cost_ledger \
+                     WHERE attribution_correlation_id IS NOT NULL ORDER BY v ASC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(k) => {
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT DISTINCT (attribution_tags::jsonb ->> $1) AS v FROM cost_ledger \
+                     WHERE (attribution_tags::jsonb ->> $1) IS NOT NULL ORDER BY v ASC LIMIT $2",
+                )
+                .bind(k.to_string())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().map(|(v,)| v).collect())
+    }
+}
+
+type TotalsRow = (f64, f64, i64, i64, i64, i64);
+type BreakdownRow = (String, f64, f64, i64, i64, i64, i64);
+
+/// Aggregate expression shared by every attribution query; order matches
+/// [`TotalsRow`]. `cache_hit` is BOOLEAN here, hence the CASE.
+fn totals_select() -> String {
+    format!(
+        "COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(saved_usd), 0.0), \
+         COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0), COUNT(*), {}",
+        CACHE_HIT_SUM
+    )
+}
+
+fn totals_from_row(row: TotalsRow) -> AttributionTotals {
+    let (cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits) = row;
+    AttributionTotals { cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits }
+}
+
+fn breakdown_from_row(row: BreakdownRow) -> AttributionBreakdownRow {
+    let (key, cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits) = row;
+    AttributionBreakdownRow {
+        key,
+        totals: AttributionTotals {
+            cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits,
+        },
+    }
+}
+
+/// SQL predicate plus its bound values, in placeholder order. Both the tag key
+/// and its value are bound, so nothing from the caller reaches the SQL text.
+fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
+    match filter {
+        AttributionFilter::CorrelationId(v) => (
+            "attribution_correlation_id = $1".to_string(),
+            vec![v.clone()],
+        ),
+        AttributionFilter::Tag { key, value } => (
+            "(attribution_tags::jsonb ->> $1) = $2".to_string(),
+            vec![key.clone(), value.clone()],
+        ),
     }
 }
