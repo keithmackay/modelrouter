@@ -172,6 +172,14 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
         .route("/admin/api/users/:id/reset-spend", post(reset_user_spend))
+        // Response cache REST API
+        .route("/admin/api/cache/stats", get(crate::api::admin::cache::get_cache_stats))
+        .route("/admin/api/cache/purge", post(crate::api::admin::cache::post_cache_purge))
+        .route(
+            "/admin/api/cache/policy",
+            get(crate::api::admin::cache::get_cache_policy)
+                .put(crate::api::admin::cache::put_cache_policy),
+        )
         // OIDC login flow
         .route("/admin/auth/oidc/login", get(crate::api::admin::oidc::oidc_login))
         .route("/admin/auth/oidc/callback", get(crate::api::admin::oidc::oidc_callback))
@@ -190,6 +198,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/prompts", get(dash_get_prompts))
         .route("/admin/prompts/:id", get(get_prompt_detail))
         .route("/admin/cost", get(get_cost))
+        // Response cache dashboard
+        .route("/admin/cache", get(crate::api::admin::cache::get_cache_page))
+        .route("/admin/cache/purge", post(crate::api::admin::cache::post_cache_purge_page))
+        .route("/admin/cache/policy", post(crate::api::admin::cache::post_cache_policy_page))
         .route("/admin/hooks", get(get_hooks))
         .route("/admin/audit", get(dash_get_audit))
         .route("/admin/admins", get(get_admins).post(post_create_admin))

@@ -234,3 +234,44 @@ fail_open    = true
 #
 # # Role assigned to auto-provisioned admins (default: "admin"; use "superadmin" for full access)
 # auto_provision_role = "admin"
+
+# ── Response cache (optional) ─────────────────────────────────────────────────
+# Serves identical eligible requests from a store instead of calling the
+# provider. Hits are recorded as usage with cost_usd = 0 and cache_hit = true,
+# so the saving shows up next to spend and is never counted as spend.
+#
+# Exact-match only — no semantic/fuzzy matching.
+#
+# [cache]
+# enabled = false
+#
+# # Store backend: "memory" (per-process; each replica warms its own copy) or
+# # "redis" (shared across stateless replicas).
+# backend = "memory"
+# redis_url = "redis://127.0.0.1:6379"
+#
+# # Key prefix, so several environments can share one Redis safely.
+# namespace = "modelrouter"
+#
+# # Bound on the in-memory backend only.
+# max_entries = 1000
+#
+# # Fallback TTL for classes that do not set their own.
+# ttl_seconds = 3600
+#
+# [cache.completions]
+# enabled = true
+# # Only cache requests whose temperature is at or below this value. The default
+# # of 0.0 means "deterministic requests only" — nondeterministic sampling never
+# # silently replays a stored answer.
+# max_temperature = 0.0
+# # Temperature assumed when a request omits it. The OpenAI default is 1.0, so
+# # with max_temperature = 0.0 a request that omits temperature is NOT cached.
+# assumed_temperature = 1.0
+# # Defaults to cache.ttl_seconds when unset.
+# ttl_seconds = 3600
+#
+# [cache.search]
+# enabled = true
+# # Search results go stale faster than completions.
+# ttl_seconds = 900

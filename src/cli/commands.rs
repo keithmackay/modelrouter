@@ -55,6 +55,78 @@ pub enum Commands {
     Model(ModelArgs),
     /// Manage outbound webhook callbacks
     Webhook(WebhookArgs),
+    /// Inspect and control the response cache on a running router
+    Cache(CacheArgs),
+}
+
+// ── Response cache subcommands ────────────────────────────────────────────────
+
+/// The cache lives in the running server's process, so these commands talk to
+/// the admin REST API rather than to the database directly.
+#[derive(Args)]
+pub struct CacheArgs {
+    /// Base URL of the running router
+    #[arg(long, env = "MODELROUTER_URL", default_value = "http://127.0.0.1:8080", global = true)]
+    pub url: String,
+    /// Admin JWT. If omitted, `--admin` + password prompt is used to log in.
+    #[arg(long, env = "MODELROUTER_ADMIN_TOKEN", global = true)]
+    pub token: Option<String>,
+    /// Admin username to log in as when no token is supplied
+    #[arg(long, global = true)]
+    pub admin: Option<String>,
+    #[command(subcommand)]
+    pub command: CacheCommands,
+}
+
+#[derive(Subcommand)]
+pub enum CacheCommands {
+    /// Show hit rate, size, evictions and top cached models
+    Stats {
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Purge cached responses
+    Purge {
+        /// Purge everything (default when neither --model nor --key is given)
+        #[arg(long)]
+        all: bool,
+        /// Purge every entry for one model
+        #[arg(long)]
+        model: Option<String>,
+        /// Purge one exact cache key
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Read or change the eligibility policy
+    Policy(CachePolicyArgs),
+}
+
+#[derive(Args)]
+pub struct CachePolicyArgs {
+    #[command(subcommand)]
+    pub command: CachePolicyCommands,
+}
+
+#[derive(Subcommand)]
+pub enum CachePolicyCommands {
+    /// Print the live policy
+    Get,
+    /// Change the live policy (runtime only — the config file is not rewritten)
+    Set {
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        completions_enabled: Option<bool>,
+        /// Cache completions only at or below this temperature
+        #[arg(long)]
+        max_temperature: Option<f64>,
+        #[arg(long)]
+        completions_ttl_seconds: Option<u64>,
+        #[arg(long)]
+        search_enabled: Option<bool>,
+        #[arg(long)]
+        search_ttl_seconds: Option<u64>,
+    },
 }
 
 #[derive(Args)]

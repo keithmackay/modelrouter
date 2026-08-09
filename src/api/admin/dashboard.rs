@@ -1255,6 +1255,37 @@ pub async fn get_cost(
     .await
     .map_err(|_| DashboardError::Internal)?;
 
+    // Cache aggregates for the same grouping key, so every spend row can show
+    // what share of its requests cost nothing.
+    let cache_by_row: std::collections::HashMap<String, crate::db::repositories::costs::CacheUsageSummary> =
+        CostRepository::cache_rows_grouped(
+            &*state.db,
+            effective_user_ids.as_deref(),
+            filter_project,
+            filter_key_id,
+            filter_model,
+            &window_since,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(user_id, model, project, api_key_id, summary)| {
+            (
+                crate::api::admin::cache::cost_row_key(
+                    user_id,
+                    &model,
+                    project.as_deref(),
+                    api_key_id,
+                ),
+                summary,
+            )
+        })
+        .collect();
+
+    let cache_total = CostRepository::cache_summary_since(&*state.db, filter_model, &window_since)
+        .await
+        .unwrap_or_default();
+
     let rows: Vec<minijinja::Value> = raw_rows
         .into_iter()
         .map(|(user_id, model, project, api_key_id, cost, tokens_in, tokens_out, count)| {
@@ -1266,6 +1297,13 @@ pub async fn get_cost(
             let key_str = api_key_id
                 .and_then(|kid| key_display.get(&kid).cloned())
                 .unwrap_or_default();
+            let row_key = crate::api::admin::cache::cost_row_key(
+                user_id,
+                &model,
+                project.as_deref(),
+                api_key_id,
+            );
+            let cache = cache_by_row.get(&row_key).cloned().unwrap_or_default();
             let project_str = project.unwrap_or_default();
             minijinja::context! {
                 user_name    => uname,
@@ -1278,6 +1316,9 @@ pub async fn get_cost(
                 total_tokens_in  => tokens_in,
                 total_tokens_out => tokens_out,
                 total_cost_usd   => cost,
+                cache_hits       => cache.hits,
+                cache_hit_pct    => (cache.hit_rate() * 100.0).round(),
+                cache_saved_usd  => cache.saved_usd,
             }
         })
         .collect();
@@ -1327,6 +1368,10 @@ pub async fn get_cost(
             projects     => projects,
             models       => models,
             key_options  => key_options,
+            cache_hit_pct   => (cache_total.hit_rate() * 100.0).round(),
+            cache_hits      => cache_total.hits,
+            cache_requests  => cache_total.requests,
+            cache_saved_usd => cache_total.saved_usd,
         },
     )
 }

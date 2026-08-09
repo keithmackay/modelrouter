@@ -2,6 +2,18 @@
 {% block title %}Cost Breakdown — modelrouter Admin{% endblock %}
 {% block content %}
 <h1>Cost Breakdown</h1>
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="stat-label">Cache hit rate</div>
+        <div class="stat-value">{{ cache_hit_pct }}%</div>
+        <div style="font-size:0.8rem;color:#777;">{{ cache_hits }} of {{ cache_requests }} requests · <a href="/admin/cache">cache detail</a></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Saved by cache</div>
+        <div class="stat-value">${{ cache_saved_usd | round(2) }}</div>
+        <div style="font-size:0.8rem;color:#777;">provider cost avoided in this window</div>
+    </div>
+</div>
 <form method="GET" action="/admin/cost" style="display:flex; flex-wrap:wrap; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-end;">
     <div>
         <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Window</label>
@@ -72,6 +84,8 @@
             <th>Requests</th>
             <th>Tokens In (Prompts)</th>
             <th>Tokens Out (Completions)</th>
+            <th>Cache Hit %</th>
+            <th>Saved (USD)</th>
         </tr>
     </thead>
     <tbody>
@@ -87,9 +101,11 @@
             <td>{{ row.request_count }}</td>
             <td>{{ row.total_tokens_out }}</td>
             <td>{{ row.total_tokens_in }}</td>
+            <td>{{ row.cache_hit_pct }}% ({{ row.cache_hits }})</td>
+            <td>${{ row.cache_saved_usd | round(4) }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="10" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
+        <tr><td colspan="12" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
         {% endfor %}
     </tbody>
 </table>

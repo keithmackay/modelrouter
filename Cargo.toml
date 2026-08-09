@@ -80,6 +80,7 @@ opentelemetry_sdk              = { version = "0.27", features = ["rt-tokio", "lo
 opentelemetry-otlp             = { version = "0.27", features = ["grpc-tonic", "logs"], optional = true }
 opentelemetry-appender-tracing = { version = "0.27", optional = true }
 tracing-opentelemetry          = { version = "0.28", optional = true }
+redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
 
 [dev-dependencies]
 toml = "0.8"

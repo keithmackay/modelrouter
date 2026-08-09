@@ -52,21 +52,9 @@ async fn chat_completions_inner(
     let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
     let stream = body["stream"].as_bool().unwrap_or(false);
 
-    // Build cache key for non-streaming requests only
-    let cache_key = if !stream {
-        Some(crate::router::cache::make_cache_key(&body))
-    } else {
-        None
-    };
-
-    // Check cache — hit returns immediately with no policy check or cost
-    if let Some(ref key) = cache_key {
-        if let Some(cached) = state.response_cache.get(key).await {
-            tracing::info!(cache_key = key.as_str(), model = model.as_str(), "response cache hit");
-            let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
-            return Ok(Json(build_openai_response(request_id, &cached)).into_response());
-        }
-    }
+    // The response-cache lookup happens further down, after the policy check and
+    // model resolution: a cache hit must still be an authorized request, and the
+    // key must be built from the *resolved* model.
 
     // Fire on_request_received lifecycle hooks
     for hook in &state.settings.hooks.lifecycle {
@@ -225,6 +213,61 @@ async fn chat_completions_inner(
     span.record("model", canonical_model.as_str());
     span.record("provider", provider_name.as_str());
     span.record("streaming", stream);
+
+    // ── Response cache ───────────────────────────────────────────────────────
+    // Eligibility is conservative (see `router::cache`): streaming and
+    // nondeterministic sampling are never served from cache.
+    let cache_key = if state.response_cache.completion_eligible(&body) {
+        Some(crate::router::cache::completion_cache_key(&canonical_model, &body))
+    } else {
+        None
+    };
+
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = state
+            .response_cache
+            .get_completion(key, &canonical_model)
+            .await
+        {
+            tracing::info!(
+                cache_key = key.as_str(),
+                model = canonical_model.as_str(),
+                "response cache hit"
+            );
+            // What the call would have cost. Recorded as a saving, not as spend.
+            let avoided_cost = state.cost_calc.calculate_with_cache(
+                &canonical_model,
+                cached.prompt_tokens,
+                cached.completion_tokens,
+                cached.cache_read_tokens,
+                cached.cache_write_tokens,
+            );
+            record_cache_hit(
+                &state,
+                CacheHitCtx {
+                    user_id: user.id,
+                    api_key_id: user.api_key_id,
+                    user_project: user.api_key_project.clone(),
+                    request_model: model.clone(),
+                    canonical_model: canonical_model.clone(),
+                    provider: provider_name.clone(),
+                    messages_json: serde_json::to_string(
+                        &body["messages"].as_array().cloned().unwrap_or_default(),
+                    )
+                    .unwrap_or_default(),
+                    avoided_cost,
+                    skip_log,
+                },
+                &cached,
+            );
+            let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
+            let mut response = Json(build_openai_response(request_id, &cached)).into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("HIT"));
+            return Ok(response);
+        }
+    }
 
     let norm_req = build_normalized_request(&body, canonical_model.clone());
 
@@ -505,12 +548,111 @@ async fn chat_completions_inner(
         }
     });
 
-    // Store result in cache for future requests
+    // Store result in cache for future requests. `cost` rides along so a later
+    // hit can report what it saved.
     if let Some(key) = cache_key {
-        state.response_cache.insert(key, result.clone()).await;
+        state
+            .response_cache
+            .put_completion(&key, &canonical_model, &result, cost)
+            .await;
     }
 
-    Ok(Json(build_openai_response(request_id, &result)).into_response())
+    let mut response = Json(build_openai_response(request_id, &result)).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
+    Ok(response)
+}
+
+/// Response header telling callers whether the body came from the router cache.
+pub const CACHE_HEADER: &str = "x-modelrouter-cache";
+
+/// Everything needed to meter a cache hit, gathered at the call site so the
+/// spawned task borrows nothing.
+struct CacheHitCtx {
+    user_id: i64,
+    api_key_id: Option<i64>,
+    user_project: Option<String>,
+    request_model: String,
+    canonical_model: String,
+    provider: String,
+    messages_json: String,
+    avoided_cost: f64,
+    skip_log: bool,
+}
+
+/// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
+/// cost-ledger row with `cache_hit = true`, `cost_usd = 0`, and the avoided cost
+/// in `saved_usd`. Fire-and-forget, matching the live-call logging path.
+fn record_cache_hit(
+    state: &AppState,
+    ctx: CacheHitCtx,
+    result: &crate::providers::adapter::CompletionResult,
+) {
+    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+
+    #[cfg(feature = "otel")]
+    {
+        crate::telemetry::metrics::record_request(&ctx.canonical_model, &ctx.provider, "cache_hit");
+    }
+    #[cfg(feature = "prometheus")]
+    if let Some(ref metrics) = state.app_metrics {
+        metrics.record_request(&ctx.canonical_model, &ctx.provider, "cache_hit");
+    }
+
+    let state = state.clone();
+    let result = result.clone();
+    tokio::spawn(async move {
+        // `cost_usd` here is the *avoided* cost; `create_cache_hit` writes it to
+        // saved_usd and forces cost_usd to zero, so it can never inflate spend.
+        let ledger = NewCostLedgerEntry {
+            user_id: ctx.user_id,
+            prompt_id: None,
+            model: ctx.canonical_model.clone(),
+            provider: ctx.provider.clone(),
+            project: ctx.user_project.clone(),
+            tokens_in: result.prompt_tokens as i64,
+            tokens_out: result.completion_tokens as i64,
+            cost_usd: ctx.avoided_cost,
+            api_key_id: ctx.api_key_id,
+        };
+
+        let prompt_id = if ctx.skip_log {
+            None
+        } else {
+            let prompt = NewPrompt {
+                user_id: ctx.user_id,
+                session_id: None,
+                request_model: ctx.request_model.clone(),
+                routed_model: ctx.canonical_model.clone(),
+                provider: ctx.provider.clone(),
+                messages: ctx.messages_json.clone(),
+                response: Some(result.content.clone()),
+                finish_reason: Some(result.finish_reason.clone()),
+                prompt_tokens: result.prompt_tokens as i64,
+                completion_tokens: result.completion_tokens as i64,
+                cache_read_tokens: result.cache_read_tokens as i64,
+                cache_write_tokens: result.cache_write_tokens as i64,
+                // Zero: the router paid nothing for this response.
+                cost_usd: 0.0,
+                latency_ms: Some(0),
+                tags: "[]".to_string(),
+                project: ctx.user_project.clone(),
+            };
+            match PromptRepository::create(&*state.db, prompt).await {
+                Ok(saved) => Some(saved.id),
+                Err(e) => {
+                    tracing::error!("Failed to record cache-hit prompt: {}", e);
+                    None
+                }
+            }
+        };
+
+        let ledger = NewCostLedgerEntry { prompt_id, ..ledger };
+        if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {
+            tracing::error!("Failed to record cache-hit usage: {}", e);
+        }
+    });
 }
 
 struct StreamLogCtx {

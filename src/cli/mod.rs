@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod admin;
+pub mod cache;
 
 use std::sync::Arc;
 
@@ -432,6 +433,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             use std::net::SocketAddr;
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
         }
+        Commands::Cache(cache_args) => {
+            cache::run(cache_args).await?;
+        }
+
         Commands::Migrate => {
             let settings = crate::config::load(cli.config)?;
             let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;

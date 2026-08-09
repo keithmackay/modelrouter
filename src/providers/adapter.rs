@@ -12,7 +12,9 @@ pub struct NormalizedRequest {
     pub extra_params: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Serializable so the response cache can persist it in any store backend.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CompletionResult {
     pub content: String,
     pub prompt_tokens: u32,

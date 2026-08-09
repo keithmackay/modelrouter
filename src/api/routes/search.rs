@@ -98,6 +98,58 @@ async fn search_inner(
         }
     }
 
+    // Pricing follows the images.rs precedent: `input_per_million` is reused as
+    // a flat per-unit dollar rate (here: dollars per query), not a
+    // per-million-token rate. See config.example.toml for the documented unit.
+    let cost = state
+        .settings
+        .pricing
+        .iter()
+        .find(|p| p.model == pseudo_model)
+        .map(|p| p.input_per_million)
+        .unwrap_or(DEFAULT_COST_PER_QUERY);
+
+    // ── Response cache ───────────────────────────────────────────────────────
+    // Search queries are deterministic enough to cache by default; the key is
+    // engine + query + options, and the TTL is shorter than for completions.
+    let cache_key = if state.response_cache.search_eligible() {
+        Some(crate::router::cache::search_cache_key(
+            &engine,
+            &query,
+            max_results,
+        ))
+    } else {
+        None
+    };
+
+    if let Some(ref key) = cache_key {
+        if let Some(payload) = state.response_cache.get_search(key, &pseudo_model).await {
+            tracing::info!(engine = engine.as_str(), "search cache hit");
+            let results_returned = payload["results"].as_array().map(|r| r.len()).unwrap_or(0) as i64;
+            record_search_cache_hit(
+                &state,
+                &user,
+                &pseudo_model,
+                &engine,
+                results_returned,
+                cost,
+            );
+            let mut body = payload;
+            body["usage"] = serde_json::json!({
+                "results": results_returned,
+                "cost_usd": 0.0,
+                "cache_hit": true,
+                "saved_usd": cost,
+            });
+            let mut response = Json(body).into_response();
+            response.headers_mut().insert(
+                crate::api::routes::completions::CACHE_HEADER,
+                axum::http::HeaderValue::from_static("HIT"),
+            );
+            return Ok(response);
+        }
+    }
+
     let adapter = state
         .search_registry
         .get(&engine)
@@ -116,17 +168,6 @@ async fn search_inner(
     let latency_ms = start.elapsed().as_millis() as i64;
 
     let results_returned = result.results.len() as i64;
-
-    // Pricing follows the images.rs precedent: `input_per_million` is reused
-    // as a flat per-unit dollar rate (here: dollars per query), not a
-    // per-million-token rate. See config.example.toml for the documented unit.
-    let cost = state
-        .settings
-        .pricing
-        .iter()
-        .find(|p| p.model == pseudo_model)
-        .map(|p| p.input_per_million)
-        .unwrap_or(DEFAULT_COST_PER_QUERY);
 
     let span = tracing::Span::current();
     span.record("cost.usd", cost);
@@ -198,13 +239,58 @@ async fn search_inner(
         }
     });
 
-    Ok(Json(serde_json::json!({
+    let payload = serde_json::json!({
         "engine": result.engine,
         "results": result.results,
         "usage": {
             "results": results_returned,
             "cost_usd": cost,
         }
-    }))
-    .into_response())
+    });
+
+    if let Some(key) = cache_key {
+        state
+            .response_cache
+            .put_search(&key, &pseudo_model, payload.clone(), cost)
+            .await;
+    }
+
+    let mut response = Json(payload).into_response();
+    response.headers_mut().insert(
+        crate::api::routes::completions::CACHE_HEADER,
+        axum::http::HeaderValue::from_static("MISS"),
+    );
+    Ok(response)
+}
+
+/// Meter a search cache hit: one usage row with `cache_hit = true`, zero cost,
+/// and the avoided per-query price recorded as the saving.
+fn record_search_cache_hit(
+    state: &AppState,
+    user: &crate::db::models::User,
+    pseudo_model: &str,
+    engine: &str,
+    results_returned: i64,
+    avoided_cost: f64,
+) {
+    use crate::db::repositories::costs::CostRepository;
+
+    let state = state.clone();
+    let ledger = NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: pseudo_model.to_string(),
+        provider: engine.to_string(),
+        project: user.api_key_project.clone(),
+        tokens_in: results_returned,
+        tokens_out: 0,
+        // Interpreted as the avoided cost by `create_cache_hit`.
+        cost_usd: avoided_cost,
+        api_key_id: user.api_key_id,
+    };
+    tokio::spawn(async move {
+        if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {
+            tracing::error!("Failed to record search cache-hit usage: {}", e);
+        }
+    });
 }

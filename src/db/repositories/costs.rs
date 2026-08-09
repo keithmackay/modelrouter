@@ -10,9 +10,64 @@ pub struct ModelSummaryRow {
     pub request_count: i64,
 }
 
+/// Cache-hit aggregates for one grouping key.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CacheUsageSummary {
+    pub hits: i64,
+    pub requests: i64,
+    pub saved_usd: f64,
+}
+
+impl CacheUsageSummary {
+    /// Fraction of requests served from cache, 0.0 when there were none.
+    pub fn hit_rate(&self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.hits as f64 / self.requests as f64
+        }
+    }
+}
+
 #[async_trait]
 pub trait CostRepository: Send + Sync {
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry>;
+    /// Record a usage row that was served from the response cache.
+    ///
+    /// `entry.cost_usd` is interpreted as the cost that *would* have been paid:
+    /// it is written to `saved_usd`, and `cost_usd` is forced to zero. A cache
+    /// hit can therefore never be counted as spend, by construction.
+    async fn create_cache_hit(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry>;
+    /// Cache hits / total requests / dollars saved since a timestamp,
+    /// optionally narrowed to one model.
+    async fn cache_summary_since(
+        &self,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<CacheUsageSummary>;
+    /// Cache hits and total requests per calendar day, for the hit-rate-over-time
+    /// chart. Returns (day, hits, requests) ascending by day.
+    async fn cache_daily_series(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<(String, i64, i64)>>;
+    /// Cache aggregates grouped by model since a timestamp, most hits first.
+    async fn cache_summary_by_model_since(
+        &self,
+        since: &str,
+    ) -> anyhow::Result<Vec<(String, CacheUsageSummary)>>;
+    /// Cache aggregates grouped by (user_id, model, project, api_key_id) —
+    /// the same grouping key as [`CostRepository::cost_rows_grouped`], so the
+    /// cost page can show a hit rate on every spend row.
+    async fn cache_rows_grouped(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_api_key_id: Option<i64>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<(i64, String, Option<String>, Option<i64>, CacheUsageSummary)>>;
     async fn sum_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<f64>;
     async fn sum_tokens_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<i64>;
     async fn sum_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<f64>;

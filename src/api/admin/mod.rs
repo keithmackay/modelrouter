@@ -6,6 +6,7 @@ pub mod templates;
 pub mod dashboard;
 pub mod groups;
 pub mod budgets;
+pub mod cache;
 pub mod reports;
 pub mod models;
 pub mod webhooks;
