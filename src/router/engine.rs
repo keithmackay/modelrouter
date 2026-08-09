@@ -116,6 +116,74 @@ mod tests {
         assert_eq!(provider, "openai"); // default_provider
     }
 
+    fn db_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn db_alias_beats_config_alias() {
+        let mut s = Settings::default();
+        s.routing
+            .model_aliases
+            .insert("deep".to_string(), "openai/gpt-4o".to_string());
+        let r = RequestRouter::new(Arc::new(s));
+        // Config alias applies before any DB alias is installed.
+        assert_eq!(r.resolve("deep"), ("openai".to_string(), "gpt-4o".to_string()));
+
+        // Installing a DB alias takes precedence, with no restart.
+        r.update_db_aliases(db_map(&[("deep", "anthropic/claude-opus-4-6")]));
+        assert_eq!(
+            r.resolve("deep"),
+            ("anthropic".to_string(), "claude-opus-4-6".to_string())
+        );
+
+        // Removing it again falls back to the config alias.
+        r.update_db_aliases(HashMap::new());
+        assert_eq!(r.resolve("deep"), ("openai".to_string(), "gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn alias_chain_resolves_through_multiple_hops() {
+        let r = RequestRouter::new(Arc::new(Settings::default()));
+        r.update_db_aliases(db_map(&[
+            ("deep", "premium"),
+            ("premium", "anthropic/claude-opus-4-6"),
+        ]));
+        assert_eq!(
+            r.resolve("deep"),
+            ("anthropic".to_string(), "claude-opus-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn alias_cycle_is_rejected_by_the_depth_cap() {
+        // Even if a cycle reaches the router (e.g. written directly to the DB),
+        // MAX_ALIAS_DEPTH must bound resolution and fall through to the default.
+        let r = RequestRouter::new(Arc::new(Settings::default()));
+        r.update_db_aliases(db_map(&[("a", "b"), ("b", "a")]));
+        let (provider, model) = r.resolve("a");
+        assert_eq!(provider, "openai"); // default_provider — not a hang, not "a"/"b"
+        assert_ne!(model, "a");
+        assert_ne!(model, "b");
+    }
+
+    #[test]
+    fn self_referential_alias_terminates() {
+        let r = RequestRouter::new(Arc::new(Settings::default()));
+        r.update_db_aliases(db_map(&[("loop", "loop")]));
+        let (provider, _) = r.resolve("loop");
+        assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn shortcuts_cannot_be_shadowed_by_db_aliases() {
+        let r = router_with_shortcuts(Some("anthropic/claude-haiku-4-5"), None);
+        r.update_db_aliases(db_map(&[(":fastest", "evil/model")]));
+        let (provider, model) = r.resolve(":fastest");
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-haiku-4-5");
+    }
+
     #[test]
     fn normal_model_unaffected_by_shortcuts() {
         let r = router_with_shortcuts(Some("x/y"), Some("a/b"));

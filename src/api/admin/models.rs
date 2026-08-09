@@ -5,11 +5,12 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::aliases::refresh_router_aliases;
 use super::audit::audit;
 use super::dashboard::{DashboardError, SuperDashboardSession, render};
 use crate::api::app::AppState;
 
-fn he(s: &str) -> String {
+pub(crate) fn he(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -73,11 +74,31 @@ pub async fn get_models(
     let shortcuts_fastest = state.settings.routing.shortcuts.fastest.clone();
     let shortcuts_cheapest = state.settings.routing.shortcuts.cheapest.clone();
 
+    // Config-file aliases, flagged where a runtime alias overrides them.
+    let effective = super::aliases::build_db_alias_map(&state.db).await;
+    let mut config_aliases: Vec<serde_json::Value> = state
+        .settings
+        .routing
+        .model_aliases
+        .iter()
+        .map(|(alias, target)| {
+            serde_json::json!({
+                "alias": alias,
+                "target": target,
+                "overridden": effective.contains_key(alias),
+            })
+        })
+        .collect();
+    config_aliases.sort_by(|a, b| {
+        a["alias"].as_str().unwrap_or("").cmp(b["alias"].as_str().unwrap_or(""))
+    });
+
     render(
         "models.html",
         minijinja::context! {
             models => minijinja::Value::from_serialize(&model_list),
             failover_rows => minijinja::Value::from_serialize(&failover_rows),
+            config_aliases => minijinja::Value::from_serialize(&config_aliases),
             shortcuts_fastest => shortcuts_fastest,
             shortcuts_cheapest => shortcuts_cheapest,
         },
@@ -269,24 +290,6 @@ fn model_row_html(m: &crate::db::models::Model) -> String {
         status = status_tag,
         toggle = toggle_btn,
     )
-}
-
-/// Reload DB aliases into the live router alias map.
-async fn refresh_router_aliases(state: &AppState) {
-    use crate::db::repositories::models::ModelRepository;
-
-    if let Ok(models) = state.db.list_models().await {
-        let map: std::collections::HashMap<String, String> = models
-            .iter()
-            .filter(|m| m.enabled)
-            .filter_map(|m| {
-                m.alias.as_ref().map(|alias| {
-                    (alias.clone(), format!("{}/{}", m.provider, m.name))
-                })
-            })
-            .collect();
-        state.router.update_db_aliases(map);
-    }
 }
 
 /// Reload DB failover chains into the live FallbackChain.

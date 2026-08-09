@@ -639,9 +639,43 @@ written back to the config file — a restart returns to the configured policy.
 
 Models resolve in this order:
 
-1. Alias lookup from `routing.model_aliases`
-2. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
-3. Fall back to `routing.default_provider`
+1. Runtime aliases (`model_aliases` table — admin API / dashboard / CLI)
+2. Aliases attached to enabled registered models (the `Alias` column on `/admin/models`)
+3. Alias lookup from `routing.model_aliases` in `config.toml`
+4. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
+5. Fall back to `routing.default_provider`
+
+Alias chains are followed up to 10 hops; anything longer (or circular) falls through to the
+default model rather than looping.
+
+#### Runtime model aliases
+
+Config-file aliases are the bootstrap set. To change the environment-wide alias map without
+editing files or restarting, use the runtime alias surfaces — every write persists to the
+database, updates the live router immediately, and is recorded in the audit log.
+
+```bash
+# CLI (writes to the database; a running server picks it up on restart)
+modelrouter alias list
+modelrouter alias set deep anthropic/claude-opus-4-6
+modelrouter alias rm deep
+```
+
+```bash
+# Admin API (takes effect on the next request, no restart)
+curl -X PUT http://localhost:8080/admin/api/aliases/deep \
+  -H "Authorization: Bearer $ADMIN_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"anthropic/claude-opus-4-6"}'
+
+curl -H "Authorization: Bearer $ADMIN_JWT" http://localhost:8080/admin/api/aliases
+curl -X DELETE -H "Authorization: Bearer $ADMIN_JWT" \
+  http://localhost:8080/admin/api/aliases/deep
+```
+
+Reads require any admin role; writes require `superadmin`. The dashboard equivalent is the
+**Model Aliases** section of `/admin/models`. A target may be a concrete `provider/model`
+or another alias; writes that would create a cycle are rejected with a 400.
 
 #### Routing Shortcuts
 

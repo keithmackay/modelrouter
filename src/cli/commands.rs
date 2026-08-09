@@ -53,6 +53,8 @@ pub enum Commands {
     CheckTls,
     /// Manage models and failover chains
     Model(ModelArgs),
+    /// Manage runtime model aliases
+    Alias(AliasArgs),
     /// Manage outbound webhook callbacks
     Webhook(WebhookArgs),
     /// Inspect and control the response cache on a running router
@@ -126,6 +128,32 @@ pub enum CachePolicyCommands {
         search_enabled: Option<bool>,
         #[arg(long)]
         search_ttl_seconds: Option<u64>,
+    },
+}
+
+#[derive(Args)]
+pub struct AliasArgs {
+    #[command(subcommand)]
+    pub command: AliasCommands,
+}
+
+#[derive(Subcommand)]
+pub enum AliasCommands {
+    /// List runtime aliases and the effective alias map
+    List {
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Create or update an alias (replaces the target if it exists)
+    Set {
+        /// Alias callers will request, e.g. "deep"
+        alias: String,
+        /// Target model, e.g. "anthropic/claude-opus-4-6" or another alias
+        target: String,
+    },
+    /// Remove an alias
+    Rm {
+        alias: String,
     },
 }
 

@@ -91,6 +91,76 @@
   </tbody>
 </table>
 
+<h2 style="margin-bottom:0.5rem;">Model Aliases</h2>
+<p style="color:#555;font-size:0.9rem;margin-bottom:1rem;">
+  Runtime aliases let callers request an abstract name (e.g. <code>deep</code>) instead of a
+  concrete model. Changes take effect on the next request &mdash; no restart. Precedence:
+  aliases defined here override the <em>Alias</em> column on registered models, which override
+  <code>routing.model_aliases</code> in <code>config.toml</code>. Every change is written to the
+  audit log.
+</p>
+
+<form hx-post="/admin/aliases" hx-target="#alias-form-message" hx-swap="innerHTML"
+      hx-on::after-request="this.reset()"
+      style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:0.5rem;flex-wrap:wrap;">
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias *</label>
+    <input type="text" name="alias" required placeholder="deep"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+  </div>
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
+    <input type="text" name="target" required placeholder="anthropic/claude-opus-4-6"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
+  </div>
+  <button type="submit" class="btn btn-success">Save Alias</button>
+</form>
+<div id="alias-form-message" style="margin-bottom:1rem;"></div>
+
+<table style="margin-bottom:2rem;">
+  <thead>
+    <tr>
+      <th>Alias</th>
+      <th>Target</th>
+      <th>Set By</th>
+      <th>Updated</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="aliases-tbody" hx-get="/admin/aliases/rows" hx-trigger="load" hx-swap="innerHTML">
+    <tr><td colspan="5" style="color:#999;font-style:italic;">Loading aliases&hellip;</td></tr>
+  </tbody>
+</table>
+
+{% if config_aliases %}
+<details style="margin-bottom:2rem;">
+  <summary style="cursor:pointer;color:#555;font-size:0.9rem;">
+    Config-file aliases &mdash; bootstrap defaults, overridden by the table above
+  </summary>
+  <table style="margin-top:0.5rem;">
+    <thead><tr><th>Alias</th><th>Target</th><th>Effective</th></tr></thead>
+    <tbody>
+      {% for row in config_aliases %}
+      <tr>
+        <td><code>{{ row.alias }}</code></td>
+        <td><code>{{ row.target }}</code></td>
+        <td>{% if row.overridden %}<span class="tag tag-disabled">overridden</span>{% else %}<span class="tag tag-enabled">active</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
+
+<script>
+function editAlias(alias, target) {
+  var form = document.querySelector('form[hx-post="/admin/aliases"]');
+  form.querySelector('input[name="alias"]').value = alias;
+  form.querySelector('input[name="target"]').value = target;
+  form.querySelector('input[name="alias"]').focus();
+}
+</script>
+
 <h2 style="margin-bottom:1rem;">Failover Chains</h2>
 <p style="color:#555;font-size:0.9rem;margin-bottom:1rem;">
   Configure ordered fallback models. When a primary model fails, these are tried in order.

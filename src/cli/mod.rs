@@ -5,7 +5,7 @@ pub mod cache;
 use std::sync::Arc;
 
 use anyhow::Result;
-use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands, ModelCommands, FailoverCommands};
+use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCommands, ModelCommands, FailoverCommands, AliasCommands};
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
@@ -363,17 +363,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Seed DB model aliases and failover chains into live router/fallback
             {
                 use crate::db::repositories::models::ModelRepository;
-                if let Ok(models) = state.db.list_models().await {
-                    let db_aliases: std::collections::HashMap<String, String> = models
-                        .iter()
-                        .filter(|m| m.enabled)
-                        .filter_map(|m| m.alias.as_ref().map(|a| (a.clone(), format!("{}/{}", m.provider, m.name))))
-                        .collect();
-                    if !db_aliases.is_empty() {
-                        tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
-                    }
-                    state.router.update_db_aliases(db_aliases);
+                let db_aliases =
+                    crate::api::admin::aliases::build_db_alias_map(&state.db).await;
+                if !db_aliases.is_empty() {
+                    tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
                 }
+                state.router.update_db_aliases(db_aliases);
                 if let Ok(rows) = state.db.list_all_failovers().await {
                     let mut db_chains: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
                     for r in rows {
@@ -1248,6 +1243,94 @@ pub async fn run(cli: Cli) -> Result<()> {
                         db.disable_key(k.id).await?;
                     }
                     println!("Disabled key(s) for '{}' / project '{}'", user, project);
+                }
+            }
+        }
+        Commands::Alias(alias_args) => {
+            use crate::db::models::NewModelAlias;
+            use crate::db::repositories::aliases::AliasRepository;
+            use crate::db::repositories::models::ModelRepository;
+
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+
+            match alias_args.command {
+                AliasCommands::List { format } => {
+                    let rows = db.list_aliases().await?;
+                    // Effective map: config < enabled model-row aliases < runtime aliases.
+                    let mut effective: std::collections::BTreeMap<String, (String, String)> =
+                        settings
+                            .routing
+                            .model_aliases
+                            .iter()
+                            .map(|(a, t)| (a.clone(), (t.clone(), "config".to_string())))
+                            .collect();
+                    for m in db.list_models().await?.iter().filter(|m| m.enabled) {
+                        if let Some(a) = m.alias.as_ref() {
+                            effective.insert(
+                                a.clone(),
+                                (format!("{}/{}", m.provider, m.name), "model".to_string()),
+                            );
+                        }
+                    }
+                    for r in &rows {
+                        effective
+                            .insert(r.alias.clone(), (r.target.clone(), "runtime".to_string()));
+                    }
+
+                    if matches!(format, OutputFormat::Json) {
+                        let out: Vec<_> = effective
+                            .iter()
+                            .map(|(alias, (target, source))| {
+                                serde_json::json!({
+                                    "alias": alias, "target": target, "source": source,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else if effective.is_empty() {
+                        println!("No aliases defined.");
+                    } else {
+                        println!("{:24}  {:40}  {}", "ALIAS", "TARGET", "SOURCE");
+                        println!("{}", "─".repeat(78));
+                        for (alias, (target, source)) in &effective {
+                            println!("{:24}  {:40}  {}", alias, target, source);
+                        }
+                    }
+                }
+                AliasCommands::Set { alias, target } => {
+                    let alias = alias.trim().to_string();
+                    let target = target.trim().to_string();
+                    if alias.is_empty() || target.is_empty() {
+                        anyhow::bail!("alias and target are required");
+                    }
+                    if alias == target {
+                        anyhow::bail!("alias '{}' cannot point at itself", alias);
+                    }
+                    if alias.starts_with(':') {
+                        anyhow::bail!(
+                            "aliases may not start with ':' — that prefix is reserved for routing shortcuts"
+                        );
+                    }
+                    db.upsert_alias(NewModelAlias {
+                        alias: alias.clone(),
+                        target: target.clone(),
+                        created_by: Some("cli".to_string()),
+                    })
+                    .await?;
+                    println!("Alias '{}' → '{}' saved.", alias, target);
+                    println!(
+                        "Note: a router already running against this database picks it up on restart; \
+                         use the admin API or dashboard for a live change."
+                    );
+                }
+                AliasCommands::Rm { alias } => {
+                    if db.delete_alias(&alias).await? {
+                        println!("Removed alias '{}'.", alias);
+                    } else {
+                        anyhow::bail!("No such alias: {}", alias);
+                    }
                 }
             }
         }
