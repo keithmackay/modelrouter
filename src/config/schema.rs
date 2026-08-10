@@ -441,6 +441,45 @@ pub struct ProviderConfig {
     /// Used only by the Vertex adapter.
     #[serde(default)]
     pub credentials_path: Option<String>,
+    /// Region for the embedding endpoint, when it differs from `region`.
+    ///
+    /// Vertex serves `text-embedding-*` regionally only — `locations/global`
+    /// has no embedding endpoint at all, while the Claude and Gemini chat models
+    /// do run there. A Vertex provider configured for chat on `global` therefore
+    /// has to name an embedding region separately, exactly as Athena's own
+    /// client does with `EMBEDDING_REGION` (default `us-central1`) alongside its
+    /// chat region. Falls back to `region` when unset.
+    #[serde(default)]
+    pub embedding_region: Option<String>,
+    /// Vertex embedding task type (`RETRIEVAL_DOCUMENT`, `RETRIEVAL_QUERY`,
+    /// `SEMANTIC_SIMILARITY`, …), sent as each instance's `task_type`.
+    ///
+    /// It lives in config rather than in code because it has no equivalent in
+    /// the OpenAI embeddings API the caller speaks, and because getting it wrong
+    /// is silent: query-typed and document-typed vectors coexist happily in one
+    /// store and simply retrieve worse. Omitted from the request when unset.
+    #[serde(default)]
+    pub embedding_task_type: Option<String>,
+}
+
+impl Default for ProviderConfig {
+    /// Must agree with the `#[serde(default)]` attributes above, so a
+    /// `[providers.x]` table that sets nothing and a `ProviderConfig::default()`
+    /// built in code describe the same provider. `tests/test_vertex.rs` pins
+    /// that equivalence.
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            api_base: None,
+            timeout_secs: default_timeout_secs(),
+            api_version: None,
+            region: None,
+            project: None,
+            credentials_path: None,
+            embedding_region: None,
+            embedding_task_type: None,
+        }
+    }
 }
 
 fn default_timeout_secs() -> u64 { 60 }

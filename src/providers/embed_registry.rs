@@ -27,9 +27,21 @@ impl EmbeddingRegistry {
             .get(provider_name)
             .ok_or_else(|| anyhow::anyhow!("No embedding adapter for provider: {}", provider_name))?;
 
-        let adapter: Arc<dyn EmbeddingAdapter> = Arc::new(
-            crate::providers::openai_embed::OpenAIEmbeddingAdapter::new(config),
-        );
+        // The OpenAI-compatible adapter stays the DEFAULT arm rather than
+        // becoming one of several named arms: Ollama, Azure, LM Studio and
+        // anything else speaking that wire shape all reach embeddings through
+        // it, and an exhaustive match would turn every one of them into an
+        // "unsupported provider" error. Only providers whose embedding API is
+        // genuinely different get an arm of their own.
+        let adapter: Arc<dyn EmbeddingAdapter> = match provider_name {
+            #[cfg(feature = "vertex")]
+            "vertex" => Arc::new(
+                crate::providers::vertex::VertexEmbeddingAdapter::new(config)?,
+            ),
+            _ => Arc::new(
+                crate::providers::openai_embed::OpenAIEmbeddingAdapter::new(config),
+            ),
+        };
 
         // Use entry API to prevent duplicate creation under concurrency — only first caller wins
         let entry = self

@@ -85,9 +85,7 @@ async fn speech_inner(
             api_base: None,
             timeout_secs: 60,
             api_version: None,
-            region: None,
-            project: None,
-            credentials_path: None,
+            ..Default::default()
         });
 
     // Circuit breaker check
@@ -271,9 +269,7 @@ async fn transcriptions_inner(
             api_base: None,
             timeout_secs: 60,
             api_version: None,
-            region: None,
-            project: None,
-            credentials_path: None,
+            ..Default::default()
         });
 
     // Circuit breaker check

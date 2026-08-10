@@ -7,9 +7,7 @@ fn provider_config_region_defaults_to_none() {
         api_base: None,
         timeout_secs: 60,
         api_version: None,
-        region: None,
-        project: None,
-        credentials_path: None,
+        ..Default::default()
     };
     assert!(config.region.is_none());
 }

@@ -37,9 +37,7 @@ fn settings_with_providers() -> Settings {
                 api_base: Some("http://mock".to_string()),
                 timeout_secs: 10,
                 api_version: None,
-                region: None,
-                project: None,
-                credentials_path: None,
+                ..Default::default()
             },
         );
     }
