@@ -31,8 +31,11 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Drop-in OpenAI compatibility** — any SDK that speaks `POST /v1/chat/completions` works without modification
 - **Multi-provider routing** — route to OpenAI, Anthropic, Google Gemini, or Ollama; switch providers by changing one config line
 - **Routing shortcuts** — use `:fastest` or `:cheapest` as the model name to route to your configured fastest or cheapest model without changing client code
+- **Failure capture** — every request that does NOT return a result is persisted with the stage it died at (`resolve` / `policy` / `provider` / `request` / `internal`) and surfaced at `/admin/failures`; prompt rows only ever record successes, so without this the router had no answer for "what failed"
+- **Strict model resolution** — refuse to silently substitute `default_model` for a model nobody configured, instead of answering with a different model than the caller asked for
+- **Embedding failover with width verification** — `/v1/embeddings` walks the same fallback chains as completions, and a `dimensions` request is verified against what the provider returned, so failing over between models of different widths can never corrupt a vector store
 - **Multi-scope budget enforcement** — set monthly or fixed date-range limits at the global (org-wide), project, user, or group level; any limit hit blocks the request before it reaches the upstream
-- **Admin dashboard** — web UI at `/admin` with usage stats, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
+- **Admin dashboard** — web UI at `/admin` with usage stats, failures, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
 - **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion; wire Datadog, Slack, or any HTTP endpoint; takes effect on next restart
 - **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
 - **Request cost attribution** — tag any metered call with your own correlation id and free-form tags (`attribution` in the request body, or `X-Attribution-*` headers); the router persists them on the prompt and cost-ledger rows and reports spend *and* cache savings per tag, so a consuming app can drop its own cost accounting. Attribution never affects routing or the cache key
@@ -580,6 +583,35 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 
 See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration.
 
+### Failure capture
+
+A `prompts` row is only ever written on the success path. Everything that failed —
+a model that resolved to a provider with no adapter, a budget denial, an upstream
+error — left no trace in the router at all, so diagnosing it meant reading the
+*calling application's* logs. That is backwards: the router is the one component
+that sees every call from every app.
+
+Every failed request is now persisted to `request_failures` and shown at
+`/admin/failures`, with counts grouped by **stage**:
+
+| Stage | Meaning | Whose problem |
+|---|---|---|
+| `resolve` | model/provider resolution — unknown provider, no configured adapter | yours (config or caller) |
+| `policy` | budget, rate limit, guardrail or policy denial | expected, or a limit to raise |
+| `provider` | the upstream was reached and returned an error | the upstream's |
+| `request` | the caller's request was malformed or unacceptable | the caller's |
+| `internal` | anything else raised inside the router | a bug |
+
+The `resolve`/`provider` split is the point. A resolve failure is always
+actionable by the operator, and lumping it in with ordinary upstream flakiness is
+how one deployment let 196 `Unknown provider: anthropic` errors pass as noise for
+a full run.
+
+Capture wraps each handler as a whole rather than sitting at individual error
+returns, so an error path added later cannot silently escape being recorded. No
+prompt or response bodies are stored — a failure record must never become a
+second, unlogged copy of content that `X-No-Log: true` was used to suppress.
+
 ### Response cache
 
 The router can serve identical requests from a cache instead of calling the
@@ -642,6 +674,56 @@ Models resolve in this order:
 1. Alias lookup from `routing.model_aliases`
 2. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
 3. Fall back to `routing.default_provider`
+
+#### Strict model resolution
+
+Step 3 is a **substitution**: the caller asked for one model and a different one
+answers. That is convenient for a shortcut and dangerous for anything else — a
+name that is neither an alias nor `provider/model` is silently served by
+`default_model`, and the response looks like an ordinary success. In one observed
+deployment 1,330 requests for `claude-opus-4-5-20251101` were answered by
+`gpt-4o-mini` before anyone noticed.
+
+```toml
+[routing]
+strict_model_resolution = true   # default: false
+```
+
+With it **on**, an unresolvable model is refused with a message naming both models
+and the ways to fix it:
+
+```
+model 'claude-opus-4-5-20251101' is not a configured alias and names no provider;
+refusing to substitute 'gpt-4o-mini' for it. Add it to [routing.model_aliases],
+request it as 'provider/model', or disable routing.strict_model_resolution.
+```
+
+With it **off** (the default, so existing deployments are unaffected) the
+substitution still happens, but is logged at WARN with both names rather than
+passing unremarked.
+
+Turning it on pairs naturally with addressing the router by **abstract tier** —
+callers send `fast`/`balanced`/`deep` and which model serves each tier stays an
+operations decision in config, instead of a literal compiled into an application
+that breaks the day the provider lineup changes.
+
+#### Fallback chains
+
+Keys are **canonical** model names (post-alias-resolution, no provider prefix);
+values are re-resolved, so they carry one. Chains apply to both
+`/v1/chat/completions` and `/v1/embeddings`.
+
+```toml
+[routing.fallback_chains]
+"gpt-4o-mini" = ["ollama/qwen3.5:4b"]
+"nomic-embed-text:latest" = ["openai/text-embedding-3-small"]
+```
+
+A chain is walked when the provider call fails **or when the provider has no
+configured adapter** — the most common way a request dies, and exactly the case an
+alternative fixes. The walk is bounded at 8 hops, so a chain that points back at
+itself errors instead of spinning; every hop is a real provider call, so avoid
+cycles rather than relying on the bound.
 
 #### Routing Shortcuts
 
@@ -879,6 +961,21 @@ curl http://localhost:8080/v1/chat/completions \
 # MCP server registry
 curl "http://localhost:8080/v1/mcp/servers/discover?q=code+review+tools" \
   -H "Authorization: Bearer <api-key>"
+
+# Embeddings
+#
+# `encoding_format` is honoured: the official OpenAI SDKs send "base64" by default
+# and decode the response as base64, so the router returns a base64 string when
+# asked for one. (Returning a float array to such a client does not error — it
+# decodes to a shorter vector of zeros.)
+#
+# `dimensions` is forwarded to providers that support it AND verified against what
+# came back, so a fallback to a different-width model fails loudly instead of
+# returning vectors that do not match the ones already in your store.
+curl http://localhost:8080/v1/embeddings \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "embed", "input": "hello world", "dimensions": 768}'
 
 # Web search — proxies to a configured search engine (Tavily by default)
 curl http://localhost:8080/v1/search \

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Failures — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Request Failures</h1>
+<p style="color:#666; font-size:0.9rem; max-width:60rem;">
+    Every request that did not return a result. <strong>Stage</strong> says where it died, which
+    is what makes it actionable: <code>resolve</code> is a routing/config problem (a provider is
+    missing, or a caller asked for one that was never configured) and is yours to fix;
+    <code>provider</code> means the upstream was reached and refused; <code>policy</code> is a
+    budget, rate limit or guardrail; <code>request</code> is a malformed call.
+</p>
+
+<div style="display:flex; gap:1rem; margin:1rem 0; flex-wrap:wrap;">
+    {% for s in by_stage %}
+    <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:0.75rem 1.25rem; min-width:8rem;">
+        <div style="font-size:1.5rem; font-weight:bold;">{{ s.count }}</div>
+        <div style="font-size:0.8rem; color:#666; text-transform:uppercase; letter-spacing:0.05em;">{{ s.stage }}</div>
+    </div>
+    {% endfor %}
+    {% if not by_stage %}
+    <div style="color:#2a7; padding:0.75rem 0;">No failures recorded.</div>
+    {% endif %}
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Stage</th>
+            <th>Endpoint</th>
+            <th>Requested</th>
+            <th>Routed</th>
+            <th>Provider</th>
+            <th>Status</th>
+            <th>Error</th>
+            <th>Created</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for f in failures %}
+        <tr>
+            <td>{{ f.id }}</td>
+            <td><span style="font-size:0.75rem; padding:0.15rem 0.5rem; border-radius:3px; background:{% if f.stage == 'resolve' %}#fde2e2{% elif f.stage == 'provider' %}#fdf0d5{% elif f.stage == 'policy' %}#e2e8fd{% else %}#eee{% endif %};">{{ f.stage }}</span></td>
+            <td>{{ f.endpoint }}</td>
+            <td>{{ f.request_model }}</td>
+            <td>{{ f.routed_model }}</td>
+            <td>{{ f.provider }}</td>
+            <td>{{ f.status_code }}</td>
+            <td style="max-width:32rem; font-size:0.8rem; word-break:break-word;">{{ f.error_message }}</td>
+            <td>{{ f.created_at | fmt_ts }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="/admin/failures?page={{ page - 1 }}">&laquo; Prev</a>
+    {% endif %}
+    <span style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">Page {{ page }}</span>
+    {% if has_next %}
+    <a href="/admin/failures?page={{ page + 1 }}">Next &raquo;</a>
+    {% endif %}
+</div>
+{% endblock %}

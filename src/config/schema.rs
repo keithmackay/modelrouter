@@ -327,6 +327,18 @@ pub struct RoutingConfig {
     pub load_balancer: HashMap<String, LoadBalancerConfig>,
     #[serde(default)]
     pub shortcuts: RoutingShortcutsConfig,
+    /// Reject a request whose model resolves to nothing, instead of silently
+    /// serving `default_model`.
+    ///
+    /// Default `false` preserves the historical behaviour. Turning it on is
+    /// strongly recommended for any caller that cares WHICH model answered:
+    /// with it off, an unaliased name (e.g. `claude-opus-4-5-20251101`, which
+    /// is neither an alias nor `provider/model`) falls through to the default
+    /// and is answered by a different model entirely, recorded as a success.
+    /// Observed live: 1,330 such requests served by `gpt-4o-mini` while the
+    /// caller believed it was using Opus.
+    #[serde(default)]
+    pub strict_model_resolution: bool,
 }
 
 impl Default for RoutingConfig {
@@ -339,6 +351,7 @@ impl Default for RoutingConfig {
             complexity_routing: None,
             load_balancer: HashMap::new(),
             shortcuts: RoutingShortcutsConfig::default(),
+            strict_model_resolution: false,
         }
     }
 }

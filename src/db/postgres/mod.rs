@@ -6,6 +6,7 @@ mod admin_users;
 mod sessions;
 mod prompts;
 mod costs;
+mod failures;
 mod budgets;
 mod audit;
 mod hooks;

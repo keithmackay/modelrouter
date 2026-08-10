@@ -202,7 +202,7 @@ async fn search_inner(
     let pseudo_model_clone = pseudo_model.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
-    let user_project = user.api_key_project.clone();
+    let user_project = attribution.project_or(user.api_key_project.clone());
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
 

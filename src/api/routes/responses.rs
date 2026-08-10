@@ -135,7 +135,7 @@ async fn responses_inner(
     let db = state.db.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
-    let user_project = user.api_key_project.clone();
+    let user_project = attribution.project_or(user.api_key_project.clone());
     let model_clone = model.clone();
     let canonical_clone = canonical_model.clone();
     let provider_clone = provider_name.clone();

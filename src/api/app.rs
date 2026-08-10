@@ -7,7 +7,8 @@ use crate::{
     config::Settings,
     db::repositories::{
         admin_users::AdminUserRepository, api_keys::ApiKeyRepository, audit::AuditRepository,
-        budgets::BudgetRepository, costs::CostRepository, hooks::HookRepository,
+        budgets::BudgetRepository, costs::CostRepository, failures::FailureRepository,
+        hooks::HookRepository,
         groups::GroupRepository,
         webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
@@ -24,6 +25,7 @@ pub trait DatabaseProvider:
     + SessionRepository
     + PromptRepository
     + CostRepository
+    + FailureRepository
     + BudgetRepository
     + AuditRepository
     + HookRepository
@@ -45,6 +47,7 @@ impl<T> DatabaseProvider for T where
         + SessionRepository
         + PromptRepository
         + CostRepository
+        + FailureRepository
         + BudgetRepository
         + AuditRepository
         + HookRepository
@@ -109,7 +112,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
         get_overview, get_users, post_create_user, post_disable_user, post_enable_user,
-        get_prompts as dash_get_prompts, get_prompt_detail,
+        get_prompts as dash_get_prompts, get_prompt_detail, get_failures,
         get_cost, get_hooks,
         get_audit as dash_get_audit,
         get_admins, post_create_admin, post_delete_admin,
@@ -204,6 +207,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/keys/:id/rotate", post(post_rotate_key))
 
         .route("/admin/prompts", get(dash_get_prompts))
+        .route("/admin/failures", get(get_failures))
         .route("/admin/prompts/:id", get(get_prompt_detail))
         .route("/admin/cost", get(get_cost))
         // Response cache dashboard
