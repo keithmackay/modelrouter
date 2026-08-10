@@ -671,9 +671,43 @@ written back to the config file — a restart returns to the configured policy.
 
 Models resolve in this order:
 
-1. Alias lookup from `routing.model_aliases`
-2. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
-3. Fall back to `routing.default_provider`
+1. Runtime aliases (`model_aliases` table — admin API / dashboard / CLI)
+2. Aliases attached to enabled registered models (the `Alias` column on `/admin/models`)
+3. Alias lookup from `routing.model_aliases` in `config.toml`
+4. Provider prefix — `anthropic/claude-opus-4-6` routes to the `anthropic` provider
+5. Fall back to `routing.default_provider`
+
+Alias chains are followed up to 10 hops; anything longer (or circular) falls through to the
+default model rather than looping.
+
+#### Runtime model aliases
+
+Config-file aliases are the bootstrap set. To change the environment-wide alias map without
+editing files or restarting, use the runtime alias surfaces — every write persists to the
+database, updates the live router immediately, and is recorded in the audit log.
+
+```bash
+# CLI (writes to the database; a running server picks it up on restart)
+modelrouter alias list
+modelrouter alias set deep anthropic/claude-opus-4-6
+modelrouter alias rm deep
+```
+
+```bash
+# Admin API (takes effect on the next request, no restart)
+curl -X PUT http://localhost:8080/admin/api/aliases/deep \
+  -H "Authorization: Bearer $ADMIN_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"anthropic/claude-opus-4-6"}'
+
+curl -H "Authorization: Bearer $ADMIN_JWT" http://localhost:8080/admin/api/aliases
+curl -X DELETE -H "Authorization: Bearer $ADMIN_JWT" \
+  http://localhost:8080/admin/api/aliases/deep
+```
+
+Reads require any admin role; writes require `superadmin`. The dashboard equivalent is the
+**Model Aliases** section of `/admin/models`. A target may be a concrete `provider/model`
+or another alias; writes that would create a cycle are rejected with a 400.
 
 #### Strict model resolution
 
@@ -746,6 +780,54 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 If a shortcut is not configured, the request falls through to normal default routing. Shortcuts are resolved before model aliases, so they cannot be overridden by alias config.
+
+### Disabling a model or a provider
+
+When a model or a whole provider should not be used — an outage, a cost spike, a security
+issue — an operator can take it out of rotation at runtime and put it back later. The change
+persists, applies to the next request without a restart, and is recorded in the audit log
+with who did it and why.
+
+```bash
+# CLI
+modelrouter model list
+modelrouter model disable --id 3 --reason "cost spike"
+modelrouter model enable --id 3
+modelrouter provider list
+modelrouter provider disable anthropic --reason "vendor incident"
+modelrouter provider enable anthropic
+```
+
+```bash
+# Admin API (superadmin for writes, any admin role to read)
+curl -X PATCH http://localhost:8080/admin/api/models/3/enabled \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"enabled":false,"reason":"cost spike"}'
+
+curl -X PATCH http://localhost:8080/admin/api/providers/anthropic/enabled \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"enabled":false,"reason":"vendor incident"}'
+```
+
+The dashboard equivalent is the **Providers** and **Models** sections of `/admin/models`,
+which show the reason, the actor and the timestamp next to anything disabled.
+
+A disabled entity is excluded everywhere it could be reached:
+
+- direct requests return **403** with `"type": "model_disabled"` and a message naming the
+  reason — not a provider error, because nothing is called upstream;
+- disabling a provider disables every model behind it;
+- load-balancer pools skip disabled members (and report a 403 if every member is disabled);
+- fallback chains skip disabled candidates and continue down the chain;
+- aliases resolving onto a disabled target produce the same 403;
+- `/v1/models` omits it.
+
+**Disable vs. the circuit breaker.** These are separate mechanisms. The circuit breaker
+reacts automatically to observed provider failures, is in-memory, and **auto-recovers**
+after a cooldown. An operator disable is a deliberate decision: it is **sticky** — it never
+auto-recovers, it survives a restart, and only an explicit enable clears it. The disable
+check runs before the breaker and before any provider dispatch, so a disabled entity is
+never called and can neither trip nor reset a breaker.
 
 ### OIDC SSO for admin login
 

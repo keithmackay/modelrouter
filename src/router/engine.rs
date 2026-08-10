@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crate::config::Settings;
+use crate::router::availability::{AvailabilityMap, Unavailable};
 
 /// The outcome of resolving a requested model name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,8 @@ pub struct RequestRouter {
     settings: Arc<Settings>,
     /// DB-sourced alias overrides. DB wins over config on conflict.
     db_aliases: Arc<ArcSwap<HashMap<String, String>>>,
+    /// Models and providers an operator has taken out of rotation (issue #5).
+    availability: Arc<ArcSwap<AvailabilityMap>>,
 }
 
 impl RequestRouter {
@@ -25,12 +28,35 @@ impl RequestRouter {
         Self {
             settings,
             db_aliases: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            availability: Arc::new(ArcSwap::from_pointee(AvailabilityMap::default())),
         }
     }
 
     /// Replace the live DB alias map (called after DB model writes).
     pub fn update_db_aliases(&self, aliases: HashMap<String, String>) {
         self.db_aliases.store(Arc::new(aliases));
+    }
+
+    /// Replace the live operator-disable snapshot (called after any enable/disable write).
+    pub fn update_availability(&self, map: AvailabilityMap) {
+        self.availability.store(Arc::new(map));
+    }
+
+    /// Current operator-disable snapshot.
+    pub fn availability(&self) -> Arc<AvailabilityMap> {
+        self.availability.load_full()
+    }
+
+    /// `Err` when an operator has disabled this model or its provider.
+    ///
+    /// Distinct from a circuit-breaker trip: this is sticky and only an explicit
+    /// re-enable clears it. See [`crate::router::availability`].
+    pub fn check_available(&self, provider: &str, model: &str) -> Result<(), Unavailable> {
+        self.availability.load().check(provider, model)
+    }
+
+    pub fn is_available(&self, provider: &str, model: &str) -> bool {
+        self.check_available(provider, model).is_ok()
     }
 
     /// Resolve a requested model, reporting whether the answer is a SUBSTITUTION.
@@ -143,6 +169,74 @@ mod tests {
         // Without config, :fastest resolves like any unknown model → default
         let (provider, _) = r.resolve(":fastest");
         assert_eq!(provider, "openai"); // default_provider
+    }
+
+    fn db_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn db_alias_beats_config_alias() {
+        let mut s = Settings::default();
+        s.routing
+            .model_aliases
+            .insert("deep".to_string(), "openai/gpt-4o".to_string());
+        let r = RequestRouter::new(Arc::new(s));
+        // Config alias applies before any DB alias is installed.
+        assert_eq!(r.resolve("deep"), ("openai".to_string(), "gpt-4o".to_string()));
+
+        // Installing a DB alias takes precedence, with no restart.
+        r.update_db_aliases(db_map(&[("deep", "anthropic/claude-opus-4-6")]));
+        assert_eq!(
+            r.resolve("deep"),
+            ("anthropic".to_string(), "claude-opus-4-6".to_string())
+        );
+
+        // Removing it again falls back to the config alias.
+        r.update_db_aliases(HashMap::new());
+        assert_eq!(r.resolve("deep"), ("openai".to_string(), "gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn alias_chain_resolves_through_multiple_hops() {
+        let r = RequestRouter::new(Arc::new(Settings::default()));
+        r.update_db_aliases(db_map(&[
+            ("deep", "premium"),
+            ("premium", "anthropic/claude-opus-4-6"),
+        ]));
+        assert_eq!(
+            r.resolve("deep"),
+            ("anthropic".to_string(), "claude-opus-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn alias_cycle_is_rejected_by_the_depth_cap() {
+        // Even if a cycle reaches the router (e.g. written directly to the DB),
+        // MAX_ALIAS_DEPTH must bound resolution and fall through to the default.
+        let r = RequestRouter::new(Arc::new(Settings::default()));
+        r.update_db_aliases(db_map(&[("a", "b"), ("b", "a")]));
+        let (provider, model) = r.resolve("a");
+        assert_eq!(provider, "openai"); // default_provider — not a hang, not "a"/"b"
+        assert_ne!(model, "a");
+        assert_ne!(model, "b");
+    }
+
+    #[test]
+    fn self_referential_alias_terminates() {
+        let r = RequestRouter::new(Arc::new(Settings::default()));
+        r.update_db_aliases(db_map(&[("loop", "loop")]));
+        let (provider, _) = r.resolve("loop");
+        assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn shortcuts_cannot_be_shadowed_by_db_aliases() {
+        let r = router_with_shortcuts(Some("anthropic/claude-haiku-4-5"), None);
+        r.update_db_aliases(db_map(&[(":fastest", "evil/model")]));
+        let (provider, model) = r.resolve(":fastest");
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-haiku-4-5");
     }
 
     /// The live case this flag exists for: `claude-opus-4-5-20251101` is neither an

@@ -77,6 +77,9 @@ async fn responses_inner(
     // Route the model
     let (provider_name, canonical_model) = state.router.resolve(&model);
 
+    // Operator disable gate (issue #5) — 403 naming the reason, never a provider call.
+    state.router.check_available(&provider_name, &canonical_model)?;
+
     // Translate body: if messages absent and input is a string, synthesize messages
     let mut body = body;
     let has_messages = body["messages"].is_array();

@@ -1,3 +1,4 @@
+pub mod aliases;
 pub mod groups;
 pub mod webhook_callbacks;
 pub mod models;
@@ -14,6 +15,7 @@ pub mod rate_limits;
 pub mod sessions;
 pub mod users;
 
+pub use aliases::AliasRepository;
 pub use groups::GroupRepository;
 pub use webhook_callbacks::WebhookCallbackRepository;
 pub use models::ModelRepository;

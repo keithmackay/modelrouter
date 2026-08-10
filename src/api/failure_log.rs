@@ -87,9 +87,12 @@ pub fn context_from_request(
 /// "Unknown provider: anthropic" errors read as ordinary upstream flakiness.
 fn stage_for(err: &ApiError) -> FailureStage {
     match err {
-        ApiError::PolicyDenied { .. } | ApiError::Unauthorized | ApiError::Forbidden => {
-            FailureStage::Policy
-        }
+        // An operator disable is a policy decision like any budget or allow-list
+        // denial — the request was refused deliberately, not by a fault.
+        ApiError::PolicyDenied { .. }
+        | ApiError::Unauthorized
+        | ApiError::Forbidden
+        | ApiError::Disabled(_) => FailureStage::Policy,
         ApiError::InvalidRequest(_) => FailureStage::Request,
         ApiError::ProviderError(e) => {
             let msg = e.to_string().to_lowercase();
@@ -110,6 +113,7 @@ fn status_for(err: &ApiError) -> i64 {
     match err {
         ApiError::Unauthorized => 401,
         ApiError::Forbidden => 403,
+        ApiError::Disabled(_) => 403,
         ApiError::ProviderError(_) => 502,
         ApiError::InvalidRequest(_) => 400,
         ApiError::PolicyDenied { status, .. } => *status as i64,

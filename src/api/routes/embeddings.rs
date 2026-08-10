@@ -117,6 +117,16 @@ async fn embeddings_inner(
         )));
     }
 
+    // Operator disable gate (issue #5) — 403 naming the reason, never a provider
+    // call. Checked on what the CALLER asked for, before any fallback: a model an
+    // operator has taken out of rotation must be refused, not quietly answered by
+    // a different one. Disabled fallback candidates are skipped inside the loop
+    // below, so a disable is never routed around.
+    {
+        let (p, m) = state.router.resolve(&model);
+        state.router.check_available(&p, &m)?;
+    }
+
     crate::api::routes::guard_model_substitution(&state, &model)?;
 
     // Walk the fallback chain, exactly as the completions path does. Embeddings
@@ -140,7 +150,12 @@ async fn embeddings_inner(
         const MAX_FALLBACK_HOPS: usize = 8;
         let mut hops = 0usize;
         loop {
-            let attempt = match state.embedding_registry.get(&current_provider) {
+            // A disabled candidate is not called. Treated as a failed attempt so
+            // the walk continues to the next entry rather than 403-ing a request
+            // whose PRIMARY model was perfectly available.
+            let attempt = match state.router.check_available(&current_provider, &current_model) {
+                Err(unavailable) => Err(anyhow::anyhow!("{}", unavailable.message())),
+                Ok(()) => match state.embedding_registry.get(&current_provider) {
                 Ok(adapter) => {
                     let req = EmbeddingRequest {
                         model: current_model.clone(),
@@ -150,6 +165,7 @@ async fn embeddings_inner(
                     adapter.embed(&req).await
                 }
                 Err(e) => Err(e),
+                },
             };
 
             match attempt {

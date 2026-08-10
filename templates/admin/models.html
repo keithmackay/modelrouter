@@ -66,7 +66,11 @@
         {% if m.enabled %}
           <span class="tag tag-enabled">Enabled</span>
         {% else %}
-          <span class="tag tag-disabled">Disabled</span>
+          <span class="tag tag-disabled">Disabled</span><br>
+          <small style="color:#666">
+            {{ m.disabled_reason | default("no reason recorded") }}
+            — {{ m.disabled_by | default("unknown") }}{% if m.disabled_at %}, {{ m.disabled_at }}{% endif %}
+          </small>
         {% endif %}
       </td>
       <td>
@@ -75,8 +79,10 @@
           hx-target="#model-row-{{ m.id }}" hx-swap="outerHTML"
           hx-confirm="Delete this model?">Delete</button>
         {% if m.enabled %}
+          <input type="text" name="reason" placeholder="reason" id="model-reason-{{ m.id }}"
+                 style="padding:0.2rem 0.4rem;border:1px solid #ccc;border-radius:4px;width:150px">
           <button class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
-            hx-post="/admin/models/{{ m.id }}/disable"
+            hx-post="/admin/models/{{ m.id }}/disable" hx-include="#model-reason-{{ m.id }}"
             hx-target="#model-row-{{ m.id }}" hx-swap="outerHTML">Disable</button>
         {% else %}
           <button class="btn btn-success" style="font-size:0.8rem;padding:0.25rem 0.5rem"
@@ -90,6 +96,92 @@
     {% endfor %}
   </tbody>
 </table>
+
+<h2 style="margin-bottom:0.5rem;">Providers</h2>
+<p style="color:#555;font-size:0.9rem;margin-bottom:1rem;">
+  Disabling a provider takes every model behind it out of rotation immediately &mdash;
+  routing, load-balancer pools, alias targets and <code>/v1/models</code>. A direct request
+  for a disabled model returns <code>403</code> naming the reason. Unlike a circuit-breaker
+  trip this is <strong>sticky</strong>: it never auto-recovers and survives a restart, so it
+  stays in force until someone re-enables it here.
+</p>
+
+<table style="margin-bottom:2rem;">
+  <thead><tr><th>Provider</th><th>Status</th><th>Actions</th></tr></thead>
+  <tbody id="providers-tbody" hx-get="/admin/providers/rows" hx-trigger="load" hx-swap="innerHTML">
+    <tr><td colspan="3" style="color:#999;font-style:italic;">Loading providers&hellip;</td></tr>
+  </tbody>
+</table>
+
+<h2 style="margin-bottom:0.5rem;">Model Aliases</h2>
+<p style="color:#555;font-size:0.9rem;margin-bottom:1rem;">
+  Runtime aliases let callers request an abstract name (e.g. <code>deep</code>) instead of a
+  concrete model. Changes take effect on the next request &mdash; no restart. Precedence:
+  aliases defined here override the <em>Alias</em> column on registered models, which override
+  <code>routing.model_aliases</code> in <code>config.toml</code>. Every change is written to the
+  audit log.
+</p>
+
+<form hx-post="/admin/aliases" hx-target="#alias-form-message" hx-swap="innerHTML"
+      hx-on::after-request="this.reset()"
+      style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:0.5rem;flex-wrap:wrap;">
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias *</label>
+    <input type="text" name="alias" required placeholder="deep"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+  </div>
+  <div>
+    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
+    <input type="text" name="target" required placeholder="anthropic/claude-opus-4-6"
+           style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
+  </div>
+  <button type="submit" class="btn btn-success">Save Alias</button>
+</form>
+<div id="alias-form-message" style="margin-bottom:1rem;"></div>
+
+<table style="margin-bottom:2rem;">
+  <thead>
+    <tr>
+      <th>Alias</th>
+      <th>Target</th>
+      <th>Set By</th>
+      <th>Updated</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="aliases-tbody" hx-get="/admin/aliases/rows" hx-trigger="load" hx-swap="innerHTML">
+    <tr><td colspan="5" style="color:#999;font-style:italic;">Loading aliases&hellip;</td></tr>
+  </tbody>
+</table>
+
+{% if config_aliases %}
+<details style="margin-bottom:2rem;">
+  <summary style="cursor:pointer;color:#555;font-size:0.9rem;">
+    Config-file aliases &mdash; bootstrap defaults, overridden by the table above
+  </summary>
+  <table style="margin-top:0.5rem;">
+    <thead><tr><th>Alias</th><th>Target</th><th>Effective</th></tr></thead>
+    <tbody>
+      {% for row in config_aliases %}
+      <tr>
+        <td><code>{{ row.alias }}</code></td>
+        <td><code>{{ row.target }}</code></td>
+        <td>{% if row.overridden %}<span class="tag tag-disabled">overridden</span>{% else %}<span class="tag tag-enabled">active</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
+
+<script>
+function editAlias(alias, target) {
+  var form = document.querySelector('form[hx-post="/admin/aliases"]');
+  form.querySelector('input[name="alias"]').value = alias;
+  form.querySelector('input[name="target"]').value = target;
+  form.querySelector('input[name="alias"]').focus();
+}
+</script>
 
 <h2 style="margin-bottom:1rem;">Failover Chains</h2>
 <p style="color:#555;font-size:0.9rem;margin-bottom:1rem;">

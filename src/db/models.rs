@@ -460,6 +460,21 @@ pub struct Model {
     pub alias: Option<String>,
     pub enabled: bool,
     pub created_at: String,
+    /// Why an operator disabled this model (issue #5). `None` while enabled.
+    pub disabled_reason: Option<String>,
+    pub disabled_by: Option<String>,
+    pub disabled_at: Option<String>,
+}
+
+/// Whole-provider enable/disable state (issue #5). Absence of a row means enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderState {
+    pub provider: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub disabled_by: Option<String>,
+    pub disabled_at: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug)]
@@ -467,6 +482,23 @@ pub struct NewModel {
     pub provider: String,
     pub name: String,
     pub alias: Option<String>,
+}
+
+/// A runtime-managed alias row (issue #9). Overrides `models.alias` and config aliases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAlias {
+    pub alias: String,
+    pub target: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewModelAlias {
+    pub alias: String,
+    pub target: String,
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

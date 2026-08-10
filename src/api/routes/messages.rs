@@ -165,10 +165,12 @@ async fn anthropic_messages_inner(
         }
     };
 
-    // Check load balancer: if `model` is a named pool, override provider + model
-    let (_lb_provider_unused, canonical_model) = if let Some((lb_provider, lb_model)) =
-        state.load_balancer.resolve(&model)
-    {
+    // Check load balancer: if `model` is a named pool, override provider + model.
+    // Operator-disabled entries are skipped when selecting (issue #5).
+    let lb_choice = state
+        .load_balancer
+        .resolve_available(&model, |p, m| state.router.is_available(p, m));
+    let (resolved_provider, canonical_model) = if let Some((lb_provider, lb_model)) = lb_choice {
         if lb_provider != "anthropic" {
             tracing::warn!(
                 pool = model.as_str(),
@@ -182,9 +184,16 @@ async fn anthropic_messages_inner(
             "load balancer selected model for /v1/messages"
         );
         (lb_provider, lb_model)  // only lb_model is used by this handler
+    } else if state.load_balancer.is_pool(&model) {
+        return Err(ApiError::Disabled(format!(
+            "every model in load balancer pool '{model}' has been disabled by an administrator"
+        )));
     } else {
         state.router.resolve(&model)
     };
+
+    // Operator disable gate (issue #5) — 403 naming the reason, never a provider call.
+    state.router.check_available(&resolved_provider, &canonical_model)?;
 
     let span = tracing::Span::current();
     span.record("user_id", user.id);

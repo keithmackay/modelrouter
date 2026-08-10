@@ -1,6 +1,7 @@
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use std::str::FromStr;
 
+mod aliases;
 mod groups;
 mod users;
 mod admin_users;

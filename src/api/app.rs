@@ -6,7 +6,8 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::Settings,
     db::repositories::{
-        admin_users::AdminUserRepository, api_keys::ApiKeyRepository, audit::AuditRepository,
+        admin_users::AdminUserRepository, aliases::AliasRepository, api_keys::ApiKeyRepository,
+        audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, failures::FailureRepository,
         hooks::HookRepository,
         groups::GroupRepository,
@@ -21,6 +22,7 @@ use crate::{
 /// Aggregated DB trait — SqliteDb implements this via blanket impl
 pub trait DatabaseProvider:
     UserRepository
+    + AliasRepository
     + AdminUserRepository
     + SessionRepository
     + PromptRepository
@@ -43,6 +45,7 @@ pub trait DatabaseProvider:
 /// Blanket impl so any type implementing all sub-traits automatically impl DatabaseProvider
 impl<T> DatabaseProvider for T where
     T: UserRepository
+        + AliasRepository
         + AdminUserRepository
         + SessionRepository
         + PromptRepository
@@ -171,6 +174,16 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/api/stats", get(get_stats))
         .route("/admin/api/audit", get(get_audit))
         .route("/admin/api/prompts", get(get_prompts))
+        // Runtime model aliases (issue #9)
+        .route(
+            "/admin/api/aliases",
+            get(crate::api::admin::aliases::list_aliases_api),
+        )
+        .route(
+            "/admin/api/aliases/:alias",
+            axum::routing::put(crate::api::admin::aliases::upsert_alias_api)
+                .delete(crate::api::admin::aliases::delete_alias_api),
+        )
         .route("/admin/api/admins", get(list_admins).post(create_admin))
         .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
@@ -234,6 +247,23 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/models/:id/enable", post(post_enable_model))
         .route("/admin/models/:id/delete", post(post_delete_model))
         .route("/admin/models/:primary/failovers", post(post_set_failovers))
+        // Model / provider enable-disable (issue #5)
+        .route("/admin/api/models", get(crate::api::admin::models::list_models_api))
+        .route(
+            "/admin/api/models/:id/enabled",
+            patch(crate::api::admin::models::set_model_enabled_api),
+        )
+        .route("/admin/api/providers", get(crate::api::admin::models::list_providers_api))
+        .route(
+            "/admin/api/providers/:provider/enabled",
+            patch(crate::api::admin::models::set_provider_enabled_api),
+        )
+        .route("/admin/providers/rows", get(crate::api::admin::models::get_provider_rows))
+        .route("/admin/providers/:provider/disable", post(crate::api::admin::models::post_disable_provider))
+        .route("/admin/providers/:provider/enable", post(crate::api::admin::models::post_enable_provider))
+        .route("/admin/aliases", post(crate::api::admin::aliases::post_set_alias))
+        .route("/admin/aliases/rows", get(crate::api::admin::aliases::get_alias_rows))
+        .route("/admin/aliases/:alias/delete", post(crate::api::admin::aliases::post_delete_alias))
         // Webhook REST API
         .route("/admin/api/webhooks", get(list_webhooks_api).post(create_webhook_api))
         .route("/admin/api/webhooks/:id", delete(delete_webhook_api))

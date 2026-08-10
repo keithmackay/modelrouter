@@ -53,6 +53,10 @@ pub enum Commands {
     CheckTls,
     /// Manage models and failover chains
     Model(ModelArgs),
+    /// Manage runtime model aliases
+    Alias(AliasArgs),
+    /// Enable or disable whole providers
+    Provider(ProviderArgs),
     /// Manage outbound webhook callbacks
     Webhook(WebhookArgs),
     /// Inspect and control the response cache on a running router
@@ -130,6 +134,56 @@ pub enum CachePolicyCommands {
 }
 
 #[derive(Args)]
+pub struct ProviderArgs {
+    #[command(subcommand)]
+    pub command: ProviderCommands,
+}
+
+#[derive(Subcommand)]
+pub enum ProviderCommands {
+    /// List configured providers and their enable state
+    List,
+    /// Take a whole provider out of rotation. Sticky: stays disabled until re-enabled.
+    Disable {
+        /// Provider name, e.g. "anthropic"
+        provider: String,
+        /// Why it is being disabled — shown to callers and recorded in the audit log
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Re-enable a provider, clearing the recorded disable reason
+    Enable {
+        provider: String,
+    },
+}
+
+#[derive(Args)]
+pub struct AliasArgs {
+    #[command(subcommand)]
+    pub command: AliasCommands,
+}
+
+#[derive(Subcommand)]
+pub enum AliasCommands {
+    /// List runtime aliases and the effective alias map
+    List {
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Create or update an alias (replaces the target if it exists)
+    Set {
+        /// Alias callers will request, e.g. "deep"
+        alias: String,
+        /// Target model, e.g. "anthropic/claude-opus-4-6" or another alias
+        target: String,
+    },
+    /// Remove an alias
+    Rm {
+        alias: String,
+    },
+}
+
+#[derive(Args)]
 pub struct ModelArgs {
     #[command(subcommand)]
     pub command: ModelCommands,
@@ -149,15 +203,18 @@ pub enum ModelCommands {
     },
     /// List all registered models
     List,
-    /// Enable a model by ID
+    /// Re-enable a model by ID, clearing the recorded disable reason
     Enable {
         #[arg(long)]
         id: i64,
     },
-    /// Disable a model by ID
+    /// Take a model out of rotation by ID. Sticky: stays disabled until re-enabled.
     Disable {
         #[arg(long)]
         id: i64,
+        /// Why it is being disabled — shown to callers and recorded in the audit log
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Delete a model by ID
     Delete {

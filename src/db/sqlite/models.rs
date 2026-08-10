@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crate::db::models::{Model, ModelFailover, NewModel};
+use crate::db::models::{Model, ModelFailover, NewModel, ProviderState};
 use crate::db::repositories::models::ModelRepository;
 use super::{SqliteDb, now_utc};
 
@@ -11,7 +11,38 @@ struct ModelRow {
     alias: Option<String>,
     enabled: i64,
     created_at: String,
+    disabled_reason: Option<String>,
+    disabled_by: Option<String>,
+    disabled_at: Option<String>,
 }
+
+#[derive(sqlx::FromRow)]
+struct ProviderStateRow {
+    provider: String,
+    enabled: i64,
+    disabled_reason: Option<String>,
+    disabled_by: Option<String>,
+    disabled_at: Option<String>,
+    updated_at: String,
+}
+
+impl From<ProviderStateRow> for ProviderState {
+    fn from(r: ProviderStateRow) -> Self {
+        ProviderState {
+            provider: r.provider,
+            enabled: r.enabled != 0,
+            disabled_reason: r.disabled_reason,
+            disabled_by: r.disabled_by,
+            disabled_at: r.disabled_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+const MODEL_COLS: &str =
+    "id, provider, name, alias, enabled, created_at, disabled_reason, disabled_by, disabled_at";
+const PROVIDER_STATE_COLS: &str =
+    "provider, enabled, disabled_reason, disabled_by, disabled_at, updated_at";
 
 impl From<ModelRow> for Model {
     fn from(r: ModelRow) -> Self {
@@ -22,6 +53,9 @@ impl From<ModelRow> for Model {
             alias: r.alias,
             enabled: r.enabled != 0,
             created_at: r.created_at,
+            disabled_reason: r.disabled_reason,
+            disabled_by: r.disabled_by,
+            disabled_at: r.disabled_at,
         }
     }
 }
@@ -61,7 +95,7 @@ impl ModelRepository for SqliteDb {
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, ModelRow>(
-            "SELECT id, provider, name, alias, enabled, created_at FROM models WHERE id = ?"
+            &format!("SELECT {MODEL_COLS} FROM models WHERE id = ?")
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -71,7 +105,7 @@ impl ModelRepository for SqliteDb {
 
     async fn list_models(&self) -> anyhow::Result<Vec<Model>> {
         let rows = sqlx::query_as::<_, ModelRow>(
-            "SELECT id, provider, name, alias, enabled, created_at FROM models ORDER BY provider, name"
+            &format!("SELECT {MODEL_COLS} FROM models ORDER BY provider, name")
         )
         .fetch_all(&self.pool)
         .await?;
@@ -80,7 +114,7 @@ impl ModelRepository for SqliteDb {
 
     async fn get_model(&self, id: i64) -> anyhow::Result<Option<Model>> {
         let row = sqlx::query_as::<_, ModelRow>(
-            "SELECT id, provider, name, alias, enabled, created_at FROM models WHERE id = ?"
+            &format!("SELECT {MODEL_COLS} FROM models WHERE id = ?")
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -89,11 +123,90 @@ impl ModelRepository for SqliteDb {
     }
 
     async fn set_model_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()> {
-        sqlx::query("UPDATE models SET enabled = ? WHERE id = ?")
-            .bind(enabled as i64)
+        self.set_model_enabled_with_reason(id, enabled, None, None).await
+    }
+
+    async fn set_model_enabled_with_reason(
+        &self,
+        id: i64,
+        enabled: bool,
+        reason: Option<&str>,
+        by: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if enabled {
+            sqlx::query(
+                "UPDATE models SET enabled = 1, disabled_reason = NULL, \
+                 disabled_by = NULL, disabled_at = NULL WHERE id = ?",
+            )
             .bind(id)
             .execute(&self.pool)
             .await?;
+        } else {
+            sqlx::query(
+                "UPDATE models SET enabled = 0, disabled_reason = ?, \
+                 disabled_by = ?, disabled_at = ? WHERE id = ?",
+            )
+            .bind(reason)
+            .bind(by)
+            .bind(now_utc())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn list_provider_states(&self) -> anyhow::Result<Vec<ProviderState>> {
+        let rows = sqlx::query_as::<_, ProviderStateRow>(&format!(
+            "SELECT {PROVIDER_STATE_COLS} FROM provider_states ORDER BY provider"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(ProviderState::from).collect())
+    }
+
+    async fn get_provider_state(&self, provider: &str) -> anyhow::Result<Option<ProviderState>> {
+        let row = sqlx::query_as::<_, ProviderStateRow>(&format!(
+            "SELECT {PROVIDER_STATE_COLS} FROM provider_states WHERE provider = ?"
+        ))
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(ProviderState::from))
+    }
+
+    async fn set_provider_enabled(
+        &self,
+        provider: &str,
+        enabled: bool,
+        reason: Option<&str>,
+        by: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = now_utc();
+        let (reason, by, at) = if enabled {
+            (None, None, None)
+        } else {
+            (reason, by, Some(now.as_str()))
+        };
+        sqlx::query(
+            "INSERT INTO provider_states \
+               (provider, enabled, disabled_reason, disabled_by, disabled_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(provider) DO UPDATE SET \
+               enabled = excluded.enabled, \
+               disabled_reason = excluded.disabled_reason, \
+               disabled_by = excluded.disabled_by, \
+               disabled_at = excluded.disabled_at, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(provider)
+        .bind(enabled as i64)
+        .bind(reason)
+        .bind(by)
+        .bind(at)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
