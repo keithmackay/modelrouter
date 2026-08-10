@@ -1077,6 +1077,68 @@ pub async fn get_prompts(
     )
 }
 
+/// GET /admin/failures — the requests that did NOT work.
+///
+/// The Prompts page answers "what ran"; without this one the dashboard had no
+/// answer at all for "what failed", and an operator's only recourse was the
+/// calling application's logs. That is backwards: the router is the single
+/// component that sees every call from every app.
+pub async fn get_failures(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    Query(q): Query<PageQuery>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::failures::FailureRepository;
+
+    let page = q.page.unwrap_or(1).max(1) as i64;
+    let per_page: i64 = 50;
+    let offset = (page - 1) * per_page;
+
+    let failures = FailureRepository::list(&*state.db, per_page, offset)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let has_next = failures.len() as i64 == per_page;
+
+    // Stage counts lead the page: "what is failing, and where" is the question an
+    // operator actually arrives with, and it is answerable at a glance.
+    let by_stage = FailureRepository::count_by_stage(&*state.db)
+        .await
+        .unwrap_or_default();
+    let stage_items: Vec<minijinja::Value> = by_stage
+        .into_iter()
+        .map(|(stage, count)| minijinja::context! { stage => stage, count => count })
+        .collect();
+
+    let page_items: Vec<minijinja::Value> = failures
+        .into_iter()
+        .map(|f| {
+            minijinja::context! {
+                id => f.id,
+                endpoint => f.endpoint,
+                request_model => f.request_model,
+                routed_model => f.routed_model.unwrap_or_else(|| "-".to_string()),
+                provider => f.provider.unwrap_or_else(|| "-".to_string()),
+                stage => f.stage,
+                status_code => f.status_code,
+                error_message => f.error_message,
+                latency_ms => f.latency_ms,
+                project => f.project.unwrap_or_else(|| "-".to_string()),
+                created_at => f.created_at,
+            }
+        })
+        .collect();
+
+    render(
+        "failures.html",
+        minijinja::context! {
+            failures => page_items,
+            by_stage => stage_items,
+            page => page,
+            has_next => has_next,
+        },
+    )
+}
+
 pub async fn get_prompt_detail(
     State(state): State<AppState>,
     _session: DashboardSession,

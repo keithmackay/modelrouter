@@ -127,7 +127,7 @@ async fn image_generations_inner(
     let provider_clone = provider_name.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
-    let user_project = user.api_key_project.clone();
+    let user_project = attribution.project_or(user.api_key_project.clone());
 
     tokio::spawn(async move {
         let prompt = NewPrompt {

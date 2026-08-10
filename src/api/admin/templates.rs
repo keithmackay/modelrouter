@@ -13,8 +13,46 @@ pub fn fmt_ts(s: &str) -> String {
     trimmed.replace('T', " ")
 }
 
+/// Format a USD amount so small spends stay legible.
+///
+/// Per-request LLM costs are routinely fractions of a cent, and a plain
+/// `round(2)` renders every one of them as "$0.00" — the dashboard showed a
+/// column of zeroes whose total was clearly not zero. Scale the unit to the
+/// magnitude instead:
+///
+/// | amount            | rendered   |
+/// |-------------------|------------|
+/// | >= $1             | `$12.34`   |
+/// | >= 1 cent         | `$0.1217`  |
+/// | > 0, < 1 cent     | `0.0044c`  |
+/// | exactly 0         | `$0.00`    |
+///
+/// Sub-cent values are shown in cents because "0.0044c" carries the magnitude
+/// at a glance where "$0.000044" is a digit-counting exercise.
+pub fn fmt_money(amount: f64) -> String {
+    if !amount.is_finite() {
+        return "-".to_string();
+    }
+    let a = amount.abs();
+    let sign = if amount < 0.0 { "-" } else { "" };
+    if a == 0.0 {
+        "$0.00".to_string()
+    } else if a >= 1.0 {
+        format!("{}${:.2}", sign, a)
+    } else if a >= 0.01 {
+        format!("{}${:.4}", sign, a)
+    } else {
+        format!("{}{:.4}c", sign, a * 100.0)
+    }
+}
+
 pub fn build_env() -> Environment<'static> {
     let mut env = Environment::new();
+
+    env.add_filter("money", |v: minijinja::Value| -> minijinja::Value {
+        let amount: f64 = f64::try_from(v.clone()).unwrap_or_else(|_| v.to_string().parse().unwrap_or(0.0));
+        minijinja::Value::from(fmt_money(amount))
+    });
 
     env.add_filter("fmt_ts", |v: minijinja::Value| -> minijinja::Value {
         let s = v.to_string();
@@ -45,6 +83,12 @@ pub fn build_env() -> Environment<'static> {
         include_str!("../../../templates/admin/cache.html").to_string(),
     )
     .expect("cache.html template is valid");
+
+    env.add_template_owned(
+        "failures.html",
+        include_str!("../../../templates/admin/failures.html").to_string(),
+    )
+    .expect("failures.html template is valid");
 
     env.add_template_owned(
         "overview.html",
@@ -125,4 +169,27 @@ pub fn build_env() -> Environment<'static> {
     .expect("models.html template is valid");
 
     env
+}
+
+
+#[cfg(test)]
+mod money_tests {
+    use super::fmt_money;
+
+    #[test]
+    fn scales_the_unit_to_the_magnitude() {
+        assert_eq!(fmt_money(0.0), "$0.00");
+        assert_eq!(fmt_money(12.3456), "$12.35");
+        assert_eq!(fmt_money(0.1217), "$0.1217");
+        // The case that motivated this: round(2) rendered these as "$0.00".
+        assert_eq!(fmt_money(0.000044), "0.0044c");
+        assert_eq!(fmt_money(0.00004365), "0.0044c");
+    }
+
+    #[test]
+    fn handles_negative_and_non_finite() {
+        assert_eq!(fmt_money(-2.5), "-$2.50");
+        assert_eq!(fmt_money(-0.00001), "-0.0010c");
+        assert_eq!(fmt_money(f64::NAN), "-");
+    }
 }

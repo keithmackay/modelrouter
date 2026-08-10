@@ -16,7 +16,7 @@
         {% for row in by_user_rows %}
             <tr>
                 <td>{{ row.name }}</td>
-                <td>${{ row.cost_usd }}</td>
+                <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.tokens_in }}</td>
                 <td>{{ row.tokens_out }}</td>
                 <td>{{ row.requests }}</td>
@@ -43,7 +43,7 @@
         {% for row in by_model_rows %}
             <tr>
                 <td>{{ row.model }}</td>
-                <td>${{ row.cost_usd }}</td>
+                <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.tokens_in }}</td>
                 <td>{{ row.tokens_out }}</td>
                 <td>{{ row.requests }}</td>
@@ -70,7 +70,7 @@
         {% for row in by_project_rows %}
             <tr>
                 <td>{{ row.project }}</td>
-                <td>${{ row.cost_usd }}</td>
+                <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.tokens_in }}</td>
                 <td>{{ row.tokens_out }}</td>
                 <td>{{ row.requests }}</td>

@@ -28,9 +28,30 @@ pub async fn chat_completions(
         "cost.usd" = tracing::field::Empty,
         "tokens.prompt" = tracing::field::Empty,
     );
-    chat_completions_inner(State(state), user, headers, Json(body))
+    // Capture context BEFORE the handler consumes these, so a failure can still
+    // be attributed after the fact. See api::failure_log for why capture wraps
+    // the whole handler rather than sitting at each `return Err(...)`.
+    let ctx = crate::api::failure_log::context_from_request(
+        "/v1/chat/completions",
+        &state,
+        &user.0,
+        &headers,
+        &body,
+    );
+    let started = Instant::now();
+
+    let result = chat_completions_inner(State(state.clone()), user, headers, Json(body))
         .instrument(span)
-        .await
+        .await;
+
+    if let Err(err) = &result {
+        let ctx = crate::api::failure_log::FailureContext {
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+            ..ctx
+        };
+        crate::api::failure_log::record_failure(&state, ctx, err).await;
+    }
+    result
 }
 
 async fn chat_completions_inner(
@@ -199,6 +220,7 @@ async fn chat_completions_inner(
             "every model in load balancer pool '{model}' has been disabled by an administrator"
         )));
     } else {
+        crate::api::routes::guard_model_substitution(&state, &model)?;
         state.router.resolve(&model)
     };
 
@@ -267,7 +289,7 @@ async fn chat_completions_inner(
                 CacheHitCtx {
                     user_id: user.id,
                     api_key_id: user.api_key_id,
-                    user_project: user.api_key_project.clone(),
+                    user_project: attribution.project_or(user.api_key_project.clone()),
                     request_model: model.clone(),
                     canonical_model: canonical_model.clone(),
                     provider: provider_name.clone(),
@@ -325,7 +347,7 @@ async fn chat_completions_inner(
                 state: state.clone(),
                 user_id: user.id,
                 api_key_id: user.api_key_id,
-                user_project: user.api_key_project.clone(),
+                user_project: attribution.project_or(user.api_key_project.clone()),
                 user_name: user.name.clone(),
                 model: model.clone(),
                 canonical_model: canonical_model.clone(),
@@ -480,7 +502,7 @@ async fn chat_completions_inner(
     let finish_clone = result.finish_reason.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
-    let user_project = user.api_key_project.clone();
+    let user_project = attribution.project_or(user.api_key_project.clone());
     let user_name_clone = user.name.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;

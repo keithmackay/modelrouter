@@ -3,9 +3,9 @@
     <h3 style="margin-bottom:0.75rem;font-size:1rem;">Attributed usage — {{ filter_label }}</h3>
     <div style="display:flex;gap:2rem;flex-wrap:wrap;">
         <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Spend</div>
-             <div style="font-size:1.5rem;font-weight:600;">${{ cost_usd }}</div></div>
+             <div style="font-size:1.5rem;font-weight:600;">{{ cost_usd | money }}</div></div>
         <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Saved by cache</div>
-             <div style="font-size:1.5rem;font-weight:600;">${{ saved_usd }}</div></div>
+             <div style="font-size:1.5rem;font-weight:600;">{{ saved_usd | money }}</div></div>
         <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Requests</div>
              <div style="font-size:1.5rem;font-weight:600;">{{ requests }}</div></div>
         <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Cache hits</div>
@@ -28,8 +28,8 @@
         {% for row in by_model_rows %}
             <tr>
                 <td>{{ row.key }}</td>
-                <td>${{ row.cost_usd }}</td>
-                <td>${{ row.saved_usd }}</td>
+                <td>{{ row.cost_usd | money }}</td>
+                <td>{{ row.saved_usd | money }}</td>
                 <td>{{ row.requests }}</td>
                 <td>{{ row.cache_hits }}</td>
             </tr>
@@ -54,8 +54,8 @@
         {% for row in by_day_rows %}
             <tr>
                 <td>{{ row.key }}</td>
-                <td>${{ row.cost_usd }}</td>
-                <td>${{ row.saved_usd }}</td>
+                <td>{{ row.cost_usd | money }}</td>
+                <td>{{ row.saved_usd | money }}</td>
                 <td>{{ row.requests }}</td>
                 <td>{{ row.cache_hits }}</td>
             </tr>

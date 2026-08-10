@@ -9,6 +9,7 @@ mod api_keys;
 mod sessions;
 mod prompts;
 mod costs;
+mod failures;
 mod budgets;
 mod audit;
 mod hooks;

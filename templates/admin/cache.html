@@ -28,7 +28,7 @@
     </div>
     <div class="stat-card">
         <div class="stat-label">Saved (last {{ window_days }}d)</div>
-        <div class="stat-value">${{ ledger_saved_usd | round(2) }}</div>
+        <div class="stat-value">{{ ledger_saved_usd | money }}</div>
         <div style="font-size:0.8rem;color:#777;">provider cost avoided</div>
     </div>
     <div class="stat-card">
@@ -90,7 +90,7 @@
             <td>{{ row.hits }}</td>
             <td>{{ row.requests }}</td>
             <td>{{ row.hit_rate_pct }}%</td>
-            <td>${{ row.saved_usd | round(4) }}</td>
+            <td>{{ row.saved_usd | money }}</td>
             <td>
                 <form method="POST" action="/admin/cache/purge">
                     <input type="hidden" name="scope" value="model">
@@ -116,7 +116,7 @@
             <td>{{ row.hits }}</td>
             <td>{{ row.misses }}</td>
             <td>{{ row.hit_rate_pct }}%</td>
-            <td>${{ row.saved_usd | round(4) }}</td>
+            <td>{{ row.saved_usd | money }}</td>
         </tr>
         {% endfor %}
     </tbody>

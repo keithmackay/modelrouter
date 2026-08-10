@@ -48,10 +48,16 @@ impl EmbeddingAdapter for OpenAIEmbeddingAdapter {
         let url = format!("{}/embeddings", self.api_base);
 
         // OpenAI accepts either a single string or array; always send array
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": req.model,
             "input": req.input,
         });
+        // OpenAI's v3 embedding models accept a `dimensions` parameter and will
+        // emit a shorter vector natively. Passing it through is what makes an
+        // openai fallback usable by a caller pinned to another provider's width.
+        if let Some(dims) = req.dimensions {
+            body["dimensions"] = serde_json::json!(dims);
+        }
 
         let resp = self
             .client
@@ -74,9 +80,14 @@ impl EmbeddingAdapter for OpenAIEmbeddingAdapter {
             .await
             .context("Failed to parse embedding response")?;
 
-        Ok(EmbeddingResult {
+        let result = EmbeddingResult {
             embeddings: parsed.data.into_iter().map(|d| d.embedding).collect(),
             prompt_tokens: parsed.usage.prompt_tokens,
-        })
+        };
+        // Providers that ignore `dimensions` (Ollama and most OpenAI-compatible
+        // servers do) would otherwise return their native width and have it
+        // accepted silently.
+        result.verify_dimensions(req.dimensions)?;
+        Ok(result)
     }
 }

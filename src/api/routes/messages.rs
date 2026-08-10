@@ -272,7 +272,7 @@ async fn anthropic_messages_inner(
         let state_c = state.clone();
         let user_id = user.id;
         let api_key_id_s = user.api_key_id;
-        let user_project_s = user.api_key_project.clone();
+        let user_project_s = attribution.project_or(user.api_key_project.clone());
         let user_name_s = user.name.clone();
         let model_s = model.clone();
         let canonical_s = canonical_model.clone();

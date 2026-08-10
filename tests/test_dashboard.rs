@@ -17,7 +17,16 @@ use std::sync::Arc;
 async fn build_test_server() -> TestServer {
     let db = common::in_memory_db().await;
     let settings = Arc::new(Settings::default());
-    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    build_test_server_with_db(Arc::new(db), settings).await
+}
+
+/// Same wiring as `build_test_server`, but over a caller-supplied database so a
+/// test can seed rows before the server reads them.
+async fn build_test_server_with_db(
+    db: Arc<modelrouter::db::sqlite::SqliteDb>,
+    settings: Arc<Settings>,
+) -> TestServer {
+    let db: Arc<dyn DatabaseProvider> = db;
     let registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
         response: "ok".to_string(),
     }));
@@ -248,4 +257,69 @@ async fn superadmin_only_admins_page() {
         .await;
 
     assert_eq!(resp.status_code(), 403, "viewer role should get 403 on /admin/admins");
+}
+
+/// The Failures page must render the captured failures, grouped by stage.
+///
+/// Capturing failures in the database is only half the job: until this page
+/// existed the dashboard could answer "what ran" but not "what failed", and an
+/// operator's only recourse was the calling application's own logs — which is
+/// exactly the dead end that left 196 "Unknown provider" errors undiagnosed for a
+/// full run.
+#[tokio::test]
+async fn failures_page_lists_captured_failures_by_stage() {
+    use modelrouter::db::models::{FailureStage, NewRequestFailure};
+    use modelrouter::db::repositories::failures::FailureRepository;
+
+    let raw_db = common::in_memory_db().await;
+    FailureRepository::create(
+        &raw_db,
+        NewRequestFailure {
+            user_id: None,
+            api_key_id: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            request_model: "anthropic/claude-sonnet-4".to_string(),
+            routed_model: Some("claude-sonnet-4".to_string()),
+            provider: Some("anthropic".to_string()),
+            stage: FailureStage::Resolve,
+            status_code: Some(502),
+            error_message: "provider error: Unknown provider: anthropic".to_string(),
+            attempts: 1,
+            latency_ms: Some(3),
+            project: None,
+            attribution_correlation_id: None,
+            attribution_tags: "{}".to_string(),
+        },
+    )
+    .await
+    .expect("failure should persist");
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/failures")
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "failures page should render for an admin");
+    let body = resp.text();
+    // The template HTML-escapes, so the slash arrives as &#x2f; — assert on the
+    // distinctive part of the name rather than the raw literal.
+    assert!(
+        body.contains("claude-sonnet-4"),
+        "the failing model must be shown: {body}"
+    );
+    assert!(
+        body.contains("Unknown provider: anthropic"),
+        "the provider's own message must be shown verbatim"
+    );
+    assert!(
+        body.contains("resolve"),
+        "the stage must be shown so the operator knows it is a config fault"
+    );
 }
