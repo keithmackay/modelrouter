@@ -460,6 +460,14 @@ pub struct ProviderConfig {
     /// store and simply retrieve worse. Omitted from the request when unset.
     #[serde(default)]
     pub embedding_task_type: Option<String>,
+    /// Gemini model used to serve `/v1/search` for this provider.
+    ///
+    /// Web search on Vertex is grounding on a generative model, so unlike Tavily
+    /// the engine has a model to choose. It is not addressed through
+    /// `[routing.model_aliases]` because the search route resolves an ENGINE,
+    /// not a model. Defaults to `gemini-2.5-flash` when unset.
+    #[serde(default)]
+    pub search_model: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -478,6 +486,7 @@ impl Default for ProviderConfig {
             credentials_path: None,
             embedding_region: None,
             embedding_task_type: None,
+            search_model: None,
         }
     }
 }
