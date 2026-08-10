@@ -5,5 +5,7 @@ pub mod gemini;
 pub mod claude;
 pub mod adapter;
 pub mod embed;
+pub mod search;
 pub use adapter::VertexAdapter;
 pub use embed::VertexEmbeddingAdapter;
+pub use search::VertexSearchAdapter;

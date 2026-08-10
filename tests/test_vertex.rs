@@ -565,3 +565,293 @@ mod pricing_tests {
         assert!(cost > 0.0, "claude-sonnet-4-6@20250514 must have non-zero pricing (got {cost})");
     }
 }
+
+/// Vertex web search via Gemini + Google Search grounding.
+///
+/// Fixtures below are trimmed copies of a REAL response captured from this host
+/// on 2026-08-10 (`gemini-2.5-flash:generateContent` on `locations/global`,
+/// query "Stripe payment processing volume 2025"), not invented shapes. Two
+/// details only the live response revealed, both of which a docs-first port
+/// would have gotten wrong:
+///   * `web.title` is the DOMAIN ("chargeflow.io"), not a page title, and a
+///     sibling `web.domain` carries the same value;
+///   * `confidenceScores` is absent from real responses far more often than not
+///     — all six supports in the captured response omit it — so the rank-order
+///     fallback is the normal path, not the exceptional one.
+#[cfg(feature = "vertex")]
+mod search_tests {
+    use modelrouter::providers::search::SearchRequest;
+    use modelrouter::providers::vertex::search::{
+        build_search_body, parse_grounded_response, redirect_target,
+    };
+
+    fn req(query: &str, max_results: Option<u32>) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            max_results,
+        }
+    }
+
+    /// Verbatim structure of the captured response, with two chunks.
+    fn grounded() -> serde_json::Value {
+        serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Stripe processed an estimated $1.9 trillion."}]},
+                "finishReason": "STOP",
+                "groundingMetadata": {
+                    "webSearchQueries": ["Stripe payment volume 2025"],
+                    "groundingChunks": [
+                        {"web": {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AAA",
+                                 "title": "chargeflow.io", "domain": "chargeflow.io"}},
+                        {"web": {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/BBB",
+                                 "title": "sacra.com", "domain": "sacra.com"}}
+                    ],
+                    "groundingSupports": [
+                        {"segment": {"text": "Stripe processed an estimated $1.9 trillion in total payment volume in 2025."},
+                         "groundingChunkIndices": [0, 1]},
+                        {"segment": {"text": "This represents a 34% increase year-over-year."},
+                         "groundingChunkIndices": [0]}
+                    ]
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn the_request_asks_gemini_to_ground_against_google_search() {
+        let body = build_search_body(&req("stripe volume", None));
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "stripe volume");
+        // The whole adapter is pointless without this tool: without it Gemini
+        // answers from parametric memory and returns no groundingMetadata.
+        assert!(
+            body["tools"][0]["googleSearch"].is_object(),
+            "must request the googleSearch tool, got: {body}"
+        );
+    }
+
+    #[test]
+    fn each_grounding_chunk_becomes_a_result() {
+        let items = parse_grounded_response(&grounded(), &req("q", None)).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "chargeflow.io");
+        assert_eq!(
+            items[0].url,
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AAA"
+        );
+    }
+
+    #[test]
+    fn the_snippet_joins_every_support_that_cites_that_chunk() {
+        let items = parse_grounded_response(&grounded(), &req("q", None)).unwrap();
+        // Chunk 0 is cited by both supports; chunk 1 by only the first.
+        assert_eq!(
+            items[0].snippet,
+            "Stripe processed an estimated $1.9 trillion in total payment volume in 2025. \
+             … This represents a 34% increase year-over-year."
+        );
+        assert_eq!(
+            items[1].snippet,
+            "Stripe processed an estimated $1.9 trillion in total payment volume in 2025."
+        );
+    }
+
+    /// The normal path, not the fallback: every support in the captured live
+    /// response omitted `confidenceScores`.
+    #[test]
+    fn score_degrades_by_rank_when_google_reports_no_confidence() {
+        let items = parse_grounded_response(&grounded(), &req("q", None)).unwrap();
+        assert_eq!(items[0].score, Some(1.0));
+        assert_eq!(items[1].score, Some(0.95));
+    }
+
+    /// The subtle one, and the reason this was ported from Athena's
+    /// `vertex-search.worker.ts` rather than written from the API reference:
+    /// `confidenceScores[k]` corresponds to `groundingChunkIndices[k]`, i.e. it
+    /// is indexed by POSITION IN THE SUPPORT, not by chunk index. Reading it as
+    /// `confidenceScores[chunk_index]` silently attaches the wrong confidence
+    /// to the wrong source — a mis-scoring no test of a single-chunk response
+    /// would ever catch.
+    #[test]
+    fn score_uses_the_confidence_aligned_with_the_chunks_position_in_the_support() {
+        let v = serde_json::json!({
+            "candidates": [{"groundingMetadata": {
+                "groundingChunks": [
+                    {"web": {"uri": "https://a", "title": "a"}},
+                    {"web": {"uri": "https://b", "title": "b"}}
+                ],
+                "groundingSupports": [{
+                    "segment": {"text": "s"},
+                    // chunk 1 sits at position 0, chunk 0 at position 1 — deliberately
+                    // reversed so an index-by-chunk-id reading fails loudly.
+                    "groundingChunkIndices": [1, 0],
+                    "confidenceScores": [0.9, 0.2]
+                }]
+            }}]
+        });
+        let items = parse_grounded_response(&v, &req("q", None)).unwrap();
+        assert_eq!(items[0].score, Some(0.2), "chunk 0 is at position 1 → 0.2");
+        assert_eq!(items[1].score, Some(0.9), "chunk 1 is at position 0 → 0.9");
+    }
+
+    #[test]
+    fn the_highest_confidence_wins_when_several_supports_cite_one_chunk() {
+        let v = serde_json::json!({
+            "candidates": [{"groundingMetadata": {
+                "groundingChunks": [{"web": {"uri": "https://a", "title": "a"}}],
+                "groundingSupports": [
+                    {"segment": {"text": "s1"}, "groundingChunkIndices": [0], "confidenceScores": [0.3]},
+                    {"segment": {"text": "s2"}, "groundingChunkIndices": [0], "confidenceScores": [0.8]}
+                ]
+            }}]
+        });
+        let items = parse_grounded_response(&v, &req("q", None)).unwrap();
+        assert_eq!(items[0].score, Some(0.8));
+    }
+
+    #[test]
+    fn results_are_truncated_to_what_the_caller_asked_for() {
+        let items = parse_grounded_response(&grounded(), &req("q", Some(1))).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "chargeflow.io");
+    }
+
+    /// The defect this adapter must not reproduce. Athena's own
+    /// `vertex-search.worker.ts` falls back here to returning the model's
+    /// PARAMETRIC PROSE as a single result with `url: ''` and a fabricated
+    /// score of 0.5 — ungrounded generated text entering the evidence base
+    /// wearing a citation's clothes. That is the silent-substitution class this
+    /// round exists to kill, so the port deliberately diverges: no grounding,
+    /// no results, loud error.
+    #[test]
+    fn an_ungrounded_answer_is_an_error_not_a_result() {
+        let v = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Stripe is a payments company founded in 2010."}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let err = parse_grounded_response(&v, &req("q", None))
+            .err()
+            .expect("an ungrounded answer must not be returned as evidence")
+            .to_string();
+        assert!(err.contains("grounding"), "error must say why: {err}");
+        assert!(
+            !err.contains("founded in 2010"),
+            "the ungrounded prose must not be smuggled out in the error: {err}"
+        );
+    }
+
+    /// Distinct from the above: Google answered with grounding metadata but
+    /// found nothing. Still an error — an empty result set is indistinguishable
+    /// from "this target has no web coverage", and that exact misread is how
+    /// run 6 produced an evidence-less deliverable.
+    #[test]
+    fn grounding_metadata_with_no_sources_is_an_error() {
+        let v = serde_json::json!({
+            "candidates": [{"groundingMetadata": {"webSearchQueries": ["q"], "groundingChunks": []}}]
+        });
+        assert!(parse_grounded_response(&v, &req("q", None)).is_err());
+    }
+
+    #[test]
+    fn a_chunk_with_no_web_source_is_skipped_not_emitted_blank() {
+        let v = serde_json::json!({
+            "candidates": [{"groundingMetadata": {"groundingChunks": [
+                {"retrievedContext": {"title": "internal doc"}},
+                {"web": {"uri": "https://b", "title": "b"}}
+            ]}}]
+        });
+        let items = parse_grounded_response(&v, &req("q", None)).unwrap();
+        assert_eq!(items.len(), 1, "only the web-sourced chunk is a search result");
+        assert_eq!(items[0].url, "https://b");
+    }
+
+    #[test]
+    fn the_domain_stands_in_when_google_supplies_no_title() {
+        let v = serde_json::json!({
+            "candidates": [{"groundingMetadata": {"groundingChunks": [
+                {"web": {"uri": "https://a", "domain": "sacra.com"}}
+            ]}}]
+        });
+        let items = parse_grounded_response(&v, &req("q", None)).unwrap();
+        assert_eq!(items[0].title, "sacra.com");
+    }
+
+    // --- redirect resolution -------------------------------------------------
+    //
+    // Chunk URIs are always vertexaisearch.cloud.google.com redirects. Athena's
+    // evidence citations and its DOMAIN-BASED credibility scoring are worthless
+    // against an opaque Google redirect, and this is the last point where the
+    // real URL is cheaply recoverable (verified live: one unauthenticated 302
+    // hop to https://www.chargeflow.io/blog/stripe-statistics).
+
+    #[test]
+    fn a_302_with_an_absolute_location_resolves_to_the_real_source() {
+        assert_eq!(
+            redirect_target(302, Some("https://www.chargeflow.io/blog/stripe-statistics")),
+            Some("https://www.chargeflow.io/blog/stripe-statistics".to_string())
+        );
+    }
+
+    #[test]
+    fn a_non_redirect_status_resolves_to_nothing() {
+        assert_eq!(redirect_target(200, Some("https://example.com")), None);
+    }
+
+    #[test]
+    fn a_redirect_with_no_location_resolves_to_nothing() {
+        assert_eq!(redirect_target(302, None), None);
+    }
+
+    /// Never let a redirect chain walk us off http(s) — the resolved URL is
+    /// stored as a citation and later rendered to a user.
+    #[test]
+    fn a_non_http_location_is_refused() {
+        assert_eq!(redirect_target(302, Some("javascript:alert(1)")), None);
+        assert_eq!(redirect_target(302, Some("/relative/path")), None);
+    }
+}
+
+#[cfg(feature = "vertex")]
+mod search_registry_tests {
+    use modelrouter::config::schema::ProviderConfig;
+    use modelrouter::providers::search_registry::{is_supported_engine, SearchRegistry};
+    use std::collections::HashMap;
+
+    #[test]
+    fn vertex_is_an_engine_the_route_will_accept() {
+        // api/routes/search.rs gates on this before ever reaching the registry.
+        assert!(is_supported_engine("vertex"));
+        assert!(is_supported_engine("tavily"));
+        assert!(!is_supported_engine("bing"));
+    }
+
+    #[tokio::test]
+    async fn vertex_engine_builds_a_vertex_search_adapter() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "vertex".to_string(),
+            ProviderConfig {
+                project: Some("my-proj".into()),
+                region: Some("global".into()),
+                ..Default::default()
+            },
+        );
+        assert!(SearchRegistry::new(configs).get("vertex").is_ok());
+    }
+
+    /// Proves the vertex arm was taken: Tavily's adapter needs no project and
+    /// would have constructed happily.
+    #[tokio::test]
+    async fn vertex_search_without_a_project_fails_at_construction() {
+        let mut configs = HashMap::new();
+        configs.insert("vertex".to_string(), ProviderConfig::default());
+        let err = SearchRegistry::new(configs)
+            .get("vertex")
+            .err()
+            .expect("must not construct")
+            .to_string();
+        assert!(err.contains("project"), "got: {err}");
+    }
+}

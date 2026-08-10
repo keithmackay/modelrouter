@@ -6,7 +6,13 @@ use std::sync::Arc;
 
 /// Search engines supported by the registry's default construction path.
 /// Extend this (and the `match` in `get`) to add a new engine.
+#[cfg(not(feature = "vertex"))]
 const SUPPORTED_ENGINES: &[&str] = &["tavily"];
+/// `vertex` is only listed when the feature is compiled in — otherwise
+/// `api/routes/search.rs` would accept the engine at the gate and then fail in
+/// the registry, reporting a configuration problem for what is a build problem.
+#[cfg(feature = "vertex")]
+const SUPPORTED_ENGINES: &[&str] = &["tavily", "vertex"];
 
 pub fn is_supported_engine(engine: &str) -> bool {
     SUPPORTED_ENGINES.contains(&engine)
@@ -36,6 +42,8 @@ impl SearchRegistry {
 
         let adapter: Arc<dyn SearchAdapter> = match engine {
             "tavily" => Arc::new(crate::providers::tavily::TavilyAdapter::new(config)),
+            #[cfg(feature = "vertex")]
+            "vertex" => Arc::new(crate::providers::vertex::VertexSearchAdapter::new(config)?),
             other => anyhow::bail!("Unsupported search engine: {}", other),
         };
 
