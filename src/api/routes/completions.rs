@@ -251,7 +251,7 @@ async fn chat_completions_inner(
                 CacheHitCtx {
                     user_id: user.id,
                     api_key_id: user.api_key_id,
-                    user_project: user.api_key_project.clone(),
+                    user_project: attribution.project_or(user.api_key_project.clone()),
                     request_model: model.clone(),
                     canonical_model: canonical_model.clone(),
                     provider: provider_name.clone(),
@@ -309,7 +309,7 @@ async fn chat_completions_inner(
                 state: state.clone(),
                 user_id: user.id,
                 api_key_id: user.api_key_id,
-                user_project: user.api_key_project.clone(),
+                user_project: attribution.project_or(user.api_key_project.clone()),
                 user_name: user.name.clone(),
                 model: model.clone(),
                 canonical_model: canonical_model.clone(),
@@ -462,7 +462,7 @@ async fn chat_completions_inner(
     let finish_clone = result.finish_reason.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
-    let user_project = user.api_key_project.clone();
+    let user_project = attribution.project_or(user.api_key_project.clone());
     let user_name_clone = user.name.clone();
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
