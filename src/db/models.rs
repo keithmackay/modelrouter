@@ -180,6 +180,79 @@ impl Prompt {
     }
 }
 
+/// Where a request died. See migrations/024_request_failures.sql.
+///
+/// Kept as a small closed enum rather than a free string so a failure can be
+/// grouped and alerted on: "resolve failures spiked" is actionable, "some
+/// requests failed" is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureStage {
+    /// Model/provider resolution — unknown provider, no configured adapter.
+    Resolve,
+    /// Budget, rate limit, guardrail or declarative policy denial.
+    Policy,
+    /// The upstream provider was reached and returned an error.
+    Provider,
+    /// The caller's request was malformed or unacceptable.
+    Request,
+    /// Anything else raised inside the router.
+    Internal,
+}
+
+impl FailureStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureStage::Resolve => "resolve",
+            FailureStage::Policy => "policy",
+            FailureStage::Provider => "provider",
+            FailureStage::Request => "request",
+            FailureStage::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RequestFailure {
+    pub id: i64,
+    pub user_id: Option<i64>,
+    pub api_key_id: Option<i64>,
+    pub endpoint: String,
+    pub request_model: String,
+    pub routed_model: Option<String>,
+    pub provider: Option<String>,
+    pub stage: String,
+    pub status_code: Option<i64>,
+    pub error_message: String,
+    pub attempts: i64,
+    pub latency_ms: Option<i64>,
+    pub project: Option<String>,
+    pub attribution_correlation_id: Option<String>,
+    pub attribution_tags: String,
+    pub created_at: String,
+}
+
+/// A failure to record. Deliberately carries NO prompt or response body: a
+/// failure record must never become a second, unlogged copy of content that
+/// `X-No-Log: true` was used to suppress.
+#[derive(Debug, Clone)]
+pub struct NewRequestFailure {
+    pub user_id: Option<i64>,
+    pub api_key_id: Option<i64>,
+    pub endpoint: String,
+    pub request_model: String,
+    pub routed_model: Option<String>,
+    pub provider: Option<String>,
+    pub stage: FailureStage,
+    pub status_code: Option<i64>,
+    pub error_message: String,
+    pub attempts: i64,
+    pub latency_ms: Option<i64>,
+    pub project: Option<String>,
+    pub attribution_correlation_id: Option<String>,
+    pub attribution_tags: String,
+}
+
 #[derive(Debug)]
 pub struct NewPrompt {
     pub user_id: i64,
