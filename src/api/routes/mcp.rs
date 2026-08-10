@@ -185,6 +185,9 @@ pub async fn discover_mcp_tools(
     let embed_req = EmbeddingRequest {
         model: "text-embedding-3-small".to_string(),
         input: texts,
+        // MCP search embeds and compares within its own index only, so it takes
+        // whatever width the model emits natively.
+        dimensions: None,
     };
     let result = embed_adapter.embed(&embed_req).await.map_err(|e| {
         tracing::error!(error = %e, "Embedding call failed during discover");

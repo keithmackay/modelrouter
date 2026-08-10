@@ -162,3 +162,89 @@ async fn embeddings_invalid_input_type_returns_400() {
         .await;
     assert_eq!(resp.status_code(), 400);
 }
+
+/// `encoding_format: "base64"` must return a base64 STRING, not a float array.
+///
+/// The official OpenAI SDKs send this by default when the caller does not specify
+/// a format, and then decode the response as base64. Returning a float array to
+/// such a client does not error — the JS SDK runs `Buffer.from(array, 'base64')`
+/// over it and produces a shorter vector of zeros. Observed against this router
+/// before the fix: a 768-dimension request arrived at the client as 192 zeros,
+/// silently, and would have been stored and compared against as if it were real.
+#[tokio::test]
+async fn embeddings_base64_format_returns_a_string_not_an_array() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/embeddings")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": "hello world",
+            "encoding_format": "base64"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    let embedding = &body["data"][0]["embedding"];
+    assert!(
+        embedding.is_string(),
+        "a base64 request must return a string, got: {embedding}"
+    );
+
+    // And it must decode back to the little-endian f32s the adapter produced.
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(embedding.as_str().unwrap())
+        .expect("must be valid base64");
+    assert_eq!(raw.len() % 4, 0, "decoded bytes must be whole f32s");
+    let first = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    assert!((first - 0.1_f32).abs() < 1e-6, "first value should round-trip, got {first}");
+}
+
+/// The explicit float format, and the absent-field default, both stay arrays.
+#[tokio::test]
+async fn embeddings_float_format_stays_an_array() {
+    let server = test_app().await;
+    for body_json in [
+        serde_json::json!({"model":"text-embedding-3-small","input":"x","encoding_format":"float"}),
+        serde_json::json!({"model":"text-embedding-3-small","input":"x"}),
+    ] {
+        let resp = server
+            .post("/v1/embeddings")
+            .add_header(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer test-token"),
+            )
+            .json(&body_json)
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["data"][0]["embedding"].is_array(),
+            "float format must stay an array"
+        );
+    }
+}
+
+/// An unrecognised format is refused rather than silently treated as float —
+/// the whole point is that the caller's decoder and ours must agree.
+#[tokio::test]
+async fn embeddings_unknown_encoding_format_is_refused() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/embeddings")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": "x",
+            "encoding_format": "float16"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+}

@@ -28,9 +28,30 @@ pub async fn chat_completions(
         "cost.usd" = tracing::field::Empty,
         "tokens.prompt" = tracing::field::Empty,
     );
-    chat_completions_inner(State(state), user, headers, Json(body))
+    // Capture context BEFORE the handler consumes these, so a failure can still
+    // be attributed after the fact. See api::failure_log for why capture wraps
+    // the whole handler rather than sitting at each `return Err(...)`.
+    let ctx = crate::api::failure_log::context_from_request(
+        "/v1/chat/completions",
+        &state,
+        &user.0,
+        &headers,
+        &body,
+    );
+    let started = Instant::now();
+
+    let result = chat_completions_inner(State(state.clone()), user, headers, Json(body))
         .instrument(span)
-        .await
+        .await;
+
+    if let Err(err) = &result {
+        let ctx = crate::api::failure_log::FailureContext {
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+            ..ctx
+        };
+        crate::api::failure_log::record_failure(&state, ctx, err).await;
+    }
+    result
 }
 
 async fn chat_completions_inner(
@@ -191,6 +212,7 @@ async fn chat_completions_inner(
         );
         (lb_provider, lb_model)
     } else {
+        crate::api::routes::guard_model_substitution(&state, &model)?;
         state.router.resolve(&model)
     };
 
