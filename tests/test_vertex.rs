@@ -3,16 +3,26 @@ use modelrouter::config::schema::ProviderConfig;
 #[test]
 fn provider_config_has_project_and_credentials_path() {
     let config = ProviderConfig {
-        api_key: String::new(),
-        api_base: None,
-        timeout_secs: 60,
-        api_version: None,
         region: Some("us-east5".into()),
         project: Some("my-proj".into()),
         credentials_path: Some("/secrets/sa.json".into()),
+        ..Default::default()
     };
     assert_eq!(config.project.as_deref(), Some("my-proj"));
     assert_eq!(config.credentials_path.as_deref(), Some("/secrets/sa.json"));
+}
+
+/// `ProviderConfig::default()` must agree with what serde fills in for a
+/// `[providers.x]` table that sets nothing — otherwise a config written by hand
+/// and one built in code diverge, and the tests stop describing production.
+#[test]
+fn provider_config_default_matches_serde_defaults() {
+    let from_toml: ProviderConfig = toml::from_str("").unwrap();
+    let from_default = ProviderConfig::default();
+    assert_eq!(from_default.timeout_secs, from_toml.timeout_secs);
+    assert_eq!(from_default.api_key, from_toml.api_key);
+    assert_eq!(from_default.embedding_region, from_toml.embedding_region);
+    assert_eq!(from_default.embedding_task_type, from_toml.embedding_task_type);
 }
 
 #[cfg(feature = "vertex")]
@@ -308,6 +318,233 @@ mod adapter_tests {
         let url = build_endpoint_url("p", "global", Publisher::Google, "gemini-2.5-pro", true);
         assert!(url.starts_with("https://aiplatform.googleapis.com/"));
         assert!(url.ends_with(":streamGenerateContent?alt=sse"));
+    }
+}
+
+/// Vertex text-embedding adapter.
+///
+/// Athena on the GCP sandbox has no provider key at all and must embed through
+/// Vertex under the VM's service account. Before this adapter existed,
+/// `embed_registry::get()` built an `OpenAIEmbeddingAdapter` for every provider
+/// name, so there was no way to route an embedding to Vertex whatever the
+/// config said.
+#[cfg(feature = "vertex")]
+mod embed_tests {
+    use modelrouter::config::schema::ProviderConfig;
+    use modelrouter::providers::embedding::EmbeddingRequest;
+    use modelrouter::providers::vertex::adapter::build_predict_url;
+    use modelrouter::providers::vertex::embed::{
+        build_request_body, parse_response, resolve_embedding_region, split_into_batches,
+    };
+    use serde_json::json;
+
+    fn config(region: Option<&str>, embedding_region: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            project: Some("my-proj".into()),
+            region: region.map(Into::into),
+            embedding_region: embedding_region.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    fn req(input: Vec<&str>, dimensions: Option<u32>) -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: "text-embedding-005".into(),
+            input: input.into_iter().map(Into::into).collect(),
+            dimensions,
+        }
+    }
+
+    #[test]
+    fn predict_url_is_regional_and_uses_the_google_publisher() {
+        assert_eq!(
+            build_predict_url("my-proj", "us-central1", "text-embedding-005"),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict"
+        );
+    }
+
+    #[test]
+    fn embedding_region_overrides_the_chat_region() {
+        // The chat models run on `global`; embeddings cannot.
+        let r = resolve_embedding_region(&config(Some("global"), Some("us-central1"))).unwrap();
+        assert_eq!(r, "us-central1");
+    }
+
+    #[test]
+    fn embedding_region_falls_back_to_region_when_unset() {
+        let r = resolve_embedding_region(&config(Some("us-east5"), None)).unwrap();
+        assert_eq!(r, "us-east5");
+    }
+
+    /// `locations/global` has no embedding endpoint. Silently substituting a
+    /// region would be a hidden default — the exact defect class this round is
+    /// about — so the adapter refuses and names the field the operator must set.
+    #[test]
+    fn global_region_is_refused_and_names_the_field_to_set() {
+        let err = resolve_embedding_region(&config(Some("global"), None))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("embedding_region"),
+            "error must name the field to set, got: {err}"
+        );
+        assert!(err.contains("global"), "error must name the bad value, got: {err}");
+    }
+
+    #[test]
+    fn no_region_at_all_is_refused() {
+        assert!(resolve_embedding_region(&config(None, None)).is_err());
+    }
+
+    #[test]
+    fn request_body_carries_one_instance_per_input() {
+        let body = build_request_body(&req(vec!["alpha", "beta"], None), None);
+        let instances = body["instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0]["content"], "alpha");
+        assert_eq!(instances[1]["content"], "beta");
+    }
+
+    /// Athena pins EMBEDDING_DIMENSIONS=768 and refuses to truncate or pad, so
+    /// the width must be asked for, not hoped for.
+    #[test]
+    fn request_body_asks_for_the_pinned_width() {
+        let body = build_request_body(&req(vec!["alpha"], Some(768)), None);
+        assert_eq!(body["parameters"]["outputDimensionality"], 768);
+    }
+
+    #[test]
+    fn request_body_omits_width_when_the_caller_did_not_pin_one() {
+        let body = build_request_body(&req(vec!["alpha"], None), None);
+        assert!(
+            body.get("parameters").is_none()
+                || body["parameters"].get("outputDimensionality").is_none(),
+            "must not invent a width: {body}"
+        );
+    }
+
+    /// Vertex's own default task type is not the one Athena uses, and mixing
+    /// query- and document-typed vectors in one store degrades every later
+    /// similarity comparison. The value is configured, never assumed.
+    #[test]
+    fn request_body_carries_the_configured_task_type() {
+        let body = build_request_body(&req(vec!["alpha"], None), Some("RETRIEVAL_DOCUMENT"));
+        assert_eq!(body["instances"][0]["task_type"], "RETRIEVAL_DOCUMENT");
+    }
+
+    #[test]
+    fn request_body_omits_task_type_when_unconfigured() {
+        let body = build_request_body(&req(vec!["alpha"], None), None);
+        assert!(
+            body["instances"][0].get("task_type").is_none(),
+            "must not invent a task type: {body}"
+        );
+    }
+
+    /// Vertex's `:predict` accepts at most 5 instances per call — Athena's
+    /// client carries the same cap as `batchSize: 5` in
+    /// `thesis-validator/src/tools/embedding.ts`. A caller embedding a page of
+    /// evidence sends far more than 5, so the adapter must split rather than
+    /// hand Vertex an over-long list and fail the whole batch.
+    #[test]
+    fn inputs_are_split_into_chunks_vertex_will_accept() {
+        let inputs: Vec<String> = (0..12).map(|i| format!("chunk-{i}")).collect();
+        let batches = split_into_batches(&inputs);
+        assert_eq!(batches.len(), 3, "12 inputs at 5 per call");
+        assert_eq!(batches[0].len(), 5);
+        assert_eq!(batches[1].len(), 5);
+        assert_eq!(batches[2].len(), 2);
+        let flattened: Vec<&String> = batches.iter().flat_map(|b| b.iter()).collect();
+        assert_eq!(flattened.len(), 12, "no input may be dropped");
+        assert_eq!(flattened[11], "chunk-11", "order must be preserved");
+    }
+
+    #[test]
+    fn a_single_input_is_one_batch() {
+        assert_eq!(split_into_batches(&["only".to_string()]).len(), 1);
+    }
+
+    #[test]
+    fn response_parsing_yields_one_vector_per_prediction() {
+        let resp = json!({
+            "predictions": [
+                {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 4}}},
+                {"embeddings": {"values": [0.4, 0.5, 0.6], "statistics": {"token_count": 6}}}
+            ]
+        });
+        let result = parse_response(resp).unwrap();
+        assert_eq!(result.embeddings.len(), 2);
+        assert_eq!(result.embeddings[0].len(), 3);
+        assert_eq!(result.prompt_tokens, 10, "token counts sum across predictions");
+    }
+
+    #[test]
+    fn response_without_predictions_is_an_error() {
+        assert!(parse_response(json!({})).is_err());
+    }
+
+    /// The width guard already in `EmbeddingResult` must apply to Vertex too:
+    /// a wrong-width vector is worse than a failed call because it is stored and
+    /// silently corrupts every similarity comparison made against it.
+    #[test]
+    fn a_vector_of_the_wrong_width_is_rejected() {
+        let resp = json!({
+            "predictions": [
+                {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 1}}}
+            ]
+        });
+        let result = parse_response(resp).unwrap();
+        let err = result.verify_dimensions(Some(768)).unwrap_err().to_string();
+        assert!(err.contains("768"), "got: {err}");
+    }
+}
+
+#[cfg(feature = "vertex")]
+mod embed_registry_tests {
+    use modelrouter::config::schema::ProviderConfig;
+    use modelrouter::providers::embed_registry::EmbeddingRegistry;
+    use std::collections::HashMap;
+
+    fn registry(vertex: ProviderConfig) -> EmbeddingRegistry {
+        let mut configs = HashMap::new();
+        configs.insert("vertex".to_string(), vertex);
+        configs.insert("openai".to_string(), ProviderConfig::default());
+        EmbeddingRegistry::new(configs)
+    }
+
+    /// `#[tokio::test]`, not `#[test]`: building the adapter constructs
+    /// `GoogleCloudAuthProvider`, whose token cache registers with the Tokio
+    /// reactor. Production always has one — the server is a Tokio app — so this
+    /// is a harness requirement, not a constraint on the adapter.
+    #[tokio::test]
+    async fn vertex_provider_builds_a_vertex_adapter() {
+        let r = registry(ProviderConfig {
+            project: Some("my-proj".into()),
+            region: Some("global".into()),
+            embedding_region: Some("us-central1".into()),
+            ..Default::default()
+        });
+        assert!(r.get("vertex").is_ok());
+    }
+
+    /// Proves the vertex arm was actually taken: the OpenAI adapter has no
+    /// notion of a region and would happily construct here.
+    #[test]
+    fn vertex_provider_without_a_usable_region_fails_at_construction() {
+        let r = registry(ProviderConfig {
+            project: Some("my-proj".into()),
+            region: Some("global".into()),
+            ..Default::default()
+        });
+        let err = r.get("vertex").err().expect("must not construct").to_string();
+        assert!(err.contains("embedding_region"), "got: {err}");
+    }
+
+    #[test]
+    fn other_providers_still_get_the_openai_compatible_adapter() {
+        // Ollama, Azure and LM Studio all depend on this staying the default arm.
+        let r = registry(ProviderConfig::default());
+        assert!(r.get("openai").is_ok());
     }
 }
 

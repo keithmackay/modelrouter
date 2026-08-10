@@ -4,4 +4,6 @@ pub mod dispatch;
 pub mod gemini;
 pub mod claude;
 pub mod adapter;
+pub mod embed;
 pub use adapter::VertexAdapter;
+pub use embed::VertexEmbeddingAdapter;

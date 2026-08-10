@@ -46,6 +46,25 @@ pub fn build_endpoint_url(
     url
 }
 
+/// Build the Vertex REST URL for a `:predict` call against a Google publisher
+/// model (the embedding path — `text-embedding-*` and friends).
+///
+/// Separate from `build_endpoint_url` because `:predict` is a different verb
+/// from the generative `:generateContent` / `:rawPredict`, not a variant of
+/// them; the host rule is shared deliberately so a region only has to be
+/// reasoned about once. Note that `global` is a legal host here but not a legal
+/// embedding location — see `vertex::embed::resolve_embedding_region`.
+pub fn build_predict_url(project: &str, region: &str, model: &str) -> String {
+    let host = if region == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    };
+    format!(
+        "https://{host}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:predict"
+    )
+}
+
 pub struct VertexAdapter {
     project: String,
     region: String,
