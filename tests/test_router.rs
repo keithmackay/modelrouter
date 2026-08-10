@@ -18,6 +18,7 @@ fn router_with_aliases() -> RequestRouter {
         complexity_routing: None,
         load_balancer: HashMap::new(),
         shortcuts: Default::default(),
+        strict_model_resolution: false,
     };
     RequestRouter::new(Arc::new(settings))
 }
