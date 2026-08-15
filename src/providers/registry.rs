@@ -35,6 +35,28 @@ impl ProviderRegistry {
             .get(provider_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", provider_name))?;
 
+        // Feature-gated provider names must never reach the OpenAI-compat
+        // fallthrough below: a "vertex" binary built without `--features
+        // vertex` would otherwise send every request to api.openai.com with
+        // whatever key this config has — a silent misroute that presents as a
+        // provider-side 401 (issue #24). serve validates this at startup via
+        // `validate_provider_features`; this guard covers every other entry
+        // point (CLI subcommands, tests, future callers).
+        #[cfg(not(feature = "vertex"))]
+        if provider_name == "vertex" {
+            anyhow::bail!(
+                "provider \"vertex\" is configured, but this binary was built without the `vertex` \
+                 cargo feature — rebuild with `cargo build --release --features vertex`"
+            );
+        }
+        #[cfg(not(feature = "bedrock"))]
+        if provider_name == "bedrock" {
+            anyhow::bail!(
+                "provider \"bedrock\" is configured, but this binary was built without the `bedrock` \
+                 cargo feature — rebuild with `cargo build --release --features bedrock`"
+            );
+        }
+
         let adapter: Arc<dyn ProviderAdapter> = if provider_name == "anthropic" {
             Arc::new(crate::providers::anthropic::AnthropicAdapter::new(config))
         } else if provider_name == "azure" {

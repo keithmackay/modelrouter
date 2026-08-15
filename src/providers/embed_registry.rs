@@ -38,6 +38,14 @@ impl EmbeddingRegistry {
             "vertex" => Arc::new(
                 crate::providers::vertex::VertexEmbeddingAdapter::new(config)?,
             ),
+            // Without the feature, "vertex" must not reach the default arm:
+            // embeddings would silently go to the OpenAI wire host with this
+            // config's (typically empty) key — same misroute as issue #24.
+            #[cfg(not(feature = "vertex"))]
+            "vertex" => anyhow::bail!(
+                "provider \"vertex\" is configured, but this binary was built without the `vertex` \
+                 cargo feature — rebuild with `cargo build --release --features vertex`"
+            ),
             _ => Arc::new(
                 crate::providers::openai_embed::OpenAIEmbeddingAdapter::new(config),
             ),
