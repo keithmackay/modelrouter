@@ -654,3 +654,46 @@ pub async fn get_provider_rows(
             .collect::<String>(),
     ))
 }
+
+
+// ── Available-models catalog endpoint (issue #34) ────────────────────────────
+
+/// TTL cache for the aggregated catalog: provider catalog calls cost quota,
+/// and the mapping UI refetches freely. 15 minutes, bypassed by ?refresh=true.
+static CATALOG_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>> =
+    std::sync::OnceLock::new();
+const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+#[derive(serde::Deserialize)]
+pub struct AvailableModelsQuery {
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// GET /admin/api/models/available — what each configured provider's catalog
+/// actually offers, per-provider degraded, TTL-cached.
+pub async fn get_available_models(
+    State(state): State<AppState>,
+    _session: AdminSession,
+    axum::extract::Query(q): axum::extract::Query<AvailableModelsQuery>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let cache = CATALOG_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut guard = cache.lock().await;
+    if !q.refresh {
+        if let Some((at, value)) = guard.as_ref() {
+            if at.elapsed() < CATALOG_TTL {
+                return Ok(axum::Json(value.clone()));
+            }
+        }
+    }
+    let providers = crate::providers::catalog_registry::aggregate_catalogs(
+        &state.live_settings.load().providers,
+    )
+    .await;
+    let value = serde_json::json!({
+        "providers": providers,
+        "ttl_seconds": CATALOG_TTL.as_secs(),
+    });
+    *guard = Some((std::time::Instant::now(), value.clone()));
+    Ok(axum::Json(value))
+}
