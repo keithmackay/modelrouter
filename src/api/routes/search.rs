@@ -116,7 +116,9 @@ async fn search_inner(
     // ── Response cache ───────────────────────────────────────────────────────
     // Search queries are deterministic enough to cache by default; the key is
     // engine + query + options, and the TTL is shorter than for completions.
-    let cache_key = if state.response_cache.search_eligible() {
+    let cache_key = if state.policy.cache_enabled(&user, &pseudo_model)
+        && state.response_cache.search_eligible()
+    {
         Some(crate::router::cache::search_cache_key(
             &engine,
             &query,

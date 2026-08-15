@@ -261,7 +261,9 @@ async fn chat_completions_inner(
     // ── Response cache ───────────────────────────────────────────────────────
     // Eligibility is conservative (see `router::cache`): streaming and
     // nondeterministic sampling are never served from cache.
-    let cache_key = if state.response_cache.completion_eligible(&body) {
+    let cache_key = if state.policy.cache_enabled(&user, &canonical_model)
+        && state.response_cache.completion_eligible(&body)
+    {
         Some(crate::router::cache::completion_cache_key(&canonical_model, &body))
     } else {
         None
