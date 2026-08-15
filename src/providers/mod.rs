@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod catalog;
 pub mod anthropic;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;

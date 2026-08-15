@@ -70,6 +70,9 @@ pub struct VertexAdapter {
     region: String,
     token_provider: Arc<dyn TokenProvider>,
     client: reqwest::Client,
+    /// Scheme+host override for the publisher-models catalog (tests only;
+    /// None in production — the host derives from `region`). See catalog.rs.
+    catalog_base: Option<String>,
 }
 
 impl VertexAdapter {
@@ -95,6 +98,7 @@ impl VertexAdapter {
             region,
             token_provider,
             client,
+            catalog_base: None,
         })
     }
 
@@ -115,7 +119,29 @@ impl VertexAdapter {
             region,
             token_provider,
             client,
+            catalog_base: None,
         })
+    }
+
+    /// Test hook: point catalog discovery at a local mock server.
+    pub fn with_catalog_base(mut self, base: String) -> Self {
+        self.catalog_base = Some(base);
+        self
+    }
+
+    // Catalog accessors (see vertex/catalog.rs) — the catalog impl lives in a
+    // sibling module and reuses this adapter's auth and HTTP client.
+    pub(crate) fn token_provider(&self) -> &Arc<dyn TokenProvider> {
+        &self.token_provider
+    }
+    pub(crate) fn region(&self) -> &str {
+        &self.region
+    }
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.client
+    }
+    pub(crate) fn catalog_base(&self) -> Option<&str> {
+        self.catalog_base.as_deref()
     }
 }
 
