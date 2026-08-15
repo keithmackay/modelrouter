@@ -152,3 +152,90 @@ impl ProviderAdapter for OpenAICompatAdapter {
         Ok(Box::pin(stream))
     }
 }
+
+
+// ── Catalog discovery (issue #33) ────────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl crate::providers::catalog::ProviderCatalog for OpenAICompatAdapter {
+    /// GET {api_base}/models — the OpenAI wire shape every compat provider
+    /// serves. `provider` is left EMPTY here: this adapter serves many
+    /// registry names (openai, groq, ollama, ...), and only the aggregation
+    /// caller (#34) knows which key it queried; it rewrites the field.
+    async fn list_models(&self) -> anyhow::Result<Vec<crate::providers::catalog::CatalogModel>> {
+        let url = format!("{}/models", self.api_base);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("catalog request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("catalog returned {status}: {text}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["id"].as_str())
+            .map(|id| crate::providers::catalog::CatalogModel {
+                provider: String::new(),
+                name: id.to_string(),
+                display_name: None,
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::providers::catalog::ProviderCatalog;
+    use axum::{routing::get, Json, Router};
+
+    fn adapter_for(base: &str) -> OpenAICompatAdapter {
+        let mut config = crate::config::schema::ProviderConfig::default();
+        config.api_base = Some(base.to_string());
+        config.api_key = "k".into();
+        OpenAICompatAdapter::new(&config)
+    }
+
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn lists_models_with_empty_provider_for_caller_to_fill() {
+        let base = serve(Router::new().route(
+            "/models",
+            get(|| async {
+                Json(serde_json::json!({"data": [{"id": "gpt-4o"}, {"id": "gpt-4o-mini"}]}))
+            }),
+        ))
+        .await;
+        let models = adapter_for(&base).list_models().await.unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-4o", "gpt-4o-mini"]
+        );
+        assert!(models.iter().all(|m| m.provider.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn catalog_error_carries_status() {
+        let base = serve(Router::new().route(
+            "/models",
+            get(|| async { (axum::http::StatusCode::UNAUTHORIZED, "bad key") }),
+        ))
+        .await;
+        let err = adapter_for(&base).list_models().await.unwrap_err().to_string();
+        assert!(err.contains("401"), "{err}");
+    }
+}

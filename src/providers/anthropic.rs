@@ -7,6 +7,9 @@ use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAda
 
 pub struct AnthropicAdapter {
     api_key: String,
+    /// Base for auxiliary endpoints (catalog); the messages path keeps its
+    /// dedicated constant. Overridable via config.api_base (used by tests).
+    api_base: String,
     client: reqwest::Client,
 }
 
@@ -18,8 +21,48 @@ impl AnthropicAdapter {
             .expect("Failed to build reqwest client");
         Self {
             api_key: config.api_key.clone(),
+            api_base: config
+                .api_base
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
             client,
         }
+    }
+}
+
+// ── Catalog discovery (issue #33) ────────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl crate::providers::catalog::ProviderCatalog for AnthropicAdapter {
+    /// GET {api_base}/models with the standard Anthropic headers.
+    async fn list_models(&self) -> anyhow::Result<Vec<crate::providers::catalog::CatalogModel>> {
+        let url = format!("{}/models", self.api_base);
+        let resp = self
+            .client
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("catalog request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("catalog returned {status}: {text}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                m["id"].as_str().map(|id| crate::providers::catalog::CatalogModel {
+                    provider: "anthropic".to_string(),
+                    name: id.to_string(),
+                    display_name: m["display_name"].as_str().map(str::to_string),
+                })
+            })
+            .collect())
     }
 }
 
@@ -300,5 +343,36 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0]["role"], "user");
         assert_eq!(filtered[1]["role"], "assistant");
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::providers::catalog::ProviderCatalog;
+    use axum::{routing::get, Json, Router};
+
+    #[tokio::test]
+    async fn lists_models_with_display_names() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let router = Router::new().route(
+                "/models",
+                get(|| async {
+                    Json(serde_json::json!({"data": [
+                        {"id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"}
+                    ]}))
+                }),
+            );
+            axum::serve(listener, router).await.unwrap()
+        });
+        let mut config = crate::config::schema::ProviderConfig::default();
+        config.api_base = Some(format!("http://{addr}"));
+        config.api_key = "k".into();
+        let models = AnthropicAdapter::new(&config).list_models().await.unwrap();
+        assert_eq!(models[0].provider, "anthropic");
+        assert_eq!(models[0].name, "claude-sonnet-4-5");
+        assert_eq!(models[0].display_name.as_deref(), Some("Claude Sonnet 4.5"));
     }
 }
