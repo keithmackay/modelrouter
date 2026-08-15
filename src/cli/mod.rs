@@ -243,6 +243,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::hooks::permissions::sync_hook_permissions(&db, &settings.hooks).await?;
 
 
+            // Refuse to serve if the config names a provider whose adapter is
+            // compiled out of this binary — the registries would silently
+            // substitute the OpenAI-compat adapter for it (issue #24).
+            crate::providers::validate_provider_features(&settings.providers)?;
+
             // Build app components
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
