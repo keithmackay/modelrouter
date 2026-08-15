@@ -136,6 +136,7 @@ async fn responses_inner(
 
     // Fire-and-forget cost logging
     let db = state.db.clone();
+    let prompt_db = state.prompt_db.clone();
     let storage = state.storage.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
@@ -177,7 +178,7 @@ async fn responses_inner(
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
-            Some(p) => match PromptRepository::create(&*db, p).await {
+            Some(p) => match PromptRepository::create(&*prompt_db, p).await {
                 Ok(s) => Some(s),
                 Err(e) => {
                     tracing::error!("Failed to record responses prompt: {e}");

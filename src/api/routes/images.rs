@@ -150,7 +150,7 @@ async fn image_generations_inner(
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
-            Some(p) => match PromptRepository::create(&*state_clone.db, p).await {
+            Some(p) => match PromptRepository::create(&*state_clone.prompt_db, p).await {
                 Ok(s) => Some(s),
                 Err(e) => {
                     tracing::error!("Failed to log image prompt: {}", e);

@@ -423,6 +423,14 @@ pub struct StorageConfig {
     /// existing logs.
     #[serde(default)]
     pub prompt_retention_days: u64,
+    /// Optional separate SQLite file for the prompt log (issue #29), so
+    /// operators can rotate/archive logs independently of the main DB.
+    /// config.toml only — pool selection is restart-scoped, so this field is
+    /// deliberately NOT exposed in the GUI form and is preserved unchanged
+    /// when the GUI saves the live toggles. Ignored (with a warning) on the
+    /// Postgres backend.
+    #[serde(default)]
+    pub prompt_db_path: Option<String>,
 }
 
 impl Default for StorageConfig {
@@ -431,6 +439,7 @@ impl Default for StorageConfig {
             store_prompts: true,
             store_prompt_content: false,
             prompt_retention_days: 0,
+            prompt_db_path: None,
         }
     }
 }

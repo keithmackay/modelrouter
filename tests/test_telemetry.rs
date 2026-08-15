@@ -317,6 +317,7 @@ async fn completions_span_has_required_attributes() {
         session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        prompt_db: db.clone(),
         app_metrics: None,
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),

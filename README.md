@@ -634,6 +634,10 @@ prompt_retention_days = 0     # purge rows older than N days; 0 = keep forever
   The per-request `X-No-Log: true` header still suppresses the row entirely.
 - `prompt_retention_days > 0` deletes older rows on an hourly check. Deletion
   is strictly opt-in: the default keeps everything forever.
+- `prompt_db_path = "~/.modelrouter/prompts.db"` (optional) puts the prompt log
+  in its own SQLite file so it can be rotated/archived independently of the
+  main DB. Restart-scoped (not editable in the GUI); SQLite only — the
+  Postgres backend ignores it. Cost rows stay in the main DB.
 
 These settings can also be edited in the admin dashboard on the **Prompts**
 page; values saved there persist in the database, override `config.toml`, and
