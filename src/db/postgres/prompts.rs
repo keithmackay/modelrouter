@@ -102,4 +102,14 @@ impl PromptRepository for PostgresDb {
             .await?;
         Ok(row.0)
     }
+
+    async fn purge_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        // created_at is uniformly RFC3339 UTC (now_utc), so string comparison
+        // orders correctly — no parsing needed at purge time.
+        let result = sqlx::query("DELETE FROM prompts WHERE created_at < $1")
+            .bind(cutoff_rfc3339)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }

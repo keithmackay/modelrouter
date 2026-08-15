@@ -7,6 +7,7 @@ use crate::{
     config::Settings,
     db::repositories::{
         admin_users::AdminUserRepository, aliases::AliasRepository, api_keys::ApiKeyRepository,
+        app_settings::AppSettingsRepository,
         audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, failures::FailureRepository,
         hooks::HookRepository,
@@ -22,6 +23,7 @@ use crate::{
 /// Aggregated DB trait — SqliteDb implements this via blanket impl
 pub trait DatabaseProvider:
     UserRepository
+    + AppSettingsRepository
     + AliasRepository
     + AdminUserRepository
     + SessionRepository
@@ -45,6 +47,7 @@ pub trait DatabaseProvider:
 /// Blanket impl so any type implementing all sub-traits automatically impl DatabaseProvider
 impl<T> DatabaseProvider for T where
     T: UserRepository
+        + AppSettingsRepository
         + AliasRepository
         + AdminUserRepository
         + SessionRepository
@@ -69,6 +72,9 @@ impl<T> DatabaseProvider for T where
 pub struct AppState {
     pub settings: Arc<Settings>,
     pub live_settings: Arc<ArcSwap<Settings>>,
+    /// Effective `[storage]` policy: config.toml overridden by the DB-stored
+    /// GUI value, swapped live when an admin saves the form (issue #4).
+    pub storage: Arc<ArcSwap<crate::config::schema::StorageConfig>>,
     pub db: Arc<dyn DatabaseProvider>,
     pub pool: Option<sqlx::SqlitePool>,
     pub router: Arc<RequestRouter>,
@@ -116,7 +122,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
         get_overview, get_users, post_create_user, post_disable_user, post_enable_user,
-        get_prompts as dash_get_prompts, get_prompt_detail, get_failures,
+        get_prompts as dash_get_prompts, get_prompt_detail, get_failures, post_storage_settings,
         get_cost, get_hooks,
         get_audit as dash_get_audit,
         get_admins, post_create_admin, post_delete_admin,
@@ -222,6 +228,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/keys/:id/rotate", post(post_rotate_key))
 
         .route("/admin/prompts", get(dash_get_prompts))
+        .route("/admin/storage-settings", axum::routing::post(post_storage_settings))
         .route("/admin/failures", get(get_failures))
         .route("/admin/prompts/:id", get(get_prompt_detail))
         .route("/admin/cost", get(get_cost))

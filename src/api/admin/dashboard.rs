@@ -1045,11 +1045,28 @@ pub async fn get_prompts(
     let per_page: i64 = 50;
     let offset = (page - 1) * per_page;
 
-    let prompts = PromptRepository::list(&*state.db, per_page, offset)
+    // Fetch one row beyond the page: `len == per_page` as a has-next signal
+    // shows a dead "Next" link whenever the total is an exact multiple of the
+    // page size. The overrun row is truncated before rendering.
+    let mut prompts = PromptRepository::list(&*state.db, per_page + 1, offset)
         .await
         .map_err(|_| DashboardError::Internal)?;
+    let has_next = prompts.len() as i64 > per_page;
+    prompts.truncate(per_page as usize);
 
-    let has_next = prompts.len() as i64 == per_page;
+    // Resolve user ids to "name (email)" for readability (issue #4). One
+    // lookup per distinct user on the page; misses fall back to the bare id.
+    let mut user_labels: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for uid in prompts.iter().map(|p| p.user_id).collect::<std::collections::HashSet<_>>() {
+        use crate::db::repositories::users::UserRepository;
+        if let Ok(Some(u)) = UserRepository::find_by_id(&*state.db, uid).await {
+            let label = match &u.email {
+                Some(email) => format!("{} ({})", u.name, email),
+                None => u.name,
+            };
+            user_labels.insert(uid, label);
+        }
+    }
 
     let page_items: Vec<minijinja::Value> = prompts
         .into_iter()
@@ -1057,6 +1074,7 @@ pub async fn get_prompts(
             minijinja::context! {
                 id => p.id,
                 user_id => p.user_id,
+                user_label => user_labels.get(&p.user_id).cloned().unwrap_or_else(|| format!("#{}", p.user_id)),
                 request_model => p.request_model,
                 routed_model => p.routed_model,
                 cost_usd => p.cost_usd,
@@ -1067,14 +1085,50 @@ pub async fn get_prompts(
         })
         .collect();
 
+    let storage = state.storage.load();
     render(
         "prompts.html",
         minijinja::context! {
             prompts => page_items,
             page => page,
             has_next => has_next,
+            store_prompts => storage.store_prompts,
+            store_prompt_content => storage.store_prompt_content,
+            prompt_retention_days => storage.prompt_retention_days,
         },
     )
+}
+
+/// Form payload for POST /admin/storage-settings. Checkboxes are absent from
+/// the form body when unchecked, hence Option<String>.
+#[derive(Deserialize)]
+pub struct StorageSettingsForm {
+    pub store_prompts: Option<String>,
+    pub store_prompt_content: Option<String>,
+    pub prompt_retention_days: Option<u64>,
+}
+
+/// POST /admin/storage-settings — persist the GUI-edited [storage] policy to
+/// the app_settings table and swap it live (issue #4). DB value overrides
+/// config.toml from then on.
+pub async fn post_storage_settings(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    axum::Form(form): axum::Form<StorageSettingsForm>,
+) -> Result<axum::response::Redirect, DashboardError> {
+    use crate::db::repositories::app_settings::AppSettingsRepository;
+
+    let cfg = crate::config::schema::StorageConfig {
+        store_prompts: form.store_prompts.is_some(),
+        store_prompt_content: form.store_prompt_content.is_some(),
+        prompt_retention_days: form.prompt_retention_days.unwrap_or(0),
+    };
+    let json = serde_json::to_string(&cfg).map_err(|_| DashboardError::Internal)?;
+    AppSettingsRepository::set_setting(&*state.db, "storage", &json)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    state.storage.store(std::sync::Arc::new(cfg));
+    Ok(axum::response::Redirect::to("/admin/prompts"))
 }
 
 /// GET /admin/failures — the requests that did NOT work.

@@ -8,4 +8,8 @@ pub trait PromptRepository: Send + Sync {
     async fn list_by_user(&self, user_id: i64, limit: i64) -> anyhow::Result<Vec<Prompt>>;
     async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<Prompt>>;
     async fn count(&self) -> anyhow::Result<i64>;
+    /// Delete prompt rows with `created_at` before the RFC3339 cutoff; returns
+    /// rows deleted. The caller computes the cutoff (retention policy lives in
+    /// config, not in the repository).
+    async fn purge_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64>;
 }

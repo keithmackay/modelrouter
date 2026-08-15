@@ -248,6 +248,52 @@ pub async fn run(cli: Cli) -> Result<()> {
             // substitute the OpenAI-compat adapter for it (issue #24).
             crate::providers::validate_provider_features(&settings.providers)?;
 
+            // Effective [storage] policy (issue #4): the DB-stored GUI value
+            // wins over config.toml; absence of a row means the file/default
+            // applies. Held in an ArcSwap so an admin saving the form takes
+            // effect immediately, without a restart.
+            let storage_live = {
+                use crate::db::repositories::app_settings::AppSettingsRepository;
+                let from_db = AppSettingsRepository::get_setting(&*db, "storage")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|json| serde_json::from_str(&json).ok());
+                Arc::new(arc_swap::ArcSwap::from_pointee(
+                    from_db.unwrap_or_else(|| settings.storage.clone()),
+                ))
+            };
+
+            // Prompt-log retention: purge on an hourly check against the LIVE
+            // policy, so a retention set in the GUI applies within the hour.
+            // retention_days == 0 (the default) means keep forever — deletion
+            // is strictly opt-in. Failures are logged, never fatal.
+            {
+                let purge_db = db.clone();
+                let purge_storage = storage_live.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let retention_days = purge_storage.load().prompt_retention_days;
+                        if retention_days > 0 {
+                            let cutoff = (chrono::Utc::now()
+                                - chrono::Duration::days(retention_days as i64))
+                            .to_rfc3339();
+                            use crate::db::repositories::prompts::PromptRepository;
+                            match PromptRepository::purge_older_than(&*purge_db, &cutoff).await {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(deleted = n, retention_days, "prompt-log retention purge")
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "prompt-log retention purge failed")
+                                }
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+                    }
+                });
+            }
+
             // Build app components
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
@@ -299,6 +345,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
                 live_settings: live_settings.clone(),
+                storage: storage_live.clone(),
                 db,
                 pool: Some(pool),
                 router,

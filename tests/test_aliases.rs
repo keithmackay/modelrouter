@@ -75,6 +75,7 @@ async fn build_server() -> (TestServer, Arc<Settings>, Arc<RequestRouter>, Arc<d
         session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
         session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
+        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
         app_metrics: None,
         callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),

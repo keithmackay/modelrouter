@@ -148,11 +148,21 @@ async fn image_generations_inner(
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
         };
-        match PromptRepository::create(&*state_clone.db, prompt).await {
-            Ok(saved_prompt) => {
+        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*state_clone.db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to log image prompt: {}", e);
+                    None
+                }
+            },
+            None => None,
+        };
+        {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: Some(saved_prompt.id),
+                    prompt_id: stored.as_ref().map(|s| s.id),
                     model: model_clone.clone(),
                     provider: provider_clone.clone(),
                     project: user_project.clone(),
@@ -166,10 +176,6 @@ async fn image_generations_inner(
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record image cost: {}", e);
                 }
-            }
-            Err(e) => {
-                tracing::error!("Failed to log image prompt: {}", e);
-            }
         }
     });
 

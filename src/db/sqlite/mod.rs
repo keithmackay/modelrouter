@@ -7,6 +7,7 @@ mod users;
 mod admin_users;
 mod api_keys;
 mod sessions;
+mod app_settings;
 mod prompts;
 mod costs;
 mod failures;

@@ -1,3 +1,4 @@
+pub mod app_settings;
 pub mod aliases;
 pub mod groups;
 pub mod webhook_callbacks;
