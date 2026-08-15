@@ -99,7 +99,8 @@ pub fn build_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         audio::{speech, transcriptions},
-        completions::chat_completions, embeddings::embeddings, health::health_check,
+        completions::chat_completions, embeddings::embeddings,
+        health::{deep_health, health_check, DeepHealthCache},
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler, search::search,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
@@ -155,6 +156,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         }))
         // Health + API routes
         .route("/health", get(health_check))
+        .route("/health/deep", get(deep_health))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -279,6 +281,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))
         .route("/v1/mcp/discover", post(discover_mcp_tools))
         .with_state(state.clone())
+        // Deep-health result cache lives in a layer, not AppState: it is
+        // route-local state, and an Extension keeps every AppState literal
+        // (tests included) unchanged.
+        .layer(axum::Extension(DeepHealthCache::default()))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(
             state.ip_rate_limiter.clone(),

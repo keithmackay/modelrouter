@@ -147,6 +147,9 @@ struct ModelCounters {
 pub struct ResponseCache {
     store: Arc<dyn CacheStore>,
     policy: ArcSwap<CachePolicy>,
+    /// Configured key namespace, surfaced by /health so an operator can see at
+    /// a glance WHICH cache a gateway is (or is not) attached to.
+    namespace: String,
     hits: AtomicU64,
     misses: AtomicU64,
     stores: AtomicU64,
@@ -156,7 +159,10 @@ pub struct ResponseCache {
 
 impl ResponseCache {
     pub fn new(config: &CacheConfig) -> Self {
-        Self::with_store(store::build_store(config), CachePolicy::from_config(config))
+        let mut cache =
+            Self::with_store(store::build_store(config), CachePolicy::from_config(config));
+        cache.namespace = config.namespace.clone();
+        cache
     }
 
     /// Build a cache over an explicit store — used by tests and by any future
@@ -165,6 +171,7 @@ impl ResponseCache {
         Self {
             store,
             policy: ArcSwap::from_pointee(policy),
+            namespace: String::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             stores: AtomicU64::new(0),
@@ -175,6 +182,31 @@ impl ResponseCache {
 
     pub fn policy(&self) -> Arc<CachePolicy> {
         self.policy.load_full()
+    }
+
+    // ── Health surfacing ──────────────────────────────────────────────────────
+
+    /// Runtime-effective enabled flag (config seed + any admin override).
+    pub fn enabled(&self) -> bool {
+        self.policy.load().enabled
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.store.backend_name()
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Live reachability of the backing store. For Redis this is a real PING
+    /// (which also heals a dropped connection); for memory it is always true.
+    pub async fn connected(&self) -> bool {
+        self.store.healthy().await
+    }
+
+    pub async fn entry_count(&self) -> u64 {
+        self.store.entry_count().await
     }
 
     /// Apply a partial policy update, returning the new policy.

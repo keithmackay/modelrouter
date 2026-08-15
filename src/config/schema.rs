@@ -188,6 +188,8 @@ pub struct Settings {
     pub archival: ArchivalConfig,
     #[serde(default)]
     pub oidc: OidcConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -358,6 +360,44 @@ impl Default for RoutingConfig {
 
 fn default_provider() -> String { "openai".to_string() }
 fn default_model() -> String { "gpt-4o".to_string() }
+
+/// `[health]` — deep-health probing (GET /health/deep).
+///
+/// The deep endpoint issues one MINIMAL real call per capability (completion,
+/// embedding, search) through the normal routing path, so it proves routing
+/// rules and provider credentials, not just process liveness. Probes cost real
+/// provider money: the TTL caps how often polling can trigger them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HealthConfig {
+    /// Seconds a deep-health result is served from memory before re-probing.
+    #[serde(default = "default_deep_ttl")]
+    pub deep_ttl_seconds: u64,
+    /// Model the LLM probe requests (resolved through aliases/routing exactly
+    /// like a caller's request). Defaults to `routing.default_model`.
+    #[serde(default)]
+    pub llm_probe_model: Option<String>,
+    /// Model the embedding probe requests.
+    #[serde(default = "default_embedding_probe_model")]
+    pub embedding_probe_model: String,
+    /// Engine the search probe uses.
+    #[serde(default = "default_search_probe_engine")]
+    pub search_probe_engine: String,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            deep_ttl_seconds: default_deep_ttl(),
+            llm_probe_model: None,
+            embedding_probe_model: default_embedding_probe_model(),
+            search_probe_engine: default_search_probe_engine(),
+        }
+    }
+}
+
+fn default_deep_ttl() -> u64 { 60 }
+fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
+fn default_search_probe_engine() -> String { "tavily".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ComplexityRoutingConfig {

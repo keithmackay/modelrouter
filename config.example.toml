@@ -275,3 +275,22 @@ fail_open    = true
 # enabled = true
 # # Search results go stale faster than completions.
 # ttl_seconds = 900
+
+# ── Deep health (optional) ────────────────────────────────────────────────────
+# GET /health/deep proves that LLM, embedding, and search calls THROUGH the
+# gateway actually work: one minimal real call per capability along the normal
+# routing path (routing rules + provider credentials), recorded in the ledger
+# under the "health-probe" user. GET /health stays a cheap liveness check and,
+# when caching is enabled, reports the cache backend's live state.
+#
+# [health]
+# # Probes cost real provider money; results are served from memory for this
+# # long so aggressive polling cannot burn quota.
+# deep_ttl_seconds = 60
+# # Model the LLM probe requests (goes through aliases/routing like any
+# # caller). Defaults to routing.default_model.
+# #llm_probe_model = "balanced"
+# # Model the embedding probe requests.
+# embedding_probe_model = "text-embedding-3-small"
+# # Engine the search probe uses.
+# search_probe_engine = "tavily"
