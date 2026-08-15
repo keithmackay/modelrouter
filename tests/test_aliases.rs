@@ -372,3 +372,26 @@ async fn runtime_alias_overrides_model_row_alias() {
         ("anthropic".to_string(), "claude-haiku-4-5".to_string())
     );
 }
+
+/// /v1/models advertises routing aliases — config and DB — with `alias_for`,
+/// so alias-only deployments no longer return an empty model list (issue #25).
+#[tokio::test]
+async fn v1_models_lists_config_and_db_aliases() {
+    let (server, _settings, router, _db) = build_server().await;
+    router.update_db_aliases(HashMap::from([(
+        "quick".to_string(),
+        "openai/gpt-4o-mini".to_string(),
+    )]));
+
+    let body: serde_json::Value = server.get("/v1/models").await.json();
+    let data = body["data"].as_array().expect("data array");
+    let find = |id: &str| data.iter().find(|m| m["id"] == id).cloned();
+
+    let deep = find("deep").expect("config alias listed");
+    assert_eq!(deep["alias_for"], "openai/gpt-4o");
+    assert_eq!(deep["owned_by"], "openai");
+
+    let quick = find("quick").expect("db alias listed");
+    assert_eq!(quick["alias_for"], "openai/gpt-4o-mini");
+    assert_eq!(quick["owned_by"], "openai");
+}
