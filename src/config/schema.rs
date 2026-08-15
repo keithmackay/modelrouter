@@ -753,6 +753,12 @@ pub struct PolicyRuleConfig {
     /// Sort order — higher priority rules are evaluated first. Default 0.
     #[serde(default)]
     pub priority: i32,
+    /// Response-cache participation for matched callers (issue #30).
+    /// `Some(false)` opts them out — no cache lookup, no store — so a group
+    /// doing creative/experimental work never gets replayed answers. `None`
+    /// (default) inherits the global cache policy.
+    #[serde(default)]
+    pub cache: Option<bool>,
 }
 
 #[cfg(test)]

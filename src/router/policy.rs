@@ -40,6 +40,22 @@ impl PolicyEngine {
         self
     }
 
+    /// Response-cache participation for this caller/model (issue #30). A
+    /// matched declarative rule with `cache = false` opts the caller out of
+    /// the response cache — no lookup, no store. No rules, no match, or a
+    /// rule without the field → enabled (the global cache policy decides).
+    pub fn cache_enabled(&self, user: &crate::db::models::User, model: &str) -> bool {
+        if let Some(ref live) = self.settings {
+            let settings = live.load();
+            if !settings.policy_rules.is_empty() {
+                if let Some(rule) = find_matching_rule(&settings.policy_rules, user, model) {
+                    return rule.cache.unwrap_or(true);
+                }
+            }
+        }
+        true
+    }
+
     #[tracing::instrument(skip(self), fields(
         policy.result = tracing::field::Empty,
         policy.reason = tracing::field::Empty,

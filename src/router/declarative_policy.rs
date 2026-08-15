@@ -62,6 +62,7 @@ mod tests {
             budget_usd: None,
             window: "monthly".to_string(),
             priority,
+            cache: None,
         }
     }
 
@@ -148,5 +149,59 @@ mod tests {
     fn matching_rule_returns_none_for_empty_rules() {
         let u = user(None, 1);
         assert!(find_matching_rule(&[], &u, "gpt-4o").is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod cache_flag_tests {
+    use super::*;
+    use crate::config::schema::{PolicyConditionConfig, PolicyRuleConfig};
+
+    fn user(id: i64) -> User {
+        User {
+            id,
+            name: "u".into(),
+            email: None,
+            enabled: true,
+            created_at: String::new(),
+            metadata: "{}".into(),
+            api_key_id: None,
+            spend_reset_at: None,
+            api_key_project: None,
+            session_window_secs: None,
+        }
+    }
+
+    fn rule_with_cache(user_id: i64, cache: Option<bool>) -> PolicyRuleConfig {
+        PolicyRuleConfig {
+            name: "r".into(),
+            condition: PolicyConditionConfig { tag: None, user_id: Some(user_id), model: None },
+            allow_models: vec![],
+            budget_usd: None,
+            window: "monthly".into(),
+            priority: 0,
+            cache: cache,
+        }
+    }
+
+    #[test]
+    fn cache_false_rule_matches_expected_user_only() {
+        let rules = vec![rule_with_cache(7, Some(false))];
+        let matched = find_matching_rule(&rules, &user(7), "m");
+        assert_eq!(matched.and_then(|r| r.cache), Some(false));
+        assert!(find_matching_rule(&rules, &user(8), "m").is_none());
+    }
+
+    #[test]
+    fn cache_field_defaults_to_none_when_absent_from_toml() {
+        let s: crate::config::schema::Settings = toml::from_str(
+            "[[policy_rules]]\nname = \"no-cache-team\"\n[policy_rules.condition]\nuser_id = 7\n"
+        ).unwrap();
+        assert_eq!(s.policy_rules[0].cache, None);
+        let s2: crate::config::schema::Settings = toml::from_str(
+            "[[policy_rules]]\nname = \"no-cache-team\"\ncache = false\n[policy_rules.condition]\nuser_id = 7\n"
+        ).unwrap();
+        assert_eq!(s2.policy_rules[0].cache, Some(false));
     }
 }
