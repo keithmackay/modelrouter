@@ -37,6 +37,19 @@ impl RequestRouter {
         self.db_aliases.store(Arc::new(aliases));
     }
 
+    /// Merged alias view — config `[routing.model_aliases]` plus DB-sourced
+    /// overrides, DB winning on conflict, mirroring `resolve_inner`'s lookup
+    /// order. For listing endpoints (issue #25): /v1/models must advertise the
+    /// names callers can actually route with, which on config-alias-only
+    /// deployments exist nowhere else.
+    pub fn alias_map(&self) -> HashMap<String, String> {
+        let mut map = self.settings.routing.model_aliases.clone();
+        for (k, v) in self.db_aliases.load().iter() {
+            map.insert(k.clone(), v.clone());
+        }
+        map
+    }
+
     /// Replace the live operator-disable snapshot (called after any enable/disable write).
     pub fn update_availability(&self, map: AvailabilityMap) {
         self.availability.store(Arc::new(map));
