@@ -136,6 +136,7 @@ async fn responses_inner(
 
     // Fire-and-forget cost logging
     let db = state.db.clone();
+    let storage = state.storage.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
@@ -174,11 +175,21 @@ async fn responses_inner(
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
         };
-        match PromptRepository::create(&*db, prompt).await {
-            Ok(saved_prompt) => {
+        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to record responses prompt: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: Some(saved_prompt.id),
+                    prompt_id: stored.as_ref().map(|s| s.id),
                     model: canonical_clone,
                     provider: provider_clone,
                     project: user_project.clone(),
@@ -190,8 +201,6 @@ async fn responses_inner(
                     attribution_tags: attr_tags.clone(),
                 };
                 let _ = CostRepository::create(&*db, ledger).await;
-            }
-            Err(e) => tracing::error!("Failed to record responses prompt: {e}"),
         }
     });
 

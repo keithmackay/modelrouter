@@ -269,11 +269,21 @@ async fn embeddings_inner(
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
         };
-        match PromptRepository::create(&*state_clone.db, prompt).await {
-            Ok(saved) => {
+        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*state_clone.db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to record embedding prompt: {}", e);
+                    None
+                }
+            },
+            None => None,
+        };
+        {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: Some(saved.id),
+                    prompt_id: stored.as_ref().map(|s| s.id),
                     model: canonical_clone,
                     provider: provider_clone,
                     project: user_project.clone(),
@@ -287,8 +297,6 @@ async fn embeddings_inner(
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record embedding cost: {}", e);
                 }
-            }
-            Err(e) => tracing::error!("Failed to record embedding prompt: {}", e),
         }
     });
 

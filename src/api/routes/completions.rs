@@ -62,7 +62,9 @@ async fn chat_completions_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
-    let skip_log = should_skip_logging(&headers);
+    // Config-level gate (issue #4) rides the same rail as x-no-log: both mean
+    // "record cost, skip the prompt row".
+    let skip_log = should_skip_logging(&headers) || !state.storage.load().store_prompts;
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
     // Read attribution from the request as it arrived: pipeline hooks may
@@ -534,6 +536,8 @@ async fn chat_completions_inner(
                 attribution_correlation_id: attr_correlation.clone(),
                 attribution_tags: attr_tags.clone(),
             };
+            let mut prompt = prompt;
+            crate::db::prompt_store::redact_prompt_content(&state_clone.storage.load(), &mut prompt);
             match PromptRepository::create(&*state_clone.db, prompt).await {
                 Ok(saved_prompt) => {
                     let ledger = NewCostLedgerEntry {
@@ -725,6 +729,8 @@ fn record_cache_hit(
                 attribution_correlation_id: ctx.attribution.correlation_id.clone(),
                 attribution_tags: ctx.attribution.tags_json(),
             };
+            let mut prompt = prompt;
+            crate::db::prompt_store::redact_prompt_content(&state.storage.load(), &mut prompt);
             match PromptRepository::create(&*state.db, prompt).await {
                 Ok(saved) => Some(saved.id),
                 Err(e) => {
@@ -769,6 +775,7 @@ fn log_streaming_request(
 
     let cost_calc = ctx.state.cost_calc.clone();
     let db = ctx.state.db.clone();
+    let storage = ctx.state.storage.clone();
     let lifecycle_hooks = ctx.state.settings.hooks.lifecycle.clone();
     let user_id = ctx.user_id;
     let api_key_id = ctx.api_key_id;
@@ -807,6 +814,7 @@ fn log_streaming_request(
                 let latency_ms = start.elapsed().as_millis() as i64;
 
                 let db_c = db.clone();
+                let storage_c = storage.clone();
                 let model_c = model.clone();
                 let canonical_c = canonical_model.clone();
                 let provider_c = provider.clone();
@@ -844,6 +852,8 @@ fn log_streaming_request(
                             attribution_correlation_id: attr_correlation_c.clone(),
                             attribution_tags: attr_tags_c.clone(),
                         };
+                        let mut prompt = prompt;
+                        crate::db::prompt_store::redact_prompt_content(&storage_c.load(), &mut prompt);
                         match PromptRepository::create(&*db_c, prompt).await {
                             Ok(saved) => {
                                 let entry = NewCostLedgerEntry {

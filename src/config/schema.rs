@@ -181,6 +181,8 @@ pub struct Settings {
     pub guardrails: Vec<GuardrailConfig>,
     #[serde(default)]
     pub policy_rules: Vec<PolicyRuleConfig>,
+    #[serde(default)]
+    pub storage: StorageConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -398,6 +400,40 @@ impl Default for HealthConfig {
 fn default_deep_ttl() -> u64 { 60 }
 fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
 fn default_search_probe_engine() -> String { "tavily".to_string() }
+
+/// `[storage]` — what the prompt log records (issue #4).
+///
+/// Two independent switches: whether prompt-log rows are written at all, and
+/// whether those rows carry message/response content or metadata only.
+/// Content storage defaults OFF because the log is operator telemetry —
+/// privacy-sensitive deployments should not have to discover a config flag
+/// after the fact to stop full conversation bodies landing on disk. Cost
+/// tracking (`cost_ledger`) is unaffected by either switch.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageConfig {
+    /// Write prompt-log rows at all. `false` skips the INSERT entirely.
+    #[serde(default = "default_true")]
+    pub store_prompts: bool,
+    /// Store full request messages and response bodies. `false` (default)
+    /// stores metadata only (tokens, cost, model, timestamps).
+    #[serde(default)]
+    pub store_prompt_content: bool,
+    /// Purge prompt-log rows older than N days. 0 (default) = keep forever —
+    /// deletion is strictly opt-in so an upgrade can never silently discard
+    /// existing logs.
+    #[serde(default)]
+    pub prompt_retention_days: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            store_prompts: true,
+            store_prompt_content: false,
+            prompt_retention_days: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ComplexityRoutingConfig {

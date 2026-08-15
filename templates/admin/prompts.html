@@ -2,11 +2,24 @@
 {% block title %}Prompts — modelrouter Admin{% endblock %}
 {% block content %}
 <h1>Prompt Log</h1>
+
+<form method="post" action="/admin/storage-settings"
+      style="display:flex; align-items:center; gap:1.25rem; flex-wrap:wrap; padding:0.6rem 0.75rem; margin-bottom:1rem; background:#f9f9f9; border:1px solid #eee; border-radius:4px; font-size:0.85rem;">
+    <strong>Storage settings</strong>
+    <label><input type="checkbox" name="store_prompts" {% if store_prompts %}checked{% endif %}> Store prompt log</label>
+    <label><input type="checkbox" name="store_prompt_content" {% if store_prompt_content %}checked{% endif %}> Store message content (privacy-sensitive)</label>
+    <label>Retention days (0 = keep forever):
+        <input type="number" name="prompt_retention_days" min="0" value="{{ prompt_retention_days }}" style="width:5rem;">
+    </label>
+    <button type="submit" class="btn">Save</button>
+    <span style="color:#888;">Saved settings override config.toml and apply immediately. Cost tracking is unaffected.</span>
+</form>
+
 <table>
     <thead>
         <tr>
             <th>ID</th>
-            <th>User ID</th>
+            <th>User</th>
             <th>Model</th>
             <th>Routed Model</th>
             <th>Cost (USD)</th>
@@ -19,7 +32,7 @@
         {% for p in prompts %}
         <tr>
             <td>{{ p.id }}</td>
-            <td>{{ p.user_id }}</td>
+            <td title="user id {{ p.user_id }}">{{ p.user_label }}</td>
             <td>{{ p.request_model }}</td>
             <td>{{ p.routed_model }}</td>
             <td>{{ p.cost_usd | money }}</td>

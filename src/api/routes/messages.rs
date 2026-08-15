@@ -48,26 +48,32 @@ async fn log_messages_cost(
         attribution_correlation_id: attribution.correlation_id.clone(),
         attribution_tags: attribution.tags_json(),
     };
-    match PromptRepository::create(&*state.db, prompt).await {
-        Ok(saved_prompt) => {
-            let ledger = NewCostLedgerEntry {
-                user_id,
-                prompt_id: Some(saved_prompt.id),
-                model: canonical_model.to_string(),
-                provider: provider.to_string(),
-                project: project.clone(),
-                tokens_in: prompt_tokens as i64,
-                tokens_out: completion_tokens as i64,
-                cost_usd: cost,
-                api_key_id,
-                attribution_correlation_id: attribution.correlation_id.clone(),
-                attribution_tags: attribution.tags_json(),
-            };
-            if let Err(e) = CostRepository::create(&*state.db, ledger).await {
-                tracing::error!("Failed to record cost: {}", e);
+    // Storage policy (issue #4): the prompt row is optional; the cost row is not.
+    let stored = match crate::db::prompt_store::apply_storage_policy(&state.storage.load(), prompt) {
+        Some(p) => match PromptRepository::create(&*state.db, p).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!("Failed to record prompt: {}", e);
+                None
             }
-        }
-        Err(e) => tracing::error!("Failed to record prompt: {}", e),
+        },
+        None => None,
+    };
+    let ledger = NewCostLedgerEntry {
+        user_id,
+        prompt_id: stored.as_ref().map(|s| s.id),
+        model: canonical_model.to_string(),
+        provider: provider.to_string(),
+        project: project.clone(),
+        tokens_in: prompt_tokens as i64,
+        tokens_out: completion_tokens as i64,
+        cost_usd: cost,
+        api_key_id,
+        attribution_correlation_id: attribution.correlation_id.clone(),
+        attribution_tags: attribution.tags_json(),
+    };
+    if let Err(e) = CostRepository::create(&*state.db, ledger).await {
+        tracing::error!("Failed to record cost: {}", e);
     }
 
     // Fire on_response_sent lifecycle hooks
@@ -408,11 +414,21 @@ async fn anthropic_messages_inner(
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
         };
-        match PromptRepository::create(&*state_clone.db, prompt).await {
-            Ok(saved_prompt) => {
+        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*state_clone.db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to record prompt: {}", e);
+                    None
+                }
+            },
+            None => None,
+        };
+        {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: Some(saved_prompt.id),
+                    prompt_id: stored.as_ref().map(|s| s.id),
                     model: canonical_c.clone(),
                     provider: "anthropic".to_string(),
                     project: project.clone(),
@@ -427,7 +443,7 @@ async fn anthropic_messages_inner(
                     tracing::error!("Failed to record cost: {}", e);
                 }
                 state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
-                    trace_id: format!("{}", saved_prompt.id),
+                    trace_id: stored.as_ref().map(|s| s.id.to_string()).unwrap_or_else(|| "0".to_string()),
                     user_id,
                     model: canonical_c.clone(),
                     provider: "anthropic".to_string(),
@@ -438,8 +454,6 @@ async fn anthropic_messages_inner(
                     cost_usd: cost,
                     latency_ms,
                 });
-            }
-            Err(e) => tracing::error!("Failed to record prompt: {}", e),
         }
 
         // Fix 1: Fire on_response_sent lifecycle hooks with correct user_name

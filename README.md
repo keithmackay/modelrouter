@@ -612,6 +612,33 @@ returns, so an error path added later cannot silently escape being recorded. No
 prompt or response bodies are stored — a failure record must never become a
 second, unlogged copy of content that `X-No-Log: true` was used to suppress.
 
+### Prompt-log storage
+
+The `[storage]` section controls what the prompt log records. Defaults are
+privacy-first: rows are written, but **message/response content is not stored**
+unless explicitly enabled, and nothing is ever purged unless a retention is
+configured.
+
+```toml
+[storage]
+store_prompts = true          # false skips prompt-log rows entirely
+store_prompt_content = false  # true stores full request/response bodies
+prompt_retention_days = 0     # purge rows older than N days; 0 = keep forever
+```
+
+- `store_prompts = false` skips the prompt-log INSERT on every route. Cost
+  tracking (`cost_ledger`) is unaffected — budgets and the cost dashboard keep
+  working, with `prompt_id` left NULL.
+- `store_prompt_content = false` (the default) stores metadata only — tokens,
+  cost, model, timestamps — with a placeholder in place of message bodies.
+  The per-request `X-No-Log: true` header still suppresses the row entirely.
+- `prompt_retention_days > 0` deletes older rows on an hourly check. Deletion
+  is strictly opt-in: the default keeps everything forever.
+
+These settings can also be edited in the admin dashboard on the **Prompts**
+page; values saved there persist in the database, override `config.toml`, and
+apply immediately without a restart.
+
 ### Response cache
 
 The router can serve identical requests from a cache instead of calling the
