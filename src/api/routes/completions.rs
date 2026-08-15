@@ -538,7 +538,7 @@ async fn chat_completions_inner(
             };
             let mut prompt = prompt;
             crate::db::prompt_store::redact_prompt_content(&state_clone.storage.load(), &mut prompt);
-            match PromptRepository::create(&*state_clone.db, prompt).await {
+            match PromptRepository::create(&*state_clone.prompt_db, prompt).await {
                 Ok(saved_prompt) => {
                     let ledger = NewCostLedgerEntry {
                         user_id,
@@ -731,7 +731,7 @@ fn record_cache_hit(
             };
             let mut prompt = prompt;
             crate::db::prompt_store::redact_prompt_content(&state.storage.load(), &mut prompt);
-            match PromptRepository::create(&*state.db, prompt).await {
+            match PromptRepository::create(&*state.prompt_db, prompt).await {
                 Ok(saved) => Some(saved.id),
                 Err(e) => {
                     tracing::error!("Failed to record cache-hit prompt: {}", e);
@@ -775,6 +775,7 @@ fn log_streaming_request(
 
     let cost_calc = ctx.state.cost_calc.clone();
     let db = ctx.state.db.clone();
+    let prompt_db = ctx.state.prompt_db.clone();
     let storage = ctx.state.storage.clone();
     let lifecycle_hooks = ctx.state.settings.hooks.lifecycle.clone();
     let user_id = ctx.user_id;
@@ -814,6 +815,7 @@ fn log_streaming_request(
                 let latency_ms = start.elapsed().as_millis() as i64;
 
                 let db_c = db.clone();
+                let prompt_db_c = prompt_db.clone();
                 let storage_c = storage.clone();
                 let model_c = model.clone();
                 let canonical_c = canonical_model.clone();
@@ -854,7 +856,7 @@ fn log_streaming_request(
                         };
                         let mut prompt = prompt;
                         crate::db::prompt_store::redact_prompt_content(&storage_c.load(), &mut prompt);
-                        match PromptRepository::create(&*db_c, prompt).await {
+                        match PromptRepository::create(&*prompt_db_c, prompt).await {
                             Ok(saved) => {
                                 let entry = NewCostLedgerEntry {
                                     user_id,

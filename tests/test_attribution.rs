@@ -118,6 +118,7 @@ async fn build_app(cache: CacheConfig) -> (TestServer, Arc<dyn DatabaseProvider>
         ),
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        prompt_db: db.clone(),
         app_metrics: None,
         callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),

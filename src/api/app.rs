@@ -75,6 +75,10 @@ pub struct AppState {
     /// Effective `[storage]` policy: config.toml overridden by the DB-stored
     /// GUI value, swapped live when an admin saves the form (issue #4).
     pub storage: Arc<ArcSwap<crate::config::schema::StorageConfig>>,
+    /// Where prompt-log rows live: the main DB, or a dedicated SQLite file
+    /// when `[storage] prompt_db_path` is set (issue #29). Everything except
+    /// prompt-log reads/writes and the retention purge stays on `db`.
+    pub prompt_db: Arc<dyn DatabaseProvider>,
     pub db: Arc<dyn DatabaseProvider>,
     pub pool: Option<sqlx::SqlitePool>,
     pub router: Arc<RequestRouter>,

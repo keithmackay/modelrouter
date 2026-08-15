@@ -285,7 +285,7 @@ pub async fn get_overview(
 
     // Total request count from prompts (using PromptRepository)
     use crate::db::repositories::prompts::PromptRepository;
-    request_count = PromptRepository::count(&*state.db)
+    request_count = PromptRepository::count(&*state.prompt_db)
         .await
         .unwrap_or(0);
 
@@ -1048,7 +1048,7 @@ pub async fn get_prompts(
     // Fetch one row beyond the page: `len == per_page` as a has-next signal
     // shows a dead "Next" link whenever the total is an exact multiple of the
     // page size. The overrun row is truncated before rendering.
-    let mut prompts = PromptRepository::list(&*state.db, per_page + 1, offset)
+    let mut prompts = PromptRepository::list(&*state.prompt_db, per_page + 1, offset)
         .await
         .map_err(|_| DashboardError::Internal)?;
     let has_next = prompts.len() as i64 > per_page;
@@ -1122,6 +1122,8 @@ pub async fn post_storage_settings(
         store_prompts: form.store_prompts.is_some(),
         store_prompt_content: form.store_prompt_content.is_some(),
         prompt_retention_days: form.prompt_retention_days.unwrap_or(0),
+        // Restart-scoped, not in the form — carry the current value through.
+        prompt_db_path: state.storage.load().prompt_db_path.clone(),
     };
     let json = serde_json::to_string(&cfg).map_err(|_| DashboardError::Internal)?;
     AppSettingsRepository::set_setting(&*state.db, "storage", &json)
@@ -1200,7 +1202,7 @@ pub async fn get_prompt_detail(
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::prompts::PromptRepository;
 
-    match PromptRepository::find_by_id(&*state.db, id)
+    match PromptRepository::find_by_id(&*state.prompt_db, id)
         .await
         .map_err(|_| DashboardError::Internal)?
     {

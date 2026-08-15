@@ -264,12 +264,25 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ))
             };
 
+            // Prompt-log store (issue #29): a dedicated SQLite file when
+            // configured, else the main DB. Restart-scoped by design.
+            let prompt_db: Arc<dyn crate::api::app::DatabaseProvider> =
+                match settings.storage.prompt_db_path.as_deref() {
+                    Some(path) => {
+                        let pdb = crate::db::sqlite::SqliteDb::connect(path).await?;
+                        crate::db::migrations::run_migrations(&pdb.pool).await?;
+                        tracing::info!(path, "prompt log using dedicated database");
+                        Arc::new(pdb)
+                    }
+                    None => db.clone(),
+                };
+
             // Prompt-log retention: purge on an hourly check against the LIVE
             // policy, so a retention set in the GUI applies within the hour.
             // retention_days == 0 (the default) means keep forever — deletion
             // is strictly opt-in. Failures are logged, never fatal.
             {
-                let purge_db = db.clone();
+                let purge_db = prompt_db.clone();
                 let purge_storage = storage_live.clone();
                 tokio::spawn(async move {
                     loop {
@@ -346,6 +359,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 settings: settings.clone(),
                 live_settings: live_settings.clone(),
                 storage: storage_live.clone(),
+                prompt_db: prompt_db.clone(),
                 db,
                 pool: Some(pool),
                 router,

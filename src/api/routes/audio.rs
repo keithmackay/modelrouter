@@ -143,6 +143,8 @@ async fn speech_inner(
     let char_count = body["input"].as_str().map(|s| s.len()).unwrap_or(0);
     let cost = (char_count as f64 / 1000.0) * 0.015;
     let db = state.db.clone();
+    let prompt_db = state.prompt_db.clone();
+    let storage = state.storage.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
@@ -170,11 +172,21 @@ async fn speech_inner(
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
         };
-        match PromptRepository::create(&*db, prompt).await {
-            Ok(saved_prompt) => {
+        // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*prompt_db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to log speech prompt: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: Some(saved_prompt.id),
+                    prompt_id: stored.as_ref().map(|s| s.id),
                     model: model_clone,
                     provider: provider_clone,
                     project: user_project.clone(),
@@ -188,8 +200,6 @@ async fn speech_inner(
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record speech cost: {e}");
                 }
-            }
-            Err(e) => tracing::error!("Failed to log speech prompt: {e}"),
         }
     });
 
@@ -346,6 +356,8 @@ async fn transcriptions_inner(
     // Cost logging
     let cost = 0.006_f64;
     let db = state.db.clone();
+    let prompt_db = state.prompt_db.clone();
+    let storage = state.storage.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
@@ -373,11 +385,21 @@ async fn transcriptions_inner(
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
         };
-        match PromptRepository::create(&*db, prompt).await {
-            Ok(saved_prompt) => {
+        // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*prompt_db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to log transcription prompt: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        {
                 let ledger = NewCostLedgerEntry {
                     user_id,
-                    prompt_id: Some(saved_prompt.id),
+                    prompt_id: stored.as_ref().map(|s| s.id),
                     model: model_clone,
                     provider: provider_clone,
                     project: user_project.clone(),
@@ -391,8 +413,6 @@ async fn transcriptions_inner(
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record transcription cost: {e}");
                 }
-            }
-            Err(e) => tracing::error!("Failed to log transcription prompt: {e}"),
         }
     });
 

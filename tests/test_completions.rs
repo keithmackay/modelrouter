@@ -64,6 +64,7 @@ async fn test_app() -> TestServer {
     let state = AppState {
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        prompt_db: db.clone(),
         settings,
         db,
         pool: None,
@@ -197,6 +198,7 @@ async fn test_app_with_blocking_guardrail() -> TestServer {
     let state = AppState {
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        prompt_db: db.clone(),
         settings,
         db,
         pool: None,
