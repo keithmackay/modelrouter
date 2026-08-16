@@ -23,6 +23,57 @@ const DEFAULT_COST_PER_QUERY: f64 = 0.005;
 /// unbounded (and unbudgeted) amount of provider work.
 const MAX_RESULTS_LIMIT: u32 = 20;
 
+/// Decide which engine serves a request, in precedence order:
+///
+/// 1. the `engine` field on the request,
+/// 2. `[routing] default_search_engine` in config.toml,
+/// 3. the sole configured search provider, when there is exactly one.
+///
+/// This replaced a hardcoded `unwrap_or("tavily")`. That default meant a host
+/// configuring only `[providers.vertex]` answered every engine-less request
+/// with `502 No search adapter configured for engine: tavily` — a working,
+/// reachable adapter sitting unused because the fallback named a provider the
+/// operator had never configured. Callers that DO send `engine` were unaffected,
+/// so the break was invisible until something omitted the field.
+///
+/// With two or more engines configured and no explicit default, refuse rather
+/// than guess: picking one would reintroduce exactly the silent-substitution
+/// problem, and the error names the available engines so the fix is obvious.
+fn resolve_engine(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(engine) = requested.map(str::trim).filter(|e| !e.is_empty()) {
+        return Ok(engine.to_string());
+    }
+
+    if let Some(configured) = state
+        .settings
+        .routing
+        .default_search_engine
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        return Ok(configured.to_string());
+    }
+
+    let available = state.search_registry.configured_engines();
+    match available.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => Err(ApiError::InvalidRequest(
+            "no search engine configured: add a [providers.<engine>] section \
+             (supported: tavily, vertex) to config.toml"
+                .to_string(),
+        )),
+        many => Err(ApiError::InvalidRequest(format!(
+            "request omitted `engine` and multiple search engines are configured ({}); \
+             send `engine` explicitly or set [routing] default_search_engine",
+            many.join(", ")
+        ))),
+    }
+}
+
 pub async fn search(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -77,7 +128,7 @@ async fn search_inner(
         None => None,
     };
 
-    let engine = body["engine"].as_str().unwrap_or("tavily").to_string();
+    let engine = resolve_engine(&state, body["engine"].as_str())?;
     if !crate::providers::search_registry::is_supported_engine(&engine) {
         return Err(ApiError::InvalidRequest(format!(
             "unsupported search engine: {}",
