@@ -583,6 +583,56 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 
 See [`config.example.toml`](config.example.toml) for a fully annotated reference configuration.
 
+### Vertex AI: publishers, Model-as-a-Service, and the model catalog
+
+The Vertex provider serves three distinct endpoint styles behind one `vertex/` prefix:
+
+| Publisher | Endpoint style | Model id form |
+|-----------|---------------|---------------|
+| `google` (Gemini) | `models/{m}:generateContent` / `:streamGenerateContent` | `vertex/google/gemini-2.5-pro` |
+| `anthropic` (Claude) | `models/{m}:rawPredict` / `:streamRawPredict` | `vertex/anthropic/claude-sonnet-4-5@…` |
+| everything else (Mistral, Llama, DeepSeek, Qwen, …) | the shared OpenAI-compatible MaaS endpoint `endpoints/openapi/chat/completions` | `vertex/mistralai/mistral-medium-3` (full `publisher/model` id travels in the request body) |
+
+Any publisher other than `google`/`anthropic` automatically routes through the MaaS arm —
+no code change is needed to call a newly enabled Model Garden partner.
+
+Vertex-specific config keys (all under `[providers.vertex]`; **publisher and region names
+are operations data and live here, never in code**):
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `project` | GCP project id | required |
+| `region` | Chat region for google/anthropic (`global` is valid) | required |
+| `embedding_region` | Embeddings are regional-only; `global` has no embedding endpoint | falls back to `region`; errors if that is `global` |
+| `maas_region` | MaaS partners are regional-only; `global` 404s for them | falls back to `region`; MaaS dispatch fails with a fix-hint if that is `global` |
+| `catalog_publishers` | Publisher catalogs probed for `GET /admin/api/models/available` | `["google", "anthropic"]` |
+| `credentials_path` | Service-account key file; omit to use ADC (metadata server on GCE — no key material on disk) | ADC |
+
+**The catalog lists only what the project can actually call.** The public publisher
+catalog enumerates what *exists*; Model Garden partner (MaaS) models additionally gate on
+per-project accepted terms. `GET /admin/api/models/available` therefore verifies access
+per MaaS model with a minimal 1-max-token probe before listing (google/anthropic are
+exempt — they are the structural dispatch arms, reachable whenever the provider works at
+all): a 404/403 answer means the project lacks access and the model is **omitted**, with
+an info log naming it. An invalid-body "free" probe does not work — Vertex validates the
+request body before resolving model access, so it cannot distinguish the two cases.
+Publishers the project cannot reach at all (catalog 403/timeout) are skipped with a
+warning, never fatal: per-project Model Garden enablement variation is normal, not an
+error. To make a listed-but-omitted model callable, accept the publisher's terms on its
+Model Garden card in the GCP console — it appears in the catalog automatically afterward.
+
+Runtime model aliases (`PUT /admin/api/aliases/{alias}`, stored in the DB) override
+`routing.model_aliases` from config — this is the seam consumer apps use to let operators
+repoint an abstract tier (`fast`/`balanced`/`deep`) at any catalog model without touching
+config or redeploying. Fallback chains (`[routing.fallback_chains]`) accept any resolved
+`provider/model` string, including cross-publisher Vertex chains
+(`"vertex/anthropic/claude-…" = ["vertex/google/gemini-…"]`).
+
+**Build note:** default cargo features include every provider (`vertex`, `bedrock`, …).
+An unconfigured provider costs nothing at runtime, while a binary missing a compiled
+feature *refuses to start* against a config that names it — so feature-stripped builds
+turn a plain `cargo build` into a startup trap. Only strip features deliberately.
+
 ### Failure capture
 
 A `prompts` row is only ever written on the success path. Everything that failed —

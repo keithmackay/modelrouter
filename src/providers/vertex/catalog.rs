@@ -61,6 +61,7 @@ impl ProviderCatalog for VertexAdapter {
             configured.iter().map(String::as_str).collect()
         };
         for publisher in publishers {
+            let mut publisher_models: Vec<CatalogModel> = Vec::new();
             let mut page_token: Option<String> = None;
             for _ in 0..MAX_PAGES {
                 let url = catalog_url(
@@ -106,7 +107,7 @@ impl ProviderCatalog for VertexAdapter {
                     let Some(id) = m["name"].as_str().and_then(model_id_from_resource_name) else {
                         continue;
                     };
-                    models.push(CatalogModel {
+                    publisher_models.push(CatalogModel {
                         provider: "vertex".to_string(),
                         name: format!("{publisher}/{id}"),
                         display_name: m["displayName"].as_str().map(str::to_string),
@@ -116,6 +117,47 @@ impl ProviderCatalog for VertexAdapter {
                 page_token = body["nextPageToken"].as_str().map(str::to_string);
                 if page_token.is_none() {
                     break;
+                }
+            }
+
+            // The public publisher catalog lists what EXISTS, not what this
+            // project may CALL — Model Garden partner (MaaS) models each gate
+            // on accepted terms, and listing an uncallable model hands the
+            // operator a picker entry that 404s (operator ruling 2026-08-20:
+            // "if the app does not have access per the model garden, it
+            // should not be listed as available"). Verify access per model
+            // with a zero-cost probe before listing. google/anthropic are
+            // exempt: they are this adapter's structural dispatch arms and
+            // demonstrably reachable via the same enablement that makes the
+            // provider work at all.
+            let is_maas = !DEFAULT_PUBLISHERS.contains(&publisher);
+            if !is_maas {
+                models.append(&mut publisher_models);
+                continue;
+            }
+            let Some(maas_region) = self.maas_region() else {
+                tracing::warn!(
+                    publisher,
+                    "maas_region unset — omitting MaaS publisher from catalog (its models \
+                     would be listed but uncallable; set `maas_region` under [providers.vertex])"
+                );
+                continue;
+            };
+            let probes = publisher_models.into_iter().map(|m| {
+                let token = token.clone();
+                async move {
+                    let accessible = self
+                        .probe_maas_access(&m.name, maas_region, &token)
+                        .await
+                        .unwrap_or(true); // transient probe failure: list optimistically
+                    (m, accessible)
+                }
+            });
+            for (m, accessible) in futures::future::join_all(probes).await {
+                if accessible {
+                    models.push(m);
+                } else {
+                    tracing::info!(model = m.name.as_str(), "omitted from catalog: project lacks Model Garden access");
                 }
             }
         }

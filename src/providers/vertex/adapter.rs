@@ -175,6 +175,49 @@ impl VertexAdapter {
     pub(crate) fn catalog_publishers(&self) -> &[String] {
         &self.catalog_publishers
     }
+    pub(crate) fn maas_region(&self) -> Option<&str> {
+        self.maas_region.as_deref()
+    }
+    pub(crate) fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// Access probe for a MaaS model: a real 1-max-token call. An invalid-body
+    /// probe does NOT work — Vertex validates the request body before
+    /// resolving model access, so a missing-`messages` 400 reads identically
+    /// for accessible and inaccessible models (verified live 2026-08-20).
+    /// Status semantics: 404/403 = the project cannot call this model (Model
+    /// Garden terms not accepted); anything else = access exists. Cost is ~a
+    /// token per MaaS model per catalog-cache window — the price of a picker
+    /// that never lists an uncallable model (operator ruling). `Err` = the
+    /// probe itself failed (network); caller decides the default.
+    pub(crate) async fn probe_maas_access(
+        &self,
+        full_model_id: &str,
+        maas_region: &str,
+        token: &str,
+    ) -> anyhow::Result<bool> {
+        let url = build_endpoint_url(
+            &self.project,
+            maas_region,
+            Publisher::Maas,
+            full_model_id,
+            false,
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "model": full_model_id,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            }))
+            .send()
+            .await
+            .context("MaaS access probe failed")?;
+        Ok(!matches!(resp.status().as_u16(), 403 | 404))
+    }
     /// Region for a MaaS dispatch, or a config fix-hint when none resolves
     /// (chat region `global` + no `maas_region` set — MaaS is regional-only).
     fn resolve_maas_region(&self) -> anyhow::Result<&str> {
