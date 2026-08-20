@@ -536,6 +536,27 @@ pub struct ProviderConfig {
     /// chat region. Falls back to `region` when unset.
     #[serde(default)]
     pub embedding_region: Option<String>,
+    /// Vertex Model-as-a-Service region (Mistral, Llama, DeepSeek, and the
+    /// other Model Garden partners served via the OpenAI-compatible
+    /// `endpoints/openapi/chat/completions` path).
+    ///
+    /// Exactly the embedding_region story again: MaaS models are regional-only
+    /// — `locations/global` answers 404 for them even though Claude and Gemini
+    /// chat models run there. Falls back to `region` when that is itself
+    /// regional; with `region = "global"` and this unset, MaaS dispatch fails
+    /// loudly with a fix-hint. No region name is baked into code (operator
+    /// ruling 2026-08-20: specific regions/publishers are config, not code).
+    #[serde(default)]
+    pub maas_region: Option<String>,
+    /// Vertex publisher catalogs to probe for the available-models endpoint
+    /// (`google`, `anthropic`, `mistralai`, `meta`, `deepseek-ai`, `qwen`,
+    /// `openai`, `ai21`, …). Operations data — which publishers a project can
+    /// reach varies with Model Garden enablement, so the list lives here, not
+    /// in code. Unset/empty = the structural floor (google + anthropic, the
+    /// two with dedicated dispatch arms). Unreachable/refused publishers are
+    /// skipped with a warning, never fatal.
+    #[serde(default)]
+    pub catalog_publishers: Option<Vec<String>>,
     /// Vertex embedding task type (`RETRIEVAL_DOCUMENT`, `RETRIEVAL_QUERY`,
     /// `SEMANTIC_SIMILARITY`, …), sent as each instance's `task_type`.
     ///
@@ -570,6 +591,8 @@ impl Default for ProviderConfig {
             project: None,
             credentials_path: None,
             embedding_region: None,
+            maas_region: None,
+            catalog_publishers: None,
             embedding_task_type: None,
             search_model: None,
         }

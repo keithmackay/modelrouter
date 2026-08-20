@@ -11,7 +11,7 @@ use crate::config::schema::ProviderConfig;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
 use crate::providers::vertex::auth::{GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::{parse_model_id, Publisher};
-use crate::providers::vertex::{claude, gemini};
+use crate::providers::vertex::{claude, gemini, maas};
 
 /// Build the full Vertex REST URL for a given (project, region, publisher, model).
 /// For Gemini streaming, appends `?alt=sse` so the server emits line-framed SSE.
@@ -26,16 +26,25 @@ pub fn build_endpoint_url(
     model: &str,
     streaming: bool,
 ) -> String {
+    let host = if region == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    };
+    // MaaS publishers (Mistral, Llama, DeepSeek, …) share one OpenAI-compatible
+    // endpoint; the publisher travels in the request body's `model` field, and
+    // streaming is a body flag (`stream: true`), not a different URL.
+    if matches!(publisher, Publisher::Maas) {
+        return format!(
+            "https://{host}/v1/projects/{project}/locations/{region}/endpoints/openapi/chat/completions"
+        );
+    }
     let (pub_segment, method) = match (publisher, streaming) {
         (Publisher::Google, false) => ("google", "generateContent"),
         (Publisher::Google, true) => ("google", "streamGenerateContent"),
         (Publisher::Anthropic, false) => ("anthropic", "rawPredict"),
         (Publisher::Anthropic, true) => ("anthropic", "streamRawPredict"),
-    };
-    let host = if region == "global" {
-        "aiplatform.googleapis.com".to_string()
-    } else {
-        format!("{region}-aiplatform.googleapis.com")
+        (Publisher::Maas, _) => unreachable!("handled above"),
     };
     let mut url = format!(
         "https://{host}/v1/projects/{project}/locations/{region}/publishers/{pub_segment}/models/{model}:{method}"
@@ -68,6 +77,17 @@ pub fn build_predict_url(project: &str, region: &str, model: &str) -> String {
 pub struct VertexAdapter {
     project: String,
     region: String,
+    /// Region for Model-as-a-Service publishers (mistralai, meta, …), which
+    /// are regional-only: `locations/global` 404s for them. From
+    /// `[providers.vertex] maas_region`, falling back to `region` when that is
+    /// itself regional. None (global region, no maas_region configured) makes
+    /// MaaS dispatch fail loudly with a config fix-hint — region names are
+    /// operations data and never live in code (operator ruling 2026-08-20).
+    maas_region: Option<String>,
+    /// Publisher catalogs to probe for `/admin/api/models/available` — from
+    /// `[providers.vertex] catalog_publishers`; empty means the structural
+    /// floor in catalog.rs (the two publishers with dedicated dispatch arms).
+    catalog_publishers: Vec<String>,
     token_provider: Arc<dyn TokenProvider>,
     client: reqwest::Client,
     /// Scheme+host override for the publisher-models catalog (tests only;
@@ -93,9 +113,15 @@ impl VertexAdapter {
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .context("failed to build reqwest client")?;
+        let maas_region = config
+            .maas_region
+            .clone()
+            .or_else(|| if region == "global" { None } else { Some(region.clone()) });
         Ok(Self {
             project,
             region,
+            maas_region,
+            catalog_publishers: config.catalog_publishers.clone().unwrap_or_default(),
             token_provider,
             client,
             catalog_base: None,
@@ -114,9 +140,12 @@ impl VertexAdapter {
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .context("failed to build reqwest client")?;
+        let maas_region = if region == "global" { None } else { Some(region.clone()) };
         Ok(Self {
             project,
             region,
+            maas_region,
+            catalog_publishers: Vec::new(),
             token_provider,
             client,
             catalog_base: None,
@@ -143,16 +172,37 @@ impl VertexAdapter {
     pub(crate) fn catalog_base(&self) -> Option<&str> {
         self.catalog_base.as_deref()
     }
+    pub(crate) fn catalog_publishers(&self) -> &[String] {
+        &self.catalog_publishers
+    }
+    /// Region for a MaaS dispatch, or a config fix-hint when none resolves
+    /// (chat region `global` + no `maas_region` set — MaaS is regional-only).
+    fn resolve_maas_region(&self) -> anyhow::Result<&str> {
+        self.maas_region.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Vertex Model-as-a-Service models need a regional location: `region` is \
+                 \"global\" (fine for Claude/Gemini, serves no MaaS models) and no \
+                 `maas_region` is set. Add `maas_region = \"<a MaaS region>\"` under \
+                 [providers.vertex]."
+            )
+        })
+    }
 }
 
 #[async_trait::async_trait]
 impl ProviderAdapter for VertexAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let (publisher, model) = parse_model_id(&req.model)?;
-        let url = build_endpoint_url(&self.project, &self.region, publisher, &model, false);
+        let region = if matches!(publisher, Publisher::Maas) {
+            self.resolve_maas_region()?
+        } else {
+            &self.region
+        };
+        let url = build_endpoint_url(&self.project, region, publisher, &model, false);
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
             Publisher::Anthropic => claude::translate_request(req),
+            Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let token = self.token_provider.token().await?;
         let resp = self
@@ -175,15 +225,22 @@ impl ProviderAdapter for VertexAdapter {
         match publisher {
             Publisher::Google => gemini::parse_response(v),
             Publisher::Anthropic => claude::parse_response(v),
+            Publisher::Maas => maas::parse_response(v),
         }
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
         let (publisher, model) = parse_model_id(&req.model)?;
-        let url = build_endpoint_url(&self.project, &self.region, publisher, &model, true);
+        let region = if matches!(publisher, Publisher::Maas) {
+            self.resolve_maas_region()?
+        } else {
+            &self.region
+        };
+        let url = build_endpoint_url(&self.project, region, publisher, &model, true);
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
             Publisher::Anthropic => claude::translate_request(req),
+            Publisher::Maas => maas::translate_request(req, &model, true),
         };
         let token = self.token_provider.token().await?;
         let resp = self
@@ -210,6 +267,15 @@ impl ProviderAdapter for VertexAdapter {
                     let translated = match publisher {
                         Publisher::Google => gemini::translate_sse_line(line),
                         Publisher::Anthropic => claude::translate_sse_line(line),
+                        // MaaS streams are already OpenAI-shaped SSE — pass
+                        // frames through untouched (including `data: [DONE]`).
+                        Publisher::Maas => {
+                            if line.is_empty() {
+                                None
+                            } else {
+                                Some(Bytes::from(format!("{line}\n\n")))
+                            }
+                        }
                     };
                     if let Some(b) = translated {
                         out.push_str(&String::from_utf8_lossy(&b));

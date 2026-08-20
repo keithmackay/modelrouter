@@ -13,7 +13,11 @@ name = "modelrouter"
 path = "src/lib.rs"
 
 [features]
-default = []
+# Operator direction (2026-08-20): build with every provider compiled in by
+# default — an unconfigured provider costs nothing at runtime, while a binary
+# missing a compiled feature refuses to start against a config that names it
+# (the fail-loud guard in main), which turns a plain `cargo build` into a trap.
+default = ["vertex", "bedrock"]
 postgres = ["sqlx/postgres"]
 prometheus = ["dep:prometheus"]
 bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]

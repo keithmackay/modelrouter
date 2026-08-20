@@ -3,6 +3,7 @@ pub mod auth;
 pub mod dispatch;
 pub mod gemini;
 pub mod claude;
+pub mod maas;
 pub mod adapter;
 pub mod catalog;
 pub mod embed;

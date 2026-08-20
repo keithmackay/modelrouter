@@ -11,8 +11,17 @@ use crate::providers::vertex::adapter::VertexAdapter;
 use anyhow::Context;
 use async_trait::async_trait;
 
-/// Publishers the Vertex adapter can dispatch to (see `dispatch.rs`).
-const PUBLISHERS: &[&str] = &["google", "anthropic"];
+/// Structural floor for catalog discovery when config names no publishers:
+/// the two with dedicated dispatch arms (`dispatch.rs`). The FULL publisher
+/// list is operations data and lives in config —
+/// `[providers.vertex] catalog_publishers = [...]` (operator ruling
+/// 2026-08-20: specific publisher and region names belong in configs, not
+/// code). Everything beyond these two is served via the shared MaaS
+/// OpenAI-compatible endpoint (`maas.rs`), so any configured publisher's
+/// catalog entries ARE dispatchable. Which publishers return models varies
+/// per project (Model Garden enablement / org policy); empty or refused
+/// answers are normal per-project variation, skipped with a warning.
+const DEFAULT_PUBLISHERS: &[&str] = &["google", "anthropic"];
 
 /// Defensive cap on catalog pagination — the publisher catalogs are a few
 /// hundred entries; anything past this is a paging bug, not data.
@@ -45,7 +54,13 @@ impl ProviderCatalog for VertexAdapter {
         let token = self.token_provider().token().await?;
         let mut models = Vec::new();
 
-        for publisher in PUBLISHERS {
+        let configured = self.catalog_publishers();
+        let publishers: Vec<&str> = if configured.is_empty() {
+            DEFAULT_PUBLISHERS.to_vec()
+        } else {
+            configured.iter().map(String::as_str).collect()
+        };
+        for publisher in publishers {
             let mut page_token: Option<String> = None;
             for _ in 0..MAX_PAGES {
                 let url = catalog_url(
@@ -54,17 +69,33 @@ impl ProviderCatalog for VertexAdapter {
                     publisher,
                     page_token.as_deref(),
                 );
-                let resp = self
+                let resp = match self
                     .http_client()
                     .get(&url)
                     .bearer_auth(&token)
                     .send()
                     .await
-                    .with_context(|| format!("catalog request failed for publisher {publisher}"))?;
+                    .with_context(|| format!("catalog request failed for publisher {publisher}"))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // A publisher the project cannot reach must not sink the
+                        // whole catalog: enablement varies per project, and the
+                        // caller needs the publishers that DO answer. Log + skip.
+                        tracing::warn!(publisher, error = %e, "publisher catalog unreachable; skipping");
+                        break;
+                    }
+                };
                 let status = resp.status();
                 if !status.is_success() {
                     let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("catalog for publisher {publisher} returned {status}: {text}");
+                    tracing::warn!(
+                        publisher,
+                        %status,
+                        body = text.as_str(),
+                        "publisher catalog refused; skipping (per-project Model Garden enablement)"
+                    );
+                    break;
                 }
                 let body: serde_json::Value = resp
                     .json()
@@ -183,11 +214,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_error_names_the_publisher() {
-        let router = Router::new().route(
-            "/v1beta1/publishers/google/models",
-            get(|| async { (axum::http::StatusCode::FORBIDDEN, "nope") }),
-        );
+    async fn refused_publisher_is_skipped_not_fatal() {
+        // A publisher the project cannot reach (403 — Model Garden enablement
+        // varies per project) must not sink the whole catalog: the other
+        // publishers' models still list. Changed from bail-on-refusal when the
+        // publisher list became config-driven and per-project variation became
+        // the normal case, not an error.
+        let router = Router::new()
+            .route(
+                "/v1beta1/publishers/google/models",
+                get(|| async { (axum::http::StatusCode::FORBIDDEN, "nope") }),
+            )
+            .route(
+                "/v1beta1/publishers/anthropic/models",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "publisherModels": [
+                            {"name": "publishers/anthropic/models/claude-sonnet-4-5"}
+                        ]
+                    }))
+                }),
+            );
         let (base, _server) = serve(router).await;
         let adapter = VertexAdapter::with_token_provider(
             "proj".into(),
@@ -198,8 +245,8 @@ mod tests {
         .unwrap()
         .with_catalog_base(base);
 
-        let err = adapter.list_models().await.unwrap_err().to_string();
-        assert!(err.contains("publisher google"), "{err}");
-        assert!(err.contains("403"), "{err}");
+        let models = adapter.list_models().await.unwrap();
+        assert_eq!(models.len(), 1, "anthropic still lists after google 403: {models:?}");
+        assert!(models[0].name.contains("claude"), "{models:?}");
     }
 }
