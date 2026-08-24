@@ -308,7 +308,8 @@ async fn chat_completions_inner(
                 &cached,
             );
             let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
-            let mut response = Json(build_openai_response(request_id, &cached)).into_response();
+            let mut response =
+                Json(build_openai_response(request_id, &canonical_model, &cached)).into_response();
             response
                 .headers_mut()
                 .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("HIT"));
@@ -617,7 +618,7 @@ async fn chat_completions_inner(
             .await;
     }
 
-    let mut response = Json(build_openai_response(request_id, &result)).into_response();
+    let mut response = Json(build_openai_response(request_id, &canonical_model, &result)).into_response();
     response
         .headers_mut()
         .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
@@ -935,11 +936,19 @@ fn build_normalized_request(
 
 fn build_openai_response(
     request_id: String,
+    model: &str,
     result: &crate::providers::adapter::CompletionResult,
 ) -> Value {
     serde_json::json!({
         "id": request_id,
         "object": "chat.completion",
+        // The concrete backing model this request actually dispatched to —
+        // not the caller's requested alias/pool name. Per the OpenAI
+        // chat-completions contract, `model` should report what served the
+        // request; omitting it left OpenAI-compatible clients unable to
+        // learn the resolved model at all (see issue referenced from
+        // athena2#1306).
+        "model": model,
         "choices": [{
             "index": 0,
             "message": {
@@ -1010,6 +1019,34 @@ pub fn extract_text_from_sse(chunk: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod openai_response_tests {
+    use super::build_openai_response;
+    use crate::providers::adapter::CompletionResult;
+
+    #[test]
+    fn includes_the_resolved_backing_model() {
+        // Issue: the response previously omitted "model" entirely, so an
+        // OpenAI-compatible client (e.g. the `ai` npm SDK) could not learn
+        // which concrete model actually served the request and silently
+        // fell back to echoing the client's own requested alias instead.
+        let result = CompletionResult {
+            content: "hello".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "stop".to_string(),
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let response = build_openai_response(
+            "chatcmpl-mr-test".to_string(),
+            "gpt-4o-2026-01-01",
+            &result,
+        );
+        assert_eq!(response["model"], "gpt-4o-2026-01-01");
+    }
 }
 
 #[cfg(test)]
