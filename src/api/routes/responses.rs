@@ -98,11 +98,21 @@ async fn responses_inner(
         obj.remove("input");
     }
 
+    // Same capability filter as /v1/chat/completions — this route resolves the
+    // same aliases through the same router, so it reaches the same models that
+    // reject `temperature` and would 400 for the same reason.
+    let temperature = body["temperature"].as_f64().filter(|_| {
+        crate::router::model_capabilities::supports_temperature(
+            &canonical_model,
+            &state.settings.model_capabilities,
+        )
+    });
+
     let norm_req = NormalizedRequest {
         model: canonical_model.clone(),
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: false,
-        temperature: body["temperature"].as_f64(),
+        temperature,
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
         extra_params: serde_json::Value::Object(Default::default()),
     };
@@ -119,7 +129,9 @@ async fn responses_inner(
         .get(&provider_name)
         .map_err(ApiError::ProviderError)?;
     let result = adapter.complete(&norm_req).await.map_err(|e| {
-        state.circuit_breaker.record_failure(&provider_name);
+        state
+            .circuit_breaker
+            .record_provider_error(&provider_name, &e.to_string());
         ApiError::ProviderError(e)
     })?;
     state.circuit_breaker.record_success(&provider_name);

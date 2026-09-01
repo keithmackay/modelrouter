@@ -257,7 +257,7 @@ async fn anthropic_messages_inner(
                 .text()
                 .await
                 .unwrap_or_else(|_| "upstream error".to_string());
-            state.circuit_breaker.record_failure("anthropic");
+            state.circuit_breaker.record_upstream_status("anthropic", status);
             return Err(ApiError::ProviderError(anyhow::anyhow!(
                 "Anthropic API error {}: {}",
                 status,
@@ -335,7 +335,7 @@ async fn anthropic_messages_inner(
             .text()
             .await
             .unwrap_or_else(|_| "upstream error".to_string());
-        state.circuit_breaker.record_failure("anthropic");
+        state.circuit_breaker.record_upstream_status("anthropic", status);
         return Err(ApiError::ProviderError(anyhow::anyhow!(
             "Anthropic API error {}: {}",
             status,

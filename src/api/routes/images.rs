@@ -96,7 +96,9 @@ async fn image_generations_inner(
     // Call image adapter
     let adapter = crate::providers::openai_images::OpenAIImageAdapter::new(&provider_config);
     let result = adapter.generate_image(&body).await.map_err(|e| {
-        state.circuit_breaker.record_failure(provider_name);
+        state
+            .circuit_breaker
+            .record_provider_error(provider_name, &e.to_string());
         ApiError::ProviderError(e)
     })?;
     state.circuit_breaker.record_success(provider_name);
