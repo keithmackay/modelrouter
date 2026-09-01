@@ -15,6 +15,25 @@ pub struct PricingEntry {
     pub cache_write_per_million: Option<f64>,
 }
 
+/// Per-model declaration of which sampling parameters the model accepts.
+///
+/// Providers drop parameters between model versions — Anthropic's Claude 5
+/// family rejects `temperature` with a 400 while `claude-haiku-4-5`, behind the
+/// same provider, still honours it. The router carries a built-in table (see
+/// [`crate::router::model_capabilities`]) and these entries override it, so an
+/// operator can react to a provider change without waiting on a release.
+///
+/// `model` is matched with the provider prefix stripped and case-insensitively,
+/// the same normalization [`PricingEntry`] uses.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ModelCapabilityEntry {
+    pub model: String,
+    /// `false` makes the router strip `temperature` before dispatch. Omitted
+    /// leaves the built-in default in force.
+    #[serde(default)]
+    pub supports_temperature: Option<bool>,
+}
+
 /// Response cache configuration.
 ///
 /// The cache is exact-match only: identical eligible requests are served from
@@ -169,6 +188,8 @@ pub struct Settings {
     pub auth: AuthConfig,
     #[serde(default)]
     pub pricing: Vec<PricingEntry>,
+    #[serde(default)]
+    pub model_capabilities: Vec<ModelCapabilityEntry>,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]

@@ -316,7 +316,8 @@ async fn chat_completions_inner(
         }
     }
 
-    let norm_req = build_normalized_request(&body, canonical_model.clone());
+    let norm_req =
+        build_normalized_request(&body, canonical_model.clone(), &state.settings.model_capabilities);
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -335,7 +336,9 @@ async fn chat_completions_inner(
             .stream(&norm_req)
             .await
             .map_err(|e| {
-                state.circuit_breaker.record_failure(&provider_name);
+                state
+                    .circuit_breaker
+                    .record_provider_error(&provider_name, &e.to_string());
                 ApiError::ProviderError(e)
             })?;
         state.circuit_breaker.record_success(&provider_name);
@@ -392,7 +395,11 @@ async fn chat_completions_inner(
         let mut retry_attempt = 0u32;
         let call_result = loop {
             match adapter
-                .complete(&build_normalized_request(&body, current_model.clone()))
+                .complete(&build_normalized_request(
+                    &body,
+                    current_model.clone(),
+                    &state.settings.model_capabilities,
+                ))
                 .instrument(tracing::info_span!(
                     "modelrouter.provider_call",
                     "provider.name" = current_provider.as_str()
@@ -426,7 +433,9 @@ async fn chat_completions_inner(
                 break r;
             }
             Err(e) => {
-                state.circuit_breaker.record_failure(&current_provider);
+                state
+                    .circuit_breaker
+                    .record_provider_error(&current_provider, &e.to_string());
                 tracing::warn!(
                     model = current_model.as_str(),
                     provider = current_provider.as_str(),
@@ -922,12 +931,31 @@ fn log_streaming_request(
 fn build_normalized_request(
     body: &Value,
     model: String,
+    capabilities: &[crate::config::schema::ModelCapabilityEntry],
 ) -> crate::providers::adapter::NormalizedRequest {
+    // Drop sampling parameters the resolved model rejects. Callers address a
+    // routing alias and cannot know what it resolves to, so forwarding
+    // `temperature` verbatim to a Claude 5 model turns every such request into
+    // a 400 — and, before the breaker learned to ignore client errors, took the
+    // whole provider down with it. Stripping here rather than in each adapter
+    // covers every provider from one place.
+    let temperature = body["temperature"].as_f64().filter(|_| {
+        let supported =
+            crate::router::model_capabilities::supports_temperature(&model, capabilities);
+        if !supported {
+            tracing::debug!(
+                model = model.as_str(),
+                "model does not accept `temperature`; dropping it from the provider request"
+            );
+        }
+        supported
+    });
+
     crate::providers::adapter::NormalizedRequest {
         model,
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: body["stream"].as_bool().unwrap_or(false),
-        temperature: body["temperature"].as_f64(),
+        temperature,
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
         extra_params: serde_json::Value::Object(Default::default()),
     }
