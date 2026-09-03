@@ -1306,8 +1306,9 @@ ceiling the key owner may edit the rubric and move their own work *down*
 the ladder freely, never above it. Delegating cheapness is safe;
 delegating expense is not.
 
-**Operator sign-off required before this ships** (§13.11): it grants a
-principal that has never had web access a browser session.
+**Deferred to a later phase, 2026-09-03** (§13.11): Phase 1 ships admin-only
+rubric editing instead. What follows is the design for delegation when it is
+scheduled, not Phase 1 scope.
 
 **The surface: a `/portal` session exchanged from the API key.** Key owners are
 `users` rows, not `admin_users` rows, and today they have no web login at all —
@@ -1480,9 +1481,8 @@ or while resolution latency exceeds its threshold. Each suppression is counted,
 so the sample loss is visible rather than inferred from a thin comparison
 report.
 
-**Operator sign-off required before this ships** (§13.10): shadow puts real
-spend on a customer's ledger under a reserved identity and sends prompt content
-to an additional provider.
+**Operator sign-off obtained, 2026-09-03** (§13.10): approved as specified,
+with the reserved user left visible in operator-facing lists.
 
 **Mirroring requires an explicit data-sharing opt-in.** A mirrored request
 sends the caller's prompt to a provider the caller never chose, and the member
@@ -1945,9 +1945,13 @@ cannot be the exclusion predicate). Taken: the health-probe pattern, plus a
 column because the cache denominator counts the whole ledger, plus a dedicated
 shadow ceiling because global-budget gating still denies real users at the
 margin (§7.0a).
-**Operator sign-off required before the shadow phase ships** — this decision
-changes what appears in a customer's ledger and sends prompt content to a
-provider the caller never chose. Record the sign-off here once obtained.
+**Operator sign-off obtained, 2026-09-03** — approved as specified. The
+reserved system user remains visible in operator-facing lists (`/admin/users`,
+per-user reports, the cost page) alongside the existing `health-probe` row;
+filtering system users out of those lists was considered and not taken, so the
+spend stays visible where an operator would look for it. Router-owned rows are
+still excluded from savings figures, the cache-hit denominator, and the global
+budget sum.
 
 **13.11 The key-owner view → a `/portal` session exchanged from the API key,
 exposing the rubric and key-scoped stats with no spend figures.** Rejected: a
@@ -1958,9 +1962,17 @@ sessions is cryptographic — domain-separated signing key plus a token-type
 claim — because the admin extractors validate only a signature against one
 shared secret. The session is bound to its key: revoking the key ends the
 portal access it granted (§6b).
-**Operator sign-off required before the delegation phase ships** — this grants a
-principal that has never had web access a session. Record the sign-off here once
-obtained.
+**Delegation deferred, 2026-09-03.** Phase 1 ships rubric editing in the
+existing admin dashboard only — a superadmin write on `/admin/routing`, no new
+authentication surface. The `/portal` session, its extractor and template
+namespace, and the `max_tier` ceiling that bounds delegated authoring move with
+it to a later phase, to be taken up once routing is proven in production. The
+sign-off this decision requires is therefore not yet needed; it becomes due when
+delegation is scheduled.
+
+The design below is retained rather than removed: the analysis of why cookie-name
+separation is insufficient, and why a limited `admin_users` role is dangerous,
+is what a later implementer needs and is expensive to rediscover.
 
 **13.12 Queue bounds → both bounds, per member, on an atomic counter with
 `Notify`.** Rejected: `tokio::sync::Semaphore` (no waiter-count API, so the
