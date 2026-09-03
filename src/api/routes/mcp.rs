@@ -66,7 +66,7 @@ pub async fn list_mcp_servers(
 }
 
 pub async fn create_mcp_server(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
     Json(req): Json<CreateMcpServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
@@ -74,6 +74,7 @@ pub async fn create_mcp_server(
         name: req.name,
         url: req.url,
         description: req.description,
+        owner_user_id: Some(user.0.id),
     }).await.map_err(|e| {
         let msg = e.to_string();
         if msg.contains("UNIQUE constraint failed") || msg.contains("unique constraint") {
@@ -112,12 +113,48 @@ pub async fn get_mcp_server(
     }
 }
 
+/// `Err` unless `user` owns the server, so a key cannot mutate another user's
+/// registration. A row with no owner predates ownership and is not mutable
+/// through this API at all — an operator adopts it before it can be edited.
+async fn require_owner(
+    state: &AppState,
+    id: i64,
+    user_id: i64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match state.db.get_mcp_server(id).await {
+        Ok(Some(server)) => {
+            if server.owner_user_id == Some(user_id) {
+                Ok(())
+            } else {
+                // Same body as "not found": whether a server the caller does not
+                // own exists is not theirs to learn.
+                Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "not found" })),
+                ))
+            }
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        )),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to load MCP server for ownership check");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            ))
+        }
+    }
+}
+
 pub async fn update_mcp_server(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateMcpServerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_owner(&state, id, user.0.id).await?;
     match state.db.update_mcp_server(id, req.name, req.url, req.description, req.enabled).await {
         Ok(Some(server)) => Ok(Json(serde_json::json!(server))),
         Ok(None) => Err((
@@ -135,10 +172,11 @@ pub async fn update_mcp_server(
 }
 
 pub async fn delete_mcp_server(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    require_owner(&state, id, user.0.id).await?;
     match state.db.delete_mcp_server(id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((

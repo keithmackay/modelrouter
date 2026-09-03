@@ -43,17 +43,17 @@ default_model = "gpt-4o"
 # Providers
 # ---------------------------------------------------------------------------
 [providers.openai]
-api_key  = ""          # or set MODELROUTER__PROVIDERS__OPENAI__API_KEY
+api_key  = ""          # or set MODELROUTER_PROVIDERS__OPENAI__API_KEY
 # api_base = "https://api.openai.com/v1"
 timeout_secs = 60
 
 [providers.anthropic]
-api_key  = ""          # or set MODELROUTER__PROVIDERS__ANTHROPIC__API_KEY
+api_key  = ""          # or set MODELROUTER_PROVIDERS__ANTHROPIC__API_KEY
 # api_base = "https://api.anthropic.com"
 timeout_secs = 60
 
 [providers.gemini]
-api_key  = ""          # or set MODELROUTER__PROVIDERS__GEMINI__API_KEY
+api_key  = ""          # or set MODELROUTER_PROVIDERS__GEMINI__API_KEY
 # api_base = "https://generativelanguage.googleapis.com/v1beta/openai"
 timeout_secs = 60
 
@@ -66,7 +66,7 @@ timeout_secs = 120
 # additional engines can be added to src/providers/search_registry.rs and
 # configured the same way under [providers.<engine>].
 # [providers.tavily]
-# api_key  = ""          # or set MODELROUTER__PROVIDERS__TAVILY__API_KEY
+# api_key  = ""          # or set MODELROUTER_PROVIDERS__TAVILY__API_KEY
 # api_base = "https://api.tavily.com"
 # timeout_secs = 30
 
@@ -165,6 +165,32 @@ fail_open    = true
 # model = "search/tavily"
 # input_per_million = 0.005
 # output_per_million = 0.0
+
+# ---------------------------------------------------------------------------
+# Model Capabilities
+# ---------------------------------------------------------------------------
+# Which sampling parameters a model will accept. Providers drop parameters
+# between model versions and do so per model, not per provider: Anthropic's
+# Claude 5 family rejects `temperature` with
+#
+#   400 {"type":"invalid_request_error",
+#        "message":"`temperature` is deprecated for this model."}
+#
+# while claude-haiku-4-5, behind the same provider, still honours it. Callers
+# address a routing alias and cannot know which they will reach, so the router
+# strips parameters the resolved model would reject.
+#
+# The router ships a built-in table (claude-opus-5, claude-sonnet-5,
+# claude-fable-5-1). These entries override it in both directions — declare a
+# model the build predates, or re-enable one whose provider restored support —
+# so you never need a new release to react to a provider change.
+#
+# `model` is matched with the provider prefix stripped and case-insensitively,
+# the same as [[pricing]]. Unlisted models are assumed to support everything.
+#
+# [[model_capabilities]]
+# model = "claude-opus-6"
+# supports_temperature = false
 
 # ---------------------------------------------------------------------------
 # Declarative Policy Rules

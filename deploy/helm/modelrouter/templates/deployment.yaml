@@ -38,7 +38,7 @@ spec:
           env:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
-            - name: MODELROUTER__DATABASE__PATH
+            - name: MODELROUTER_DATABASE__PATH
               value: /data/router.db
           volumeMounts:
             - name: config
@@ -59,15 +59,15 @@ spec:
           env:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
-            - name: MODELROUTER__DATABASE__PATH
+            - name: MODELROUTER_DATABASE__PATH
               value: /data/router.db
-            - name: MODELROUTER__AUTH__JWT_SECRET
+            - name: MODELROUTER_AUTH__JWT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "modelrouter.fullname" . }}-secrets
                   key: jwt-secret
             {{- range $provider, $_ := .Values.secrets.providers }}
-            - name: MODELROUTER__PROVIDERS__{{ $provider | upper }}__API_KEY
+            - name: MODELROUTER_PROVIDERS__{{ $provider | upper }}__API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "modelrouter.fullname" $ }}-secrets

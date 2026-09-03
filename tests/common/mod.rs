@@ -1,3 +1,6 @@
+pub mod e2e;
+pub mod mock_llm;
+
 use modelrouter::db::{migrations::run_migrations, sqlite::SqliteDb};
 use modelrouter::providers::adapter::{
     CompletionResult, NormalizedRequest, ProviderAdapter, SseStream,

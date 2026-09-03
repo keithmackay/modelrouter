@@ -15,6 +15,25 @@ pub struct PricingEntry {
     pub cache_write_per_million: Option<f64>,
 }
 
+/// Per-model declaration of which sampling parameters the model accepts.
+///
+/// Providers drop parameters between model versions — Anthropic's Claude 5
+/// family rejects `temperature` with a 400 while `claude-haiku-4-5`, behind the
+/// same provider, still honours it. The router carries a built-in table (see
+/// [`crate::router::model_capabilities`]) and these entries override it, so an
+/// operator can react to a provider change without waiting on a release.
+///
+/// `model` is matched with the provider prefix stripped and case-insensitively,
+/// the same normalization [`PricingEntry`] uses.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ModelCapabilityEntry {
+    pub model: String,
+    /// `false` makes the router strip `temperature` before dispatch. Omitted
+    /// leaves the built-in default in force.
+    #[serde(default)]
+    pub supports_temperature: Option<bool>,
+}
+
 /// Response cache configuration.
 ///
 /// The cache is exact-match only: identical eligible requests are served from
@@ -169,6 +188,8 @@ pub struct Settings {
     pub auth: AuthConfig,
     #[serde(default)]
     pub pricing: Vec<PricingEntry>,
+    #[serde(default)]
+    pub model_capabilities: Vec<ModelCapabilityEntry>,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -415,7 +436,8 @@ pub struct StorageConfig {
     #[serde(default = "default_true")]
     pub store_prompts: bool,
     /// Store full request messages and response bodies. `false` (default)
-    /// stores metadata only (tokens, cost, model, timestamps).
+    /// stores metadata only (tokens, cost, model, timestamps). Governs the
+    /// callback egress (Langfuse/LangSmith/webhook) as well as the row.
     #[serde(default)]
     pub store_prompt_content: bool,
     /// Purge prompt-log rows older than N days. 0 (default) = keep forever —
@@ -531,8 +553,8 @@ pub struct ProviderConfig {
     /// Vertex serves `text-embedding-*` regionally only — `locations/global`
     /// has no embedding endpoint at all, while the Claude and Gemini chat models
     /// do run there. A Vertex provider configured for chat on `global` therefore
-    /// has to name an embedding region separately, exactly as Athena's own
-    /// client does with `EMBEDDING_REGION` (default `us-central1`) alongside its
+    /// has to name an embedding region separately, exactly as the pilot
+    /// application's own client does with `EMBEDDING_REGION` (default `us-central1`) alongside its
     /// chat region. Falls back to `region` when unset.
     #[serde(default)]
     pub embedding_region: Option<String>,
@@ -653,7 +675,37 @@ impl Default for AuthConfig {
     }
 }
 
-fn default_jwt_secret() -> String { "change-me-jwt-secret".to_string() }
+pub const PLACEHOLDER_JWT_SECRET: &str = "change-me-jwt-secret";
+
+fn default_jwt_secret() -> String { PLACEHOLDER_JWT_SECRET.to_string() }
+
+impl AuthConfig {
+    /// `Err` when the signing key is unset or still the shipped placeholder.
+    ///
+    /// Every admin and dashboard session is authenticated by an HS256 signature
+    /// over this value and nothing else, so an empty or well-known secret makes
+    /// every session token forgeable. This is not hypothetical: the Helm chart
+    /// shipped `jwt_secret = ""` in its ConfigMap on the assumption an env var
+    /// overrode it, and a prefix typo in the env name meant it never did.
+    pub fn validate_secret(&self) -> anyhow::Result<()> {
+        if self.jwt_secret.trim().is_empty() {
+            anyhow::bail!(
+                "auth.jwt_secret is empty. Every admin session token is signed with it, so an empty \
+                 value makes them all forgeable. Set it in config.toml or via \
+                 MODELROUTER_AUTH__JWT_SECRET (note: one underscore after the prefix, two between \
+                 path segments). Refusing to start."
+            );
+        }
+        if self.jwt_secret == PLACEHOLDER_JWT_SECRET {
+            anyhow::bail!(
+                "auth.jwt_secret is still the shipped placeholder value. It is published in this \
+                 repository, so anyone can forge an admin session. Set a real secret in config.toml \
+                 or via MODELROUTER_AUTH__JWT_SECRET. Refusing to start."
+            );
+        }
+        Ok(())
+    }
+}
 fn default_jwt_expiry_mins() -> i64 { 60 }
 fn default_rotation_overlap_mins() -> i64 { 15 }
 

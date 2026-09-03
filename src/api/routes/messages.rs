@@ -257,7 +257,7 @@ async fn anthropic_messages_inner(
                 .text()
                 .await
                 .unwrap_or_else(|_| "upstream error".to_string());
-            state.circuit_breaker.record_failure("anthropic");
+            state.circuit_breaker.record_upstream_status("anthropic", status);
             return Err(ApiError::ProviderError(anyhow::anyhow!(
                 "Anthropic API error {}: {}",
                 status,
@@ -335,7 +335,7 @@ async fn anthropic_messages_inner(
             .text()
             .await
             .unwrap_or_else(|_| "upstream error".to_string());
-        state.circuit_breaker.record_failure("anthropic");
+        state.circuit_breaker.record_upstream_status("anthropic", status);
         return Err(ApiError::ProviderError(anyhow::anyhow!(
             "Anthropic API error {}: {}",
             status,
@@ -442,7 +442,7 @@ async fn anthropic_messages_inner(
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
                 }
-                state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
+                let mut event = crate::callbacks::CallbackEvent {
                     trace_id: stored.as_ref().map(|s| s.id.to_string()).unwrap_or_else(|| "0".to_string()),
                     user_id,
                     model: canonical_c.clone(),
@@ -453,7 +453,10 @@ async fn anthropic_messages_inner(
                     completion_tokens,
                     cost_usd: cost,
                     latency_ms,
-                });
+                };
+                // The row above was redacted; the egress must be too (issue #53).
+                crate::db::prompt_store::redact_callback_content(&state_clone.storage.load(), &mut event);
+                state_clone.callbacks.dispatch(event);
         }
 
         // Fix 1: Fire on_response_sent lifecycle hooks with correct user_name

@@ -62,7 +62,7 @@ async fn test_app() -> TestServer {
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
         prompt_db: db.clone(),
         settings,
-        db,
+        db: db.clone(),
         pool: None,
         router,
         cost_calc,

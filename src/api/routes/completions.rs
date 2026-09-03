@@ -308,7 +308,8 @@ async fn chat_completions_inner(
                 &cached,
             );
             let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
-            let mut response = Json(build_openai_response(request_id, &cached)).into_response();
+            let mut response =
+                Json(build_openai_response(request_id, &canonical_model, &cached)).into_response();
             response
                 .headers_mut()
                 .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("HIT"));
@@ -316,7 +317,8 @@ async fn chat_completions_inner(
         }
     }
 
-    let norm_req = build_normalized_request(&body, canonical_model.clone());
+    let norm_req =
+        build_normalized_request(&body, canonical_model.clone(), &state.settings.model_capabilities);
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -335,7 +337,9 @@ async fn chat_completions_inner(
             .stream(&norm_req)
             .await
             .map_err(|e| {
-                state.circuit_breaker.record_failure(&provider_name);
+                state
+                    .circuit_breaker
+                    .record_provider_error(&provider_name, &e.to_string());
                 ApiError::ProviderError(e)
             })?;
         state.circuit_breaker.record_success(&provider_name);
@@ -392,7 +396,11 @@ async fn chat_completions_inner(
         let mut retry_attempt = 0u32;
         let call_result = loop {
             match adapter
-                .complete(&build_normalized_request(&body, current_model.clone()))
+                .complete(&build_normalized_request(
+                    &body,
+                    current_model.clone(),
+                    &state.settings.model_capabilities,
+                ))
                 .instrument(tracing::info_span!(
                     "modelrouter.provider_call",
                     "provider.name" = current_provider.as_str()
@@ -426,7 +434,9 @@ async fn chat_completions_inner(
                 break r;
             }
             Err(e) => {
-                state.circuit_breaker.record_failure(&current_provider);
+                state
+                    .circuit_breaker
+                    .record_provider_error(&current_provider, &e.to_string());
                 tracing::warn!(
                     model = current_model.as_str(),
                     provider = current_provider.as_str(),
@@ -558,7 +568,7 @@ async fn chat_completions_inner(
                     if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                         tracing::error!("Failed to record cost: {}", e);
                     }
-                    state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
+                    let mut event = crate::callbacks::CallbackEvent {
                         trace_id: format!("{}", saved_prompt.id),
                         user_id,
                         model: canonical_clone.clone(),
@@ -569,7 +579,10 @@ async fn chat_completions_inner(
                         completion_tokens,
                         cost_usd: cost,
                         latency_ms,
-                    });
+                    };
+                    // The row above was redacted; the egress must be too (issue #53).
+                    crate::db::prompt_store::redact_callback_content(&state_clone.storage.load(), &mut event);
+                    state_clone.callbacks.dispatch(event);
                 }
                 Err(e) => tracing::error!("Failed to record prompt: {}", e),
             }
@@ -617,7 +630,7 @@ async fn chat_completions_inner(
             .await;
     }
 
-    let mut response = Json(build_openai_response(request_id, &result)).into_response();
+    let mut response = Json(build_openai_response(request_id, &canonical_model, &result)).into_response();
     response
         .headers_mut()
         .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
@@ -922,12 +935,31 @@ fn log_streaming_request(
 fn build_normalized_request(
     body: &Value,
     model: String,
+    capabilities: &[crate::config::schema::ModelCapabilityEntry],
 ) -> crate::providers::adapter::NormalizedRequest {
+    // Drop sampling parameters the resolved model rejects. Callers address a
+    // routing alias and cannot know what it resolves to, so forwarding
+    // `temperature` verbatim to a Claude 5 model turns every such request into
+    // a 400 — and, before the breaker learned to ignore client errors, took the
+    // whole provider down with it. Stripping here rather than in each adapter
+    // covers every provider from one place.
+    let temperature = body["temperature"].as_f64().filter(|_| {
+        let supported =
+            crate::router::model_capabilities::supports_temperature(&model, capabilities);
+        if !supported {
+            tracing::debug!(
+                model = model.as_str(),
+                "model does not accept `temperature`; dropping it from the provider request"
+            );
+        }
+        supported
+    });
+
     crate::providers::adapter::NormalizedRequest {
         model,
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: body["stream"].as_bool().unwrap_or(false),
-        temperature: body["temperature"].as_f64(),
+        temperature,
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
         extra_params: serde_json::Value::Object(Default::default()),
     }
@@ -935,11 +967,19 @@ fn build_normalized_request(
 
 fn build_openai_response(
     request_id: String,
+    model: &str,
     result: &crate::providers::adapter::CompletionResult,
 ) -> Value {
     serde_json::json!({
         "id": request_id,
         "object": "chat.completion",
+        // The concrete backing model this request actually dispatched to —
+        // not the caller's requested alias/pool name. Per the OpenAI
+        // chat-completions contract, `model` should report what served the
+        // request; omitting it left OpenAI-compatible clients unable to
+        // learn the resolved model at all, and the `ai` SDK fell back to
+        // the requested id, corrupting the caller's cost attribution.
+        "model": model,
         "choices": [{
             "index": 0,
             "message": {
@@ -1010,6 +1050,34 @@ pub fn extract_text_from_sse(chunk: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod openai_response_tests {
+    use super::build_openai_response;
+    use crate::providers::adapter::CompletionResult;
+
+    #[test]
+    fn includes_the_resolved_backing_model() {
+        // Issue: the response previously omitted "model" entirely, so an
+        // OpenAI-compatible client (e.g. the `ai` npm SDK) could not learn
+        // which concrete model actually served the request and silently
+        // fell back to echoing the client's own requested alias instead.
+        let result = CompletionResult {
+            content: "hello".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "stop".to_string(),
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let response = build_openai_response(
+            "chatcmpl-mr-test".to_string(),
+            "gpt-4o-2026-01-01",
+            &result,
+        );
+        assert_eq!(response["model"], "gpt-4o-2026-01-01");
+    }
 }
 
 #[cfg(test)]

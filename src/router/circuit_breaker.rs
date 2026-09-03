@@ -69,6 +69,50 @@ impl CircuitBreaker {
         }
     }
 
+    /// Record a provider error unless the provider was rejecting the *request*
+    /// rather than failing to serve it.
+    ///
+    /// The breaker is keyed on the provider, so every failure counted against
+    /// it is charged to every model behind it. A 400 for an unsupported
+    /// parameter is not evidence the provider is unwell — counting it lets one
+    /// caller's bad request deny service to unrelated models. This was not
+    /// hypothetical: a `temperature` that Anthropic's Claude 5 models no longer
+    /// accept 400'd on every skill call, and five of those opened the Vertex
+    /// breaker and took down *every* Vertex-backed model, including ones that
+    /// would have answered.
+    ///
+    /// Suppressing the count does not hide the failure: the caller still gets
+    /// its error, still gets it fast (client errors are not retried), and it is
+    /// still written to the failure log.
+    pub fn record_provider_error(&self, provider: &str, err_str: &str) {
+        if crate::router::retry::RetryableError::classify(err_str).counts_toward_circuit_breaker() {
+            self.record_failure(provider);
+        } else {
+            tracing::debug!(
+                provider,
+                error = err_str,
+                "client error; not counting toward the provider circuit breaker"
+            );
+        }
+    }
+
+    /// Same policy as [`Self::record_provider_error`], for call sites that hold
+    /// the upstream HTTP status directly and need no string parsing.
+    pub fn record_upstream_status(&self, provider: &str, status: u16) {
+        // 429 is a 4xx but a real health signal — it means this provider cannot
+        // take the traffic, which is exactly what the breaker is for.
+        let request_fault = (400..500).contains(&status) && status != 429;
+        if request_fault {
+            tracing::debug!(
+                provider,
+                status,
+                "client error; not counting toward the provider circuit breaker"
+            );
+        } else {
+            self.record_failure(provider);
+        }
+    }
+
     pub fn record_failure(&self, provider: &str) {
         let entry = self.circuits
             .entry(provider.to_string())

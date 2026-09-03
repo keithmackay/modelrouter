@@ -323,7 +323,7 @@ mod adapter_tests {
 
 /// Vertex text-embedding adapter.
 ///
-/// Athena on the GCP sandbox has no provider key at all and must embed through
+/// The pilot application on the GCP sandbox has no provider key at all and must embed through
 /// Vertex under the VM's service account. Before this adapter existed,
 /// `embed_registry::get()` built an `OpenAIEmbeddingAdapter` for every provider
 /// name, so there was no way to route an embedding to Vertex whatever the
@@ -405,7 +405,7 @@ mod embed_tests {
         assert_eq!(instances[1]["content"], "beta");
     }
 
-    /// Athena pins EMBEDDING_DIMENSIONS=768 and refuses to truncate or pad, so
+    /// The pilot application pins EMBEDDING_DIMENSIONS=768 and refuses to truncate or pad, so
     /// the width must be asked for, not hoped for.
     #[test]
     fn request_body_asks_for_the_pinned_width() {
@@ -423,7 +423,7 @@ mod embed_tests {
         );
     }
 
-    /// Vertex's own default task type is not the one Athena uses, and mixing
+    /// Vertex's own default task type is not the one the pilot application uses, and mixing
     /// query- and document-typed vectors in one store degrades every later
     /// similarity comparison. The value is configured, never assumed.
     #[test]
@@ -441,9 +441,8 @@ mod embed_tests {
         );
     }
 
-    /// Vertex's `:predict` accepts at most 5 instances per call — Athena's
-    /// client carries the same cap as `batchSize: 5` in
-    /// `thesis-validator/src/tools/embedding.ts`. A caller embedding a page of
+    /// Vertex's `:predict` accepts at most 5 instances per call — the pilot
+    /// application's client carries the same cap as `batchSize: 5`. A caller embedding a page of
     /// evidence sends far more than 5, so the adapter must split rather than
     /// hand Vertex an over-long list and fail the whole batch.
     #[test]
@@ -665,8 +664,8 @@ mod search_tests {
         assert_eq!(items[1].score, Some(0.95));
     }
 
-    /// The subtle one, and the reason this was ported from Athena's
-    /// `vertex-search.worker.ts` rather than written from the API reference:
+    /// The subtle one, and the reason this was ported from the pilot
+    /// application's search worker rather than written from the API reference:
     /// `confidenceScores[k]` corresponds to `groundingChunkIndices[k]`, i.e. it
     /// is indexed by POSITION IN THE SUPPORT, not by chunk index. Reading it as
     /// `confidenceScores[chunk_index]` silently attaches the wrong confidence
@@ -716,8 +715,8 @@ mod search_tests {
         assert_eq!(items[0].title, "chargeflow.io");
     }
 
-    /// The defect this adapter must not reproduce. Athena's own
-    /// `vertex-search.worker.ts` falls back here to returning the model's
+    /// The defect this adapter must not reproduce. The pilot application's
+    /// own search worker falls back here to returning the model's
     /// PARAMETRIC PROSE as a single result with `url: ''` and a fabricated
     /// score of 0.5 — ungrounded generated text entering the evidence base
     /// wearing a citation's clothes. That is the silent-substitution class this
@@ -780,8 +779,8 @@ mod search_tests {
 
     // --- redirect resolution -------------------------------------------------
     //
-    // Chunk URIs are always vertexaisearch.cloud.google.com redirects. Athena's
-    // evidence citations and its DOMAIN-BASED credibility scoring are worthless
+    // Chunk URIs are always vertexaisearch.cloud.google.com redirects. A caller's
+    // evidence citations and any DOMAIN-BASED credibility scoring are worthless
     // against an opaque Google redirect, and this is the last point where the
     // real URL is cheaply recoverable (verified live: one unauthenticated 302
     // hop to https://www.chargeflow.io/blog/stripe-statistics).
