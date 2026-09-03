@@ -193,6 +193,24 @@ impl CostCalculator {
         calc
     }
 
+    /// Normalise a model name to the key the pricing table uses: strip the
+    /// provider prefix (`anthropic/claude-haiku-4-5` -> `claude-haiku-4-5`)
+    /// and lowercase.
+    fn pricing_key(model: &str) -> String {
+        let model_key = match model.find('/') {
+            Some(pos) => &model[pos + 1..],
+            None => model,
+        };
+        model_key.to_lowercase()
+    }
+
+    /// Whether `model` has a pricing entry. A model without one is recorded in
+    /// the ledger at zero cost, so callers presenting cost figures use this to
+    /// flag them as incomplete rather than free.
+    pub fn has_price(&self, model: &str) -> bool {
+        self.pricing.contains_key(&Self::pricing_key(model))
+    }
+
     /// Cost for a request with no cache activity. Equivalent to
     /// `calculate_with_cache(model, prompt_tokens, completion_tokens, 0, 0)`.
     pub fn calculate(&self, model: &str, prompt_tokens: u32, completion_tokens: u32) -> f64 {
@@ -211,14 +229,7 @@ impl CostCalculator {
         cache_read_tokens: u32,
         cache_write_tokens: u32,
     ) -> f64 {
-        // Strip provider prefix (e.g. "anthropic/claude-haiku-4-5" -> "claude-haiku-4-5")
-        let model_key = if let Some(pos) = model.find('/') {
-            &model[pos + 1..]
-        } else {
-            model
-        };
-        let model_lower = model_key.to_lowercase();
-        match self.pricing.get(&model_lower) {
+        match self.pricing.get(&Self::pricing_key(model)) {
             Some(p) => {
                 (prompt_tokens as f64 / 1_000_000.0) * p.input_per_million
                     + (completion_tokens as f64 / 1_000_000.0) * p.output_per_million
@@ -268,6 +279,35 @@ mod tests {
         // claude-sonnet-4-6: $3/M input -> cache write defaults to 125% = $3.75/M
         let cost = calc.calculate_with_cache("claude-sonnet-4-6", 0, 0, 0, 1_000_000);
         assert!((cost - 3.75).abs() < 0.001, "cache write cost: {cost}");
+    }
+
+    #[test]
+    fn has_price_normalises_prefix_and_case() {
+        let calc = CostCalculator::default();
+        assert!(calc.has_price("gpt-4o"));
+        assert!(calc.has_price("openai/gpt-4o"));
+        assert!(calc.has_price("GPT-4o"));
+    }
+
+    #[test]
+    fn has_price_is_false_for_unknown_model() {
+        let calc = CostCalculator::default();
+        assert!(!calc.has_price("not-a-real-model"));
+        assert!(!calc.has_price("ollama/llama3"));
+    }
+
+    #[test]
+    fn has_price_sees_models_added_through_config() {
+        use crate::config::schema::PricingEntry;
+        let calc = CostCalculator::new_with_config(&[PricingEntry {
+            model: "custom-model".into(),
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        }]);
+        assert!(calc.has_price("custom-model"));
+        assert!(calc.has_price("local/Custom-Model"));
     }
 
     #[test]
