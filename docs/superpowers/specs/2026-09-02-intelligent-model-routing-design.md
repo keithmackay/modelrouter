@@ -702,11 +702,63 @@ The file does what a bootstrap file should: get the process to the database,
 carry the secrets, seed a fresh install. Everything else is edited in the
 dashboard and hot-swapped.
 
-**Secrets stay in the file.** Provider API keys must be usable, not hashed, so
-moving them into the DB would put live upstream credentials in every database
-backup. User API keys are SHA-256 digests (CLAUDE.md) precisely because they
-never need recovering; provider keys do. The line is drawn at secrecy, not
-convenience — §13.14 records what is still open about it.
+**Where the provider line falls — the rule.** *Any field that determines where
+a credentialed request is sent, or how it authenticates, stays in the config
+file and is never writable through the overlay.* The rule matters more than the
+lists it produces, because it decides where a field added later belongs.
+
+| Side | Fields | Why |
+|---|---|---|
+| File | `api_key`, `credentials_path`, `region`, `project`, `api_version`, `api_base`, `embedding_region`, `embedding_task_type`, `search_model` | Credentials, or the endpoint and model a credential is presented to |
+| `provider_ops` overlay | `free`, `max_concurrent`, `throttle_cooldown_secs` | Capacity and cost knobs with no credential reach |
+
+`api_base` sits on the file side **against §13.14's own grouping of it as an
+operational knob**: it selects the endpoint the credential is transmitted to,
+so a GUI-editable value would repoint a provider at an attacker-controlled host
+and exfiltrate both the credential and every prompt routed through it. That is
+the same harm the separate-section reasoning below exists to prevent, so the
+rule settles it.
+
+`timeout_secs` **stays in the file** even though it is operational.
+`ProviderRegistry` snapshots provider config at startup and each adapter bakes
+the timeout into a cached HTTP client, so an overlay value would be stored and
+never take effect — an operator would see the new number and the old behaviour.
+A silent wrong outcome is worse than the deploy cadence the move was meant to
+fix; moving it would require a registry rebuild this design does not scope.
+
+**The overlay section is separate from `providers`, not an overlay of it.**
+Overlay merge is whole-section JSON replacement where serde defaults fill gaps,
+so overlaying `providers` would let a capacity edit blank every credential
+through nothing but defaults. The same hazard applies *within* `provider_ops`:
+a partial write must carry sibling knobs through rather than resetting them to
+defaults, the way `post_storage_settings` already carries `prompt_db_path` by
+hand.
+
+**Who may write it.** `provider_ops` writes are capacity and cost controls, so
+they require `SuperDashboardSession` like model and alias writes — not
+`DashboardSession`, which gates budgets and reports.
+
+**Existing file values are seeded, not dropped.** On first run the values an
+operator already has for the moved fields are seeded into the overlay,
+following the pricing-seed pattern in §7.0; the file keys then log a
+deprecation warning rather than being silently ignored. Without this an
+operator's deliberate setting reverts to a default at upgrade and surfaces as
+failures nobody caused.
+
+**Why credentials do not move.** Provider API keys must be usable, not hashed,
+so moving them into the DB would put live upstream credentials in every
+database backup. User API keys are SHA-256 digests (CLAUDE.md) precisely
+because they never need recovering; provider keys do. The container path is the
+sharper argument: compose mounts config read-only and the database on a
+writable host volume, so credentials in the database are a regression against a
+`:ro` mount. The chart's `values.yaml` already states the intent that secrets
+arrive as environment variables.
+
+**The env-reference variant is the deliberate follow-on**, not a rejected
+option: store `api_key_env = "ANTHROPIC_API_KEY"` and resolve it at load, so
+secrets stay in Kubernetes Secrets or compose environment and the DB holds only
+a pointer. It needs a resolver that does not exist and is blocked on the Helm
+prefix defect below.
 
 **The router starts and serves with the database unavailable.** No routing
 policy is reachable in that state, so every request routes as if no policy
@@ -866,14 +918,21 @@ section with no `app_settings` row.
 [database]
 url = "sqlite:///var/lib/modelrouter/router.db"
 
-# ── Secrets: usable credentials, deliberately not in the DB ────────────
+# ── Credentials and endpoints: file-only, never overlay-writable ───────
+# No ${VAR} interpolation exists inside TOML values. Supply a secret either
+# literally here or by environment override: MODELROUTER_PROVIDERS__ANTHROPIC__API_KEY
+# (single underscore after the prefix, double between path segments).
 [providers.anthropic]
-api_key = "${ANTHROPIC_API_KEY}"
+api_key = "sk-ant-..."
 
 [providers.ollama]
-api_base               = "http://localhost:11434/v1"
+api_base     = "http://localhost:11434/v1"
+timeout_secs = 120              # file-only: adapters bake this into a cached client
+
+# ── provider_ops overlay: file seeds it, DB wins once set ──────────────
+[provider_ops.ollama]
 free                   = true   # genuinely $0, distinct from "unpriced"
-max_concurrent         = 2      # ProviderCapacity cap (overlay: DB may override)
+max_concurrent         = 2      # ProviderCapacity cap
 throttle_cooldown_secs = 30
 
 # ── Overlay defaults: seed a fresh install; DB wins once set ───────────
@@ -1360,6 +1419,10 @@ Principle: smart routing degrades, never breaks.
 - Multi-replica guard: a nonzero capacity cap plus a declared replica count
   above one refuses to start, naming both values; the same check fires on an
   overlay write that raises a cap above the declared count.
+- Provider split: an overlay write to `provider_ops` cannot alter any
+  credential or endpoint field; a partial write leaves sibling knobs unchanged
+  rather than resetting them to defaults; existing file values for the moved
+  fields are seeded into the overlay on first run.
 - Validity gate, per row of §4e: an out-of-range tier clamps, an unknown
   category becomes `other` without creating a stats cell, a bad
   `X-Routing-Objective` is 400, an unknown experiment variant is 400, a
@@ -1564,6 +1627,20 @@ guard is a contract with the operator, not an observation — an autoscaler that
 scales out after boot defeats it, and that limitation is stated rather than
 papered over.
 
+**13.14 The provider secrets line → a rule, not a list.** Any field that
+determines where a credentialed request is sent, or how it authenticates, stays
+in the config file and is never overlay-writable; `free`, `max_concurrent` and
+`throttle_cooldown_secs` move to a `provider_ops` overlay section (§5).
+Rejected: keeping the whole block in the file (leaves `free` outside the store
+holding the ladder, reintroducing the cross-store inconsistency the pricing gate
+removes); moving credentials into the DB (needs a crypto dependency and
+root-key story the product has never had, and the container path mounts config
+read-only while the database sits on a writable volume). `api_base` lands on the
+file side against §13.14's own grouping because it selects the endpoint a
+credential is presented to; `timeout_secs` stays because adapters bake it into
+cached clients, so an overlay value would never take effect. The env-reference
+variant is the recorded follow-on, blocked on the Helm prefix defect.
+
 ### Still open
 
 **13.10 Whose budget do shadow tokens land on?** Shadow requests are real
@@ -1583,19 +1660,6 @@ shared deployment.
 Open: what a sane non-zero default is, whether the queue is per member or per
 provider, and whether a queued request should be pre-empted when a cheaper
 member frees up elsewhere in the tier.
-
-**13.14 Where exactly does the secrets line fall in `[providers.*]`?** A
-provider block mixes a secret (`api_key`) with operational knobs (`api_base`,
-`max_concurrent`, `throttle_cooldown_secs`, `free`). Keeping the whole block in
-the file keeps credentials out of DB backups but leaves capacity tuning on a
-deploy cadence — awkward, since capacity is exactly the kind of thing an
-operator adjusts while watching a queue build. Options: (a) whole block stays
-in the file, capacity tuned by restart; (b) split the block, secrets in file and
-knobs in the overlay, at the cost of one provider being configured in two
-places; (c) whole block in the DB with `api_key` encrypted at rest or stored as
-an env-var reference rather than a literal. (c) is the most coherent long-term
-and the most work, and it is a decision about the whole product's config model,
-not just routing.
 
 **13.13 Does the objective belong in the cache key?** Two identical requests,
 one `cost` and one `latency`, may resolve to different members and therefore
@@ -1634,6 +1698,15 @@ codebase:
   its own replica count), what the guard does not cover, and what the follow-on
   needs. The RAII release discipline is corrected: it holds for the per-process
   counter and cannot carry over to a shared one, because `Drop` is synchronous.
+- **13.14 the provider secrets line → a stated rule**: anything determining
+  where a credentialed request goes, or how it authenticates, stays in the file.
+  That puts `api_base` on the file side against the question's own grouping, and
+  keeps `timeout_secs` there because adapters bake it into cached HTTP clients.
+  The overlay section is separate from `providers` so a capacity edit cannot
+  blank a credential through serde defaults, requires `SuperDashboardSession`,
+  and seeds existing file values rather than reverting them at upgrade.
+  Corrected: `${VAR}` interpolation inside TOML values does not exist — the
+  supported override is `MODELROUTER_<SECTION>__<FIELD>`.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
