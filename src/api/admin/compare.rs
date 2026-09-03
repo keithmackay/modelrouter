@@ -25,7 +25,7 @@ use crate::db::repositories::failures::FailureRepository;
 use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
 use crate::router::cost::CostCalculator;
 
-use super::attribution::window_range;
+use super::attribution::{window_range, FACET_LIMIT};
 use super::auth::AdminSession;
 use super::dashboard::{DashboardError, DashboardSession};
 
@@ -56,12 +56,8 @@ pub struct CompareQuery {
     pub a: String,
     #[serde(default)]
     pub b: String,
-    #[serde(default = "default_window")]
+    #[serde(default = "super::attribution::default_window")]
     pub window: String,
-}
-
-fn default_window() -> String {
-    "monthly".to_string()
 }
 
 /// A query that has passed validation: two arm filters and a window.
@@ -370,11 +366,13 @@ async fn arm_metrics(
     start: &str,
     end: &str,
 ) -> anyhow::Result<ArmMetrics> {
-    let totals = CostRepository::arm_totals(&*sources.db, filter, start, end).await?;
-    let by_model = CostRepository::arm_by_model(&*sources.db, filter, start, end).await?;
-    let by_day = CostRepository::arm_by_day(&*sources.db, filter, start, end).await?;
-    let latency = PromptRepository::latency_summary(&*sources.prompt_db, filter, start, end).await?;
-    let failures = FailureRepository::count_for_arm(&*sources.db, filter, start, end).await?;
+    let (totals, by_model, by_day, latency, failures) = tokio::try_join!(
+        CostRepository::arm_totals(&*sources.db, filter, start, end),
+        CostRepository::arm_by_model(&*sources.db, filter, start, end),
+        CostRepository::arm_by_day(&*sources.db, filter, start, end),
+        PromptRepository::latency_summary(&*sources.prompt_db, filter, start, end),
+        FailureRepository::count_for_arm(&*sources.db, filter, start, end),
+    )?;
 
     let per_request = |v: f64| {
         if totals.requests == 0 { None } else { Some(v / totals.requests as f64) }
@@ -422,9 +420,6 @@ pub async fn get_compare(
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
-
-/// Cap on picker options, matching the attribution facet limit.
-const FACET_LIMIT: i64 = 500;
 
 /// Selection echoed back into the page. Everything is optional so a bare
 /// `/admin/compare` renders the pickers with nothing chosen yet.
@@ -516,11 +511,18 @@ fn fmt_opt<F: Fn(f64) -> String>(v: Option<f64>, f: F) -> String {
     v.map(f).unwrap_or_else(|| "—".to_string())
 }
 
+/// Sign prefix for a delta: `+` for an increase, nothing for zero (the
+/// number carries its own `-`). The dashboard and the CLI share it so a zero
+/// delta prints the same in both.
+pub(crate) fn sign_prefix(v: f64) -> &'static str {
+    if v > 0.0 { "+" } else { "" }
+}
+
 fn fmt_delta<F: Fn(f64) -> String>(d: &Option<Delta>, f: F) -> String {
     match d {
         None => "—".to_string(),
         Some(d) => {
-            let sign = if d.abs > 0.0 { "+" } else { "" };
+            let sign = sign_prefix(d.abs);
             match d.pct {
                 Some(pct) => format!("{sign}{} ({sign}{pct:.1}%)", f(d.abs)),
                 None => format!("{sign}{}", f(d.abs)),

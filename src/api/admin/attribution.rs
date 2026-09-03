@@ -15,7 +15,7 @@ use crate::db::repositories::costs::{AttributionFilter, AttributionTotals, CostR
 use super::auth::AdminSession;
 
 /// Cap on how many distinct values the pickers will load.
-const FACET_LIMIT: i64 = 500;
+pub(super) const FACET_LIMIT: i64 = 500;
 
 /// Query shared by the REST endpoint and the dashboard panel.
 ///
@@ -30,7 +30,7 @@ pub struct AttributionQuery {
     pub window: String,
 }
 
-fn default_window() -> String {
+pub(super) fn default_window() -> String {
     "monthly".to_string()
 }
 

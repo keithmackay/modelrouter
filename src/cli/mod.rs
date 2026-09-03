@@ -288,16 +288,10 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             // Prompt-log store (issue #29): a dedicated SQLite file when
             // configured, else the main DB. Restart-scoped by design.
-            let prompt_db: Arc<dyn crate::api::app::DatabaseProvider> =
-                match settings.storage.prompt_db_path.as_deref() {
-                    Some(path) => {
-                        let pdb = crate::db::sqlite::SqliteDb::connect(path).await?;
-                        crate::db::migrations::run_migrations(&pdb.pool).await?;
-                        tracing::info!(path, "prompt log using dedicated database");
-                        Arc::new(pdb)
-                    }
-                    None => db.clone(),
-                };
+            let prompt_db = open_prompt_db(&settings, &db).await?;
+            if let Some(path) = settings.storage.prompt_db_path.as_deref() {
+                tracing::info!(path, "prompt log using dedicated database");
+            }
 
             // Prompt-log retention: purge on an hourly check against the LIVE
             // policy, so a retention set in the GUI applies within the hour.
@@ -1793,6 +1787,23 @@ struct CompareRow {
     percent: String,
 }
 
+/// The prompt-log store: a dedicated SQLite file when `[storage]
+/// prompt_db_path` is set, else the main database. `serve` and `report
+/// compare` open it the same way.
+async fn open_prompt_db(
+    settings: &crate::config::schema::Settings,
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+) -> anyhow::Result<Arc<dyn crate::api::app::DatabaseProvider>> {
+    Ok(match settings.storage.prompt_db_path.as_deref() {
+        Some(path) => {
+            let pdb = crate::db::sqlite::SqliteDb::connect(path).await?;
+            crate::db::migrations::run_migrations(&pdb.pool).await?;
+            Arc::new(pdb)
+        }
+        None => db.clone(),
+    })
+}
+
 /// `report compare`: build the comparison from the CLI's own sources — the
 /// main database, the dedicated prompt database when one is configured, and
 /// the configured pricing — and print it. Never constructs an `AppState`.
@@ -1808,15 +1819,7 @@ async fn report_compare(
     query.validate()?;
 
     let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
-    let prompt_db: Arc<dyn crate::api::app::DatabaseProvider> =
-        match settings.storage.prompt_db_path.as_deref() {
-            Some(path) => {
-                let pdb = crate::db::sqlite::SqliteDb::connect(path).await?;
-                crate::db::migrations::run_migrations(&pdb.pool).await?;
-                Arc::new(pdb)
-            }
-            None => db.clone(),
-        };
+    let prompt_db = open_prompt_db(settings, &db).await?;
     let sources = CompareSources {
         db,
         prompt_db,
@@ -1837,7 +1840,7 @@ fn write_comparison(
     format: OutputFormat,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
-    use crate::api::admin::compare::Delta;
+    use crate::api::admin::compare::{sign_prefix, Delta};
     use crate::report::formatter::write_rows;
 
     if matches!(format, OutputFormat::Json) {
@@ -1855,9 +1858,9 @@ fn write_comparison(
     // Deltas are signed so the direction reads without the A and B columns.
     let delta = |d: Option<Delta>, f: &dyn Fn(f64) -> String| match d {
         Some(d) => {
-            let abs = f(d.abs);
-            let abs = if d.abs > 0.0 { format!("+{}", abs) } else { abs };
-            (abs, d.pct.map(|p| format!("{:+.1}%", p)).unwrap_or_else(|| dash.clone()))
+            let abs = format!("{}{}", sign_prefix(d.abs), f(d.abs));
+            let pct = d.pct.map(|p| format!("{}{:.1}%", sign_prefix(p), p));
+            (abs, pct.unwrap_or_else(|| dash.clone()))
         }
         None => (dash.clone(), dash.clone()),
     };

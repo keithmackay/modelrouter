@@ -174,8 +174,7 @@ impl PromptRepository for PostgresDb {
                 anyhow::Ok(v)
             }
         };
-        let p50_ms = percentile(0.5).await?;
-        let p95_ms = percentile(0.95).await?;
+        let (p50_ms, p95_ms) = tokio::try_join!(percentile(0.5), percentile(0.95))?;
 
         Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
     }
