@@ -531,6 +531,29 @@ name.
 | At-capacity | **wait**: bounded queue for a cheaper member — bounded in *both* time (`max_queue_ms`, default 0 = off) and depth (`max_queue_depth`), shedding to the costlier tier when either bound is hit, since a time bound alone lets waiters accumulate until memory sheds them | **spill immediately**, never queue |
 | Classification | LLM classifier worth its ~200ms | prefers the token heuristic; `llm_above_tokens` is effectively lower |
 
+**The primitive is an atomic counter with `Notify`, not a semaphore.**
+`tokio::sync::Semaphore` gives the time bound free — a timeout around an
+acquire, with cancellation safely removing the waiter — but it cannot express
+the depth bound: there is no waiter-count API, and `available_permits()` reads
+0 for one waiter and for two hundred alike. It also fights the live cap §4a
+requires, since shrinking means acquiring surplus permits and forgetting them,
+which blocks until in-flight requests drain. So: an atomic in-flight counter
+compared against the live snapshot, `Notify` for release wakeups, a separate
+atomic for queue depth, and a timeout for the time bound. This is also the
+shape a shared implementation degrades to, so choosing `Semaphore` here would
+make §13.17's follow-on materially harder to retrofit.
+
+Two mechanics worth stating because they are easy to get wrong: **admission is
+a single compare-and-swap** against the live cap, never a read-then-increment,
+which admits over the cap under concurrency; and the `Notify` future must be
+created **before** the final counter re-check, or a release that lands in
+between is lost and the waiter sleeps until its timeout.
+
+Queueing is **per member, not per provider**. Tokio's semaphore is strict FIFO
+and any hand-rolled queue inherits the same constraint, so "wake the cheapest
+waiter first" is not expressible across members without building a scheduler.
+Per member is the shape that works without one.
+
 The queueing behaviour reopens a decision §12 previously closed. "Cap plus
 short queue" was rejected in favour of immediate overflow — correctly, for a
 request someone is waiting on. For a background job the calculus inverts:
@@ -1517,6 +1540,10 @@ Principle: smart routing degrades, never breaks.
 - Multi-replica guard: a nonzero capacity cap plus a declared replica count
   above one refuses to start, naming both values; the same check fires on an
   overlay write that raises a cap above the declared count.
+- Queue and admission: concurrent admissions never exceed the live cap; a
+  queued request that exceeds either bound spills to the next tier; depth is
+  decremented on the timeout path and on cancellation; a release that lands
+  between the counter check and the wait is not lost.
 - Portal: an unauthenticated portal request redirects; a portal token is
   rejected by both admin extractors; a portal session stops working on the next
   request after its key is disabled; a rubric write is clamped by the tier
@@ -1771,12 +1798,22 @@ claim — because the admin extractors validate only a signature against one
 shared secret. The session is bound to its key: revoking the key ends the
 portal access it granted (§6b).
 
-### Still open
+**13.12 Queue bounds → both bounds, per member, on an atomic counter with
+`Notify`.** Rejected: `tokio::sync::Semaphore` (no waiter-count API, so the
+depth bound is inexpressible, and a live cap shrink requires draining
+permits); per-provider queueing (FIFO makes cheapest-first unexpressible
+across members). Taken: bounded in time and depth, shedding to the next tier
+when either is hit, with compare-and-swap admission (§4d).
 
-**13.12 Queue bounds on the cost path.** `max_queue_ms` defaults to 0 (off).
-Open: what a sane non-zero default is, whether the queue is per member or per
-provider, and whether a queued request should be pre-empted when a cheaper
-member frees up elsewhere in the tier.
+**Deferred within 13.12: the default queue depth.** `max_queue_ms` defaults to
+0, so queueing is off until an operator opts in and nothing breaks unattended.
+The depth default is user-visible — it decides whether a request waits or sheds
+— and picking a number without traffic data would be inventing one. Starting
+point for the first deployment that enables queueing: a depth equal to the
+member's `max_concurrent`, so a saturated member holds at most one waiting
+request per in-flight one. Revisit against observed shed rates.
+
+### Still open
 
 **13.13 Does the objective belong in the cache key?** Two identical requests,
 one `cost` and one `latency`, may resolve to different members and therefore
@@ -1839,6 +1876,11 @@ codebase:
   accepted on admin routes. The session is bound to its key's lifetime, so
   revoking a leaked key ends the access. The view renders no spend figures,
   because pooled per-policy stats would show one tenant another's usage.
+- **13.12 queue bounds → time and depth, per member, on an atomic counter with
+  `Notify`** rather than a semaphore, which cannot express a depth bound and
+  fights the live cap. Admission is a compare-and-swap. The default queue depth
+  is recorded as an explicit deferral with a starting point rather than
+  marked resolved with the number left to the implementer.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
