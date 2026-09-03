@@ -165,6 +165,105 @@ async fn migrations_are_idempotent() {
     assert!(second, "second migrate failed, migrations are not idempotent: {e2}");
 }
 
+/// `[server] port` in config is what the process binds when no flag is given.
+///
+/// Every test in this tier now proves this implicitly — the fixture passes no
+/// `--port` — but this one says so by name, because before #55 the config
+/// value was silently ignored in favour of the flag's clap default and only
+/// the fixture's explicit `--port` made anything work.
+#[tokio::test]
+#[ignore = "e2e: spawns the real binary"]
+async fn config_port_is_honoured_without_a_flag() {
+    let mock = MockLlm::start().await;
+    let router = RouterProcess::start(RouterOptions::new(mock.base_url())).await;
+
+    let written = std::fs::read_to_string(router.config_path()).expect("read fixture config");
+    let configured = format!("port = {}", router.port());
+    assert!(
+        written.contains(&configured),
+        "fixture config should carry the port it expects; wanted {configured:?} in:\n{written}"
+    );
+
+    let resp = reqwest::get(format!("{}/health", router.base_url()))
+        .await
+        .expect("GET /health on the configured port");
+    assert!(resp.status().is_success());
+}
+
+/// An explicit `--port` still wins over `[server] port`. The precedence is
+/// flag > config > default; this pins the top of it.
+#[tokio::test]
+#[ignore = "e2e: spawns the real binary"]
+async fn port_flag_overrides_config() {
+    let mock = MockLlm::start().await;
+    let router = RouterProcess::start_with_port_flag(RouterOptions::new(mock.base_url())).await;
+
+    let written = std::fs::read_to_string(router.config_path()).expect("read fixture config");
+    assert!(
+        !written.contains(&format!("port = {}", router.port())),
+        "config must name a different port from the flag for this test to mean anything"
+    );
+
+    let resp = reqwest::get(format!("{}/health", router.base_url()))
+        .await
+        .expect("GET /health on the flag's port");
+    assert!(resp.status().is_success());
+}
+
+/// `[server] request_body_limit_mb` is applied. A body just over the
+/// configured limit is refused with 413; the same body under a larger limit is
+/// accepted. Before #55 the setting was never read and axum's 2 MB default
+/// applied whatever the config said.
+#[tokio::test]
+#[ignore = "e2e: spawns the real binary"]
+async fn request_body_limit_is_applied_from_config() {
+    let mock = MockLlm::start().await;
+    let key_for = |router: &RouterProcess| router.create_user_and_key("alice");
+
+    // ~1.5 MB of padding inside an otherwise valid request.
+    let big = serde_json::json!({
+        "model": "mock-model",
+        "messages": [{ "role": "user", "content": "x".repeat(1_500_000) }]
+    });
+
+    let small_limit = RouterProcess::start(
+        RouterOptions::new(mock.base_url()).with_request_body_limit_mb(1),
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", small_limit.base_url()))
+        .bearer_auth(key_for(&small_limit))
+        .json(&big)
+        .send()
+        .await
+        .expect("POST over the limit");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "a 1 MB limit should refuse a 1.5 MB body; router log:\n{}",
+        small_limit.logs()
+    );
+    drop(small_limit);
+
+    let large_limit = RouterProcess::start(
+        RouterOptions::new(mock.base_url()).with_request_body_limit_mb(4),
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", large_limit.base_url()))
+        .bearer_auth(key_for(&large_limit))
+        .json(&big)
+        .send()
+        .await
+        .expect("POST under the limit");
+    assert!(
+        resp.status().is_success(),
+        "a 4 MB limit should accept a 1.5 MB body, got {}; router log:\n{}",
+        resp.status(),
+        large_limit.logs()
+    );
+}
+
 /// The fixture itself works: a real process starts, answers `/health`, and is
 /// reachable over a real socket. Everything else in this tier depends on it.
 #[tokio::test]

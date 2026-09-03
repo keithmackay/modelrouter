@@ -104,6 +104,9 @@ exists anywhere in `src/`.
 | `migrations_apply_to_a_fresh_database` | `migrate` creates the database and its schema | R6 |
 | `migrations_are_idempotent` | Running `migrate` twice succeeds, as a restart does | R6 |
 | `fixture_starts_a_healthy_server` | The fixture works; everything else depends on it | R1–R3 |
+| `config_port_is_honoured_without_a_flag` | `[server] port` is what the process binds when no flag is given (#55) | R5 |
+| `port_flag_overrides_config` | `--port` still wins over config: flag > config > default | R5 |
+| `request_body_limit_is_applied_from_config` | `[server] request_body_limit_mb` is applied: 413 over it, 200 under it (#55) | R5 |
 | `valid_key_reaches_provider` | A keyed request reaches the provider, and the provider sees the requested model | R7 |
 | `missing_key_is_rejected_before_the_provider` | An unauthenticated request is rejected **and never reaches upstream** | R7 |
 | `invalid_key_is_rejected_before_the_provider` | Same for an unknown key | R7 |
@@ -177,17 +180,22 @@ indistinguishable from one that works.
 Building the harness surfaced a second silent-discard defect, of the same class
 as the Helm prefix bug:
 
-**`serve` never reads `settings.server.host` or `settings.server.port`.** It
-binds from its own `--host`/`--port` flags, which carry clap `default_value`s, so
-those flags always have a value and the config is ignored entirely. An operator
-setting `port = 9000` in `config.toml` gets 8080, with no warning — even though
-`config.example.toml` documents the field and `ServerConfig` defines it. Only
-`server.ip_rate_limit_rpm` is read from that struct.
+**`serve` never read `settings.server.host`, `.port` or
+`.request_body_limit_mb`.** It bound from its own `--host`/`--port` flags, which
+carried clap `default_value`s, so those flags always had a value and the config
+was ignored entirely. An operator setting `port = 9000` in `config.toml` got
+8080, with no warning — even though `config.example.toml` documents the field
+and `ServerConfig` defines it. The body limit was never referenced at all, so
+axum's 2 MB default applied whatever the config said.
 
-The fixture works around it by passing `--port` explicitly. **The defect is not
-fixed** — fixing it would change behaviour for anyone currently relying on the
-flag while having a different value in config, so it wants a deliberate decision
-rather than a drive-by change.
+Fixed in #55: the flags are now `Option` with no default, precedence is
+flag > config > built-in default, and the body limit is applied in
+`build_router`. The fixture originally worked around the defect by passing
+`--port` explicitly; it no longer does, so every test in this tier now depends
+on the config port being honoured. Three tests pin it by name
+(`config_port_is_honoured_without_a_flag`, `port_flag_overrides_config`,
+`request_body_limit_is_applied_from_config`); the first and third fail against
+the pre-fix binary.
 
 ## Known gaps
 

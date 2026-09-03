@@ -297,6 +297,11 @@ pub fn build_router(state: AppState) -> axum::Router {
         // route-local state, and an Extension keeps every AppState literal
         // (tests included) unchanged.
         .layer(axum::Extension(DeepHealthCache::default()))
+        // axum's built-in limit is 2 MB; `[server] request_body_limit_mb`
+        // documents 10 and was never applied (#55).
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.settings.server.request_body_limit_mb.saturating_mul(1024 * 1024),
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(
             state.ip_rate_limiter.clone(),

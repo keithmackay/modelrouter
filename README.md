@@ -314,6 +314,9 @@ modelrouter serve
 curl http://localhost:8080/health   # → {"status":"ok"}
 ```
 
+`serve` binds the `host`/`port` from `[server]` in `config.toml`; `--host` and
+`--port` override them for a single run.
+
 ### 3. Create the first superadmin
 
 The first admin must be created via the CLI. All subsequent admin management is available in the web UI.

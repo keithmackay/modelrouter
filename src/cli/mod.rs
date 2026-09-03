@@ -519,6 +519,10 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             let app = crate::api::app::build_router(state);
 
+            // Flag > config > built-in default. The config defaults already
+            // supply 127.0.0.1:8080 when the section is absent.
+            let host = host.unwrap_or_else(|| settings.server.host.clone());
+            let port = port.unwrap_or(settings.server.port);
             let bind_addr = format!("{}:{}", host, port);
             tracing::info!("Listening on {}", bind_addr);
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

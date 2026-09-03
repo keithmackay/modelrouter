@@ -19,10 +19,15 @@ pub enum Commands {
     Init,
     /// Start the proxy server
     Serve {
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
+        /// Address to bind. Overrides `[server] host` in config.toml.
+        ///
+        /// No `default_value`: a clap default would always win over the
+        /// config file, which is exactly how `[server]` was ignored (#55).
+        #[arg(long)]
+        host: Option<String>,
+        /// Port to bind. Overrides `[server] port` in config.toml.
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Run database migrations
     Migrate,
