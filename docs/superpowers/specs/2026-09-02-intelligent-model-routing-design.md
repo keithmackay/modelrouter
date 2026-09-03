@@ -149,8 +149,8 @@ Checked against the codebase on 2026-09-02 (`96f8cd48`):
   `session_id` and attribution tags precisely to stop per-engagement tagging
   from fragmenting the cache — the model axis cannot be stripped the same way,
   since it is part of the answer's identity.
-- The admin dashboard nav carries fourteen pages
-  (`templates/admin/base.html:50-63`); every operator-facing feature since
+- The admin dashboard nav carries fifteen pages
+  (`templates/admin/base.html:50-64`); every operator-facing feature since
   April 2026 ships one — hence the Routing page in §5.
 - Highest existing migration is `027_app_settings.sql`, with a parallel
   `migrations/postgres/` tree — new migrations start at **028**.
@@ -563,7 +563,13 @@ the core falls back to the policy's `fallback_router` if set, else routes as if
 no policy existed.
 
 - **Plugins run on the blocking pool.** Invocation goes through
-  `tokio::task::spawn_blocking`, not directly on an async worker. Rust's type
+  `tokio::task::spawn_blocking`, not directly on an async worker. The bridge is
+  explicit because `spawn_blocking` takes a synchronous closure while `route` is
+  an `async_trait` method: the core wraps the call as
+  `spawn_blocking(move || Handle::current().block_on(plugin.route(&ctx)))`. The
+  consequence to price in: a plugin that awaits I/O holds a blocking-pool thread
+  for the whole await, not only for CPU work, so the per-plugin thread
+  accounting below covers awaits too. Rust's type
   system prevents data races but not executor starvation: an `async fn` doing
   CPU-bound work or a blocking syscall occupies a worker thread, and tokio runs
   roughly one worker per core, so a single misbehaving plugin on the async pool
@@ -801,15 +807,18 @@ and that must be visible as a number rather than inferred from latency.
 Routing does not invent a storage story. It follows the overlay already
 established by `app_settings` (migration 027, issue #4), whose own comment
 states the rule: *a DB row overrides the config-file value for that section;
-absence of a row means "use config.toml / built-in defaults."* The live view is
-`AppState.live_settings: Arc<ArcSwap<Settings>>`, so an overlay write takes
-effect on the next request with no restart.
+absence of a row means "use config.toml / built-in defaults."* Routing does
+**not** reach the request path through `AppState.live_settings`: that value is
+initialized from the file and re-stored wholesale by the config-file reload
+loop, so anything merged into it from the DB is clobbered within the loop's
+interval. Routing state lives in a component-owned `ArcSwap`, refreshed by the
+dedicated task described under *Live reload* below.
 
 Three tiers, by what the data *is*:
 
 | Tier | Holds | Why there |
 |---|---|---|
-| **Bootstrap — file only** | DB URL, listen address, TLS/CA paths, **provider credentials** | Needed before the DB is readable, or must not appear in a DB backup |
+| **Bootstrap — file only** | DB path (`database.path` / `database.postgres_url`), listen address, TLS/CA paths, **provider credentials** | Needed before the DB is readable, or must not appear in a DB backup |
 | **Overlay — file seeds, DB decides** | `[[pricing]]`, routing policies and their ladders, `[smart_routing]`, per-provider capacity caps | Operator decisions that change on an operational cadence, not a deploy cadence |
 | **DB only** | Rubrics, assignments, decisions, stats, experiments | Generated or edited at runtime; never had a file representation |
 
@@ -981,9 +990,9 @@ must pass.
 ### Live reload
 
 One path, not two. Every routing write — policy, ladder member, rubric,
-assignment — is a DB write that refreshes the in-memory snapshot and takes
-effect on the next request, exactly as `app_settings` overlay writes already do
-through `AppState.live_settings`, and as DB-sourced aliases do through
+assignment — is a DB write that refreshes the component-owned in-memory
+snapshot and takes effect on the next request, as DB-sourced aliases do
+through
 `RequestRouter::update_db_aliases` (`src/router/engine.rs:36`). This is the
 alias behaviour, not the webhook behaviour — stated explicitly so the
 implementation does not default to `RwLock` or restart-to-apply.
@@ -1052,7 +1061,7 @@ section with no `app_settings` row.
 ```toml
 # ── Bootstrap: needed before the DB is readable ────────────────────────
 [database]
-url = "sqlite:///var/lib/modelrouter/router.db"
+path = "/var/lib/modelrouter/router.db"
 
 # ── Credentials and endpoints: file-only, never overlay-writable ───────
 # No ${VAR} interpolation exists inside TOML values. Supply a secret either
@@ -1297,6 +1306,9 @@ ceiling the key owner may edit the rubric and move their own work *down*
 the ladder freely, never above it. Delegating cheapness is safe;
 delegating expense is not.
 
+**Operator sign-off required before this ships** (§13.11): it grants a
+principal that has never had web access a browser session.
+
 **The surface: a `/portal` session exchanged from the API key.** Key owners are
 `users` rows, not `admin_users` rows, and today they have no web login at all —
 every dashboard route requires `DashboardSession`, and the `users` table has
@@ -1398,8 +1410,7 @@ visible, which is the achievable goal.
 ### 7.0 Pricing gate (Phase 1)
 
 A ladder member must have a known price before it can serve traffic: either a
-`[[pricing]]` entry for the model, or `free = true` on its provider. The gate
-is enforced at three points:
+`[[pricing]]` entry for the model, or `free = true` on its provider.
 
 **"Unpriced" is defined against a seeded overlay.** `CostCalculator::new()`
 hardcodes roughly thirty models and `new_with_config` merges the file's
@@ -1411,7 +1422,7 @@ pricing overlay — the built-in table and any file entries — **on first run a
 on upgrade of an existing installation**, not only on fresh install. File
 entries are thereafter a bootstrap input, not a live source the gate consults.
 
-The gate is enforced at three points:
+The gate is enforced at four points:
 
 - **Write time** — adding an unpriced member to a ladder is rejected in the
   same transaction, with an error naming the model. Not a warning; the operator
@@ -1468,6 +1479,10 @@ while the primary's breaker is open, while `ProviderCapacity` is near its cap,
 or while resolution latency exceeds its threshold. Each suppression is counted,
 so the sample loss is visible rather than inferred from a thin comparison
 report.
+
+**Operator sign-off required before this ships** (§13.10): shadow puts real
+spend on a customer's ledger under a reserved identity and sends prompt content
+to an additional provider.
 
 **Mirroring requires an explicit data-sharing opt-in.** A mirrored request
 sends the caller's prompt to a provider the caller never chose, and the member
@@ -1613,8 +1628,8 @@ Principle: smart routing degrades, never breaks.
 | Classification exceeds the assignment's `max_tier` | Clamp to `max_tier`; metric + log — the structural backstop of §6b/§6c |
 | Cost-path queue exceeds `max_queue_ms` | Stop waiting, spill to the next tier as if capacity were simply unavailable; record `queued_ms` |
 | Shadow request fails | Silent; shadow sample lost; primary response unaffected; metric |
-| Router plugin errors, panics, or returns malformed output | Treated as abstention: fall back to `fallback_router`, else route as if no policy. Panics are caught (`catch_unwind`) and logged with the plugin name; metric per plugin |
-| Router plugin exceeds `timeout_ms` at an await point | Cancelled, treated as abstention. A compiled-in plugin that blocks without awaiting cannot be cancelled — operator-owned bug, documented |
+| Router plugin errors, panics, or returns malformed output | Treated as abstention: fall back to `fallback_router`, else route as if no policy. Panics surface as `JoinError::is_panic()` on the plugin's `JoinHandle` and are logged with the plugin name; metric per plugin |
+| Router plugin exceeds the resolution deadline | The core drops the `JoinHandle` and ships the standing fallback — abandonment, not cancellation (§4f). The abandoned blocking-pool thread is counted per plugin |
 | Router plugin returns a choice that fails validation | Reject, log the failed check (not-in-ladder / unpriced / unhealthy / budget-denied / above `max_tier`), fall back as above |
 | Router plugin named by a policy is not registered | Policy rejected at write time, naming the missing cargo feature; an already-live policy naming a plugin absent from this binary falls back and alerts |
 | Ladder write would leave an invalid policy (unpriced member, empty tier) | Reject the write in-transaction with a message naming the cause; the live snapshot is untouched |
@@ -1790,9 +1805,11 @@ hypothetical one.
 Second, and decisively, the repo had already answered this question. Migration
 027 (`app_settings`, issue #4) established the overlay — *"a DB row overrides
 the config-file value for that section; absence of a row means use
-config.toml"* — with `AppState.live_settings: Arc<ArcSwap<Settings>>` doing the
-hot-swap. Routing inventing a third storage story would have been the
-inconsistency, not the DB choice.
+config.toml"* — read into a dedicated `ArcSwap` at startup. Note the overlay is
+*not* `AppState.live_settings`, which the config-file reload loop owns and
+overwrites; routing therefore carries its own refresh task (§5). Routing
+inventing a third storage story would have been the inconsistency, not the DB
+choice.
 
 The review guarantee that motivated TOML is preserved by other means: the
 pricing gate becomes a single transactional check (ladder and pricing are now
@@ -1838,7 +1855,9 @@ paid only when classification is plausibly what was wrong.
 
 **13.9 Cache probe → all members, measure later.** Probe every ladder member
 cheapest-first. It is the only variant that recovers the hits explore and
-overflow scatter across the ladder, and the cost is in-memory lookups. Narrow
+overflow scatter across the ladder. The cost is 5–15 in-memory lookups on the
+`memory` store but real network I/O on `redis`, which is why §4 *Probe* requires
+a single batched read inside a slice of the resolution deadline. Narrow
 it only if a profile ever justifies it.
 
 **13.15 Routing logic → plugins, superseding the `ComplexityRouter` merge.**
@@ -1918,6 +1937,9 @@ cannot be the exclusion predicate). Taken: the health-probe pattern, plus a
 column because the cache denominator counts the whole ledger, plus a dedicated
 shadow ceiling because global-budget gating still denies real users at the
 margin (§7.0a).
+**Operator sign-off required before the shadow phase ships** — this decision
+changes what appears in a customer's ledger and sends prompt content to a
+provider the caller never chose. Record the sign-off here once obtained.
 
 **13.11 The key-owner view → a `/portal` session exchanged from the API key,
 exposing the rubric and key-scoped stats with no spend figures.** Rejected: a
@@ -1928,6 +1950,9 @@ sessions is cryptographic — domain-separated signing key plus a token-type
 claim — because the admin extractors validate only a signature against one
 shared secret. The session is bound to its key: revoking the key ends the
 portal access it granted (§6b).
+**Operator sign-off required before the delegation phase ships** — this grants a
+principal that has never had web access a session. Record the sign-off here once
+obtained.
 
 **13.12 Queue bounds → both bounds, per member, on an atomic counter with
 `Notify`.** Rejected: `tokio::sync::Semaphore` (no waiter-count API, so the
@@ -2023,6 +2048,20 @@ codebase:
   writes, the Postgres reports 500 after a health probe, and OIDC admins who
   can never hold superadmin — the last of which blocks the very writes §5
   requires superadmin for.
+- **Correctness-review corrections.** Superseded text left standing after the
+  §13 pass was corrected in place, not layered over: three claims that the
+  `app_settings` overlay reaches the request path through
+  `AppState.live_settings` (it does not — that value is file-initialized and
+  the config-reload loop overwrites it); the §8 rows still prescribing
+  `catch_unwind` and await-point cancellation after §4c/§4f replaced them with
+  `JoinError` and abandonment; §13.9 still calling the cache probe
+  in-memory-only; a duplicated pricing-gate lead-in that also miscounted its
+  own bullets; a config example using `database.url`, a key `Settings` has no
+  field for, which would have been silently discarded exactly like the Helm
+  defect in §2; and an admin-nav count off by one. Both sign-off-gated
+  decisions now carry their marker in §13 and in their body sections, and §4c
+  names the `block_on` bridge between the `async_trait` signature and
+  `spawn_blocking`.
 - **Corrections.** Five claims research disproved: `${VAR}` interpolation
   inside TOML values does not exist; RAII release does not carry over to a
   shared counter; the `app_settings` overlay is read once at startup into its
@@ -2113,7 +2152,8 @@ posture, and a scaling gap:
   exactly the cheap deterministic plugins most likely to be written.
 - Compiled-in plugins raise no content-egress question, so `send_content`
   applies only to `http`.
-- Panic containment (`catch_unwind` → abstention, logged by plugin name) and
+- Panic containment (abstention, logged by plugin name — `catch_unwind` at the
+  time, later superseded by `JoinError` in revision 8) and
   honest timeout semantics: `tokio::time::timeout` binds at await points, and a
   plugin that blocks the executor is an operator-owned bug rather than
   something the router can pretend to cancel.
@@ -2159,7 +2199,7 @@ posture, and a scaling gap:
 
 - Routing configuration follows the **`app_settings` overlay** (migration 027 /
   issue #4) rather than inventing a storage model: file seeds and carries
-  secrets, DB row overrides, `live_settings` hot-swaps. Three tiers documented
+  secrets, DB row overrides, a component-owned `ArcSwap` hot-swaps. Three tiers documented
   in §5 (bootstrap / overlay / DB-only).
 - Reverses revision 4's TOML-as-source-of-truth decision, and with it the
   read-only dashboard, the config-reload audit event, the ladder mirror tables,
