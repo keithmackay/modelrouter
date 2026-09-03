@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-02
 **Status:** Approved design, pre-implementation
-**Revision:** 13 — incorporates critical reviews
+**Revision:** 14 — incorporates critical reviews
 [1](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-1.md)
 and [2](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-2.md).
 See §14 for what changed; §13 records the decisions and their alternatives.
@@ -1143,7 +1143,8 @@ an object with an ordered set of members:
   inventing a second charting idiom: a per-policy panel (requests kept local
   vs escalated, dollars saved net of cache displacement, overflow reasons) and
   a head-to-head panel used for both trial-vs-incumbent and experiment
-  variants.
+  variants. The general two-arm comparison lives on its own page (§7b), which
+  the head-to-head panel links to rather than duplicating.
 
 ### API and CLI surface
 
@@ -1534,6 +1535,51 @@ admin user list beside `health-probe`, and the disable control on it appears to
 work and does nothing — a false kill switch. The real control is the
 per-policy `shadow` setting.
 
+**Mirroring at `fraction = 1.0` is an experiment, not just evidence.** The
+paragraphs above describe shadow as a sampling mechanism — a trickle of
+mirrored requests building confidence in a member nobody has served with. Set
+the fraction to 1.0 and it becomes something else: every request is answered
+twice, and the result is an exactly paired dataset — same prompt, same caller,
+same moment, two models. Nothing but the model varies, which makes it the
+cleanest comparison available. It also doubles the bill, which is why it is a
+deliberate mode and not a default.
+
+**Paired mode retains both outputs.** Sampling mode scores the shadow response
+and discards it; a paired comparison cannot, because the outputs *are* the
+dataset. In paired mode both legs are written with a shared `pair_id` and the
+shadow leg stores its completion exactly as the primary does. That is a
+retention change, not only a routing one — text that previously lived only for
+the duration of a scoring call is now stored — so paired mode inherits the
+whole prompt-storage discipline: off unless `store_prompts` is on, and
+suppressed entirely by `X-No-Log`, as mirroring already is.
+
+**A shed leg must be recorded as shed, not omitted.** Mirroring is suppressed
+under pressure (above), which in paired mode silently deletes one side of a
+pair. Left implicit that is actively misleading, because suppression correlates
+with load: the pairs that vanish are the slow, expensive, degraded ones, so the
+surviving sample flatters whichever model was healthier. Each pair therefore
+carries a completeness state, comparisons are computed over complete pairs
+only, and the incomplete count is shown beside the result rather than left to
+be inferred from a discrepancy between two totals.
+
+**What mirroring cannot measure.** A mirror forks one call, not a trajectory.
+In an agentic loop the conversation continues from the *primary's* response, so
+at turn 12 the mirrored call is asked to continue a history the primary
+produced. That answers "how does the candidate respond to the incumbent's
+trajectory" — a real question, but not usually the one being asked. A model
+that reaches the same result in 30 turns instead of 45 shows no advantage here
+at all: its benefit lies entirely in the steps it did not take, and mirroring
+cannot see steps that were never mirrored. Per-call substitutability is the
+ceiling of what this instrument measures, which is why §7a exists rather than
+being folded into it.
+
+**Two samples, not a diff.** The same prompt to the same model twice yields
+different text, so every paired comparison contains variation that is not
+attributable to the model. Pairwise judging absorbs that correctly — it asks
+which of two responses to an identical prompt is better, which is exactly the
+comparison a pair supports. A textual diff does not, and will overstate every
+difference it finds.
+
 ### 7.1 Adaptive allocation (Phase 2)
 
 Active only when the requesting application API key's matched assignment
@@ -1573,38 +1619,179 @@ has `learning_enabled = true`.
 
 ## 7a. Controlled experiments (A/B runs)
 
-Motivating case: Athena runs one engagement twice in parallel — once per
-model — and compares outcomes. The client orchestrates the parallel runs;
-modelrouter provides variant pinning, measurement grouping, and the
-comparison report.
+Motivating case: Athena runs one engagement twice in parallel — each run on a
+different set of models — and compares the outcomes. The client orchestrates
+the parallel runs; modelrouter supplies variant binding, measurement grouping,
+and the comparison report.
 
-- `experiments` table: `id`, `name`, `variants` (JSON: label →
-  `{provider, model}`), `status` (active | closed), `feed_learning` (bool),
-  `created_at`. Managed via `/admin/api/routing/experiments`, the Routing
-  page, and `modelrouter routing experiment add|list|close`. Variant models
-  are subject to the same pricing gate (§7.0) — an unpriced variant makes the
-  cost comparison the experiment exists to produce meaningless.
+This is the complement to §7.0a's mirroring, not a flavour of it. Mirroring
+measures **per-call substitutability** on identical inputs. A run-level
+experiment measures the **end-to-end outcome**, and is the only one of the two
+that can see a compounding effect — fewer turns, less backtracking, an earlier
+correct answer — because each run takes its own path from the start. Neither
+subsumes the other, and an operator choosing a model usually wants both.
+
+**A variant is a routing overlay, not a model.** An engagement uses several
+models at once: a planner, a worker, a summarizer, perhaps a judge. Binding a
+variant to a single `{provider, model}` pair cannot express "run the whole
+thing on the 5.1 family". A variant is therefore a *set* of bindings — alias
+overrides, or a policy id the run pins to — applied for the run's duration. The
+single-model case stays the common one; it is just an overlay of size one.
+
+- `experiments` table: `id`, `name`, `variants` (JSON: label → routing
+  overlay), `status` (active | closed), `feed_learning` (bool), `created_at`.
+  Managed via `/admin/api/routing/experiments`, the Routing page, and
+  `modelrouter routing experiment add|list|close`. Every model an overlay can
+  reach is subject to the pricing gate (§7.0) — an unpriced model anywhere in a
+  variant makes the cost comparison the experiment exists to produce
+  meaningless.
 - **Variant pinning:** a request carrying
-  `x-modelrouter-experiment: <experiment_id>:<variant>` routes directly to
-  that variant's model — classifier and ladder are bypassed, because the
+  `x-modelrouter-experiment: <experiment_id>:<variant>` resolves through that
+  variant's overlay — classifier and ladder are bypassed, because the
   experiment is the routing decision. All measurements are still recorded.
-  Header-tagged runs must send the tag on **every request** of the run —
-  the existing session-affinity primitive cannot hold a session on a
-  variant (it always defers to the newly resolved provider/model, and
-  same-provider variants are invisible to it).
+  Header-tagged runs must send the tag on **every request** of the run: the
+  existing session-affinity primitive cannot hold a session on a variant (it
+  always defers to the newly resolved provider/model, and same-provider
+  variants are invisible to it).
 - **Router-assigned variants:** if the header carries only the experiment id,
   the router assigns a variant by stable hash of `session_id` — automatic
-  50/50 splits without client-side assignment logic, and deterministic per
-  session on every turn (no pinning needed). Requests without a
-  `session_id` must use the explicit `<experiment>:<variant>` form.
-- **Comparison:** the experiment report shows variants side by side per
-  category across all measured dimensions (success rate, user rating, judge
-  score, token cost per query, latency/TTFT) — the same report component as
-  the auto-trial head-to-head, with an experiment filter instead of a
-  trial-vs-incumbent filter.
-- Experiment traffic is excluded from `model_quality_stats` updates by
-  default (a deliberately forced route is not evidence about the ladder);
-  an experiment can opt in with `feed_learning = true`.
+  50/50 splits without client-side assignment logic, deterministic per session
+  on every turn. Requests without a `session_id` must use the explicit
+  `<experiment>:<variant>` form.
+- **Run grouping reuses the existing attribution primitive.** A run is the set
+  of requests sharing an `attribution_correlation_id`. That column already
+  exists on both `prompts` and `cost_ledger` and is already indexed on
+  `(attribution_correlation_id, created_at)`, so no new grouping key is needed
+  and a caller that already attributes spend per engagement is already emitting
+  one.
+- **Per-run aggregates.** A run's report needs total cost, wall-clock span,
+  total tokens, and **turn count** — how many requests the run took to finish.
+  Turn count is the figure that carries the compounding effect: it is where a
+  model needing fewer steps shows its advantage, and it is invisible in every
+  per-call average. All four are computable from `cost_ledger` grouped by
+  correlation id.
+- **Outcome is reported by the caller, because the router cannot observe it.**
+  modelrouter sees requests and responses; it does not see whether the
+  engagement succeeded, whether the answer was accepted, or whether a human had
+  to step in. Cost, latency and tokens it computes alone; quality it cannot. A
+  run-level experiment therefore depends on the Phase 2 feedback endpoint,
+  which takes an outcome keyed by correlation id. Without it an experiment
+  compares two runs on price and speed alone — and will report that the cheaper
+  model won, which is precisely the conclusion this feature exists to prevent.
+  That makes the feedback endpoint a **prerequisite** of §7a rather than a
+  parallel Phase 2 item; §11 records the ordering. Mirroring carries no
+  equivalent dependency, because pairwise judging is self-contained: both
+  responses answer the same prompt.
+- Experiment traffic is excluded from `model_quality_stats` updates by default
+  (a deliberately forced route is not evidence about the ladder); an experiment
+  may opt in with `feed_learning = true`.
+
+**Arms may differ on any dimension — but something has to label them.** The
+comparison machinery does not care what distinguishes two arms: two versions of
+one model, two providers entirely, or one model at two speed settings. What it
+needs is a way to tell the arms apart in the recorded data, and there are only
+two sources for that.
+
+The router labels two dimensions itself, because it decides them: the **model**
+and the **provider** it dispatched to. Everything else in a request — reasoning
+effort, thinking budget, temperature, tool configuration, the client's own
+prompt variant — is passed through to the provider and **not recorded anywhere**.
+`prompts` stores the messages and the response; no column holds the sampling
+parameters. So the router cannot today answer "which speed setting should we
+use for this model" from its own data: it never wrote the setting down.
+
+Two ways to close that, complements rather than alternatives:
+
+1. **The caller labels the arm.** `x-attribution-tags: effort=high` on one run
+   and `effort=low` on the other makes the dimension comparable immediately,
+   with no schema change — tags are already free-form and already land on both
+   `prompts` and `cost_ledger`. This covers any dimension the caller knows
+   about, including ones modelrouter has no concept of, and it is the
+   mechanism Phase 2 ships with.
+2. **The router records the request parameters.** A `request_params` JSON
+   column on `prompts`, holding the sampling-relevant fields as actually sent
+   upstream, would let the router self-label these dimensions without any
+   cooperation from the caller — and would answer the question
+   *retrospectively*, over traffic that was never set up as an experiment.
+   It carries a disclosure obligation, since parameters can encode caller
+   intent, and inherits the `X-No-Log` discipline. Recorded here as the
+   follow-on that makes the dimension self-describing; not required for
+   experiments to ship.
+
+## 7b. Comparison analysis (`/admin/compare`)
+
+Both experiment forms end in the same question — *how do these two arms differ?*
+— so they share one page rather than growing two, at `/admin/compare`, with a
+**Compare** nav link after **Reports**. It follows the Reports page
+conventions: a filter header, an HTMX-swapped panel body
+(`compare_panels.html`), and the vendored D3 at `/static/d3.js`. No second
+charting idiom is introduced, and `compare.html` and `compare_panels.html` are
+both registered in `src/api/admin/templates.rs` — an unregistered template is a
+500 on a page the nav links to, which has happened once already (§2).
+
+**Arms are chosen by dimension, then by value.** One selector picks the
+dimension and two pick the values, which holds a single mental model across
+every kind of experiment:
+
+| Dimension | Arm A / Arm B | Labelled by | Available |
+|---|---|---|---|
+| Model | two `model` values | the router | today |
+| Provider | two `provider` values | the router | today |
+| Tag | two values of one attribution tag key | the caller | today |
+| Run | two `attribution_correlation_id` values | the caller | today |
+| Variant | two variants of one experiment | the experiment | with §7a |
+| Pair | primary vs shadow leg of a paired run | the router | with §7.0a |
+
+The first four need no schema this repo does not already have — `cost_ledger`
+carries model, provider, correlation id and tags, and `prompts` carries
+latency — so the page can ship and be useful **before** either experiment
+mechanism lands, comparing runs an application has already tagged. The last two
+appear as the tables behind them appear. That ordering matters: it puts the
+analysis surface in operators' hands early, and means the experiment features
+arrive into a page that is already proven against real data.
+
+**Tag keys arriving from the query string are validated before use.** The tag
+dimension interpolates a key into a JSON path, and on the ingest side that is
+safe because `api::attribution::is_safe_tag_key` has already run. A dashboard
+query parameter has had no such pass, so the handler re-validates with the same
+function before constructing a filter — matching what
+`AttributionQuery::filter` already does for the Reports page.
+
+**Metrics, per arm and as a delta.** Requests; total cost and cost per request;
+tokens in and out, and per request; mean, p50 and p95 latency; TTFT where
+recorded; cache hits and hit rate; error rate. Every figure appears per arm with
+the delta and the percentage change. Per-request figures are the default and
+the totals are secondary, because two arms almost never carry identical request
+counts and comparing raw totals across unequal volume is the single easiest way
+to read this page wrong.
+
+**Charts — three, and no more.** A grouped bar of the normalized per-request
+metrics (cost, tokens, latency) side by side; a two-line daily cost series; and
+a latency percentile comparison (p50/p95 per arm). Each is a small D3 render in
+`compare_panels.html`, following the existing series code in
+`reports_panels.html`.
+
+**Where the page must not overstate its data.** Three traps, each surfaced in
+the UI rather than left for the reader to work out:
+
+- **Latency has a different denominator from cost.** Cost and tokens come from
+  `cost_ledger`, written for every request. Latency comes from `prompts`,
+  written only when prompt storage is on and never for a request that opted out
+  of logging. The counts can differ by a lot, so the latency block states its
+  own sample count beside the request count, and is suppressed rather than
+  rendered as zero when there are no samples.
+- **Incomplete pairs are excluded and counted** (§7.0a), never silently
+  dropped.
+- **An unpriced model makes the cost column fiction.** An arm whose traffic
+  touched a model with no price is badged, and its cost figures are marked
+  rather than shown as if complete — the same gate as §7.0, applied at read
+  time.
+
+**Quality appears only once something supplies it.** Until the feedback
+endpoint (§7a) and judge sampling (§7.1) exist, this page has cost, speed and
+volume and nothing more. It says so, in place. A cost-and-latency table with no
+quality column reads as a recommendation for the cheaper model unless it
+explicitly declines to be one.
 
 ## 8. Error handling
 
@@ -1770,10 +1957,18 @@ Principle: smart routing degrades, never breaks.
   page, with no new authentication surface. Delivers the core goal with fully
   predictable behavior.
 - **Phase 2 — adaptive allocation & experiments:** explore/exploit, judge
-  sampling, feedback endpoint, decay, auto-trial + comparison view, and
-  controlled A/B experiments (§7a). Off by default, enabled per application
-  API key, piloted on Athena's key. Disabling it reverts cleanly to Phase 1
-  behavior.
+  sampling, feedback endpoint, decay, auto-trial + comparison view, controlled
+  A/B experiments (§7a) and paired mirroring (§7.0a). Off by default, enabled
+  per application API key, piloted on Athena's key. Disabling it reverts
+  cleanly to Phase 1 behavior. Ordering inside the phase is not free: the
+  **feedback endpoint precedes run-level experiments**, because an experiment
+  that cannot see an outcome reports only that the cheaper model won (§13.18).
+
+The comparison page (§7b) is **not gated on either experiment mechanism**. Four
+of its six arm dimensions read columns the shipped router already writes, so it
+can land as soon as there is appetite for it — including ahead of Phase 1 — and
+gains the variant and pair dimensions later, as the tables behind them appear
+(§13.20).
 
 Delegated rubric authoring is **not** Phase 1 (§13.11, decided 2026-09-03).
 The `/portal` session, its extractor and template namespace, and the `max_tier`
@@ -2007,14 +2202,116 @@ de-duplicate provider-collapsed members, keep probe-specific counters, and
 consult store reachability through a freshness window — are recorded in §4
 *Probe*.
 
+**13.18 Two experiment forms, kept as two mechanisms.** Router-side mirroring
+(§7.0a at `fraction = 1.0`) and application-side run experiments (§7a) look
+like one feature with two settings and are not. Mirroring answers *per-call
+substitutability* on byte-identical inputs; a run experiment answers
+*end-to-end outcome*, which is the only place a compounding effect — fewer
+turns, less backtracking — can appear at all. Rejected: unifying them behind
+one mechanism, which would have shipped whichever question that mechanism
+happened to answer and silently dropped the other. The asymmetry that follows
+is recorded rather than smoothed over: mirroring is self-contained, because
+pairwise judging compares two answers to the same prompt, while a run
+experiment cannot score itself at all — the router never learns whether the
+engagement succeeded. The **feedback endpoint is therefore a prerequisite of
+§7a**, not a parallel Phase 2 item, because without it every run experiment
+reports that the cheaper model won.
+
+**13.19 A variant is a routing overlay; dimensions the router does not record
+are labelled by the caller.** Binding a variant to one `{provider, model}` pair
+cannot express "run this engagement on the 5.1 family", so a variant is a set
+of bindings. The wider point behind it: an arm may differ on any dimension, but
+only two of them — model and provider — are labelled by the router, because
+they are the only two it decides. Reasoning effort, thinking budget,
+temperature and every other request parameter are passed upstream and written
+down nowhere, so "which speed setting should we use" is not answerable from the
+router's own data. Taken: callers label such arms with attribution tags, which
+are already free-form and already land on both `prompts` and `cost_ledger`, so
+the dimension costs no schema. Rejected **for now**: a `request_params` column
+on `prompts`, which would make the dimension self-describing and answerable
+retrospectively over traffic never set up as an experiment. It is the right
+follow-on and carries a disclosure obligation; it is not a prerequisite, and
+adding storage for it before the experiment surface exists would be building
+the harder half first.
+
+**13.20 One comparison page, shipped ahead of the tables it will eventually
+read.** Both experiment forms end in the same question, so §7b is one page and
+not two. Four of its six arm dimensions — model, provider, tag, run — are
+computable from columns this repo already writes, which means `/admin/compare`
+can ship and be used before either experiment mechanism exists, comparing runs
+an application has already tagged. Taken deliberately: it puts the analysis
+surface in operators' hands early and lets the experiment features arrive into
+a page already proven against real data, rather than shipping a chart and its
+data source in the same untested step.
+
 ### Still open
 
-Nothing. The six questions above are resolved; the only item deliberately left
-open is the default queue depth, recorded as an explicit deferral inside 13.12
-with a starting point and the reason a number should not be invented before
-there is traffic to size it against.
+Nothing blocking. The nine questions above are resolved. Two items are
+deliberately left open, each recorded where it belongs rather than parked as a
+placeholder: the default queue depth (inside 13.12, with a starting point and
+the reason a number should not be invented before there is traffic to size it
+against), and the `request_params` column (inside 13.19, as the follow-on that
+would make non-routing dimensions self-describing).
 
 ## 14. Revision history
+
+**Revision 14 (2026-09-03)** — model-versus-model evaluation specified as two
+distinct mechanisms, plus the surface that reads them:
+
+- **§7.0a gains a paired mode.** At `fraction = 1.0` mirroring stops being a
+  sampling mechanism and becomes an experiment: every request answered twice,
+  producing an exactly paired dataset in which nothing but the model varies.
+  Three consequences are written down rather than left to the implementer.
+  Paired mode must **retain both outputs** — the previous text scored and
+  discarded the shadow response, which is exactly wrong when the outputs are
+  the dataset — so it inherits the whole prompt-storage discipline. A leg shed
+  under pressure must be **recorded as shed**, because suppression correlates
+  with load and the pairs that vanish are the slow, expensive, degraded ones;
+  silently dropping them flatters whichever model was healthier. And pairwise
+  judging, not textual diffing, is the comparison a pair supports, because two
+  samples of a non-deterministic model always differ.
+- **The limit of mirroring is stated.** A mirror forks one call, not a
+  trajectory: in an agentic loop the conversation continues from the primary's
+  response, so the shadow model is always answering a history the primary
+  produced. A model that finishes in 30 turns rather than 45 shows no advantage
+  under mirroring at all, because its benefit is entirely in steps that were
+  never mirrored. This is why §7a is a second mechanism rather than a setting.
+- **§7a: a variant is a routing overlay, not a model.** An engagement uses a
+  planner, a worker and a summarizer at once, so `label → {provider, model}`
+  cannot express "run the whole thing on the 5.1 family". Variants become sets
+  of bindings; the single-model case is an overlay of size one.
+- **The feedback endpoint is reclassified as a prerequisite of §7a**, not a
+  parallel Phase 2 item. The router sees requests and responses; it cannot see
+  whether an engagement succeeded. Without an outcome, a run experiment
+  compares price and speed alone and reports that the cheaper model won —
+  the conclusion the feature exists to prevent. §11 carries the ordering.
+- **Which dimensions are even labelled, and by whom.** An arm may differ on
+  anything, but the router labels only two dimensions — model and provider —
+  because they are the only two it decides. Reasoning effort, thinking budget
+  and temperature are passed upstream and recorded nowhere, so "which speed
+  setting should we use" is unanswerable from the router's own data today.
+  Attribution tags close it with no schema change and are the Phase 2
+  mechanism; a `request_params` column on `prompts` is recorded as the
+  follow-on that would make such dimensions self-describing and answerable
+  retrospectively.
+- **New §7b: `/admin/compare`.** One page for both experiment forms, since both
+  end in the same question. Arms are chosen by dimension then value; four of
+  the six dimensions read columns the shipped router already writes, so the
+  page is explicitly **not gated on either experiment mechanism** and can land
+  first, comparing runs an application has already tagged. Three honesty
+  constraints are part of the specification rather than polish: latency has a
+  different denominator from cost (it comes from `prompts`, cost from
+  `cost_ledger`) and must state its own sample count; incomplete pairs are
+  excluded and counted; an arm touching an unpriced model is badged. And the
+  page must say that it has no quality column, because a cost-and-latency table
+  reads as a recommendation for the cheaper model unless it declines to be one.
+- **Both templates registered.** §7b names `compare.html` and
+  `compare_panels.html` as registered in `src/api/admin/templates.rs`,
+  because an unregistered template is a 500 on a page the nav links to — which
+  has already happened once in this repo (§2).
+- **Decisions 13.18–13.20 recorded**, and *Still open* re-stated: two
+  deliberate deferrals, the queue depth and `request_params`, each parked
+  inside the decision it belongs to.
 
 **Revision 13 (2026-09-03)** — the two sign-off gates answered:
 
