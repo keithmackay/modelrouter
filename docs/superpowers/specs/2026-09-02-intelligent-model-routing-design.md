@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-02
 **Status:** Approved design, pre-implementation
-**Revision:** 12 — incorporates critical reviews
+**Revision:** 16 — incorporates critical reviews
 [1](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-1.md)
 and [2](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-2.md).
 See §14 for what changed; §13 records the decisions and their alternatives.
@@ -78,8 +78,9 @@ candidates by a price it is guessing at. See §7.
 
 ### Known defects this design depends on
 
-Found while researching the §13 decisions. None is caused by this design; two
-gate a phase of it. They are recorded here rather than only in a tracker,
+Found while researching the §13 decisions and, for the last of them, while
+auditing what the router records per request. None is caused by this design;
+three gate a phase of it. They are recorded here rather than only in a tracker,
 because a reader deciding whether a phase is ready needs them in the same place
 as the decisions that depend on them.
 
@@ -111,6 +112,19 @@ as the decisions that depend on them.
   appears only in the `--features postgres` build. §7.0a's shadow writer must
   use `"{}"`, and the existing rows want backfilling alongside the `spend_kind`
   migration.
+- **Content redaction is not applied to the callback egress path.**
+  `[storage] store_prompt_content` defaults to `false`, and its own doc comment
+  gives the reason: a privacy-sensitive deployment should not have to discover
+  a flag after the fact "to stop full conversation bodies landing on disk".
+  `redact_prompt_content` is duly applied to the `NewPrompt` row — but the
+  `CallbackEvent` dispatched a few lines later in `src/api/routes/completions.rs`
+  and `src/api/routes/messages.rs` is built from the *original*
+  `messages_json` and response values, so the un-redacted prompt and completion
+  are still sent to every configured callback backend (langfuse, langsmith,
+  webhook). The flag therefore keeps bodies off local disk while shipping them
+  to a third party over the network. `X-No-Log` does suppress the dispatch, via
+  the enclosing `skip_log` branch. **Gates §7c**, whose whole premise is that
+  local retention for analysis is not consent to transmit.
 - **OIDC-provisioned admins can never hold superadmin.** `default_oidc_role()`
   in `src/config/schema.rs` returns `"admin"`, which is neither validated role
   (`superadmin` / `viewer`), so `SuperDashboardSession` rejects them
@@ -1143,7 +1157,8 @@ an object with an ordered set of members:
   inventing a second charting idiom: a per-policy panel (requests kept local
   vs escalated, dollars saved net of cache displacement, overflow reasons) and
   a head-to-head panel used for both trial-vs-incumbent and experiment
-  variants.
+  variants. The general two-arm comparison lives on its own page (§7b), which
+  the head-to-head panel links to rather than duplicating.
 
 ### API and CLI surface
 
@@ -1306,8 +1321,9 @@ ceiling the key owner may edit the rubric and move their own work *down*
 the ladder freely, never above it. Delegating cheapness is safe;
 delegating expense is not.
 
-**Operator sign-off required before this ships** (§13.11): it grants a
-principal that has never had web access a browser session.
+**Deferred to a later phase, 2026-09-03** (§13.11): Phase 1 ships admin-only
+rubric editing instead. What follows is the design for delegation when it is
+scheduled, not Phase 1 scope.
 
 **The surface: a `/portal` session exchanged from the API key.** Key owners are
 `users` rows, not `admin_users` rows, and today they have no web login at all —
@@ -1480,9 +1496,8 @@ or while resolution latency exceeds its threshold. Each suppression is counted,
 so the sample loss is visible rather than inferred from a thin comparison
 report.
 
-**Operator sign-off required before this ships** (§13.10): shadow puts real
-spend on a customer's ledger under a reserved identity and sends prompt content
-to an additional provider.
+**Operator sign-off obtained, 2026-09-03** (§13.10): approved as specified,
+with the reserved user left visible in operator-facing lists.
 
 **Mirroring requires an explicit data-sharing opt-in.** A mirrored request
 sends the caller's prompt to a provider the caller never chose, and the member
@@ -1534,6 +1549,52 @@ admin user list beside `health-probe`, and the disable control on it appears to
 work and does nothing — a false kill switch. The real control is the
 per-policy `shadow` setting.
 
+**Mirroring at `fraction = 1.0` is an experiment, not just evidence.** The
+paragraphs above describe shadow as a sampling mechanism — a trickle of
+mirrored requests building confidence in a member nobody has served with. Set
+the fraction to 1.0 and it becomes something else: every request is answered
+twice, and the result is an exactly paired dataset — same prompt, same caller,
+same moment, two models. Nothing but the model varies, which makes it the
+cleanest comparison available. It also doubles the bill, which is why it is a
+deliberate mode and not a default.
+
+**Paired mode retains both outputs.** Sampling mode scores the shadow response
+and discards it; a paired comparison cannot, because the outputs *are* the
+dataset. In paired mode both legs are written with a shared `pair_id` and the
+shadow leg stores its completion exactly as the primary does. That is a
+retention change, not only a routing one — text that previously lived only for
+the duration of a scoring call is now stored — and it runs against a default
+that stores metadata only. §7c governs it: content retention is an explicit,
+bounded, per-experiment override, and `X-No-Log` still suppresses the mirror
+entirely.
+
+**A shed leg must be recorded as shed, not omitted.** Mirroring is suppressed
+under pressure (above), which in paired mode silently deletes one side of a
+pair. Left implicit that is actively misleading, because suppression correlates
+with load: the pairs that vanish are the slow, expensive, degraded ones, so the
+surviving sample flatters whichever model was healthier. Each pair therefore
+carries a completeness state, comparisons are computed over complete pairs
+only, and the incomplete count is shown beside the result rather than left to
+be inferred from a discrepancy between two totals.
+
+**What mirroring cannot measure.** A mirror forks one call, not a trajectory.
+In an agentic loop the conversation continues from the *primary's* response, so
+at turn 12 the mirrored call is asked to continue a history the primary
+produced. That answers "how does the candidate respond to the incumbent's
+trajectory" — a real question, but not usually the one being asked. A model
+that reaches the same result in 30 turns instead of 45 shows no advantage here
+at all: its benefit lies entirely in the steps it did not take, and mirroring
+cannot see steps that were never mirrored. Per-call substitutability is the
+ceiling of what this instrument measures, which is why §7a exists rather than
+being folded into it.
+
+**Two samples, not a diff.** The same prompt to the same model twice yields
+different text, so every paired comparison contains variation that is not
+attributable to the model. Pairwise judging absorbs that correctly — it asks
+which of two responses to an identical prompt is better, which is exactly the
+comparison a pair supports. A textual diff does not, and will overstate every
+difference it finds.
+
 ### 7.1 Adaptive allocation (Phase 2)
 
 Active only when the requesting application API key's matched assignment
@@ -1573,38 +1634,290 @@ has `learning_enabled = true`.
 
 ## 7a. Controlled experiments (A/B runs)
 
-Motivating case: Athena runs one engagement twice in parallel — once per
-model — and compares outcomes. The client orchestrates the parallel runs;
-modelrouter provides variant pinning, measurement grouping, and the
-comparison report.
+Motivating case: Athena runs one engagement twice in parallel — each run on a
+different set of models — and compares the outcomes. The client orchestrates
+the parallel runs; modelrouter supplies variant binding, measurement grouping,
+and the comparison report.
 
-- `experiments` table: `id`, `name`, `variants` (JSON: label →
-  `{provider, model}`), `status` (active | closed), `feed_learning` (bool),
-  `created_at`. Managed via `/admin/api/routing/experiments`, the Routing
-  page, and `modelrouter routing experiment add|list|close`. Variant models
-  are subject to the same pricing gate (§7.0) — an unpriced variant makes the
-  cost comparison the experiment exists to produce meaningless.
+This is the complement to §7.0a's mirroring, not a flavour of it. Mirroring
+measures **per-call substitutability** on identical inputs. A run-level
+experiment measures the **end-to-end outcome**, and is the only one of the two
+that can see a compounding effect — fewer turns, less backtracking, an earlier
+correct answer — because each run takes its own path from the start. Neither
+subsumes the other, and an operator choosing a model usually wants both.
+
+**A variant is a routing overlay, not a model.** An engagement uses several
+models at once: a planner, a worker, a summarizer, perhaps a judge. Binding a
+variant to a single `{provider, model}` pair cannot express "run the whole
+thing on the 5.1 family". A variant is therefore a *set* of bindings — alias
+overrides, or a policy id the run pins to — applied for the run's duration. The
+single-model case stays the common one; it is just an overlay of size one.
+
+- `experiments` table: `id`, `name`, `variants` (JSON: label → routing
+  overlay), `status` (active | closed), `feed_learning` (bool), `expires_at`,
+  `created_at`. `expires_at` is **required at creation and has no default**
+  (§7c) — `0`, meaning never, is a permitted answer but not a permitted
+  silence. An expired experiment stops assigning variants and closes itself;
+  closing is what starts any content-retention clock.
+  Managed via `/admin/api/routing/experiments`, the Routing page, and
+  `modelrouter routing experiment add|list|close`. Every model an overlay can
+  reach is subject to the pricing gate (§7.0) — an unpriced model anywhere in a
+  variant makes the cost comparison the experiment exists to produce
+  meaningless.
 - **Variant pinning:** a request carrying
-  `x-modelrouter-experiment: <experiment_id>:<variant>` routes directly to
-  that variant's model — classifier and ladder are bypassed, because the
+  `x-modelrouter-experiment: <experiment_id>:<variant>` resolves through that
+  variant's overlay — classifier and ladder are bypassed, because the
   experiment is the routing decision. All measurements are still recorded.
-  Header-tagged runs must send the tag on **every request** of the run —
-  the existing session-affinity primitive cannot hold a session on a
-  variant (it always defers to the newly resolved provider/model, and
-  same-provider variants are invisible to it).
+  Header-tagged runs must send the tag on **every request** of the run: the
+  existing session-affinity primitive cannot hold a session on a variant (it
+  always defers to the newly resolved provider/model, and same-provider
+  variants are invisible to it).
 - **Router-assigned variants:** if the header carries only the experiment id,
   the router assigns a variant by stable hash of `session_id` — automatic
-  50/50 splits without client-side assignment logic, and deterministic per
-  session on every turn (no pinning needed). Requests without a
-  `session_id` must use the explicit `<experiment>:<variant>` form.
-- **Comparison:** the experiment report shows variants side by side per
-  category across all measured dimensions (success rate, user rating, judge
-  score, token cost per query, latency/TTFT) — the same report component as
-  the auto-trial head-to-head, with an experiment filter instead of a
-  trial-vs-incumbent filter.
-- Experiment traffic is excluded from `model_quality_stats` updates by
-  default (a deliberately forced route is not evidence about the ladder);
-  an experiment can opt in with `feed_learning = true`.
+  50/50 splits without client-side assignment logic, deterministic per session
+  on every turn. Requests without a `session_id` must use the explicit
+  `<experiment>:<variant>` form.
+- **Run grouping reuses the existing attribution primitive.** A run is the set
+  of requests sharing an `attribution_correlation_id`. That column already
+  exists on both `prompts` and `cost_ledger` and is already indexed on
+  `(attribution_correlation_id, created_at)`, so no new grouping key is needed
+  and a caller that already attributes spend per engagement is already emitting
+  one.
+- **Per-run aggregates.** A run's report needs total cost, wall-clock span,
+  total tokens, and **turn count** — how many requests the run took to finish.
+  Turn count is the figure that carries the compounding effect: it is where a
+  model needing fewer steps shows its advantage, and it is invisible in every
+  per-call average. All four are computable from `cost_ledger` grouped by
+  correlation id.
+- **Outcome is reported by the caller, because the router cannot observe it.**
+  modelrouter sees requests and responses; it does not see whether the
+  engagement succeeded, whether the answer was accepted, or whether a human had
+  to step in. Cost, latency and tokens it computes alone; quality it cannot. A
+  run-level experiment therefore depends on the Phase 2 feedback endpoint,
+  which takes an outcome keyed by correlation id. Without it an experiment
+  compares two runs on price and speed alone — and will report that the cheaper
+  model won, which is precisely the conclusion this feature exists to prevent.
+  That makes the feedback endpoint a **prerequisite** of §7a rather than a
+  parallel Phase 2 item; §11 records the ordering. Mirroring carries no
+  equivalent dependency, because pairwise judging is self-contained: both
+  responses answer the same prompt.
+- Experiment traffic is excluded from `model_quality_stats` updates by default
+  (a deliberately forced route is not evidence about the ladder); an experiment
+  may opt in with `feed_learning = true`.
+
+**Arms may differ on any dimension — but something has to label them.** The
+comparison machinery does not care what distinguishes two arms: two versions of
+one model, two providers entirely, or one model at two speed settings. What it
+needs is a way to tell the arms apart in the recorded data, and there are only
+two sources for that.
+
+The router labels two dimensions itself, because it decides them: the **model**
+and the **provider** it dispatched to. Everything else in a request — reasoning
+effort, thinking budget, temperature, tool configuration, the client's own
+prompt variant — is passed through to the provider and **not recorded anywhere**.
+`prompts` stores the messages and the response; no column holds the sampling
+parameters. So the router cannot today answer "which speed setting should we
+use for this model" from its own data: it never wrote the setting down.
+
+Two ways to close that, complements rather than alternatives:
+
+1. **The caller labels the arm.** `x-attribution-tags: effort=high` on one run
+   and `effort=low` on the other makes the dimension comparable immediately,
+   with no schema change — tags are already free-form and already land on both
+   `prompts` and `cost_ledger`. This covers any dimension the caller knows
+   about, including ones modelrouter has no concept of, and it is the
+   mechanism Phase 2 ships with.
+2. **The router records the request parameters.** A `request_params` JSON
+   column on `prompts`, holding the sampling-relevant fields as actually sent
+   upstream, would let the router self-label these dimensions without any
+   cooperation from the caller — and would answer the question
+   *retrospectively*, over traffic that was never set up as an experiment.
+   It carries a disclosure obligation, since parameters can encode caller
+   intent, and inherits the `X-No-Log` discipline. Recorded here as the
+   follow-on that makes the dimension self-describing; not required for
+   experiments to ship.
+
+## 7b. Comparison analysis (`/admin/compare`)
+
+Both experiment forms end in the same question — *how do these two arms differ?*
+— so they share one page rather than growing two, at `/admin/compare`, with a
+**Compare** nav link after **Reports**. It follows the Reports page
+conventions: a filter header, an HTMX-swapped panel body
+(`compare_panels.html`), and the vendored D3 at `/static/d3.js`. No second
+charting idiom is introduced, and `compare.html` and `compare_panels.html` are
+both registered in `src/api/admin/templates.rs` — an unregistered template is a
+500 on a page the nav links to, which has happened once already (§2).
+
+**Arms are chosen by dimension, then by value.** One selector picks the
+dimension and two pick the values, which holds a single mental model across
+every kind of experiment:
+
+| Dimension | Arm A / Arm B | Labelled by | Available |
+|---|---|---|---|
+| Model | two `model` values | the router | today |
+| Provider | two `provider` values | the router | today |
+| Tag | two values of one attribution tag key | the caller | today |
+| Run | two `attribution_correlation_id` values | the caller | today |
+| Variant | two variants of one experiment | the experiment | with §7a |
+| Pair | primary vs shadow leg of a paired run | the router | with §7.0a |
+
+The first four need no schema this repo does not already have — `cost_ledger`
+carries model, provider, correlation id and tags, and `prompts` carries
+latency — so the page can ship and be useful **before** either experiment
+mechanism lands, comparing runs an application has already tagged. The last two
+appear as the tables behind them appear. That ordering matters: it puts the
+analysis surface in operators' hands early, and means the experiment features
+arrive into a page that is already proven against real data.
+
+**Tag keys arriving from the query string are validated before use.** The tag
+dimension interpolates a key into a JSON path, and on the ingest side that is
+safe because `api::attribution::is_safe_tag_key` has already run. A dashboard
+query parameter has had no such pass, so the handler re-validates with the same
+function before constructing a filter — matching what
+`AttributionQuery::filter` already does for the Reports page.
+
+**Metrics, per arm and as a delta.** Requests; total cost and cost per request;
+tokens in and out, and per request; mean, p50 and p95 latency; TTFT where
+recorded; cache hits and hit rate; error rate. Every figure appears per arm with
+the delta and the percentage change. Per-request figures are the default and
+the totals are secondary, because two arms almost never carry identical request
+counts and comparing raw totals across unequal volume is the single easiest way
+to read this page wrong.
+
+**Charts — three, and no more.** A grouped bar of the normalized per-request
+metrics (cost, tokens, latency) side by side; a two-line daily cost series; and
+a latency percentile comparison (p50/p95 per arm). Each is a small D3 render in
+`compare_panels.html`, following the existing series code in
+`reports_panels.html`.
+
+**Where the page must not overstate its data.** Three traps, each surfaced in
+the UI rather than left for the reader to work out:
+
+- **Latency has a different denominator from cost.** Cost and tokens come from
+  `cost_ledger`, written for every request. Latency comes from `prompts`,
+  written only when prompt storage is on and never for a request that opted out
+  of logging. The counts can differ by a lot, so the latency block states its
+  own sample count beside the request count, and is suppressed rather than
+  rendered as zero when there are no samples.
+- **Incomplete pairs are excluded and counted** (§7.0a), never silently
+  dropped.
+- **An unpriced model makes the cost column fiction.** An arm whose traffic
+  touched a model with no price is badged, and its cost figures are marked
+  rather than shown as if complete — the same gate as §7.0, applied at read
+  time.
+
+**Quality appears only once something supplies it.** Until the feedback
+endpoint (§7a) and judge sampling (§7.1) exist, this page has cost, speed and
+volume and nothing more. It says so, in place. A cost-and-latency table with no
+quality column reads as a recommendation for the cheaper model unless it
+explicitly declines to be one.
+
+## 7c. Content retention under experiment
+
+An experiment's outputs *are* its dataset. Cost, latency and token counts can
+be compared from metadata alone, but "did the new model answer better" cannot
+be answered without the answers. Experiment traffic therefore stores full
+inputs and outputs, while ordinary traffic keeps the shipped default of
+metadata only (`[storage] store_prompt_content = false`, which exists so that a
+privacy-sensitive deployment does not have to discover a flag after the fact to
+keep conversation bodies off disk).
+
+That default is not wrong; it is simply the wrong default *for this traffic*.
+So this is specified as a scoped exception, and deliberately not as a new
+global default.
+
+**Precedence, stated once so no call site has to reason it out.**
+
+| Signal | Effect |
+|---|---|
+| `X-No-Log` on the request | Nothing stored, no mirror, no callback egress. Always wins. |
+| Experiment content retention | Inputs and outputs stored for participating requests |
+| `[storage]` defaults | Everything else — metadata only |
+
+A caller who opted out of logging does not opt back in by being swept into an
+experiment. That rule already governs mirroring (§7.0a) and is repeated here
+because the override is exactly the kind of thing that quietly erodes it.
+
+**The override implies both storage switches, for its own traffic only.**
+`store_prompts = false` skips the prompt row outright, leaving nowhere to put
+content, so an experiment that retains content writes its rows regardless of
+that switch. The scope is the participating requests and nothing else: traffic
+outside the experiment is unaffected, and the global configuration is not
+edited to enable an experiment.
+
+**It is bounded in time, and the bound is never inferred.** A retention
+override with no expiry is a permanent policy change wearing a temporary label.
+So the experiment row carries `retain_content` and `content_retention_days`,
+closing the experiment starts the clock — and **neither an experiment's
+`expires_at` nor its retention period has a default**. Both are required at
+creation, in the dashboard, in the REST API and on the CLI alike. `0`, meaning
+never, is a permitted answer; it is not a permitted silence. Purging is the
+existing retention sweep, given the experiment's window.
+
+Requiring the answer rather than defaulting it is the whole mechanism, because
+the alternative fails in the worst direction. A default of 30 days deletes
+someone's evidence on a schedule they never agreed to; a default of 0 accrues
+conversation bodies forever under a setting nobody read. Neither is a decision
+anyone made. Forcing the choice costs one form field and makes the retention
+period something a person chose and the audit log can attribute.
+
+**Unset and never must not collapse into each other.** They are one careless
+line apart at three layers, and the collapse always fails toward "keep
+forever":
+
+- **Serde.** A field with no `#[serde(default)]` is already required — absence
+  is a deserialization error, which is the behaviour wanted. The hazard is
+  habit: nearly every config struct in this repo carries `#[serde(default)]`,
+  and adding it here to match the surrounding style silently converts
+  "required" into "defaults to 0, which means never expires". The API returns
+  **400 naming the missing field** instead.
+- **Clap.** The CLI flag is `required = true` with **no `default_value`**. A
+  `default_value` is precisely why `serve` ignores `[server] port` today: the
+  flag always has a value, so the configured one can never win. The same
+  mistake here would make every CLI-created experiment permanent.
+- **HTML.** A `<select>` with no `selected` attribute submits its first option,
+  so an option list beginning with "Never" chooses never for anyone who does
+  not touch the control. The first option is therefore an empty,
+  non-submittable placeholder and the control carries `required`; "Never" is a
+  deliberate selection further down the list.
+
+The column is `NOT NULL` with no SQL `DEFAULT`, so the same rule holds for
+anything writing the table directly.
+
+**Choosing "never" is recorded and stays visible.** The audit entry names the
+value chosen, including never, so "who decided this retains forever" has an
+answer. An experiment that both retains content and never expires is badged in
+the experiments list and on the comparison page, because it is the one
+combination that accrues data indefinitely with nothing scheduled to stop it.
+
+**Enabling it is a superadmin write, and audited.** Storing conversation bodies
+is a disclosure decision rather than a routing one, so it takes
+`SuperDashboardSession` and lands in the audit log with the experiment it
+applies to — the same treatment as the mirroring data-sharing opt-in (§7.0a).
+
+**Storage does not widen egress.** Retaining content locally for analysis is
+not consent to send it anywhere. The callback backends (langfuse, langsmith,
+webhook) are governed by their own configuration and are unchanged by this
+override. This is worth stating explicitly because those two paths are already
+inconsistent in the shipped code — the callback dispatch in
+`completions.rs` and `messages.rs` sends the *un-redacted* messages and
+response while the prompt row beside it is redacted, so `store_prompt_content
+= false` today keeps bodies off local disk and still ships them to a third
+party. That is recorded as a defect in §2; §7c must not be built on top of it.
+
+**Both experiment forms, one rule.** Paired mirroring (§7.0a) and run-level
+experiments (§7a) use the same override, so a reader does not have to hold two
+retention models at once. For a pair, both legs are stored or neither is.
+
+**It is visible where the data is.** The experiment card names content
+retention and its expiry date; the comparison page (§7b) says whether the arms
+it is showing have stored content, because an operator about to judge output
+quality needs to know whether there is any output to judge before they start.
+
+**Volume is a real cost, not a footnote.** Paired mirroring at `fraction = 1.0`
+with content retention doubles the provider bill *and* stores two full bodies
+per request. The experiment view shows retained-content bytes beside spend, so
+the storage cost is visible on the same screen as the decision to keep running.
 
 ## 8. Error handling
 
@@ -1765,13 +2078,29 @@ Principle: smart routing degrades, never breaks.
   the validation gate, and three built-in plugins (`complexity`, `smart`,
   `http`); both classifier kinds inside `smart`; tiered pools, `ProviderCapacity`,
   `MemberHealth`, the pricing gate, policy tables + admin dashboard page +
-  REST + CLI, decision log (recording only), cache probe, metrics. Delivers
-  the core goal with fully predictable behavior.
+  REST + CLI, decision log (recording only), cache probe, metrics. Rubric
+  editing is **admin-only** in this phase — a superadmin write on the routing
+  page, with no new authentication surface. Delivers the core goal with fully
+  predictable behavior.
 - **Phase 2 — adaptive allocation & experiments:** explore/exploit, judge
-  sampling, feedback endpoint, decay, auto-trial + comparison view, and
-  controlled A/B experiments (§7a). Off by default, enabled per application
-  API key, piloted on Athena's key. Disabling it reverts cleanly to Phase 1
-  behavior.
+  sampling, feedback endpoint, decay, auto-trial + comparison view, controlled
+  A/B experiments (§7a) and paired mirroring (§7.0a). Off by default, enabled
+  per application API key, piloted on Athena's key. Disabling it reverts
+  cleanly to Phase 1 behavior. Ordering inside the phase is not free: the
+  **feedback endpoint precedes run-level experiments**, because an experiment
+  that cannot see an outcome reports only that the cheaper model won (§13.18).
+
+The comparison page (§7b) is **not gated on either experiment mechanism**. Four
+of its six arm dimensions read columns the shipped router already writes, so it
+can land as soon as there is appetite for it — including ahead of Phase 1 — and
+gains the variant and pair dimensions later, as the tables behind them appear
+(§13.20).
+
+Delegated rubric authoring is **not** Phase 1 (§13.11, decided 2026-09-03).
+The `/portal` session, its extractor and template namespace, and the `max_tier`
+ceiling ship later, once routing is proven in production. Phase 1 therefore adds
+no authentication surface at all, which also takes the Helm JWT defect off its
+critical path.
 
 The dashboard page is Phase 1, not deferred: policies are unusable by an
 operator who cannot see a ladder, and every comparable feature since April
@@ -1945,9 +2274,13 @@ cannot be the exclusion predicate). Taken: the health-probe pattern, plus a
 column because the cache denominator counts the whole ledger, plus a dedicated
 shadow ceiling because global-budget gating still denies real users at the
 margin (§7.0a).
-**Operator sign-off required before the shadow phase ships** — this decision
-changes what appears in a customer's ledger and sends prompt content to a
-provider the caller never chose. Record the sign-off here once obtained.
+**Operator sign-off obtained, 2026-09-03** — approved as specified. The
+reserved system user remains visible in operator-facing lists (`/admin/users`,
+per-user reports, the cost page) alongside the existing `health-probe` row;
+filtering system users out of those lists was considered and not taken, so the
+spend stays visible where an operator would look for it. Router-owned rows are
+still excluded from savings figures, the cache-hit denominator, and the global
+budget sum.
 
 **13.11 The key-owner view → a `/portal` session exchanged from the API key,
 exposing the rubric and key-scoped stats with no spend figures.** Rejected: a
@@ -1958,9 +2291,17 @@ sessions is cryptographic — domain-separated signing key plus a token-type
 claim — because the admin extractors validate only a signature against one
 shared secret. The session is bound to its key: revoking the key ends the
 portal access it granted (§6b).
-**Operator sign-off required before the delegation phase ships** — this grants a
-principal that has never had web access a session. Record the sign-off here once
-obtained.
+**Delegation deferred, 2026-09-03.** Phase 1 ships rubric editing in the
+existing admin dashboard only — a superadmin write on `/admin/routing`, no new
+authentication surface. The `/portal` session, its extractor and template
+namespace, and the `max_tier` ceiling that bounds delegated authoring move with
+it to a later phase, to be taken up once routing is proven in production. The
+sign-off this decision requires is therefore not yet needed; it becomes due when
+delegation is scheduled.
+
+The design below is retained rather than removed: the analysis of why cookie-name
+separation is insufficient, and why a limited `admin_users` role is dangerous,
+is what a later implementer needs and is expensive to rediscover.
 
 **13.12 Queue bounds → both bounds, per member, on an atomic counter with
 `Notify`.** Rejected: `tokio::sync::Semaphore` (no waiter-count API, so the
@@ -1987,14 +2328,209 @@ de-duplicate provider-collapsed members, keep probe-specific counters, and
 consult store reachability through a freshness window — are recorded in §4
 *Probe*.
 
+**13.18 Two experiment forms, kept as two mechanisms.** Router-side mirroring
+(§7.0a at `fraction = 1.0`) and application-side run experiments (§7a) look
+like one feature with two settings and are not. Mirroring answers *per-call
+substitutability* on byte-identical inputs; a run experiment answers
+*end-to-end outcome*, which is the only place a compounding effect — fewer
+turns, less backtracking — can appear at all. Rejected: unifying them behind
+one mechanism, which would have shipped whichever question that mechanism
+happened to answer and silently dropped the other. The asymmetry that follows
+is recorded rather than smoothed over: mirroring is self-contained, because
+pairwise judging compares two answers to the same prompt, while a run
+experiment cannot score itself at all — the router never learns whether the
+engagement succeeded. The **feedback endpoint is therefore a prerequisite of
+§7a**, not a parallel Phase 2 item, because without it every run experiment
+reports that the cheaper model won.
+
+**13.19 A variant is a routing overlay; dimensions the router does not record
+are labelled by the caller.** Binding a variant to one `{provider, model}` pair
+cannot express "run this engagement on the 5.1 family", so a variant is a set
+of bindings. The wider point behind it: an arm may differ on any dimension, but
+only two of them — model and provider — are labelled by the router, because
+they are the only two it decides. Reasoning effort, thinking budget,
+temperature and every other request parameter are passed upstream and written
+down nowhere, so "which speed setting should we use" is not answerable from the
+router's own data. Taken: callers label such arms with attribution tags, which
+are already free-form and already land on both `prompts` and `cost_ledger`, so
+the dimension costs no schema. Rejected **for now**: a `request_params` column
+on `prompts`, which would make the dimension self-describing and answerable
+retrospectively over traffic never set up as an experiment. It is the right
+follow-on and carries a disclosure obligation; it is not a prerequisite, and
+adding storage for it before the experiment surface exists would be building
+the harder half first.
+
+**13.20 One comparison page, shipped ahead of the tables it will eventually
+read.** Both experiment forms end in the same question, so §7b is one page and
+not two. Four of its six arm dimensions — model, provider, tag, run — are
+computable from columns this repo already writes, which means `/admin/compare`
+can ship and be used before either experiment mechanism exists, comparing runs
+an application has already tagged. Taken deliberately: it puts the analysis
+surface in operators' hands early and lets the experiment features arrive into
+a page already proven against real data, rather than shipping a chart and its
+data source in the same untested step.
+
+**13.21 Experiment content retention → a scoped, bounded, superadmin-gated
+override, not a new default.** An experiment cannot answer "which answered
+better" from metadata, so it needs the inputs and outputs that
+`store_prompt_content = false` withholds. Rejected: flipping the global default
+(it would retain bodies for every deployment to serve a minority of traffic,
+discarding a privacy decision that was made deliberately); and a bare boolean
+with no expiry, which is a permanent policy change wearing a temporary label.
+
+**Superseded 2026-09-03: the expiry is required, not defaulted.** Revision 15
+gave `content_retention_days` a default of 30 days. That was wrong in both
+directions — a 30-day default deletes evidence on a schedule the operator never
+agreed to, and any default of 0 accrues conversation bodies forever under a
+setting nobody read. Creating an experiment now requires an explicit
+`expires_at` and, when content is retained, an explicit retention period.
+Never (`0`) remains available; it must be chosen rather than inherited. §7c
+carries the three places where "unset" and "never" collapse into each other —
+serde, clap and HTML — because each of them fails toward "keep forever".
+`X-No-Log` outranks the override, so being
+swept into an experiment never reverses a caller's own opt-out. And retention
+is explicitly not egress: §7c stores locally and changes nothing about the
+callback backends — which is only safe once the redaction defect in §2 is
+fixed, since that path currently transmits content the local row redacts.
+
 ### Still open
 
-Nothing. The six questions above are resolved; the only item deliberately left
-open is the default queue depth, recorded as an explicit deferral inside 13.12
-with a starting point and the reason a number should not be invented before
-there is traffic to size it against.
+Nothing blocking. The ten questions above are resolved. Two items are
+deliberately left open, each recorded where it belongs rather than parked as a
+placeholder: the default queue depth (inside 13.12, with a starting point and
+the reason a number should not be invented before there is traffic to size it
+against), and the `request_params` column (inside 13.19, as the follow-on that
+would make non-routing dimensions self-describing).
 
 ## 14. Revision history
+
+**Revision 16 (2026-09-03)** — the experiment expiry is required, not
+defaulted:
+
+- **Creating an experiment requires an explicit expiry**, in the dashboard, the
+  REST API and the CLI alike. `0` (never) is a permitted answer, not a
+  permitted silence. Revision 15's 30-day default is **superseded and corrected
+  in place** in both §7c and 13.21, rather than layered over: it was wrong in
+  both directions, since a finite default deletes evidence on a schedule nobody
+  agreed to and a zero default accrues conversation bodies forever under a
+  setting nobody read.
+- **§7c names the three places "unset" and "never" collapse**, because each
+  fails toward keep-forever: a `#[serde(default)]` added to match the
+  surrounding style (nearly every config struct here has one) turns required
+  into never; a clap `default_value` does the same, and is already why `serve`
+  ignores `[server] port`; and an HTML `<select>` submits its first option, so
+  a list beginning with "Never" chooses never for anyone who does not touch the
+  control. Absent field → 400 naming it; `required = true` with no default;
+  an empty non-submittable first option. Column is `NOT NULL` with no SQL
+  `DEFAULT`.
+- **`expires_at` added to the `experiments` table** in §7a. An expired
+  experiment stops assigning variants and closes itself; closing starts any
+  content-retention clock.
+- **Choosing never is audited and badged.** The audit entry names the value,
+  and an experiment that both retains content and never expires is marked in
+  the experiments list and on the comparison page — the one combination that
+  accrues indefinitely with nothing scheduled to stop it.
+
+**Revision 15 (2026-09-03)** — experiment traffic stores its inputs and
+outputs, as a scoped exception rather than a new default:
+
+- **New §7c.** An experiment's outputs are its dataset, so "which answered
+  better" is unanswerable under `store_prompt_content = false`. Content
+  retention becomes a per-experiment override with an explicit precedence
+  order: `X-No-Log` always wins, then the experiment override, then the
+  `[storage]` defaults. A caller who opted out of logging does not opt back in
+  by being swept into an experiment.
+- **Bounded in time, not only in scope.** `retain_content` and
+  `content_retention_days` live on the experiment row, closing it starts the
+  clock, and the default is a finite 30 days — deliberately unlike the global
+  `prompt_retention_days = 0` (keep forever). The asymmetry is the point:
+  global deletion is opt-in so an upgrade cannot discard logs an operator
+  relied on, while experiment content exists only because of an override.
+  **Superseded by revision 16:** there is no default at all; the expiry is
+  required at creation. This entry records what revision 15 said, not current
+  behaviour.
+- **Storage is not egress**, stated explicitly because the shipped code does
+  not currently honour the distinction.
+- **New known defect in §2: content redaction is not applied to the callback
+  egress path.** `redact_prompt_content` is applied to the prompt row, but the
+  `CallbackEvent` dispatched beside it in `completions.rs` and `messages.rs` is
+  built from the original un-redacted values — so the default config keeps
+  conversation bodies off local disk and still sends them to langfuse,
+  langsmith or any configured webhook. Found while auditing per-request
+  recording; it gates §7c.
+- **Decision 13.21 recorded.**
+
+**Revision 14 (2026-09-03)** — model-versus-model evaluation specified as two
+distinct mechanisms, plus the surface that reads them:
+
+- **§7.0a gains a paired mode.** At `fraction = 1.0` mirroring stops being a
+  sampling mechanism and becomes an experiment: every request answered twice,
+  producing an exactly paired dataset in which nothing but the model varies.
+  Three consequences are written down rather than left to the implementer.
+  Paired mode must **retain both outputs** — the previous text scored and
+  discarded the shadow response, which is exactly wrong when the outputs are
+  the dataset — so it inherits the whole prompt-storage discipline. A leg shed
+  under pressure must be **recorded as shed**, because suppression correlates
+  with load and the pairs that vanish are the slow, expensive, degraded ones;
+  silently dropping them flatters whichever model was healthier. And pairwise
+  judging, not textual diffing, is the comparison a pair supports, because two
+  samples of a non-deterministic model always differ.
+- **The limit of mirroring is stated.** A mirror forks one call, not a
+  trajectory: in an agentic loop the conversation continues from the primary's
+  response, so the shadow model is always answering a history the primary
+  produced. A model that finishes in 30 turns rather than 45 shows no advantage
+  under mirroring at all, because its benefit is entirely in steps that were
+  never mirrored. This is why §7a is a second mechanism rather than a setting.
+- **§7a: a variant is a routing overlay, not a model.** An engagement uses a
+  planner, a worker and a summarizer at once, so `label → {provider, model}`
+  cannot express "run the whole thing on the 5.1 family". Variants become sets
+  of bindings; the single-model case is an overlay of size one.
+- **The feedback endpoint is reclassified as a prerequisite of §7a**, not a
+  parallel Phase 2 item. The router sees requests and responses; it cannot see
+  whether an engagement succeeded. Without an outcome, a run experiment
+  compares price and speed alone and reports that the cheaper model won —
+  the conclusion the feature exists to prevent. §11 carries the ordering.
+- **Which dimensions are even labelled, and by whom.** An arm may differ on
+  anything, but the router labels only two dimensions — model and provider —
+  because they are the only two it decides. Reasoning effort, thinking budget
+  and temperature are passed upstream and recorded nowhere, so "which speed
+  setting should we use" is unanswerable from the router's own data today.
+  Attribution tags close it with no schema change and are the Phase 2
+  mechanism; a `request_params` column on `prompts` is recorded as the
+  follow-on that would make such dimensions self-describing and answerable
+  retrospectively.
+- **New §7b: `/admin/compare`.** One page for both experiment forms, since both
+  end in the same question. Arms are chosen by dimension then value; four of
+  the six dimensions read columns the shipped router already writes, so the
+  page is explicitly **not gated on either experiment mechanism** and can land
+  first, comparing runs an application has already tagged. Three honesty
+  constraints are part of the specification rather than polish: latency has a
+  different denominator from cost (it comes from `prompts`, cost from
+  `cost_ledger`) and must state its own sample count; incomplete pairs are
+  excluded and counted; an arm touching an unpriced model is badged. And the
+  page must say that it has no quality column, because a cost-and-latency table
+  reads as a recommendation for the cheaper model unless it declines to be one.
+- **Both templates registered.** §7b names `compare.html` and
+  `compare_panels.html` as registered in `src/api/admin/templates.rs`,
+  because an unregistered template is a 500 on a page the nav links to — which
+  has already happened once in this repo (§2).
+- **Decisions 13.18–13.20 recorded**, and *Still open* re-stated: two
+  deliberate deferrals, the queue depth and `request_params`, each parked
+  inside the decision it belongs to.
+
+**Revision 13 (2026-09-03)** — the two sign-off gates answered:
+
+- **Shadow spend approved as specified** (§13.10, §7.0a). The reserved system
+  user stays visible in operator-facing lists rather than being filtered out of
+  them, so router-initiated spend is visible where an operator would look.
+  Router-owned rows remain excluded from savings, the cache-hit denominator and
+  the global budget sum.
+- **Delegated rubric authoring deferred** (§13.11, §6b, §11). Phase 1 ships
+  rubric editing as an admin-only write and adds no authentication surface; the
+  `/portal` session and the `max_tier` ceiling move to a later phase. The
+  delegation design is retained rather than deleted — why cookie-name separation
+  is insufficient and why a limited admin role is dangerous are expensive to
+  rediscover.
 
 **Revision 12 (2026-09-02)** — the §13 open questions resolved against the
 codebase:
