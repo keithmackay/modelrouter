@@ -1161,14 +1161,69 @@ ceiling the key owner may edit the rubric and move their own work *down*
 the ladder freely, never above it. Delegating cheapness is safe;
 delegating expense is not.
 
-**New surface required.** Key owners are `users` rows, not `admin_users` rows,
-and today they have no dashboard login at all — every existing dashboard route
-requires `DashboardSession`, which only an admin can hold. Delegated rubric
-editing therefore needs a scoped non-admin entry point: a key-owner view
-authenticated by the API key itself (or a limited role on `admin_users`),
-reaching exactly two things — this key's rubric, and the read-only stats for
-its policy. This is genuinely new authorization surface and should be priced
-into the phase that ships delegation, not discovered during it.
+**The surface: a `/portal` session exchanged from the API key.** Key owners are
+`users` rows, not `admin_users` rows, and today they have no web login at all —
+every dashboard route requires `DashboardSession`, and the `users` table has
+carried no credential column of any kind since migration 012. So the owner
+posts their key to `/portal`, the server runs the same hash-lookup-validate
+sequence `AuthenticatedUser` already performs, and issues a session cookie read
+by its own extractor, rendering server-side templates from its own environment.
+No migration, no new credential, no change to any existing route.
+
+Rejected: a password login for `users` (invents a second identity system for a
+population already holding a strong bearer credential); a limited role on
+`admin_users` (`SuperDashboardSession` gates on `role != "superadmin"` and
+nothing else, so any new role is silently full-viewer — with read access to
+every user's prompt *and response* bodies, the global key inventory, and a
+write gated only by `DashboardSession`; making it safe is a repo-wide
+authorization refactor riding on a rubric feature).
+
+**Separation is cryptographic, not nominal.** A different cookie name is not
+separation: `DashboardSession` and `AdminSession` validate only an HS256
+signature and expiry against the one shared `auth.jwt_secret`, with no role or
+token-type check, and `AdminSession` also accepts the token from an
+`Authorization` header. An implementer reusing the repo's existing JWT helpers
+— the obvious path — would mint a portal token that deserializes as admin
+claims and is accepted on the admin prompt, user, and audit routes. So portal
+tokens are signed with a key derived from `auth.jwt_secret` under a fixed
+domain-separation label, failing signature verification in both admin
+extractors without either being edited, and carry a token-type claim the portal
+extractor requires.
+
+**The session is bound to its key's lifetime.** `AuthenticatedUser` re-checks
+key validity and user-enabled state on every request; a cookie issued once
+would be the first place in the product where an API-key principal outlives its
+key. The portal claims therefore carry the originating `api_key_id`, the
+extractor re-runs the same checks per request, and the cookie's expiry is
+capped at the key's own — so revoking a leaked key ends the access it granted.
+The portal cookie also sets `Secure`, notwithstanding the repo's existing
+plain-HTTP allowance, because this is the first place a bearer credential is
+submitted through a browser form.
+
+**What the view exposes.** This key's rubric, and read-only stats scoped to
+that key. It renders **no cost or spend figures**: §13.7 pools learning per
+policy, so policy-scoped stats would show one tenant another tenant's usage,
+and per-key scoping exists at the repository layer for cost queries but not in
+the reports handlers. It does not touch the prompt log at all — the `prompts`
+table has no key column, so prompt content cannot be scoped to a key.
+
+**The portal's boundary is permanent.** It is scoped to the key's own rubric
+and its own stats. Any further key-holder-facing page — spend visibility, key
+rotation, usage history — is a separate product decision, not an extension of
+this one.
+
+**Exposure.** `/portal` mounts on the same listener as `/v1`, so it is
+reachable wherever the inference API is, and any ingress rule an operator wrote
+for `/admin` must be extended to cover it.
+
+Audit works unchanged: `audit_log.actor_id` is already `Option<i64>`, so a
+key-owner edit records with a null actor id and a `key:<id>` actor name.
+
+The honest cost is a login page, a session cookie, an extractor, and a template
+namespace — a small feature, priced into the phase that ships delegation rather
+than discovered during it. It is also gated on the Helm prefix defect below:
+that defect nullifies `auth.jwt_secret`, which is the only thing protecting a
+portal session.
 
 Four things bound the blast radius, strongest first:
 
@@ -1462,6 +1517,10 @@ Principle: smart routing degrades, never breaks.
 - Multi-replica guard: a nonzero capacity cap plus a declared replica count
   above one refuses to start, naming both values; the same check fires on an
   overlay write that raises a cap above the declared count.
+- Portal: an unauthenticated portal request redirects; a portal token is
+  rejected by both admin extractors; a portal session stops working on the next
+  request after its key is disabled; a rubric write is clamped by the tier
+  ceiling; the portal renders no cost figures.
 - Shadow accounting: router-owned rows are excluded from the cache-hit
   denominator and from the global budget sum; mirroring stops at its own
   ceiling under concurrent launches; creating an API key for the reserved user
@@ -1702,14 +1761,17 @@ column because the cache denominator counts the whole ledger, plus a dedicated
 shadow ceiling because global-budget gating still denies real users at the
 margin (§7.0a).
 
-### Still open
+**13.11 The key-owner view → a `/portal` session exchanged from the API key,
+exposing the rubric and key-scoped stats with no spend figures.** Rejected: a
+password login for `users` (no credential column exists since migration 012);
+a limited `admin_users` role (any non-superadmin role is silently full-viewer,
+including every user's prompt and response bodies). Separation from admin
+sessions is cryptographic — domain-separated signing key plus a token-type
+claim — because the admin extractors validate only a signature against one
+shared secret. The session is bound to its key: revoking the key ends the
+portal access it granted (§6b).
 
-**13.11 What exactly does the key-owner view expose?** Delegated rubric editing
-needs a non-admin surface (§6b). Minimal version: this key's rubric plus its
-policy's read-only stats, authenticated by the API key. Open: whether that is a
-new session type, a role on `admin_users`, or a separate lightweight route
-group — and whether it also shows spend, which is a privacy question in a
-shared deployment.
+### Still open
 
 **13.12 Queue bounds on the cost path.** `max_queue_ms` defaults to 0 (off).
 Open: what a sane non-zero default is, whether the queue is per member or per
@@ -1770,6 +1832,13 @@ codebase:
   budget only stops mirroring *after* it has consumed the headroom that denies
   the next real request. Mirroring now requires an explicit data-sharing opt-in
   — it sends a caller's prompt to a provider the caller never chose.
+- **13.11 the key-owner view → a `/portal` session exchanged from the API
+  key**, with separation from admin sessions made cryptographic rather than
+  nominal: the admin extractors validate only a signature against one shared
+  secret, so a portal token minted with the repo's existing helpers would be
+  accepted on admin routes. The session is bound to its key's lifetime, so
+  revoking a leaked key ends the access. The view renders no spend figures,
+  because pooled per-policy stats would show one tenant another's usage.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
