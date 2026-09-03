@@ -568,7 +568,7 @@ async fn chat_completions_inner(
                     if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                         tracing::error!("Failed to record cost: {}", e);
                     }
-                    state_clone.callbacks.dispatch(crate::callbacks::CallbackEvent {
+                    let mut event = crate::callbacks::CallbackEvent {
                         trace_id: format!("{}", saved_prompt.id),
                         user_id,
                         model: canonical_clone.clone(),
@@ -579,7 +579,10 @@ async fn chat_completions_inner(
                         completion_tokens,
                         cost_usd: cost,
                         latency_ms,
-                    });
+                    };
+                    // The row above was redacted; the egress must be too (issue #53).
+                    crate::db::prompt_store::redact_callback_content(&state_clone.storage.load(), &mut event);
+                    state_clone.callbacks.dispatch(event);
                 }
                 Err(e) => tracing::error!("Failed to record prompt: {}", e),
             }

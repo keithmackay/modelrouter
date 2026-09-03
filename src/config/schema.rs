@@ -436,7 +436,8 @@ pub struct StorageConfig {
     #[serde(default = "default_true")]
     pub store_prompts: bool,
     /// Store full request messages and response bodies. `false` (default)
-    /// stores metadata only (tokens, cost, model, timestamps).
+    /// stores metadata only (tokens, cost, model, timestamps). Governs the
+    /// callback egress (Langfuse/LangSmith/webhook) as well as the row.
     #[serde(default)]
     pub store_prompt_content: bool,
     /// Purge prompt-log rows older than N days. 0 (default) = keep forever —

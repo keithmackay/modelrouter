@@ -631,6 +631,8 @@ prompt_retention_days = 0     # purge rows older than N days; 0 = keep forever
   working, with `prompt_id` left NULL.
 - `store_prompt_content = false` (the default) stores metadata only — tokens,
   cost, model, timestamps — with a placeholder in place of message bodies.
+  The same policy applies to the observability egress: a Langfuse, LangSmith
+  or webhook backend receives the placeholder too, never the bodies.
   The per-request `X-No-Log: true` header still suppresses the row entirely.
 - `prompt_retention_days > 0` deletes older rows on an hourly check. Deletion
   is strictly opt-in: the default keeps everything forever.

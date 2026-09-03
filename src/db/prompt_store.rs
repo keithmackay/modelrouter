@@ -9,6 +9,7 @@
 //! written regardless of prompt-log policy — when the log row is skipped the
 //! ledger entry simply carries `prompt_id: NULL`.
 
+use crate::callbacks::CallbackEvent;
 use crate::config::schema::StorageConfig;
 use crate::db::models::NewPrompt;
 
@@ -42,6 +43,20 @@ pub fn redact_prompt_content(storage: &StorageConfig, prompt: &mut NewPrompt) {
     }
 }
 
+/// The same content policy for the observability egress (issue #53).
+///
+/// A `CallbackEvent` carries the prompt and response to Langfuse, LangSmith
+/// or a webhook. Those are a stricter retention surface than the local
+/// database, not a looser one, so an operator who has turned content storage
+/// off must not have every prompt shipped to a third party anyway. Both
+/// halves live in this module so the row and the event cannot drift apart.
+pub fn redact_callback_content(storage: &StorageConfig, event: &mut CallbackEvent) {
+    if !storage.store_prompt_content {
+        event.input = serde_json::Value::String(CONTENT_NOT_STORED.to_string());
+        event.output = CONTENT_NOT_STORED.to_string();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +82,42 @@ mod tests {
             attribution_correlation_id: None,
             attribution_tags: "[]".into(),
         }
+    }
+
+    fn sample_event() -> CallbackEvent {
+        CallbackEvent {
+            trace_id: "1".into(),
+            user_id: 1,
+            model: "vertex/anthropic/claude".into(),
+            provider: "vertex".into(),
+            input: serde_json::json!([{"role": "user", "content": "secret"}]),
+            output: "secret answer".into(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cost_usd: 0.01,
+            latency_ms: 123,
+        }
+    }
+
+    #[test]
+    fn default_policy_strips_callback_content_keeps_metadata() {
+        let cfg = StorageConfig::default();
+        let mut ev = sample_event();
+        redact_callback_content(&cfg, &mut ev);
+        assert_eq!(ev.input, serde_json::Value::String(CONTENT_NOT_STORED.into()));
+        assert_eq!(ev.output, CONTENT_NOT_STORED);
+        assert_eq!(ev.prompt_tokens, 10);
+        assert_eq!(ev.cost_usd, 0.01);
+        assert_eq!(ev.model, "vertex/anthropic/claude");
+    }
+
+    #[test]
+    fn content_enabled_leaves_callback_untouched() {
+        let cfg = StorageConfig { store_prompt_content: true, ..Default::default() };
+        let mut ev = sample_event();
+        redact_callback_content(&cfg, &mut ev);
+        assert_eq!(ev.output, "secret answer");
+        assert_eq!(ev.input[0]["content"], "secret");
     }
 
     #[test]
