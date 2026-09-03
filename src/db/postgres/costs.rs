@@ -4,8 +4,8 @@ use async_trait::async_trait;
 
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
 use crate::db::repositories::costs::{
-    AttributionBreakdownRow, AttributionFilter, AttributionTotals, CacheUsageSummary,
-    CostRepository,
+    ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
+    CacheUsageSummary, CostRepository,
 };
 use super::{PostgresDb, now_utc};
 
@@ -366,6 +366,28 @@ impl CostRepository for PostgresDb {
         Ok(rows.into_iter().map(|(m,)| m).collect())
     }
 
+    async fn distinct_providers_in_ledger(&self) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT provider FROM cost_ledger WHERE provider IS NOT NULL ORDER BY provider",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
+    async fn distinct_recent_correlation_ids(&self, limit: i64) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT attribution_correlation_id FROM cost_ledger \
+             WHERE attribution_correlation_id IS NOT NULL AND attribution_correlation_id <> '' \
+             GROUP BY attribution_correlation_id \
+             ORDER BY MAX(created_at) DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     async fn cost_rows_grouped(
         &self,
         filter_user_ids: Option<&[i64]>,
@@ -554,20 +576,7 @@ impl CostRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<AttributionTotals> {
         let (predicate, binds) = attribution_predicate(filter);
-        let n = binds.len();
-        let sql = format!(
-            "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ${} AND created_at < ${}",
-            totals_select(),
-            predicate,
-            n + 1,
-            n + 2
-        );
-        let mut q = sqlx::query_as::<_, TotalsRow>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let row = q.bind(start).bind(end).fetch_one(&self.pool).await?;
-        Ok(totals_from_row(row))
+        self.totals_where(&predicate, binds, start, end).await
     }
 
     async fn attribution_by_model(
@@ -577,22 +586,7 @@ impl CostRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
         let (predicate, binds) = attribution_predicate(filter);
-        let n = binds.len();
-        let sql = format!(
-            "SELECT model, {} FROM cost_ledger \
-             WHERE {} AND created_at >= ${} AND created_at < ${} \
-             GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
-            totals_select(),
-            predicate,
-            n + 1,
-            n + 2
-        );
-        let mut q = sqlx::query_as::<_, BreakdownRow>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(breakdown_from_row).collect())
+        self.by_model_where(&predicate, binds, start, end).await
     }
 
     async fn attribution_by_day(
@@ -602,24 +596,7 @@ impl CostRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
         let (predicate, binds) = attribution_predicate(filter);
-        let n = binds.len();
-        // created_at is an ISO 8601 string column, so the first ten characters
-        // are the calendar day — no timestamp cast needed.
-        let sql = format!(
-            "SELECT substring(created_at from 1 for 10) AS day, {} FROM cost_ledger \
-             WHERE {} AND created_at >= ${} AND created_at < ${} \
-             GROUP BY day ORDER BY day ASC",
-            totals_select(),
-            predicate,
-            n + 1,
-            n + 2
-        );
-        let mut q = sqlx::query_as::<_, BreakdownRow>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(breakdown_from_row).collect())
+        self.by_day_where(&predicate, binds, start, end).await
     }
 
     async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
@@ -660,6 +637,122 @@ impl CostRepository for PostgresDb {
         };
         Ok(rows.into_iter().map(|(v,)| v).collect())
     }
+
+    // ── Comparison arms ──────────────────────────────────────────────────────
+
+    async fn arm_totals(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals> {
+        let (predicate, binds) = arm_predicate(filter);
+        self.totals_where(&predicate, binds, start, end).await
+    }
+
+    async fn arm_by_model(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = arm_predicate(filter);
+        self.by_model_where(&predicate, binds, start, end).await
+    }
+
+    async fn arm_by_day(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = arm_predicate(filter);
+        self.by_day_where(&predicate, binds, start, end).await
+    }
+}
+
+impl PostgresDb {
+    /// `SELECT totals FROM cost_ledger WHERE {predicate} AND window`. The
+    /// predicate uses `$1..$n`; `start`/`end` take `$n+1`/`$n+2`.
+    async fn totals_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals> {
+        let n = binds.len();
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ${} AND created_at < ${}",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        let mut q = sqlx::query_as::<_, TotalsRow>(&sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let row = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(totals_from_row(row))
+    }
+
+    async fn by_model_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let n = binds.len();
+        let sql = format!(
+            "SELECT model, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        self.breakdown_query(&sql, binds, start, end).await
+    }
+
+    async fn by_day_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let n = binds.len();
+        // created_at is an ISO 8601 string column, so the first ten characters
+        // are the calendar day — no timestamp cast needed.
+        let sql = format!(
+            "SELECT substring(created_at from 1 for 10) AS day, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY day ORDER BY day ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        self.breakdown_query(&sql, binds, start, end).await
+    }
+
+    async fn breakdown_query(
+        &self,
+        sql: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let mut q = sqlx::query_as::<_, BreakdownRow>(sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(breakdown_from_row).collect())
+    }
 }
 
 type TotalsRow = (f64, f64, i64, i64, i64, i64);
@@ -692,7 +785,7 @@ fn breakdown_from_row(row: BreakdownRow) -> AttributionBreakdownRow {
 
 /// SQL predicate plus its bound values, in placeholder order. Both the tag key
 /// and its value are bound, so nothing from the caller reaches the SQL text.
-fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
+pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
     match filter {
         AttributionFilter::CorrelationId(v) => (
             "attribution_correlation_id = $1".to_string(),
@@ -702,5 +795,14 @@ fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
             "(attribution_tags::jsonb ->> $1) = $2".to_string(),
             vec![key.clone(), value.clone()],
         ),
+    }
+}
+
+/// SQL predicate plus its bound values for a comparison arm against the ledger.
+fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
+    match filter {
+        ArmFilter::Model(m) => ("model = $1".to_string(), vec![m.clone()]),
+        ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
+        ArmFilter::Attribution(f) => attribution_predicate(f),
     }
 }
