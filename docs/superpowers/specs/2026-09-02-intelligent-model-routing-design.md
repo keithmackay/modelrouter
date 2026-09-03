@@ -59,7 +59,7 @@ candidates by a price it is guessing at. See §7.
   per-provider capacity tracking. The streaming path has no retry/fallback, so
   routing decisions must happen pre-dispatch (they do, in this design).
 - **The response cache sits downstream of this seam and is keyed by the
-  resolved model.** The lookup is at `completions.rs:263-275`; the key is
+  resolved model.** The lookup is at `completions.rs:264-275`; the key is
   `completion_cache_key(&canonical_model, &body)`. The comment at `:82-84`
   records why it is placed after resolution: a cache hit must still be an
   authorized request, and the key must be built from the resolved model. Smart
@@ -144,8 +144,8 @@ Checked against the codebase on 2026-09-02 (`96f8cd48`):
   exists — commit 2971f2b (#34).
 - The response cache is keyed on the resolved canonical model
   (`completion_cache_key(&canonical_model, &body)`,
-  `src/api/routes/completions.rs:266`) and is consulted after resolution
-  (`:263-275`). `VOLATILE_FIELDS` (`src/router/cache/mod.rs:43-51`) strips
+  `src/api/routes/completions.rs:267`) and is consulted after resolution
+  (`:264-275`). `VOLATILE_FIELDS` (`src/router/cache/mod.rs:43-52`) strips
   `session_id` and attribution tags precisely to stop per-engagement tagging
   from fragmenting the cache — the model axis cannot be stripped the same way,
   since it is part of the answer's identity.
@@ -1731,6 +1731,14 @@ Principle: smart routing degrades, never breaks.
   decision row.
 - Migration tests for the new tables on **both** backends; `cargo build
   --features postgres` in CI, per CLAUDE.md.
+- Overlay propagation: a routing-overlay DB write reaches a process whose
+  config-file reload loop is running — the refresh task is independent of that
+  loop and its value is not overwritten by the next tick.
+- Pricing seeding runs on **upgrade** of an existing installation, not only on
+  a fresh install; a ladder naming a model priced only in the built-in table or
+  in `config.toml` still validates after the seed.
+- A CI check asserts `panic = "unwind"` survives in `[profile.release]`, so the
+  guarantee §4c depends on cannot be removed by an unrelated profile edit.
 - Storage: an overlay row overrides the file value for its section and absence
   falls back to the file (the `app_settings` contract); a policy write swaps
   the live snapshot without a restart; `export` then `import` round-trips a
