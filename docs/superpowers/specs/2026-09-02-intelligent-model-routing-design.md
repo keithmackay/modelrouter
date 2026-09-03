@@ -194,9 +194,27 @@ sequence can be reordered without stale numbering:
    read** rather than N sequential gets, give it a slice of the resolution
    deadline (§4f), treat exceeding that slice as a miss, and skip the probe
    entirely when the store reports itself unreachable — the reachability signal
-   already exists (`cache/mod.rs:202`, a real PING for Redis). The probe is an
-   optimisation and must never be able to slow the path it exists to shorten.
-   On a miss, continue.
+   already exists (`cache/mod.rs:202`, a real PING for Redis) — but that check
+   is itself a live round trip, so it is consulted through a short freshness
+   window rather than per request. The probe is an optimisation and must never
+   be able to slow the path it exists to shorten. On a miss, continue.
+
+   **Filter, then de-duplicate, then read.** Members are filtered through the
+   caller's allow/deny rules *before* any key is computed. The cache key omits
+   caller identity by design, so an unfiltered probe would both serve an entry
+   under a key derived from a model the caller is forbidden, and reveal through
+   probe timing that some other caller has asked this question. Members are then
+   de-duplicated, because the key carries the resolved model and not the
+   provider: the same model offered by two providers collapses to one key, and
+   a batched read must not carry it twice.
+
+   **The probe keeps its own counters.** `ResponseCache::lookup` increments
+   global and per-model hit/miss counters on every call, so a fifteen-member
+   probe would book one hit and fourteen misses against models nobody
+   requested — corrupting the statistic that feeds `/health` and the admin
+   cache page. The probe records one accounting event for the request,
+   attributed to the member that hit, with probe-specific counters kept
+   separate.
 
 4. **Classify.** A compact prompt (system prompt + truncated conversation tail)
    goes to the policy's classifier. Response is strict JSON:
@@ -1540,6 +1558,10 @@ Principle: smart routing degrades, never breaks.
 - Multi-replica guard: a nonzero capacity cap plus a declared replica count
   above one refuses to start, naming both values; the same check fires on an
   overlay write that raises a cap above the declared count.
+- Probe: one accounting event per request, not one per member; a key is never
+  computed for a model the caller is denied; provider-collapsed duplicates are
+  read once; an unreachable store skips the probe without a per-request round
+  trip.
 - Queue and admission: concurrent admissions never exceed the live cap; a
   queued request that exceeds either bound spills to the next tier; depth is
   decremented on the timeout path and on cancellation; a release that lands
@@ -1813,13 +1835,17 @@ point for the first deployment that enables queueing: a depth equal to the
 member's `max_concurrent`, so a saturated member holds at most one waiting
 request per in-flight one. Revisit against observed shed rates.
 
-### Still open
+**13.13 The objective stays out of the cache key.** Two identical requests on
+different objectives may resolve to different members, but probing every member
+already lets a `latency` request find an entry a `cost` request stored, so
+adding the objective would fragment the cache to buy nothing. Rejected: keying
+on the objective (fragmentation with no recovered hit). The probe corrections
+that travel with it — filter by allow/deny before computing keys,
+de-duplicate provider-collapsed members, keep probe-specific counters, and
+consult store reachability through a freshness window — are recorded in §4
+*Probe*.
 
-**13.13 Does the objective belong in the cache key?** Two identical requests,
-one `cost` and one `latency`, may resolve to different members and therefore
-different keys — correct, since the answers differ. But a `latency` request
-could legitimately be served by a cached `cost` response. Probing across
-members already covers most of this; whether to make it explicit is unresolved.
+### Still open
 
 ## 14. Revision history
 
@@ -1881,6 +1907,14 @@ codebase:
   fights the live cap. Admission is a compare-and-swap. The default queue depth
   is recorded as an explicit deferral with a starting point rather than
   marked resolved with the number left to the implementer.
+- **13.13 the objective stays out of the cache key** — multi-member probing
+  already achieves the cross-objective hit. The probe's specification is
+  corrected alongside: it filters by the caller's allow/deny rules before
+  computing any key (the key omits caller identity, so an unfiltered probe both
+  serves forbidden models and leaks through timing), de-duplicates
+  provider-collapsed members, and keeps its own counters — a fifteen-member
+  probe would otherwise book fourteen misses against models nobody asked for,
+  corrupting the hit-rate statistic on `/health` and the cache page.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
