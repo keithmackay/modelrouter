@@ -2,10 +2,10 @@
 
 **Date:** 2026-09-02
 **Status:** Approved design, pre-implementation
-**Revision:** 11 — incorporates critical reviews
+**Revision:** 12 — incorporates critical reviews
 [1](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-1.md)
 and [2](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-2.md).
-See §14 for what changed.
+See §14 for what changed; §13 records the decisions and their alternatives.
 
 ## 1. Goal
 
@@ -116,6 +116,28 @@ Checked against the codebase on 2026-09-02 (`96f8cd48`):
 - Live config maps are hot-swapped with `ArcSwap`
   (`RequestRouter::update_db_aliases`, `src/router/engine.rs:36`) — the
   pattern routing policies follow (§5).
+- The `app_settings` overlay is read from the DB **once at startup** into its
+  own `ArcSwap` and is never re-read; `live_settings` is a different value,
+  initialized from the file and re-stored wholesale by the config-file reload
+  loop, which is spawned only when a config path is named and carries no
+  environment source. Hence the dedicated refresh task in §5.
+- Environment override of config fields exists and is tested
+  (`MODELROUTER_<SECTION>__<FIELD>`); `${VAR}` interpolation **inside** TOML
+  values does not. Hence the corrected example in §5.
+- A reserved system user already owns router-initiated spend
+  (`src/api/routes/health.rs`, `health-probe`), and `cost_ledger.user_id` is
+  NOT NULL. Hence the reserved-user decision in §7.0a rather than a nullable
+  column.
+- The `users` table has carried no credential column since migration 012, and
+  `SuperDashboardSession` gates on `role != "superadmin"` alone — any other
+  role is viewer-equivalent with access to every user's prompt and response
+  bodies. Hence the exchanged-session portal in §6b rather than a new role.
+- `CostCalculator::new()` hardcodes roughly thirty models and
+  `new_with_config` merges the file's `[[pricing]]` over them, so "absent from
+  the overlay" is not the same as "unpriced". Hence the seeding in §7.0.
+- `tokio::sync::Semaphore` exposes no waiter count, and shrinking a live
+  permit count requires draining surplus permits. Hence the atomic counter in
+  §4d.
 
 ## 3. Decisions
 
@@ -913,6 +935,26 @@ through `AppState.live_settings`, and as DB-sourced aliases do through
 alias behaviour, not the webhook behaviour — stated explicitly so the
 implementation does not default to `RwLock` or restart-to-apply.
 
+**Other processes need a refresh task of their own.** An in-process write
+refreshes only the process that served it. `app_settings` today is read from
+the DB once at startup into a dedicated `ArcSwap` and never re-read, so on N
+replicas an admin edit reaches one of N until restart — tolerable for a storage
+retention flag, not for a routing ladder or a capacity cap. The routing overlay
+therefore carries a **dedicated, unconditional background refresh task** that
+re-reads its sections on an interval and pushes into the component-owned
+`ArcSwap`, following the alias/failover pattern
+(`RequestRouter::update_db_aliases`, `FallbackChain::update_db_chains`).
+
+It must **not** ride the existing 30-second config-file reload loop, for two
+reasons. That loop is spawned only when `--config` or `MODELROUTER_CONFIG`
+names a path (`src/cli/mod.rs`), so a bare `modelrouter serve` — which still
+loads a config from the default location — never starts it; the hole is
+invisible in container testing because compose and Helm both set the variable,
+and appears only on bare-metal installs. And the loop re-stores `live_settings`
+wholesale from the file, so anything merged into it from the DB is clobbered on
+the next tick, and env-provided values are dropped because that reload path
+carries no environment source.
+
 A config-file change still needs a restart or a config reload, but the file now
 carries only bootstrap, secrets and seeds — none of which an operator tunes
 during a normal day.
@@ -1305,6 +1347,18 @@ visible, which is the achievable goal.
 A ladder member must have a known price before it can serve traffic: either a
 `[[pricing]]` entry for the model, or `free = true` on its provider. The gate
 is enforced at three points:
+
+**"Unpriced" is defined against a seeded overlay.** `CostCalculator::new()`
+hardcodes roughly thirty models and `new_with_config` merges the file's
+`[[pricing]]` entries over them, so there are two price sources the DB knows
+nothing about. A gate checking only the overlay would reject a model the
+operator has already priced; a gate consulting the calculator could not run
+inside the ladder-write transaction. So both sources are seeded into the
+pricing overlay — the built-in table and any file entries — **on first run and
+on upgrade of an existing installation**, not only on fresh install. File
+entries are thereafter a bootstrap input, not a live source the gate consults.
+
+The gate is enforced at three points:
 
 - **Write time** — adding an unpriced member to a ladder is rejected in the
   same transaction, with an error naming the model. Not a warning; the operator
@@ -1847,27 +1901,12 @@ consult store reachability through a freshness window — are recorded in §4
 
 ### Still open
 
+Nothing. The six questions above are resolved; the only item deliberately left
+open is the default queue depth, recorded as an explicit deferral inside 13.12
+with a starting point and the reason a number should not be invented before
+there is traffic to size it against.
+
 ## 14. Revision history
-
-**Revision 2 (2026-09-02)** — incorporates critical review round 2 and the
-operator decision on pricing:
-
-- `ComplexityRouter` is **merged into** SmartRouter rather than coexisting
-  with it; the token heuristic survives as the `token_threshold` classifier
-  and `[routing.complexity]` is translated into an implicit policy (R2 §3.1,
-  option (a)).
-- Cache probe added **before** classification, and the savings metric now
-  reports net of cache displacement (R2 §2.1, §2.2).
-- Estimated ladder-average pricing replaced by a hard **pricing gate**
-  (R2 §2.3).
-- Ladder stored relationally in `routing_policy_members` (R2 §4.7).
-- Added: Postgres migrations and dual repository impls with `*Row` convention
-  (R2 §4.1); audit rows for every mutation (R2 §4.2); `/admin/routing`
-  dashboard page in Phase 1 (R2 §4.3); `virtual_model` advertised by
-  `/v1/models` (R2 §4.5); `ArcSwap` hot-reload stated (R2 §4.6);
-  `MemberHealth` façade (R2 §4.8); `ProviderCapacity` reconfiguration
-  behaviour contrasted with `ConcurrencyLimiter` (R2 §4.9).
-- PR #46 recorded as a ship-blocking dependency (§2).
 
 **Revision 12 (2026-09-02)** — the §13 open questions resolved against the
 codebase:
@@ -1915,6 +1954,21 @@ codebase:
   provider-collapsed members, and keeps its own counters — a fifteen-member
   probe would otherwise book fourteen misses against models nobody asked for,
   corrupting the hit-rate statistic on `/health` and the cache page.
+- **Supporting decisions recorded.** The routing overlay gets a dedicated,
+  unconditional refresh task rather than riding the config-file reload loop —
+  that loop is spawned only when a config path is named, so a bare
+  `modelrouter serve` never starts it, and it re-stores `live_settings`
+  wholesale from the file, clobbering anything merged from the DB. "Unpriced"
+  is defined against an overlay seeded from *both* existing price sources, on
+  upgrade as well as fresh install, since the built-in pricing table and the
+  file's `[[pricing]]` entries are two sources the DB knows nothing about.
+- **Corrections.** Five claims research disproved: `${VAR}` interpolation
+  inside TOML values does not exist; RAII release does not carry over to a
+  shared counter; the `app_settings` overlay is read once at startup into its
+  own `ArcSwap` and is not `live_settings`; the cache probe is neither free nor
+  off-network on the Redis backend and needs its own counters; and "unpriced"
+  had a second source of truth. Revision entries were also re-ordered
+  newest-first — successive inserts had pinned revision 2 above revision 12.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
@@ -2107,6 +2161,26 @@ safety net around it:
   busy cheap tier must not fail requests toward the most expensive rung (§6, §8).
 - The pricing gate extends to `classifier_model` and `judge_model` (§7.0).
 - New §13 records the options still open rather than closing them by default.
+
+**Revision 2 (2026-09-02)** — incorporates critical review round 2 and the
+operator decision on pricing:
+
+- `ComplexityRouter` is **merged into** SmartRouter rather than coexisting
+  with it; the token heuristic survives as the `token_threshold` classifier
+  and `[routing.complexity]` is translated into an implicit policy (R2 §3.1,
+  option (a)).
+- Cache probe added **before** classification, and the savings metric now
+  reports net of cache displacement (R2 §2.1, §2.2).
+- Estimated ladder-average pricing replaced by a hard **pricing gate**
+  (R2 §2.3).
+- Ladder stored relationally in `routing_policy_members` (R2 §4.7).
+- Added: Postgres migrations and dual repository impls with `*Row` convention
+  (R2 §4.1); audit rows for every mutation (R2 §4.2); `/admin/routing`
+  dashboard page in Phase 1 (R2 §4.3); `virtual_model` advertised by
+  `/v1/models` (R2 §4.5); `ArcSwap` hot-reload stated (R2 §4.6);
+  `MemberHealth` façade (R2 §4.8); `ProviderCapacity` reconfiguration
+  behaviour contrasted with `ConcurrencyLimiter` (R2 §4.9).
+- PR #46 recorded as a ship-blocking dependency (§2).
 
 **Revision 1 (2026-09-02)** — incorporates critical review round 1: per-candidate
 policy filtering, per-key learning opt-in, session-affinity claim removed,
