@@ -140,6 +140,23 @@ fn print_audit_rows(rows: Vec<AuditRow>, fmt: OutputFormat) {
 
 const CONFIG_TEMPLATE: &str = include_str!("../../config.example.toml");
 
+/// The template ships a placeholder signing key so the file is readable as
+/// documentation. `serve` refuses to start on that value, so `init` must
+/// substitute a real one — otherwise the quickstart it prints leads straight
+/// into a refusal.
+fn config_template_with_generated_secret() -> String {
+    use rand::Rng;
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut rng = rand::thread_rng();
+    let secret: String = (0..64)
+        .map(|_| HEX[rng.gen_range(0..HEX.len())] as char)
+        .collect();
+    CONFIG_TEMPLATE.replace(
+        crate::config::schema::PLACEHOLDER_JWT_SECRET,
+        &secret,
+    )
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => {
@@ -168,7 +185,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim().eq_ignore_ascii_case("y") {
-                    tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;
+                    tokio::fs::write(&config_path, config_template_with_generated_secret()).await?;
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -181,7 +198,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             } else {
-                tokio::fs::write(&config_path, CONFIG_TEMPLATE).await?;
+                tokio::fs::write(&config_path, config_template_with_generated_secret()).await?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
