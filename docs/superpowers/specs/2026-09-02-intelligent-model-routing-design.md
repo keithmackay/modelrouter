@@ -229,6 +229,17 @@ sequence can be reordered without stale numbering:
    its trigger: `all` chat-completion requests from assigned users/keys, or
    only requests naming the policy's `virtual_model` (e.g. `"auto"`).
 
+   **A `virtual_model` name must not collide with an alias.** *Match* runs at
+   the pre-routing seam, ahead of the resolution order CLAUDE.md documents,
+   where alias lookup is step 1 — so a policy named `auto` would silently
+   shadow a configured or DB-sourced `auto` alias. That is the failure class
+   §2 names: two components rewriting the caller's model with no stated
+   precedence. The alias keeps step 1 because it is the older, documented
+   surface, and a policy whose `virtual_model_name` matches a configured or
+   DB alias is **rejected at policy write time**, alongside the unpriced-member
+   and unregistered-plugin rejections. This matters doubly because §5 has
+   `/v1/models` advertise policy names and aliases in one namespace.
+
    On a match the core does three cheap things, all in memory or one query:
    starts the resolution deadline (§4f); **fetches the caller's budget and
    allow/deny rules once**, to be reused by every later step; and computes the
@@ -881,7 +892,7 @@ flows DB→file as well as file→DB.
 
 ### DB tables
 
-Five migrations, each with a SQLite file and a Postgres counterpart, numbered
+Six migrations, each with a SQLite file and a Postgres counterpart, numbered
 from the next free slot. These tables are **authoritative**, not a mirror of
 anything:
 
@@ -892,6 +903,7 @@ anything:
 | `migrations/030_routing_decisions.sql` | `migrations/postgres/030_routing_decisions.sql` | `routing_decisions`, `model_quality_stats` |
 | `migrations/031_routing_experiments.sql` | `migrations/postgres/031_routing_experiments.sql` | `experiments`; `experiment_id`/`variant` on `routing_decisions` |
 | `migrations/032_routing_rubrics.sql` | `migrations/postgres/032_routing_rubrics.sql` | `routing_policy_rubrics` |
+| `migrations/033_cost_ledger_spend_kind.sql` | `migrations/postgres/033_cost_ledger_spend_kind.sql` | `spend_kind` on `cost_ledger` — additive `NOT NULL DEFAULT 'user'` per migration 022's shape, values `user` / `shadow` / `classifier` / `judge` / `probe`, backfilling existing `health-probe` rows to `probe` (§7.0a) |
 
 Repository traits live in `src/db/repositories/routing.rs` with implementations
 in `src/db/sqlite/routing.rs` and `src/db/postgres/routing.rs`. Each table that
@@ -1674,6 +1686,8 @@ Principle: smart routing degrades, never breaks.
   credential or endpoint field; a partial write leaves sibling knobs unchanged
   rather than resetting them to defaults; existing file values for the moved
   fields are seeded into the overlay on first run.
+- Name collision: a policy whose `virtual_model_name` matches a configured or
+  DB-sourced alias is rejected at write time, naming both.
 - Validity gate, per row of §4e: an out-of-range tier clamps, an unknown
   category becomes `other` without creating a stats cell, a bad
   `X-Routing-Objective` is 400, an unknown experiment variant is 400, a
