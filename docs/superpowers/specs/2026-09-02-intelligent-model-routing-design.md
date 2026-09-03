@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-02
 **Status:** Approved design, pre-implementation
-**Revision:** 15 — incorporates critical reviews
+**Revision:** 16 — incorporates critical reviews
 [1](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-1.md)
 and [2](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-2.md).
 See §14 for what changed; §13 records the decisions and their alternatives.
@@ -1654,7 +1654,11 @@ overrides, or a policy id the run pins to — applied for the run's duration. Th
 single-model case stays the common one; it is just an overlay of size one.
 
 - `experiments` table: `id`, `name`, `variants` (JSON: label → routing
-  overlay), `status` (active | closed), `feed_learning` (bool), `created_at`.
+  overlay), `status` (active | closed), `feed_learning` (bool), `expires_at`,
+  `created_at`. `expires_at` is **required at creation and has no default**
+  (§7c) — `0`, meaning never, is a permitted answer but not a permitted
+  silence. An expired experiment stops assigning variants and closes itself;
+  closing is what starts any content-retention clock.
   Managed via `/admin/api/routing/experiments`, the Routing page, and
   `modelrouter routing experiment add|list|close`. Every model an overlay can
   reach is subject to the pricing gate (§7.0) — an unpriced model anywhere in a
@@ -1841,16 +1845,50 @@ that switch. The scope is the participating requests and nothing else: traffic
 outside the experiment is unaffected, and the global configuration is not
 edited to enable an experiment.
 
-**It is bounded in time, not only in scope.** A retention override with no
-expiry is a permanent policy change wearing a temporary label. The experiment
-row therefore carries `retain_content` and `content_retention_days`, closing
-the experiment starts the clock, and the retention default is **finite** — 30
-days — rather than the global `prompt_retention_days = 0` meaning "keep
-forever". The two defaults differ on purpose and for symmetric reasons: global
-deletion is opt-in so an upgrade cannot silently discard logs an operator was
-relying on, while experiment content exists *only* because of an override and
-should expire unless someone renews it. Purging is the existing retention
-sweep, given the experiment's window.
+**It is bounded in time, and the bound is never inferred.** A retention
+override with no expiry is a permanent policy change wearing a temporary label.
+So the experiment row carries `retain_content` and `content_retention_days`,
+closing the experiment starts the clock — and **neither an experiment's
+`expires_at` nor its retention period has a default**. Both are required at
+creation, in the dashboard, in the REST API and on the CLI alike. `0`, meaning
+never, is a permitted answer; it is not a permitted silence. Purging is the
+existing retention sweep, given the experiment's window.
+
+Requiring the answer rather than defaulting it is the whole mechanism, because
+the alternative fails in the worst direction. A default of 30 days deletes
+someone's evidence on a schedule they never agreed to; a default of 0 accrues
+conversation bodies forever under a setting nobody read. Neither is a decision
+anyone made. Forcing the choice costs one form field and makes the retention
+period something a person chose and the audit log can attribute.
+
+**Unset and never must not collapse into each other.** They are one careless
+line apart at three layers, and the collapse always fails toward "keep
+forever":
+
+- **Serde.** A field with no `#[serde(default)]` is already required — absence
+  is a deserialization error, which is the behaviour wanted. The hazard is
+  habit: nearly every config struct in this repo carries `#[serde(default)]`,
+  and adding it here to match the surrounding style silently converts
+  "required" into "defaults to 0, which means never expires". The API returns
+  **400 naming the missing field** instead.
+- **Clap.** The CLI flag is `required = true` with **no `default_value`**. A
+  `default_value` is precisely why `serve` ignores `[server] port` today: the
+  flag always has a value, so the configured one can never win. The same
+  mistake here would make every CLI-created experiment permanent.
+- **HTML.** A `<select>` with no `selected` attribute submits its first option,
+  so an option list beginning with "Never" chooses never for anyone who does
+  not touch the control. The first option is therefore an empty,
+  non-submittable placeholder and the control carries `required`; "Never" is a
+  deliberate selection further down the list.
+
+The column is `NOT NULL` with no SQL `DEFAULT`, so the same rule holds for
+anything writing the table directly.
+
+**Choosing "never" is recorded and stays visible.** The audit entry names the
+value chosen, including never, so "who decided this retains forever" has an
+answer. An experiment that both retains content and never expires is badged in
+the experiments list and on the comparison page, because it is the one
+combination that accrues data indefinitely with nothing scheduled to stop it.
 
 **Enabling it is a superadmin write, and audited.** Storing conversation bodies
 is a disclosure decision rather than a routing one, so it takes
@@ -2338,12 +2376,18 @@ better" from metadata, so it needs the inputs and outputs that
 `store_prompt_content = false` withholds. Rejected: flipping the global default
 (it would retain bodies for every deployment to serve a minority of traffic,
 discarding a privacy decision that was made deliberately); and a bare boolean
-with no expiry, which is a permanent policy change wearing a temporary label —
-hence `content_retention_days`, defaulting to a finite 30 days on experiment
-close. The two retention defaults now differ, and symmetrically: global
-deletion is opt-in because an upgrade must not silently discard logs an
-operator relied on, while experiment content exists only because of an override
-and should lapse unless renewed. `X-No-Log` outranks the override, so being
+with no expiry, which is a permanent policy change wearing a temporary label.
+
+**Superseded 2026-09-03: the expiry is required, not defaulted.** Revision 15
+gave `content_retention_days` a default of 30 days. That was wrong in both
+directions — a 30-day default deletes evidence on a schedule the operator never
+agreed to, and any default of 0 accrues conversation bodies forever under a
+setting nobody read. Creating an experiment now requires an explicit
+`expires_at` and, when content is retained, an explicit retention period.
+Never (`0`) remains available; it must be chosen rather than inherited. §7c
+carries the three places where "unset" and "never" collapse into each other —
+serde, clap and HTML — because each of them fails toward "keep forever".
+`X-No-Log` outranks the override, so being
 swept into an experiment never reverses a caller's own opt-out. And retention
 is explicitly not egress: §7c stores locally and changes nothing about the
 callback backends — which is only safe once the redaction defect in §2 is
@@ -2360,6 +2404,33 @@ would make non-routing dimensions self-describing).
 
 ## 14. Revision history
 
+**Revision 16 (2026-09-03)** — the experiment expiry is required, not
+defaulted:
+
+- **Creating an experiment requires an explicit expiry**, in the dashboard, the
+  REST API and the CLI alike. `0` (never) is a permitted answer, not a
+  permitted silence. Revision 15's 30-day default is **superseded and corrected
+  in place** in both §7c and 13.21, rather than layered over: it was wrong in
+  both directions, since a finite default deletes evidence on a schedule nobody
+  agreed to and a zero default accrues conversation bodies forever under a
+  setting nobody read.
+- **§7c names the three places "unset" and "never" collapse**, because each
+  fails toward keep-forever: a `#[serde(default)]` added to match the
+  surrounding style (nearly every config struct here has one) turns required
+  into never; a clap `default_value` does the same, and is already why `serve`
+  ignores `[server] port`; and an HTML `<select>` submits its first option, so
+  a list beginning with "Never" chooses never for anyone who does not touch the
+  control. Absent field → 400 naming it; `required = true` with no default;
+  an empty non-submittable first option. Column is `NOT NULL` with no SQL
+  `DEFAULT`.
+- **`expires_at` added to the `experiments` table** in §7a. An expired
+  experiment stops assigning variants and closes itself; closing starts any
+  content-retention clock.
+- **Choosing never is audited and badged.** The audit entry names the value,
+  and an experiment that both retains content and never expires is marked in
+  the experiments list and on the comparison page — the one combination that
+  accrues indefinitely with nothing scheduled to stop it.
+
 **Revision 15 (2026-09-03)** — experiment traffic stores its inputs and
 outputs, as a scoped exception rather than a new default:
 
@@ -2375,6 +2446,9 @@ outputs, as a scoped exception rather than a new default:
   `prompt_retention_days = 0` (keep forever). The asymmetry is the point:
   global deletion is opt-in so an upgrade cannot discard logs an operator
   relied on, while experiment content exists only because of an override.
+  **Superseded by revision 16:** there is no default at all; the expiry is
+  required at creation. This entry records what revision 15 said, not current
+  behaviour.
 - **Storage is not egress**, stated explicitly because the shipped code does
   not currently honour the distinction.
 - **New known defect in §2: content redaction is not applied to the callback
