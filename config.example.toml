@@ -43,17 +43,17 @@ default_model = "gpt-4o"
 # Providers
 # ---------------------------------------------------------------------------
 [providers.openai]
-api_key  = ""          # or set MODELROUTER__PROVIDERS__OPENAI__API_KEY
+api_key  = ""          # or set MODELROUTER_PROVIDERS__OPENAI__API_KEY
 # api_base = "https://api.openai.com/v1"
 timeout_secs = 60
 
 [providers.anthropic]
-api_key  = ""          # or set MODELROUTER__PROVIDERS__ANTHROPIC__API_KEY
+api_key  = ""          # or set MODELROUTER_PROVIDERS__ANTHROPIC__API_KEY
 # api_base = "https://api.anthropic.com"
 timeout_secs = 60
 
 [providers.gemini]
-api_key  = ""          # or set MODELROUTER__PROVIDERS__GEMINI__API_KEY
+api_key  = ""          # or set MODELROUTER_PROVIDERS__GEMINI__API_KEY
 # api_base = "https://generativelanguage.googleapis.com/v1beta/openai"
 timeout_secs = 60
 
@@ -66,7 +66,7 @@ timeout_secs = 120
 # additional engines can be added to src/providers/search_registry.rs and
 # configured the same way under [providers.<engine>].
 # [providers.tavily]
-# api_key  = ""          # or set MODELROUTER__PROVIDERS__TAVILY__API_KEY
+# api_key  = ""          # or set MODELROUTER_PROVIDERS__TAVILY__API_KEY
 # api_base = "https://api.tavily.com"
 # timeout_secs = 30
 

@@ -443,6 +443,9 @@ pub struct McpServer {
     pub description: Option<String>,
     pub enabled: bool,
     pub created_at: String,
+    /// Who registered it. `None` for rows created before ownership existed;
+    /// those are not mutable through the key-authenticated API.
+    pub owner_user_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -450,6 +453,8 @@ pub struct NewMcpServer {
     pub name: String,
     pub url: String,
     pub description: Option<String>,
+    #[serde(skip)]
+    pub owner_user_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +552,7 @@ mod mcp_tests {
     #[test]
     fn mcp_server_roundtrip() {
         let s = McpServer {
+            owner_user_id: None,
             id: 1,
             name: "my-server".to_string(),
             url: "https://example.com/mcp".to_string(),

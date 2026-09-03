@@ -89,3 +89,11 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing", "experimental_metrics_periodic_reader_no_runtime"] }
+
+[profile.release]
+# Pinned ahead of the routing plugin runtime (design spec §4c): plugins will run
+# on the blocking pool with panics surfaced as `JoinError`, which only works
+# while panics unwind. Switching to `panic = "abort"` would silently delete that
+# guarantee before it is ever built. Do not change without reading §4c.
+# `unwind` is already the release default, so this pin is behaviourally inert.
+panic = "unwind"

@@ -13,6 +13,7 @@ struct McpServerRow {
     description: Option<String>,
     enabled: bool,
     created_at: String,
+    owner_user_id: Option<i64>,
 }
 
 impl From<McpServerRow> for McpServer {
@@ -24,6 +25,7 @@ impl From<McpServerRow> for McpServer {
             description: r.description,
             enabled: r.enabled,
             created_at: r.created_at,
+            owner_user_id: r.owner_user_id,
         }
     }
 }
@@ -33,14 +35,15 @@ impl McpServerRepository for PostgresDb {
     async fn create_mcp_server(&self, server: NewMcpServer) -> anyhow::Result<McpServer> {
         let now = now_utc();
         let row = sqlx::query_as::<_, McpServerRow>(
-            r#"INSERT INTO mcp_servers (name, url, description, enabled, created_at)
-               VALUES ($1, $2, $3, true, $4)
-               RETURNING id, name, url, description, enabled, created_at"#
+            r#"INSERT INTO mcp_servers (name, url, description, enabled, created_at, owner_user_id)
+               VALUES ($1, $2, $3, true, $4, $5)
+               RETURNING id, name, url, description, enabled, created_at, owner_user_id"#
         )
         .bind(&server.name)
         .bind(&server.url)
         .bind(&server.description)
         .bind(&now)
+        .bind(server.owner_user_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(McpServer::from(row))
@@ -48,7 +51,7 @@ impl McpServerRepository for PostgresDb {
 
     async fn list_mcp_servers(&self) -> anyhow::Result<Vec<McpServer>> {
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, name, url, description, enabled, created_at FROM mcp_servers ORDER BY id"
+            "SELECT id, name, url, description, enabled, created_at, owner_user_id FROM mcp_servers ORDER BY id"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -57,7 +60,7 @@ impl McpServerRepository for PostgresDb {
 
     async fn get_mcp_server(&self, id: i64) -> anyhow::Result<Option<McpServer>> {
         let row = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, name, url, description, enabled, created_at FROM mcp_servers WHERE id = $1"
+            "SELECT id, name, url, description, enabled, created_at, owner_user_id FROM mcp_servers WHERE id = $1"
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -86,7 +89,7 @@ impl McpServerRepository for PostgresDb {
         }
 
         let sql = format!(
-            "UPDATE mcp_servers SET {} WHERE id = ${} RETURNING id, name, url, description, enabled, created_at",
+            "UPDATE mcp_servers SET {} WHERE id = ${} RETURNING id, name, url, description, enabled, created_at, owner_user_id",
             sets.join(", "),
             param_idx
         );

@@ -34,7 +34,7 @@ async fn test_app() -> TestServer {
 
     let state = AppState {
         settings: settings.clone(),
-        db,
+        db: db.clone(),
         pool: None,
         router,
         cost_calc,

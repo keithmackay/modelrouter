@@ -55,6 +55,7 @@ async fn declarative_rule_denies_disallowed_model() {
         budget_usd: None,
         window: "monthly".to_string(),
         priority: 10,
+        cache: None,
     };
     let settings = settings_with_rules(vec![rule]);
     let engine = PolicyEngine::new(db).with_settings(settings);
@@ -82,6 +83,7 @@ async fn declarative_rule_allows_permitted_model() {
         budget_usd: None,
         window: "monthly".to_string(),
         priority: 10,
+        cache: None,
     };
     let settings = settings_with_rules(vec![rule]);
     let engine = PolicyEngine::new(db).with_settings(settings);
@@ -104,6 +106,7 @@ async fn declarative_rule_allows_under_budget() {
         budget_usd: Some(100.0),
         window: "monthly".to_string(),
         priority: 5,
+        cache: None,
     };
     let settings = settings_with_rules(vec![rule]);
     let engine = PolicyEngine::new(db).with_settings(settings);
@@ -129,6 +132,7 @@ async fn no_matching_rule_falls_through_to_db_rules() {
         budget_usd: None,
         window: "monthly".to_string(),
         priority: 10,
+        cache: None,
     };
     let settings = settings_with_rules(vec![rule]);
     let engine = PolicyEngine::new(db).with_settings(settings);

@@ -11,6 +11,7 @@ struct McpServerRow {
     description: Option<String>,
     enabled: i64,
     created_at: String,
+    owner_user_id: Option<i64>,
 }
 
 impl From<McpServerRow> for McpServer {
@@ -22,6 +23,7 @@ impl From<McpServerRow> for McpServer {
             description: r.description,
             enabled: r.enabled != 0,
             created_at: r.created_at,
+            owner_user_id: r.owner_user_id,
         }
     }
 }
@@ -31,18 +33,19 @@ impl McpServerRepository for SqliteDb {
     async fn create_mcp_server(&self, server: NewMcpServer) -> anyhow::Result<McpServer> {
         let now = now_utc();
         let result = sqlx::query(
-            "INSERT INTO mcp_servers (name, url, description, enabled, created_at) VALUES (?, ?, ?, 1, ?)"
+            "INSERT INTO mcp_servers (name, url, description, enabled, created_at, owner_user_id) VALUES (?, ?, ?, 1, ?, ?)"
         )
         .bind(&server.name)
         .bind(&server.url)
         .bind(&server.description)
         .bind(&now)
+        .bind(server.owner_user_id)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, name, url, description, enabled, created_at FROM mcp_servers WHERE id = ?"
+            "SELECT id, name, url, description, enabled, created_at, owner_user_id FROM mcp_servers WHERE id = ?"
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -52,7 +55,7 @@ impl McpServerRepository for SqliteDb {
 
     async fn list_mcp_servers(&self) -> anyhow::Result<Vec<McpServer>> {
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, name, url, description, enabled, created_at FROM mcp_servers ORDER BY id"
+            "SELECT id, name, url, description, enabled, created_at, owner_user_id FROM mcp_servers ORDER BY id"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -61,7 +64,7 @@ impl McpServerRepository for SqliteDb {
 
     async fn get_mcp_server(&self, id: i64) -> anyhow::Result<Option<McpServer>> {
         let row = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, name, url, description, enabled, created_at FROM mcp_servers WHERE id = ?"
+            "SELECT id, name, url, description, enabled, created_at, owner_user_id FROM mcp_servers WHERE id = ?"
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -132,6 +135,7 @@ mod tests {
     async fn test_create_and_list() {
         let db = test_db().await;
         let server = db.create_mcp_server(NewMcpServer {
+            owner_user_id: None,
             name: "test".to_string(),
             url: "https://example.com".to_string(),
             description: None,
@@ -147,6 +151,7 @@ mod tests {
     async fn test_get() {
         let db = test_db().await;
         let created = db.create_mcp_server(NewMcpServer {
+            owner_user_id: None,
             name: "get-test".to_string(),
             url: "https://example.com".to_string(),
             description: Some("desc".to_string()),
@@ -164,6 +169,7 @@ mod tests {
     async fn test_update() {
         let db = test_db().await;
         let created = db.create_mcp_server(NewMcpServer {
+            owner_user_id: None,
             name: "update-test".to_string(),
             url: "https://old.com".to_string(),
             description: None,
@@ -185,6 +191,7 @@ mod tests {
     async fn test_delete() {
         let db = test_db().await;
         let created = db.create_mcp_server(NewMcpServer {
+            owner_user_id: None,
             name: "delete-test".to_string(),
             url: "https://example.com".to_string(),
             description: None,

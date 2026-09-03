@@ -651,7 +651,37 @@ impl Default for AuthConfig {
     }
 }
 
-fn default_jwt_secret() -> String { "change-me-jwt-secret".to_string() }
+pub const PLACEHOLDER_JWT_SECRET: &str = "change-me-jwt-secret";
+
+fn default_jwt_secret() -> String { PLACEHOLDER_JWT_SECRET.to_string() }
+
+impl AuthConfig {
+    /// `Err` when the signing key is unset or still the shipped placeholder.
+    ///
+    /// Every admin and dashboard session is authenticated by an HS256 signature
+    /// over this value and nothing else, so an empty or well-known secret makes
+    /// every session token forgeable. This is not hypothetical: the Helm chart
+    /// shipped `jwt_secret = ""` in its ConfigMap on the assumption an env var
+    /// overrode it, and a prefix typo in the env name meant it never did.
+    pub fn validate_secret(&self) -> anyhow::Result<()> {
+        if self.jwt_secret.trim().is_empty() {
+            anyhow::bail!(
+                "auth.jwt_secret is empty. Every admin session token is signed with it, so an empty \
+                 value makes them all forgeable. Set it in config.toml or via \
+                 MODELROUTER_AUTH__JWT_SECRET (note: one underscore after the prefix, two between \
+                 path segments). Refusing to start."
+            );
+        }
+        if self.jwt_secret == PLACEHOLDER_JWT_SECRET {
+            anyhow::bail!(
+                "auth.jwt_secret is still the shipped placeholder value. It is published in this \
+                 repository, so anyone can forge an admin session. Set a real secret in config.toml \
+                 or via MODELROUTER_AUTH__JWT_SECRET. Refusing to start."
+            );
+        }
+        Ok(())
+    }
+}
 fn default_jwt_expiry_mins() -> i64 { 60 }
 fn default_rotation_overlap_mins() -> i64 { 15 }
 
