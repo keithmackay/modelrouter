@@ -89,3 +89,10 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing", "experimental_metrics_periodic_reader_no_runtime"] }
+
+[profile.release]
+# Pinned deliberately: routing plugins run on the blocking pool and their panics
+# are caught as `JoinError`, which only works while panics unwind. Switching to
+# `panic = "abort"` would silently delete that guarantee — a panicking plugin
+# would end the process instead of abstaining. See the routing design spec, §4c.
+panic = "unwind"
