@@ -210,7 +210,9 @@
         var y = d3.scaleLinear().domain([0, (d3.max(all, function(p) { return p.v; }) || 1) * 1.05]).range([f.h, 0]);
 
         f.svg.append('g').attr('transform', 'translate(0,' + f.h + ')')
-            .call(d3.axisBottom(x).ticks(5).tickFormat(d3.timeFormat('%m/%d')))
+            // Whole days only: a short series otherwise gets sub-day ticks that
+            // all print the same date.
+            .call(d3.axisBottom(x).ticks(d3.timeDay.every(Math.max(1, Math.ceil(d3.timeDay.count(x.domain()[0], x.domain()[1]) / 6)))).tickFormat(d3.timeFormat('%m/%d')))
             .selectAll('text').style('font-size', '0.7rem');
         f.svg.append('g')
             .call(d3.axisLeft(y).ticks(5).tickFormat(function(d) { return '$' + d.toFixed(2); }))
