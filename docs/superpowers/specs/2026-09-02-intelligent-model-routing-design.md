@@ -1266,12 +1266,55 @@ or while resolution latency exceeds its threshold. Each suppression is counted,
 so the sample loss is visible rather than inferred from a thin comparison
 report.
 
-Shadow requests write ordinary `routing_decisions` rows with `is_shadow = true`
-and are excluded from savings reporting. They are **real spend**: the tokens
-are billed by the provider and must be recorded in the cost ledger. Whose
-budget they land on is deliberately left open (§13.10) — charging the
-triggering user for an experiment they did not ask for is wrong, and charging
-nobody makes the ledger lie.
+**Mirroring requires an explicit data-sharing opt-in.** A mirrored request
+sends the caller's prompt to a provider the caller never chose, and the member
+being trialled may be a different vendor entirely. That is a disclosure
+decision, not a routing one: shadow is off by default, enabling it per policy
+states which provider receives mirrored content, and the `X-No-Log` discipline
+that governs prompt storage governs mirroring too — a request that opts out of
+logging is never mirrored.
+
+**Whose budget: a reserved user, plus a `spend_kind` column.** Shadow requests
+write ordinary `routing_decisions` rows with `is_shadow = true`, and their
+tokens are real spend that must reach the cost ledger. They are attributed to a
+lazily-created reserved user, exactly as `src/api/routes/health.rs` already
+does for probe spend — *"probes are real provider calls and must appear in the
+ledger like any other call, attributed to a stable system user so their spend
+is visible and separable."* Same question, answered once already.
+
+The reserved user alone is not enough, because the cache "requests" denominator
+is `COUNT(*)` over the whole ledger in five query builders, and "not the router
+user" cannot be expressed there without hardcoding an id lookup into each. So
+`cost_ledger` gains `spend_kind`, following migration 022's additive
+`ALTER TABLE … NOT NULL DEFAULT` shape, with values `user`, `shadow`,
+`classifier`, `judge`, and `probe`. Unlike 022 — where `cache_hit = 0` was true
+of every backfilled row — the default is *not* true of rows that already exist:
+the migration backfills existing probe rows to `probe` rather than relying on
+it.
+
+**Shadow gets its own ceiling, and is excluded from the global sum.** Gating
+mirroring on the global budget is not sufficient. Shadow rows sit inside
+`sum_global_since`, which has no user predicate, so an experiment consumes the
+headroom that pushes the next *real* request over a global rule's limit and
+into a 429. Shadow therefore carries a dedicated ceiling checked before
+mirroring fires, and router-owned rows are excluded from the global sum. The
+ceiling check must be atomic against concurrent launches — a read-then-fire
+gate admits a burst past it. This matters doubly because a shadow request is
+spawned after the response and never passes through `PolicyEngine::check` at
+all.
+
+**The reserved row must not be able to authenticate — as an invariant, not an
+observation.** Migration 012 removed inline user keys and auth resolves through
+`api_keys`, so a lazily-created user has no credential *today*. But both
+key-creation paths find-or-create a user by name, so typing the reserved name
+into the admin key form would attach a live credential to the shadow identity
+and produce real traffic under an identity excluded from savings and the cache
+denominator. Reserved system names are rejected at both key-creation paths.
+
+Two rough edges, recorded rather than hidden: the reserved user appears in the
+admin user list beside `health-probe`, and the disable control on it appears to
+work and does nothing — a false kill switch. The real control is the
+per-policy `shadow` setting.
 
 ### 7.1 Adaptive allocation (Phase 2)
 
@@ -1419,6 +1462,11 @@ Principle: smart routing degrades, never breaks.
 - Multi-replica guard: a nonzero capacity cap plus a declared replica count
   above one refuses to start, naming both values; the same check fires on an
   overlay write that raises a cap above the declared count.
+- Shadow accounting: router-owned rows are excluded from the cache-hit
+  denominator and from the global budget sum; mirroring stops at its own
+  ceiling under concurrent launches; creating an API key for the reserved user
+  fails; existing probe rows read as `probe` after migration; a request
+  carrying `X-No-Log` is never mirrored.
 - Provider split: an overlay write to `provider_ops` cannot alter any
   credential or endpoint field; a partial write leaves sibling knobs unchanged
   rather than resetting them to defaults; existing file values for the moved
@@ -1641,13 +1689,20 @@ credential is presented to; `timeout_secs` stays because adapters bake it into
 cached clients, so an overlay value would never take effect. The env-reference
 variant is the recorded follow-on, blocked on the Helm prefix defect.
 
-### Still open
+**13.10 Shadow spend → a reserved user plus a `spend_kind` column, on its own
+ceiling.** Rejected: charging the triggering user (they did not ask for the
+experiment, and per-user budget sums cannot exclude it); making
+`cost_ledger.user_id` nullable (a SQLite table rebuild, a breaking archive
+format change, and eleven `JOIN users` sites that would silently drop the rows,
+making the headline spend figure under-report real money); the `project` column
+as sole carrier (already used this way by the health-probe precedent, but
+caller-settable through the `x-project` header and therefore spoofable, so it
+cannot be the exclusion predicate). Taken: the health-probe pattern, plus a
+column because the cache denominator counts the whole ledger, plus a dedicated
+shadow ceiling because global-budget gating still denies real users at the
+margin (§7.0a).
 
-**13.10 Whose budget do shadow tokens land on?** Shadow requests are real
-spend. Charging the triggering user for an experiment they did not request is
-wrong; charging nobody makes the ledger lie; charging a global "experiments"
-pseudo-scope needs a budget scope that does not exist yet. Blocks nothing until
-shadow ships, but must be answered before it does.
+### Still open
 
 **13.11 What exactly does the key-owner view expose?** Delegated rubric editing
 needs a non-admin surface (§6b). Minimal version: this key's rubric plus its
@@ -1707,6 +1762,14 @@ codebase:
   and seeds existing file values rather than reverting them at upgrade.
   Corrected: `${VAR}` interpolation inside TOML values does not exist — the
   supported override is `MODELROUTER_<SECTION>__<FIELD>`.
+- **13.10 shadow spend → a reserved user and a `spend_kind` column**, following
+  the `health-probe` precedent that already answered this question for probe
+  spend. The column is load-bearing rather than tidy: the cache-hit denominator
+  counts the whole ledger in five query builders. Shadow also gains its own
+  ceiling and is excluded from the global sum, because gating on the global
+  budget only stops mirroring *after* it has consumed the headroom that denies
+  the next real request. Mirroring now requires an explicit data-sharing opt-in
+  — it sends a caller's prompt to a provider the caller never chose.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
