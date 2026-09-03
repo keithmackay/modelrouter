@@ -76,6 +76,47 @@ candidates by a price it is guessing at. See §7.
   Athena's cost attribution) lands on the same deployment piloting Phase 2.
   Smart routing should not ship before #46 merges.
 
+### Known defects this design depends on
+
+Found while researching the §13 decisions. None is caused by this design; two
+gate a phase of it. They are recorded here rather than only in a tracker,
+because a reader deciding whether a phase is ready needs them in the same place
+as the decisions that depend on them.
+
+- **The Helm environment-variable prefix is wrong chart-wide, and the JWT
+  secret is empty as a result.** `src/config/mod.rs` builds its environment
+  source with prefix `MODELROUTER` and separator `__`, so a name must read
+  `MODELROUTER_<SECTION>__<FIELD>`. `deploy/helm/modelrouter/templates/deployment.yaml`
+  uses a doubled prefix separator on four entries — the provider-key loop,
+  `MODELROUTER__AUTH__JWT_SECRET`, and `MODELROUTER__DATABASE__PATH` twice,
+  including the migrate initContainer. Each strips to a top-level key `Settings`
+  has no field for, and serde discards it silently. So Kubernetes provider
+  secrets never reach `ProviderConfig::api_key`, and because the chart's
+  ConfigMap ships `jwt_secret = ""` on the assumption the env var overrides it,
+  **every Helm deployment signs sessions with an empty secret**.
+  `config.example.toml` documents the broken form on four comment lines;
+  `docker-compose.yml` already uses the correct single-underscore form, so the
+  fix follows an in-repo pattern.
+  **Gates §5's env-reference follow-on and §6b's portal** — the portal's only
+  protection is a signature made with that secret.
+- **`/v1/mcp/servers` writes are unscoped.** `src/api/routes/mcp.rs` POST,
+  PATCH and DELETE bind `_user: AuthenticatedUser` and discard the identity, so
+  any valid API key can create, edit, or delete any MCP server. Relevant here
+  as precedent rather than dependency: §6b's portal must *use* the key identity
+  it authenticates, not merely require one.
+- **`/admin/reports` returns 500 on Postgres once any health probe has run.**
+  `src/api/routes/health.rs` writes `attribution_tags: "[]"` where every other
+  writer uses `"{}"`; Postgres `jsonb_object_keys` raises on an array and the
+  handler maps it to a 500 for the whole page. SQLite tolerates it, so this
+  appears only in the `--features postgres` build. §7.0a's shadow writer must
+  use `"{}"`, and the existing rows want backfilling alongside the `spend_kind`
+  migration.
+- **OIDC-provisioned admins can never hold superadmin.** `default_oidc_role()`
+  in `src/config/schema.rs` returns `"admin"`, which is neither validated role
+  (`superadmin` / `viewer`), so `SuperDashboardSession` rejects them
+  permanently. Relevant to §5, whose `provider_ops` and ladder writes require
+  `SuperDashboardSession`: on an OIDC-only deployment nobody can perform them.
+
 ## 2a. Verified assumptions
 
 Checked against the codebase on 2026-09-02 (`96f8cd48`):
@@ -1962,6 +2003,12 @@ codebase:
   is defined against an overlay seeded from *both* existing price sources, on
   upgrade as well as fresh install, since the built-in pricing table and the
   file's `[[pricing]]` entries are two sources the DB knows nothing about.
+- **Known defects recorded** in §2: the chart-wide Helm prefix defect (which
+  leaves every Helm deployment signing sessions with an empty JWT secret, and
+  gates both the env-reference follow-on and the portal), unscoped MCP server
+  writes, the Postgres reports 500 after a health probe, and OIDC admins who
+  can never hold superadmin — the last of which blocks the very writes §5
+  requires superadmin for.
 - **Corrections.** Five claims research disproved: `${VAR}` interpolation
   inside TOML values does not exist; RAII release does not carry over to a
   shared counter; the `app_settings` overlay is read once at startup into its
