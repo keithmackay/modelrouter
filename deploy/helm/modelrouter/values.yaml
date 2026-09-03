@@ -51,10 +51,10 @@ config: |
   default_model = "gpt-4o"
 
   [auth]
-  jwt_secret = ""  # overridden by MODELROUTER__AUTH__JWT_SECRET env var
+  jwt_secret = ""  # overridden by MODELROUTER_AUTH__JWT_SECRET env var
 
 # Provider API keys and other secrets injected as environment variables.
-# These become env vars of the form MODELROUTER__PROVIDERS__<UPPER>__API_KEY.
+# These become env vars of the form MODELROUTER_PROVIDERS__<UPPER>__API_KEY.
 secrets:
   jwtSecret: "change-me"
   providers: {}

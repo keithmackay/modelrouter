@@ -248,6 +248,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             // substitute the OpenAI-compat adapter for it (issue #24).
             crate::providers::validate_provider_features(&settings.providers)?;
 
+            // Refuse to serve with an unset or placeholder signing key: admin
+            // and dashboard sessions are authenticated by an HS256 signature
+            // over it alone, so a weak value makes every session forgeable.
+            settings.auth.validate_secret()?;
+
             // Effective [storage] policy (issue #4): the DB-stored GUI value
             // wins over config.toml; absence of a row means the file/default
             // applies. Held in an ArcSwap so an admin saving the form takes
