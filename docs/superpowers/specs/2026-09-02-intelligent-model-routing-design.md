@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-02
 **Status:** Approved design, pre-implementation
-**Revision:** 14 — incorporates critical reviews
+**Revision:** 15 — incorporates critical reviews
 [1](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-1.md)
 and [2](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-2.md).
 See §14 for what changed; §13 records the decisions and their alternatives.
@@ -78,8 +78,9 @@ candidates by a price it is guessing at. See §7.
 
 ### Known defects this design depends on
 
-Found while researching the §13 decisions. None is caused by this design; two
-gate a phase of it. They are recorded here rather than only in a tracker,
+Found while researching the §13 decisions and, for the last of them, while
+auditing what the router records per request. None is caused by this design;
+three gate a phase of it. They are recorded here rather than only in a tracker,
 because a reader deciding whether a phase is ready needs them in the same place
 as the decisions that depend on them.
 
@@ -111,6 +112,19 @@ as the decisions that depend on them.
   appears only in the `--features postgres` build. §7.0a's shadow writer must
   use `"{}"`, and the existing rows want backfilling alongside the `spend_kind`
   migration.
+- **Content redaction is not applied to the callback egress path.**
+  `[storage] store_prompt_content` defaults to `false`, and its own doc comment
+  gives the reason: a privacy-sensitive deployment should not have to discover
+  a flag after the fact "to stop full conversation bodies landing on disk".
+  `redact_prompt_content` is duly applied to the `NewPrompt` row — but the
+  `CallbackEvent` dispatched a few lines later in `src/api/routes/completions.rs`
+  and `src/api/routes/messages.rs` is built from the *original*
+  `messages_json` and response values, so the un-redacted prompt and completion
+  are still sent to every configured callback backend (langfuse, langsmith,
+  webhook). The flag therefore keeps bodies off local disk while shipping them
+  to a third party over the network. `X-No-Log` does suppress the dispatch, via
+  the enclosing `skip_log` branch. **Gates §7c**, whose whole premise is that
+  local retention for analysis is not consent to transmit.
 - **OIDC-provisioned admins can never hold superadmin.** `default_oidc_role()`
   in `src/config/schema.rs` returns `"admin"`, which is neither validated role
   (`superadmin` / `viewer`), so `SuperDashboardSession` rejects them
@@ -1549,9 +1563,10 @@ and discards it; a paired comparison cannot, because the outputs *are* the
 dataset. In paired mode both legs are written with a shared `pair_id` and the
 shadow leg stores its completion exactly as the primary does. That is a
 retention change, not only a routing one — text that previously lived only for
-the duration of a scoring call is now stored — so paired mode inherits the
-whole prompt-storage discipline: off unless `store_prompts` is on, and
-suppressed entirely by `X-No-Log`, as mirroring already is.
+the duration of a scoring call is now stored — and it runs against a default
+that stores metadata only. §7c governs it: content retention is an explicit,
+bounded, per-experiment override, and `X-No-Log` still suppresses the mirror
+entirely.
 
 **A shed leg must be recorded as shed, not omitted.** Mirroring is suppressed
 under pressure (above), which in paired mode silently deletes one side of a
@@ -1792,6 +1807,79 @@ endpoint (§7a) and judge sampling (§7.1) exist, this page has cost, speed and
 volume and nothing more. It says so, in place. A cost-and-latency table with no
 quality column reads as a recommendation for the cheaper model unless it
 explicitly declines to be one.
+
+## 7c. Content retention under experiment
+
+An experiment's outputs *are* its dataset. Cost, latency and token counts can
+be compared from metadata alone, but "did the new model answer better" cannot
+be answered without the answers. Experiment traffic therefore stores full
+inputs and outputs, while ordinary traffic keeps the shipped default of
+metadata only (`[storage] store_prompt_content = false`, which exists so that a
+privacy-sensitive deployment does not have to discover a flag after the fact to
+keep conversation bodies off disk).
+
+That default is not wrong; it is simply the wrong default *for this traffic*.
+So this is specified as a scoped exception, and deliberately not as a new
+global default.
+
+**Precedence, stated once so no call site has to reason it out.**
+
+| Signal | Effect |
+|---|---|
+| `X-No-Log` on the request | Nothing stored, no mirror, no callback egress. Always wins. |
+| Experiment content retention | Inputs and outputs stored for participating requests |
+| `[storage]` defaults | Everything else — metadata only |
+
+A caller who opted out of logging does not opt back in by being swept into an
+experiment. That rule already governs mirroring (§7.0a) and is repeated here
+because the override is exactly the kind of thing that quietly erodes it.
+
+**The override implies both storage switches, for its own traffic only.**
+`store_prompts = false` skips the prompt row outright, leaving nowhere to put
+content, so an experiment that retains content writes its rows regardless of
+that switch. The scope is the participating requests and nothing else: traffic
+outside the experiment is unaffected, and the global configuration is not
+edited to enable an experiment.
+
+**It is bounded in time, not only in scope.** A retention override with no
+expiry is a permanent policy change wearing a temporary label. The experiment
+row therefore carries `retain_content` and `content_retention_days`, closing
+the experiment starts the clock, and the retention default is **finite** — 30
+days — rather than the global `prompt_retention_days = 0` meaning "keep
+forever". The two defaults differ on purpose and for symmetric reasons: global
+deletion is opt-in so an upgrade cannot silently discard logs an operator was
+relying on, while experiment content exists *only* because of an override and
+should expire unless someone renews it. Purging is the existing retention
+sweep, given the experiment's window.
+
+**Enabling it is a superadmin write, and audited.** Storing conversation bodies
+is a disclosure decision rather than a routing one, so it takes
+`SuperDashboardSession` and lands in the audit log with the experiment it
+applies to — the same treatment as the mirroring data-sharing opt-in (§7.0a).
+
+**Storage does not widen egress.** Retaining content locally for analysis is
+not consent to send it anywhere. The callback backends (langfuse, langsmith,
+webhook) are governed by their own configuration and are unchanged by this
+override. This is worth stating explicitly because those two paths are already
+inconsistent in the shipped code — the callback dispatch in
+`completions.rs` and `messages.rs` sends the *un-redacted* messages and
+response while the prompt row beside it is redacted, so `store_prompt_content
+= false` today keeps bodies off local disk and still ships them to a third
+party. That is recorded as a defect in §2; §7c must not be built on top of it.
+
+**Both experiment forms, one rule.** Paired mirroring (§7.0a) and run-level
+experiments (§7a) use the same override, so a reader does not have to hold two
+retention models at once. For a pair, both legs are stored or neither is.
+
+**It is visible where the data is.** The experiment card names content
+retention and its expiry date; the comparison page (§7b) says whether the arms
+it is showing have stored content, because an operator about to judge output
+quality needs to know whether there is any output to judge before they start.
+
+**Volume is a real cost, not a footnote.** Paired mirroring at `fraction = 1.0`
+with content retention doubles the provider bill *and* stores two full bodies
+per request. The experiment view shows retained-content bytes beside spend, so
+the storage cost is visible on the same screen as the decision to keep running.
 
 ## 8. Error handling
 
@@ -2244,9 +2332,26 @@ surface in operators' hands early and lets the experiment features arrive into
 a page already proven against real data, rather than shipping a chart and its
 data source in the same untested step.
 
+**13.21 Experiment content retention → a scoped, bounded, superadmin-gated
+override, not a new default.** An experiment cannot answer "which answered
+better" from metadata, so it needs the inputs and outputs that
+`store_prompt_content = false` withholds. Rejected: flipping the global default
+(it would retain bodies for every deployment to serve a minority of traffic,
+discarding a privacy decision that was made deliberately); and a bare boolean
+with no expiry, which is a permanent policy change wearing a temporary label —
+hence `content_retention_days`, defaulting to a finite 30 days on experiment
+close. The two retention defaults now differ, and symmetrically: global
+deletion is opt-in because an upgrade must not silently discard logs an
+operator relied on, while experiment content exists only because of an override
+and should lapse unless renewed. `X-No-Log` outranks the override, so being
+swept into an experiment never reverses a caller's own opt-out. And retention
+is explicitly not egress: §7c stores locally and changes nothing about the
+callback backends — which is only safe once the redaction defect in §2 is
+fixed, since that path currently transmits content the local row redacts.
+
 ### Still open
 
-Nothing blocking. The nine questions above are resolved. Two items are
+Nothing blocking. The ten questions above are resolved. Two items are
 deliberately left open, each recorded where it belongs rather than parked as a
 placeholder: the default queue depth (inside 13.12, with a starting point and
 the reason a number should not be invented before there is traffic to size it
@@ -2254,6 +2359,32 @@ against), and the `request_params` column (inside 13.19, as the follow-on that
 would make non-routing dimensions self-describing).
 
 ## 14. Revision history
+
+**Revision 15 (2026-09-03)** — experiment traffic stores its inputs and
+outputs, as a scoped exception rather than a new default:
+
+- **New §7c.** An experiment's outputs are its dataset, so "which answered
+  better" is unanswerable under `store_prompt_content = false`. Content
+  retention becomes a per-experiment override with an explicit precedence
+  order: `X-No-Log` always wins, then the experiment override, then the
+  `[storage]` defaults. A caller who opted out of logging does not opt back in
+  by being swept into an experiment.
+- **Bounded in time, not only in scope.** `retain_content` and
+  `content_retention_days` live on the experiment row, closing it starts the
+  clock, and the default is a finite 30 days — deliberately unlike the global
+  `prompt_retention_days = 0` (keep forever). The asymmetry is the point:
+  global deletion is opt-in so an upgrade cannot discard logs an operator
+  relied on, while experiment content exists only because of an override.
+- **Storage is not egress**, stated explicitly because the shipped code does
+  not currently honour the distinction.
+- **New known defect in §2: content redaction is not applied to the callback
+  egress path.** `redact_prompt_content` is applied to the prompt row, but the
+  `CallbackEvent` dispatched beside it in `completions.rs` and `messages.rs` is
+  built from the original un-redacted values — so the default config keeps
+  conversation bodies off local disk and still sends them to langfuse,
+  langsmith or any configured webhook. Found while auditing per-request
+  recording; it gates §7c.
+- **Decision 13.21 recorded.**
 
 **Revision 14 (2026-09-03)** — model-versus-model evaluation specified as two
 distinct mechanisms, plus the surface that reads them:
