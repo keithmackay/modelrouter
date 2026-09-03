@@ -106,6 +106,7 @@ async fn declarative_rule_allows_under_budget() {
         budget_usd: Some(100.0),
         window: "monthly".to_string(),
         priority: 5,
+        cache: None,
     };
     let settings = settings_with_rules(vec![rule]);
     let engine = PolicyEngine::new(db).with_settings(settings);
