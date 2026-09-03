@@ -2177,6 +2177,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compare_table_zero_delta_has_no_plus_sign() {
+        // A and B are seeded identically, so every delta -- including
+        // requests -- is exactly zero. `sign_prefix` only emits `+` for
+        // v > 0.0, so the rendered table must show `0.0%`, never `+0.0%`.
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        crate::db::repositories::users::UserRepository::create(
+            &db,
+            crate::db::models::NewUser { name: "u".into(), email: None },
+        )
+        .await
+        .unwrap();
+        for model in ["m1", "m2"] {
+            CostRepository::create(&db, NewCostLedgerEntry {
+                user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
+                project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+            }).await.unwrap();
+            PromptRepository::create(&db, NewPrompt {
+                user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
+                provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
+                prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+                cost_usd: 0.0, latency_ms: Some(100), tags: "[]".into(), project: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+            }).await.unwrap();
+        }
+        let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+        let sources = CompareSources {
+            prompt_db: db.clone(),
+            db,
+            cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&[])),
+        };
+        let comparison = build_comparison(&sources, &query()).await.unwrap();
+        assert_eq!(comparison.a.requests, comparison.b.requests, "fixture must have equal A/B requests");
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("0.0%"), "{}", text);
+        assert!(!text.contains("+0.0%"), "{}", text);
+    }
+
+    #[tokio::test]
     async fn compare_invalid_dimension_fails_with_the_validation_message() {
         let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();

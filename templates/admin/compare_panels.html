@@ -291,15 +291,14 @@
         initLatencyChart();
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initCharts);
-    } else {
-        initCharts();
-    }
-
-    // This script arrives with every swap; bind the listener once.
+    // This script arrives with every htmx swap into #panels. htmx dispatches
+    // htmx:afterSwap before this settle-time script executes, so the FIRST
+    // swap's afterSwap has already fired by the time we get here -- render
+    // directly just this once, then let the listener handle every later
+    // swap (it's already bound before any subsequent afterSwap fires).
     if (!window.__compareChartsBound) {
         window.__compareChartsBound = true;
+        initCharts();
         document.addEventListener('htmx:afterSwap', function(e) {
             if (e.detail && e.detail.target && e.detail.target.id === 'panels') {
                 initCharts();

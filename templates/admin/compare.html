@@ -40,6 +40,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">A</label>
         <select name="a" id="cf-a"
             hx-get="/admin/compare/panels" hx-target="#panels" hx-trigger="change"
+            hx-sync="closest form:replace"
             hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;min-width:12rem;">
             <option value="" {% if not sel_a %}selected{% endif %}>Choose…</option>
@@ -52,6 +53,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">B</label>
         <select name="b" id="cf-b"
             hx-get="/admin/compare/panels" hx-target="#panels" hx-trigger="change"
+            hx-sync="closest form:replace"
             hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;min-width:12rem;">
             <option value="" {% if not sel_b %}selected{% endif %}>Choose…</option>
@@ -64,6 +66,7 @@
         <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Window</label>
         <select name="window" id="cf-window"
             hx-get="/admin/compare/panels" hx-target="#panels" hx-trigger="change"
+            hx-sync="closest form:replace"
             hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window"
             style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
             <option value="all"     {% if sel_window == "all"     %}selected{% endif %}>All time</option>

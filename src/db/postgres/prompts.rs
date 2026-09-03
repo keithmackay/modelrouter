@@ -150,31 +150,50 @@ impl PromptRepository for PostgresDb {
         }
 
         // Nearest-rank percentiles: one indexed fetch each, offset computed
-        // here and bound rather than done in SQL.
+        // here and bound rather than done in SQL. The count above and these
+        // reads are separate statements, so a retention purge in between can
+        // leave the offset past the end; fall back to the largest remaining
+        // value, and if nothing is left treat the arm as empty.
         let sql = format!(
             "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms ASC LIMIT 1 OFFSET ${}",
             where_clause,
             n + 3
         );
+        let last_sql = format!(
+            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms DESC LIMIT 1",
+            where_clause
+        );
         let percentile = |q_frac: f64| {
             let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
             let sql = sql.clone();
+            let last_sql = last_sql.clone();
             let binds = binds.clone();
             async move {
                 let mut q = sqlx::query_as::<_, (i64,)>(&sql);
-                for b in binds {
-                    q = q.bind(b);
+                for b in &binds {
+                    q = q.bind(b.clone());
                 }
-                let (v,) = q
+                let row = q
                     .bind(start)
                     .bind(end)
                     .bind(offset)
-                    .fetch_one(&self.pool)
+                    .fetch_optional(&self.pool)
                     .await?;
-                anyhow::Ok(v)
+                if let Some((v,)) = row {
+                    return anyhow::Ok(Some(v));
+                }
+                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
+                for b in binds {
+                    q = q.bind(b);
+                }
+                let row = q.bind(start).bind(end).fetch_optional(&self.pool).await?;
+                anyhow::Ok(row.map(|(v,)| v))
             }
         };
         let (p50_ms, p95_ms) = tokio::try_join!(percentile(0.5), percentile(0.95))?;
+        let (Some(p50_ms), Some(p95_ms)) = (p50_ms, p95_ms) else {
+            return Ok(LatencySummary::default());
+        };
 
         Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
     }
