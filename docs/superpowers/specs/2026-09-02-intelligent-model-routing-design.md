@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-02
 **Status:** Approved design, pre-implementation
-**Revision:** 12 — incorporates critical reviews
+**Revision:** 13 — incorporates critical reviews
 [1](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-1.md)
 and [2](../../criticalreviews/2026-09-02-intelligent-model-routing-design-critical-review-2.md).
 See §14 for what changed; §13 records the decisions and their alternatives.
@@ -1765,13 +1765,21 @@ Principle: smart routing degrades, never breaks.
   the validation gate, and three built-in plugins (`complexity`, `smart`,
   `http`); both classifier kinds inside `smart`; tiered pools, `ProviderCapacity`,
   `MemberHealth`, the pricing gate, policy tables + admin dashboard page +
-  REST + CLI, decision log (recording only), cache probe, metrics. Delivers
-  the core goal with fully predictable behavior.
+  REST + CLI, decision log (recording only), cache probe, metrics. Rubric
+  editing is **admin-only** in this phase — a superadmin write on the routing
+  page, with no new authentication surface. Delivers the core goal with fully
+  predictable behavior.
 - **Phase 2 — adaptive allocation & experiments:** explore/exploit, judge
   sampling, feedback endpoint, decay, auto-trial + comparison view, and
   controlled A/B experiments (§7a). Off by default, enabled per application
   API key, piloted on Athena's key. Disabling it reverts cleanly to Phase 1
   behavior.
+
+Delegated rubric authoring is **not** Phase 1 (§13.11, decided 2026-09-03).
+The `/portal` session, its extractor and template namespace, and the `max_tier`
+ceiling ship later, once routing is proven in production. Phase 1 therefore adds
+no authentication surface at all, which also takes the Helm JWT defect off its
+critical path.
 
 The dashboard page is Phase 1, not deferred: policies are unusable by an
 operator who cannot see a ladder, and every comparable feature since April
@@ -2007,6 +2015,20 @@ with a starting point and the reason a number should not be invented before
 there is traffic to size it against.
 
 ## 14. Revision history
+
+**Revision 13 (2026-09-03)** — the two sign-off gates answered:
+
+- **Shadow spend approved as specified** (§13.10, §7.0a). The reserved system
+  user stays visible in operator-facing lists rather than being filtered out of
+  them, so router-initiated spend is visible where an operator would look.
+  Router-owned rows remain excluded from savings, the cache-hit denominator and
+  the global budget sum.
+- **Delegated rubric authoring deferred** (§13.11, §6b, §11). Phase 1 ships
+  rubric editing as an admin-only write and adds no authentication surface; the
+  `/portal` session and the `max_tier` ceiling move to a later phase. The
+  delegation design is retained rather than deleted — why cookie-name separation
+  is insufficient and why a limited admin role is dangerous are expensive to
+  rediscover.
 
 **Revision 12 (2026-09-02)** — the §13 open questions resolved against the
 codebase:
