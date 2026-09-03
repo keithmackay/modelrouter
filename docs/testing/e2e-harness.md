@@ -34,9 +34,18 @@ a program rather than as a library.
 ## How to run it
 
 ```bash
-cargo test -- --ignored                       # the whole tier
-cargo test --test test_e2e_startup -- --ignored   # one file
+# the whole tier
+cargo test --test test_e2e_startup --test test_e2e_requests --test test_e2e_accounting -- --ignored
+
+# one file
+cargo test --test test_e2e_startup -- --ignored
 ```
+
+**Do not use a bare `cargo test -- --ignored`.** It also runs
+`redis_live_round_trip_scratch_namespace` in `src/router/cache/store.rs`, which
+requires a Redis on `127.0.0.1:6379` and fails without one. That test is
+unrelated to this tier and predates it; naming the three targets explicitly
+avoids it.
 
 Every test is `#[ignore]`d so `cargo test` stays fast for ordinary development.
 The default run reports them as ignored rather than skipping them silently:

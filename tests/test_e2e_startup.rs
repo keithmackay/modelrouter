@@ -5,6 +5,7 @@
 //! the 425 in-process tests passed, because none of them executes `serve`.
 //!
 //! Run with: `cargo test --test test_e2e_startup -- --ignored`
+//! (a bare `cargo test -- --ignored` also picks up a Redis-dependent test)
 
 mod common;
 

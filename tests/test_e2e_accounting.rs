@@ -6,6 +6,7 @@
 //! page renders.
 //!
 //! Run with: `cargo test --test test_e2e_accounting -- --ignored`
+//! (a bare `cargo test -- --ignored` also picks up a Redis-dependent test)
 
 mod common;
 
