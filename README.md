@@ -566,14 +566,15 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `server.host` | Bind address | `127.0.0.1` |
-| `server.port` | Listen port | `8080` |
+| `server.host` | Bind address (`--host` overrides for one run) | `127.0.0.1` |
+| `server.port` | Listen port (`--port` overrides for one run) | `8080` |
+| `server.request_body_limit_mb` | Largest request body accepted; larger returns 413 | `10` |
 | `database.path` | SQLite file path | `~/.modelrouter/router.db` |
 | `routing.default_provider` | Fallback provider when model prefix is absent | `openai` |
 | `routing.model_aliases` | Map short names to canonical model IDs | — |
 | `providers.<name>.api_key` | Upstream provider API key | required |
 | `providers.<name>.base_url` | Override provider endpoint | provider default |
-| `auth.jwt_secret` | Secret for admin JWT signing | required |
+| `auth.jwt_secret` | Secret for admin JWT signing. `init` generates one; `serve` refuses to start if it is empty or the shipped placeholder | required |
 | `[[guardrails]]` | Content safety rules (type, fail_open, api_key, endpoint) | — |
 | `[[policy_rules]]` | Declarative access rules matched by project/group/user/model | — |
 | `[oidc]` | OIDC SSO for admin login (issuer_url, client_id, client_secret, …) | disabled |
@@ -1304,11 +1305,21 @@ cargo test
 # Run OTel tests
 cargo test --features otel
 
+# End-to-end tier: runs the real binary against a mock provider.
+# Ignored by default so `cargo test` stays fast. Name the targets rather than
+# using a bare `-- --ignored`, which also picks up a Redis-dependent test.
+cargo test --test test_e2e_startup --test test_e2e_requests --test test_e2e_accounting -- --ignored
+
 # Start development server
 cargo run -- serve
 ```
 
 Logs go to stdout via `tracing`. Set `RUST_LOG=modelrouter=debug` for verbose output.
+
+The in-process tests build `AppState` by hand and never execute `serve`, config
+resolution or the startup guards; the e2e tier is the only place the binary is
+tested as a program. Its design and what each test proves are in
+[`docs/testing/e2e-harness.md`](docs/testing/e2e-harness.md).
 
 The database schema lives in `migrations/`. After adding a new migration file, run `modelrouter migrate` to apply it. `sqlx::migrate!` embeds migrations into the binary at compile time.
 
