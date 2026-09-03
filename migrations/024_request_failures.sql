@@ -6,7 +6,7 @@
 -- logs, which is exactly backwards: the router is the one component that sees
 -- every call from every app.
 --
--- Concretely (Athena, 2026-08-09): 196 requests failed with
+-- Concretely (one production caller, 2026-08-09): 196 requests failed with
 -- "Unknown provider: anthropic" and the router's own history showed nothing,
 -- because a provider-resolution failure produces no prompt row. Diagnosis
 -- required reading the caller's worker log and reverse-engineering the routing

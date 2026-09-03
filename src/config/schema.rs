@@ -553,8 +553,8 @@ pub struct ProviderConfig {
     /// Vertex serves `text-embedding-*` regionally only — `locations/global`
     /// has no embedding endpoint at all, while the Claude and Gemini chat models
     /// do run there. A Vertex provider configured for chat on `global` therefore
-    /// has to name an embedding region separately, exactly as Athena's own
-    /// client does with `EMBEDDING_REGION` (default `us-central1`) alongside its
+    /// has to name an embedding region separately, exactly as the pilot
+    /// application's own client does with `EMBEDDING_REGION` (default `us-central1`) alongside its
     /// chat region. Falls back to `region` when unset.
     #[serde(default)]
     pub embedding_region: Option<String>,
