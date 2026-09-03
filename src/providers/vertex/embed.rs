@@ -1,9 +1,8 @@
 //! Vertex AI text-embedding adapter.
 //!
-//! Ported from Athena's own Vertex embedding client
-//! (`thesis-validator/src/tools/embedding.ts`, `embedWithVertexAI` /
-//! `embedBatchWithVertexAI`), which had been reaching Vertex directly through
-//! `@google-cloud/aiplatform`. Moving it behind the gateway is what lets the
+//! Ported from the pilot application's own Vertex embedding client
+//! (a TypeScript `embedWithVertexAI` / `embedBatchWithVertexAI` pair), which
+//! had been reaching Vertex directly through `@google-cloud/aiplatform`. Moving it behind the gateway is what lets the
 //! application hold no credential at all: on the GCP sandbox the only usable
 //! identity is the VM's service account via ADC, and modelrouter is the single
 //! component allowed to use it. It also brings embeddings under the same
@@ -22,9 +21,8 @@ use crate::providers::embedding::{EmbeddingAdapter, EmbeddingRequest, EmbeddingR
 use crate::providers::vertex::adapter::build_predict_url;
 use crate::providers::vertex::auth::{GoogleCloudAuthProvider, TokenProvider};
 
-/// Vertex rejects a `:predict` call carrying more than five instances. Athena's
-/// client encodes the same limit as `batchSize: 5`
-/// (`thesis-validator/src/tools/embedding.ts`). A caller embedding a page of
+/// Vertex rejects a `:predict` call carrying more than five instances. The
+/// pilot application's client encodes the same limit as `batchSize: 5`. A caller embedding a page of
 /// evidence sends far more than five, so the adapter splits rather than letting
 /// the whole batch fail.
 const MAX_INSTANCES_PER_REQUEST: usize = 5;
@@ -35,7 +33,7 @@ const MAX_INSTANCES_PER_REQUEST: usize = 5;
 /// cannot — `global` exposes no embedding endpoint. Rather than quietly
 /// substituting a region that happens to work (a hidden default is precisely
 /// the failure this gateway exists to prevent), refuse and name the field the
-/// operator has to set. Mirrors Athena's separate `EMBEDDING_REGION`.
+/// operator has to set. Mirrors the pilot application's separate `EMBEDDING_REGION`.
 pub fn resolve_embedding_region(config: &ProviderConfig) -> anyhow::Result<String> {
     let region = config
         .embedding_region
@@ -77,7 +75,7 @@ pub fn build_request_body_for(
         .map(|text| {
             let mut instance = serde_json::json!({ "content": text });
             // Omitted rather than defaulted when unconfigured: Vertex's own
-            // default is not the one Athena uses, and a mismatched task type
+            // default is not the one the pilot application uses, and a mismatched task type
             // does not fail — it just retrieves worse.
             if let Some(t) = task_type {
                 instance["task_type"] = serde_json::json!(t);
@@ -101,7 +99,7 @@ pub fn build_request_body(req: &EmbeddingRequest, task_type: Option<&str>) -> se
 
 /// Parse one `:predict` response.
 ///
-/// Athena's client noted that "Vertex predict responses carry no authoritative
+/// The pilot application's client noted that "Vertex predict responses carry no authoritative
 /// token count here" — true of the Node client's decoded value, but the raw
 /// REST response does carry `statistics.token_count` per prediction, so it is
 /// read when present rather than estimated.

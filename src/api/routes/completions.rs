@@ -977,8 +977,8 @@ fn build_openai_response(
         // not the caller's requested alias/pool name. Per the OpenAI
         // chat-completions contract, `model` should report what served the
         // request; omitting it left OpenAI-compatible clients unable to
-        // learn the resolved model at all (see issue referenced from
-        // athena2#1306).
+        // learn the resolved model at all, and the `ai` SDK fell back to
+        // the requested id, corrupting the caller's cost attribution.
         "model": model,
         "choices": [{
             "index": 0,

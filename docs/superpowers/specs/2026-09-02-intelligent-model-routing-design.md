@@ -25,7 +25,7 @@ ability or their capacity. Three pillars:
    one that is good enough, and automatically trials newly released model
    versions against incumbents.
 
-Pilot for Phase 2: the Athena deployment's API key gets `learning_enabled`,
+Pilot for Phase 2: the pilot application's API key gets `learning_enabled`,
 so its traffic trains the quality stats while all other consumers stay on
 deterministic routing.
 
@@ -71,9 +71,9 @@ candidates by a price it is guessing at. See §7.
   `/v1/chat/completions` report the concrete backing model in the response
   `model` field. Smart routing makes this mandatory rather than merely
   correct: a caller requesting a `virtual_model` has no other way to learn
-  what served the request, and the downstream failure it fixes (athena2#1306 —
-  the `ai` SDK falling back to the client's requested id, silently corrupting
-  Athena's cost attribution) lands on the same deployment piloting Phase 2.
+  what served the request, and the downstream failure it fixes (the `ai` SDK
+  falling back to the client's requested id, silently corrupting the caller's
+  cost attribution) lands on the same deployment piloting Phase 2.
   Smart routing should not ship before #46 merges.
 
 ### Known defects this design depends on
@@ -627,8 +627,8 @@ default, not a policy-wide setting.
 2. **Virtual-model suffix** — `auto:cheap` / `auto:fast` alongside plain
    `auto`. This is the primary mechanism, because `model` is the one field
    every OpenAI-compatible SDK exposes; the existing `:fastest` / `:cheapest`
-   routing shortcuts already establish the idiom, and Athena already addresses
-   this router by tier alias. A client that cannot set headers can always set
+   routing shortcuts already establish the idiom, and the pilot application
+   already addresses this router by tier alias. A client that cannot set headers can always set
    a model string.
 3. The policy's `objective` in TOML (default `cost`).
 
@@ -962,7 +962,7 @@ must pass.
   select above it, §6b). Scope: an
   assignment with `api_key_id` applies to that application API key only and
   overrides any user-scoped (`api_key_id IS NULL`) assignment; this is how
-  learning is enabled for a single app key (e.g. Athena's) without
+  learning is enabled for a single app key (e.g. the pilot's) without
   affecting the user's other keys. Legacy-auth callers have no
   `api_key_id` (`AuthenticatedUser.api_key_id: Option<i64>`) and can only
   match user-scoped assignments.
@@ -1634,7 +1634,7 @@ has `learning_enabled = true`.
 
 ## 7a. Controlled experiments (A/B runs)
 
-Motivating case: Athena runs one engagement twice in parallel — each run on a
+Motivating case: an application runs one engagement twice in parallel — each run on a
 different set of models — and compares the outcomes. The client orchestrates
 the parallel runs; modelrouter supplies variant binding, measurement grouping,
 and the comparison report.
@@ -2085,7 +2085,7 @@ Principle: smart routing degrades, never breaks.
 - **Phase 2 — adaptive allocation & experiments:** explore/exploit, judge
   sampling, feedback endpoint, decay, auto-trial + comparison view, controlled
   A/B experiments (§7a) and paired mirroring (§7.0a). Off by default, enabled
-  per application API key, piloted on Athena's key. Disabling it reverts
+  per application API key, piloted on one application's key. Disabling it reverts
   cleanly to Phase 1 behavior. Ordering inside the phase is not free: the
   **feedback endpoint precedes run-level experiments**, because an experiment
   that cannot see an outcome reports only that the cheaper model won (§13.18).

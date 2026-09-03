@@ -10,8 +10,8 @@ pub struct EmbeddingRequest {
     /// unsafe: `nomic-embed-text` emits 768 dimensions and
     /// `text-embedding-3-small` emits 1536, so failing over between them
     /// silently produces vectors of a different shape than every vector already
-    /// in the caller's store. Callers that pin a width (Athena sets
-    /// EMBEDDING_DIMENSIONS=768 and refuses to truncate or pad) send it here,
+    /// in the caller's store. Callers that pin a width (the pilot application
+    /// sets EMBEDDING_DIMENSIONS=768 and refuses to truncate or pad) send it here,
     /// OpenAI-family models are asked to honour it, and the result is VERIFIED
     /// against it before being returned — see `verify_dimensions`.
     pub dimensions: Option<u32>,
@@ -63,7 +63,7 @@ mod tests {
         }
     }
 
-    /// The live shape of the risk: Athena pins 768 (nomic-embed-text) and refuses
+    /// The live shape of the risk: the pilot application pins 768 (nomic-embed-text) and refuses
     /// to truncate or pad. If an openai fallback answered with its native 1536,
     /// the vectors would be accepted and silently poison every later similarity
     /// comparison. Failing the call is strictly better than storing the vector.

@@ -1,6 +1,6 @@
 //! Vertex AI web search, via Gemini + Google Search grounding.
 //!
-//! Ported from Athena's `thesis-validator/src/workers/search/vertex-search.worker.ts`,
+//! Ported from the pilot application's TypeScript Vertex search worker,
 //! moved server-side so the mapping is applied once — and so it is cached,
 //! priced and metered like every other call — instead of being reimplemented per
 //! worker. On this host it is the ONLY usable web search: Tavily needs a key the
@@ -9,7 +9,7 @@
 //!
 //! One deliberate divergence from the TypeScript, called out because it is a
 //! behaviour change and not a port artefact. When Google returns no grounding,
-//! Athena's worker falls back to emitting the model's parametric prose as a
+//! that worker falls back to emitting the model's parametric prose as a
 //! single result with `url: ''` and a hardcoded score of `0.5`. That is
 //! generated text entering the evidence base wearing a citation's clothes — the
 //! silent-substitution failure this round exists to eliminate. Here, no
@@ -222,7 +222,7 @@ impl VertexSearchAdapter {
     /// Unwrap one `vertexaisearch.cloud.google.com/grounding-api-redirect/…`
     /// URL into the real source.
     ///
-    /// Athena's evidence citations and its domain-based credibility scoring are
+    /// A caller's evidence citations and any domain-based credibility scoring are
     /// both worthless against an opaque Google redirect, and this is the last
     /// point at which the real URL is cheaply recoverable. Failure returns the
     /// redirect unchanged — a slightly worse citation beats a dropped result.
