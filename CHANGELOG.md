@@ -1,83 +1,126 @@
 # Changelog
 
-## [Unreleased]
+## Unreleased
 
-### Security
+Everything since 0.1.0, by week. Entries are the merged result, not every
+commit; `git log v0.1.0..` has the detail.
 
-- **`init` generates a real JWT signing secret.** It previously wrote the
-  published placeholder `change-me-jwt-secret` into every fresh config. Combined
-  with the startup guard below, this meant a fresh install could not start:
-  `init` printed "Run: modelrouter serve" and `serve` refused. `init` now
-  substitutes a 256-bit random secret at both write sites. Existing configs are
-  untouched — `init` only writes when no config exists or you confirm an
-  overwrite.
-- **`serve` refuses to start on a weak `auth.jwt_secret`** — empty, or still the
-  shipped placeholder — and names the field. (#48, PR #52)
-- **Helm chart env-var names corrected.** Four entries used `MODELROUTER__X`
-  where the loader expects `MODELROUTER_X__Y`, so they were silently discarded.
-  The chart's ConfigMap ships `jwt_secret = ""` expecting the env var to
-  override it, and it never did: every Helm deployment had been signing admin
-  sessions with an empty secret. (#48, PR #52)
-- **MCP server writes are scoped to their owner.** Any valid key could edit or
-  delete any registration. Migration 028 adds an owner column; rows predating it
-  are read-only through the API. (#49, PR #52)
-- **The observability egress now honours `[storage] store_prompt_content`.**
-  With content storage off (the default), the prompt row was redacted but the
-  `CallbackEvent` sent to Langfuse, LangSmith or a webhook still carried the
-  full prompt and response. Both are now redacted from one shared helper. (#53)
+### Week of 2026-08-31
 
-### Fixed
+**Security**
+- `init` generates a real JWT secret instead of writing the published placeholder, so a fresh install can start again.
+- `serve` refuses to start on an empty or placeholder `auth.jwt_secret`.
+- Helm chart env-var names corrected; deployments had been signing admin sessions with an empty secret. (#48)
+- MCP server registrations can only be edited or deleted by their owner. (#49)
+- Langfuse/LangSmith/webhook callbacks now honour `store_prompt_content`; they no longer receive full prompts when content storage is off. (#53)
 
-- **`serve` honours `[server] host`, `port` and `request_body_limit_mb`.** The
-  `--host`/`--port` flags carried clap defaults that always won, so the config
-  values were never read; `request_body_limit_mb` was never referenced at all,
-  so axum's 2 MB default applied whatever the config said. Precedence is now
-  flag > config > built-in default. **Behaviour change:** an operator with a
-  `port` in config that differs from 8080, who has been getting 8080, now gets
-  the configured port. (#55)
-- **`/admin/webhooks` returned 500** — the template was never registered with
-  the environment. A test now walks `templates/admin/` and fails on the next
-  unregistered page. (#54)
-- **`cargo test` did not build on `main`.** Two independent breakages had
-  accumulated across eight test targets. 425 tests pass again. (PR #52)
-- **Per-model parameter deprecations no longer take a provider down.** Vertex
-  rejects `temperature` on Claude 5 with a 400; five of those opened the circuit
-  breaker for every Vertex-backed model. A per-model capability table
-  (`[[model_capabilities]]`, operator-overridable) strips parameters the
-  resolved model is known to reject, and client errors no longer count toward
-  the breaker. (#47)
-- `chat_completions` responses include the resolved backing model. (#46)
+**Features**
+- End-to-end test tier that runs the real binary against a mock provider — startup, auth, routing, ledger, cache, streaming. (`docs/testing/e2e-harness.md`)
+- Intelligent model routing design spec, revision 16 — plugin routers, tiered pools, experiments, `/admin/compare`. Design only.
+- Chat completion responses include the resolved backing model. (#46)
 
-### Added
+**Fixes**
+- `serve` honours `[server] host`, `port` and `request_body_limit_mb` from config; flags override for a single run. Operators with a non-default port in config now get it. (#55)
+- `/admin/webhooks` rendered a 500 — template was never registered. (#54)
+- Per-model parameter deprecations (e.g. `temperature` on Claude 5 via Vertex) are routed around instead of failing, and client errors no longer trip the provider circuit breaker. (#47)
+- `cargo test` builds on `main` again; eight targets had rotted.
 
-- **End-to-end test tier** (`tests/test_e2e_*.rs`) that runs the compiled
-  binary as a child process against a mock OpenAI-shaped provider. Covers
-  `init`/`migrate`/`serve`, the startup guards, auth rejection before the
-  upstream call, the cost ledger, the cache, and streaming. `#[ignore]`d by
-  default; see [`docs/testing/e2e-harness.md`](docs/testing/e2e-harness.md).
-  This is the tier that would have caught the `init` defect above: none of the
-  in-process tests execute `serve`.
-- **Intelligent model routing design spec** (revision 16) at
-  `docs/superpowers/specs/2026-09-02-intelligent-model-routing-design.md`,
-  covering plugin routers, tiered pools, learning, experiments (paired mirroring
-  and application-level A/B runs), the `/admin/compare` page, and content
-  retention under experiment. Documentation only — no routing code is
-  implemented.
+### Week of 2026-08-10
 
-### Since 0.1.0, not previously itemised
+**Features**
+- Redis-backed response cache with reconnect resilience; cache block on `/health` and `/health/deep` capability probes. (#22)
+- `[storage]` prompt-log policy — store rows, content, and retention, editable from the admin UI. (#28, #36)
+- Dedicated `prompt_db_path` so the prompt log can live in its own SQLite file. (#36)
+- Per-caller response-cache opt-out via policy rules. (#37)
+- Provider catalog discovery for Vertex, OpenAI-compatible and Anthropic, aggregated at `/admin/api/models/available`. (#38, #39, #40)
+- Vertex AI embedding and web-search adapters.
+- Runtime model aliases and model/provider disable from the admin UI. (#15)
+- Per-request project override for cost attribution; small costs display legibly. (#16)
+- Failed requests are captured and shown in the admin UI; silent model substitution removed; embeddings hardened. (#17)
 
-This changelog was not maintained between 0.1.0 and the entries above. The
-larger additions in that period, in merge order: session stickiness with a
-model-change override; `X-No-Log`; DB-managed webhook callbacks with admin UI
-and CLI; `:fastest`/`:cheapest` routing shortcuts; Chinese provider pricing
-(DeepSeek, Qwen, Doubao); a DB-driven model registry with failover chains; the
-Vertex AI provider, embedding and web-search adapters; the reports page with
-burndown charts; response caching (memory or Redis) with `/health/deep`
-capability probes; search proxying; per-request project attribution and
-failure capture; the `[storage]` prompt-log policy with a dedicated
-`prompt_db_path`; per-caller cache opt-out via policy rules; and provider
-catalog discovery (`/admin/api/models/available`). See `git log v0.1.0..` for
-the full record.
+**Fixes**
+- `/v1/models` lists routing aliases with `alias_for`. (#31)
+- A provider whose cargo feature is compiled out now fails loudly instead of silently. (#26)
+
+### Week of 2026-08-03
+
+**Features**
+- Provider prompt-cache tokens are tracked and priced.
+- Web search proxying with per-engine metering, Tavily first. (#11)
+- Response caching for LLM and search calls, with hit rate in usage metrics. (#12)
+- Per-request cost attribution (`x-attribution-*` headers) and an attribution-filtered usage query. (#14)
+
+### Week of 2026-07-27
+
+**Fixes**
+- Group-membership index creation moved out of an already-applied migration.
+
+### Week of 2026-06-15
+
+**Features**
+- Session stickiness: requests in the same session stay on the same model, with a model-change override and a per-key session window.
+- `X-No-Log` header skips prompt logging while keeping cost tracking.
+- DB-managed webhook callbacks with admin UI and CLI (SQLite and Postgres).
+- `:fastest` / `:cheapest` routing shortcuts via `[routing.shortcuts]`.
+- Chinese provider docs and pricing: DeepSeek, Qwen, Doubao.
+- Mailto link on key rotation.
+
+### Week of 2026-04-20
+
+**Features**
+- GCP Vertex AI provider — Gemini and Claude-on-Vertex. (#6)
+
+### Week of 2026-04-13
+
+**Features**
+- Reports page with spend detail tables and budget burndown charts.
+- Cost breakdown: all-time window, project/group/key/model filters, per-row detail; CLI cost report aligned with the UI.
+- DB-driven model registry with failover chains. (#2)
+- Zscaler / corporate CA support and a `check-tls` command.
+- Mailto button after API key creation. (#1)
+
+**Fixes**
+- Router fallback bug.
+- Burndown chart starts at the budget ceiling and shows remaining budget.
+- Currency formatting, token in/out labels, and date sorting across admin tables.
+
+### Week of 2026-04-06
+
+**Features**
+- CI publishes multi-arch Docker images to GHCR on release; four image variants (base, otel, postgres, full).
+- `modelrouter admin` CLI for creating and managing admin users.
+- `modelrouter key` CLI (create / list / rotate / disable) and `group` CLI.
+- `report usage` CLI with scope, window and granularity flags.
+- Per-project cost tracking via keys; `--user` / `--project` / `--group` filters on `report cost`.
+- Keys & Users admin pages rebuilt: create-user form, copy-to-clipboard on new keys, duplicate-key guard, key history.
+- Groups: tables, admin page, inline priority editing.
+- Budgets: project / global scopes, total-window support, card-per-scope admin page.
+- OTel docker-compose stack (Arize Phoenix).
+- `init` sets 0700/0600 on the config directory and file.
+
+**Fixes**
+- Postgres repositories synced with SQLite (missing fields, `reset_spend`).
+- HTMX bundled locally rather than loaded from a CDN.
+- XSS escaping in group and budget cards.
+- Debian-slim runtime image; offline vendor builds.
+
+### Week of 2026-03-30
+
+**Features**
+- Anthropic Messages API passthrough (`/v1/messages`), plus `/v1/responses`, `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech` and `/v1/audio/transcriptions`.
+- Providers: Azure OpenAI, AWS Bedrock (`--features bedrock`).
+- Routing: complexity router (auto-downgrade on large prompts), fallback chains with retry, round-robin and weighted load balancing.
+- Reliability: per-provider circuit breaker, transparent retry with backoff on 429/5xx, IP rate limiting, per-session TPM/RPM limits, per-user concurrency limits.
+- Budgets: per-key budgets, per-tag budgets, token limits, spend reset, key expiry.
+- Config-driven pricing table; config hot-reload every 30s.
+- Declarative `[[policy_rules]]` matched by project/group/user/model.
+- Guardrail framework with OpenAI moderation built in.
+- OIDC SSO for admin login with PKCE.
+- MCP server registry with CRUD endpoints and similarity-ranked discovery.
+- Observability: Prometheus `/metrics` (`--features prometheus`), LangFuse and LangSmith callbacks, OTel design and implementation.
+- Exact-match response cache with LRU + TTL.
+- Cold-storage archival of cost rows to S3-compatible storage.
+- Helm chart.
 
 ## [0.1.0] - 2026-03-31
 
