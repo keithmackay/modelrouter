@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Compare — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Compare</h1>
+<p style="color:#666;font-size:0.85rem;margin-top:-0.5rem;margin-bottom:1rem;">
+    Two arms of an experiment side by side: cost, tokens, cache hits, failures and latency.
+    Arms are chosen by the calling application (a model per arm, or a tag per request); this
+    page only partitions what was recorded.
+</p>
+
+{# Dimension and tag key change which values exist, so they reload the page.
+   Arm values and the window only change the panels, so they swap #panels. #}
+<form method="get" action="/admin/compare"
+    style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem;padding:1rem;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Dimension</label>
+        <select name="dimension" id="cf-dimension" onchange="this.form.submit()"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="model"    {% if sel_dimension == "model"    %}selected{% endif %}>Model</option>
+            <option value="provider" {% if sel_dimension == "provider" %}selected{% endif %}>Provider</option>
+            <option value="tag"      {% if sel_dimension == "tag"      %}selected{% endif %}>Attribution tag</option>
+            <option value="run"      {% if sel_dimension == "run"      %}selected{% endif %}>Run (correlation id)</option>
+        </select>
+    </div>
+    {% if sel_dimension == "tag" %}
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Tag key</label>
+        <select name="key" id="cf-key" onchange="this.form.submit()"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_key %}selected{% endif %}>Choose a key…</option>
+            {% for k in keys %}
+            <option value="{{ k }}" {% if sel_key == k %}selected{% endif %}>{{ k }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    {% else %}
+    <input type="hidden" name="key" id="cf-key" value="">
+    {% endif %}
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">A</label>
+        <select name="a" id="cf-a"
+            hx-get="/admin/compare/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;min-width:12rem;">
+            <option value="" {% if not sel_a %}selected{% endif %}>Choose…</option>
+            {% for v in values %}
+            <option value="{{ v }}" {% if sel_a == v %}selected{% endif %}>{{ v }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">B</label>
+        <select name="b" id="cf-b"
+            hx-get="/admin/compare/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;min-width:12rem;">
+            <option value="" {% if not sel_b %}selected{% endif %}>Choose…</option>
+            {% for v in values %}
+            <option value="{{ v }}" {% if sel_b == v %}selected{% endif %}>{{ v }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Window</label>
+        <select name="window" id="cf-window"
+            hx-get="/admin/compare/panels" hx-target="#panels" hx-trigger="change"
+            hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="all"     {% if sel_window == "all"     %}selected{% endif %}>All time</option>
+            <option value="daily"   {% if sel_window == "daily"   %}selected{% endif %}>Daily</option>
+            <option value="weekly"  {% if sel_window == "weekly"  %}selected{% endif %}>Weekly</option>
+            <option value="monthly" {% if sel_window == "monthly" %}selected{% endif %}>Monthly</option>
+        </select>
+    </div>
+</form>
+
+<p style="font-size:0.8rem;color:#777;margin-bottom:1rem;">{{ caveat_quality }}</p>
+
+<div id="panels"
+    hx-get="/admin/compare/panels"
+    hx-trigger="load"
+    hx-include="#cf-dimension,#cf-key,#cf-a,#cf-b,#cf-window">
+    <div style="text-align:center;padding:2rem;color:#999;">Loading…</div>
+</div>
+{% endblock %}

@@ -140,6 +140,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_budgets, post_create_budget, post_edit_budget, post_delete_budget,
     };
     use crate::api::admin::reports::{get_reports, get_reports_panels};
+    use crate::api::admin::compare::{get_compare_page, get_compare_panels};
     use crate::api::admin::models::{
         get_models, post_create_model, post_disable_model, post_enable_model,
         post_delete_model, post_set_failovers,
@@ -260,6 +261,8 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/budgets/:id/delete", post(post_delete_budget))
         .route("/admin/reports", get(get_reports))
         .route("/admin/reports/panels", get(get_reports_panels))
+        .route("/admin/compare", get(get_compare_page))
+        .route("/admin/compare/panels", get(get_compare_panels))
         .route("/admin/models", get(get_models).post(post_create_model))
         .route("/admin/models/:id/disable", post(post_disable_model))
         .route("/admin/models/:id/enable", post(post_enable_model))

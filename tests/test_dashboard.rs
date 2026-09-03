@@ -329,3 +329,308 @@ async fn failures_page_lists_captured_failures_by_stage() {
         "the stage must be shown so the operator knows it is a config fault"
     );
 }
+
+// ── Compare page ──────────────────────────────────────────────────────────────
+
+fn session_cookie(token: &str) -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    (
+        axum::http::header::COOKIE,
+        axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+    )
+}
+
+/// Ledger rows for one arm. The ledger references `users`, so the first call
+/// creates the row every entry points at.
+async fn seed_compare_ledger(
+    db: &modelrouter::db::sqlite::SqliteDb,
+    model: &str,
+    provider: &str,
+    tags: &str,
+    n: usize,
+) {
+    use modelrouter::db::models::{NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    if UserRepository::find_by_name(db, "compare-user").await.unwrap().is_none() {
+        UserRepository::create(db, NewUser { name: "compare-user".to_string(), email: None })
+            .await
+            .unwrap();
+    }
+    let user = UserRepository::find_by_name(db, "compare-user").await.unwrap().unwrap();
+    for _ in 0..n {
+        CostRepository::create(
+            db,
+            NewCostLedgerEntry {
+                user_id: user.id,
+                prompt_id: None,
+                model: model.to_string(),
+                provider: provider.to_string(),
+                project: None,
+                tokens_in: 10,
+                tokens_out: 5,
+                cost_usd: 0.01,
+                api_key_id: None,
+                attribution_correlation_id: Some(format!("run-{model}")),
+                attribution_tags: tags.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Reverse minijinja's HTML escaping so a `data-chart-data` attribute can be
+/// parsed back as JSON.
+fn html_unescape(s: &str) -> String {
+    s.replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#x2f;", "/")
+        .replace("&#47;", "/")
+        .replace("&amp;", "&")
+}
+
+/// Every `data-chart-data="..."` attribute value in `body`, keyed by the `id`
+/// that precedes it on the same element.
+fn chart_data_attrs(body: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let marker = "data-chart-data=\"";
+    let mut from = 0;
+    while let Some(pos) = body[from..].find(marker) {
+        let start = from + pos + marker.len();
+        let value = body[start..].split('"').next().unwrap_or("");
+        let id = body[..from + pos]
+            .rsplit("id=\"")
+            .next()
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        out.insert(id, value.to_string());
+        from = start;
+    }
+    out
+}
+
+#[tokio::test]
+async fn compare_page_renders_for_viewer() {
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(common::in_memory_db().await), settings).await;
+
+    let resp = server
+        .get("/admin/compare")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(resp.status_code(), 200, "viewer should see the compare page");
+    let body = resp.text();
+    assert!(body.contains("name=\"dimension\""), "dimension selector missing: {body}");
+    assert!(body.contains("href=\"/admin/compare\""), "nav link missing");
+    assert!(
+        body.contains("no quality column"),
+        "the quality caveat must be visible on the page itself"
+    );
+}
+
+#[tokio::test]
+async fn compare_pickers_and_panels_list_both_models() {
+    let raw_db = common::in_memory_db().await;
+    seed_compare_ledger(&raw_db, "mock-model", "mock", "{}", 3).await;
+    seed_compare_ledger(&raw_db, "mock-model-b", "mock", "{}", 2).await;
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let page = server
+        .get("/admin/compare")
+        .add_query_param("dimension", "model")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(page.status_code(), 200);
+    let body = page.text();
+    assert!(body.contains("value=\"mock-model\""), "picker must list mock-model: {body}");
+    assert!(body.contains("value=\"mock-model-b\""), "picker must list mock-model-b");
+
+    let panels = server
+        .get("/admin/compare/panels")
+        .add_query_param("dimension", "model")
+        .add_query_param("a", "mock-model")
+        .add_query_param("b", "mock-model-b")
+        .add_query_param("window", "all")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(panels.status_code(), 200, "{}", panels.text());
+    let body = panels.text();
+    assert!(body.contains("mock-model"), "arm A label missing: {body}");
+    assert!(body.contains("mock-model-b"), "arm B label missing");
+    assert!(body.contains(">3<"), "arm A request count missing: {body}");
+    assert!(body.contains(">2<"), "arm B request count missing: {body}");
+}
+
+#[tokio::test]
+async fn compare_panels_tag_dimension_with_no_rows_says_no_data() {
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(common::in_memory_db().await), settings).await;
+
+    let resp = server
+        .get("/admin/compare/panels")
+        .add_query_param("dimension", "tag")
+        .add_query_param("key", "arm")
+        .add_query_param("a", "control")
+        .add_query_param("b", "treatment")
+        .add_query_param("window", "all")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(resp.status_code(), 200, "an empty arm is not an error: {}", resp.text());
+    let body = resp.text();
+    assert!(body.to_lowercase().contains("no data"), "empty arms must say so: {body}");
+}
+
+#[tokio::test]
+async fn compare_panels_unsafe_tag_key_renders_inline_message() {
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(common::in_memory_db().await), settings).await;
+
+    let resp = server
+        .get("/admin/compare/panels")
+        .add_query_param("dimension", "tag")
+        .add_query_param("key", "a b")
+        .add_query_param("a", "x")
+        .add_query_param("b", "y")
+        .add_query_param("window", "all")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(resp.status_code(), 200, "validation is shown inline, not as an error page");
+    let body = resp.text();
+    assert!(body.contains("tag key"), "validation message must name the field: {body}");
+    assert!(!body.contains("<h1>Bad Request</h1>"), "must not be the generic error page");
+}
+
+#[tokio::test]
+async fn compare_panels_carry_chart_data_json() {
+    let raw_db = common::in_memory_db().await;
+    seed_compare_ledger(&raw_db, "mock-model", "mock", "{}", 2).await;
+    seed_compare_ledger(&raw_db, "mock-model-b", "mock", "{}", 1).await;
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/compare/panels")
+        .add_query_param("dimension", "model")
+        .add_query_param("a", "mock-model")
+        .add_query_param("b", "mock-model-b")
+        .add_query_param("window", "all")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    let charts = chart_data_attrs(&body);
+    for id in ["compare-bars-chart", "compare-daily-chart", "compare-latency-chart"] {
+        let raw = charts
+            .get(id)
+            .unwrap_or_else(|| panic!("{id} must carry data-chart-data: {body}"));
+        let parsed: serde_json::Value = serde_json::from_str(&html_unescape(raw))
+            .unwrap_or_else(|e| panic!("{id} chart data is not JSON ({e}): {raw}"));
+        assert!(parsed.is_object() || parsed.is_array(), "{id} chart data must be structured");
+    }
+    let bars: serde_json::Value =
+        serde_json::from_str(&html_unescape(&charts["compare-bars-chart"])).unwrap();
+    assert_eq!(bars["a"]["label"], "mock-model");
+    assert_eq!(bars["b"]["label"], "mock-model-b");
+}
+
+#[tokio::test]
+async fn compare_panels_auth_matches_reports_panels() {
+    let settings = Arc::new(Settings::default());
+    let server =
+        build_test_server_with_db(Arc::new(common::in_memory_db().await), settings.clone()).await;
+
+    // No session at all: whatever the reports panels do, the compare panels do.
+    let reports = server.get("/admin/reports/panels").await;
+    let compare = server.get("/admin/compare/panels").await;
+    assert_eq!(compare.status_code(), reports.status_code());
+    assert_eq!(
+        compare.headers().get("location"),
+        reports.headers().get("location"),
+        "unauthenticated compare panels must go where reports panels go"
+    );
+
+    // A token with a role the dashboard does not recognise gets the same answer
+    // from both pages.
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+    let odd = issue_jwt(
+        &AdminClaims { sub: 7, name: "odd".to_string(), role: "nobody".to_string(), exp },
+        &settings.auth.jwt_secret,
+    )
+    .unwrap();
+    let reports = server
+        .get("/admin/reports")
+        .add_header(session_cookie(&odd).0, session_cookie(&odd).1)
+        .await;
+    let compare = server
+        .get("/admin/compare")
+        .add_header(session_cookie(&odd).0, session_cookie(&odd).1)
+        .await;
+    assert_eq!(compare.status_code(), reports.status_code());
+
+    // A forged token is rejected the same way.
+    let reports = server
+        .get("/admin/reports")
+        .add_header(session_cookie("garbage").0, session_cookie("garbage").1)
+        .await;
+    let compare = server
+        .get("/admin/compare")
+        .add_header(session_cookie("garbage").0, session_cookie("garbage").1)
+        .await;
+    assert_eq!(compare.status_code(), reports.status_code());
+    assert_eq!(compare.headers().get("location"), reports.headers().get("location"));
+}
+
+#[tokio::test]
+async fn compare_escapes_tag_values_and_chart_json_round_trips() {
+    let raw_db = common::in_memory_db().await;
+    let hostile = "<b>x</b> \"quoted\" a&b";
+    let tags = serde_json::json!({ "arm": hostile }).to_string();
+    seed_compare_ledger(&raw_db, "mock-model", "mock", &tags, 2).await;
+    seed_compare_ledger(&raw_db, "mock-model-b", "mock", r#"{"arm":"plain"}"#, 1).await;
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    // The picker lists the hostile value, escaped.
+    let page = server
+        .get("/admin/compare")
+        .add_query_param("dimension", "tag")
+        .add_query_param("key", "arm")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(page.status_code(), 200);
+    let body = page.text();
+    assert!(!body.contains("<b>x</b>"), "raw markup from a tag value leaked into the page: {body}");
+    assert!(
+        body.contains("&lt;b&gt;x&lt;&#x2f;b&gt;") || body.contains("&lt;b&gt;x&lt;/b&gt;"),
+        "escaped value missing: {body}"
+    );
+
+    let panels = server
+        .get("/admin/compare/panels")
+        .add_query_param("dimension", "tag")
+        .add_query_param("key", "arm")
+        .add_query_param("a", hostile)
+        .add_query_param("b", "plain")
+        .add_query_param("window", "all")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(panels.status_code(), 200, "{}", panels.text());
+    let body = panels.text();
+    assert!(!body.contains("<b>x</b>"), "raw markup leaked into the panels: {body}");
+    let charts = chart_data_attrs(&body);
+    let bars: serde_json::Value =
+        serde_json::from_str(&html_unescape(&charts["compare-bars-chart"])).unwrap();
+    assert_eq!(bars["a"]["label"], hostile, "chart JSON must round-trip the original value");
+}

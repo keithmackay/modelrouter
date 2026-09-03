@@ -1,0 +1,90 @@
+{% if message %}
+<div class="stat-card" style="padding:1.25rem;">
+    {% if hint %}
+    <p style="color:#777;text-align:center;margin:0;">{{ message }}</p>
+    {% else %}
+    <p style="color:#c0392b;margin:0;"><strong>Invalid comparison:</strong> {{ message }}</p>
+    {% endif %}
+</div>
+{% else %}
+{% set a = cmp.a %}
+{% set b = cmp.b %}
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;">
+
+<div class="stat-card" style="grid-column:1/-1;">
+    <h3 style="margin-top:0;">
+        A: <code>{{ a.label }}</code>
+        <span style="color:#999;font-weight:normal;">vs</span>
+        B: <code>{{ b.label }}</code>
+        <span style="font-size:0.75rem;color:#999;font-weight:normal;margin-left:0.5rem;">
+            {% if cmp.window == "all" %}all time{% else %}{{ cmp.window }} · {{ cmp.start|fmt_ts }} → {{ cmp.end|fmt_ts }}{% endif %}
+        </span>
+    </h3>
+
+    {% if a.requests == 0 or b.requests == 0 %}
+    <p style="color:#999;font-size:0.85rem;">
+        No data for
+        {% if a.requests == 0 and b.requests == 0 %}either arm{% elif a.requests == 0 %}arm A{% else %}arm B{% endif %}
+        in this window: the ledger has no rows matching it. Per-request figures show a dash.
+    </p>
+    {% endif %}
+
+    {% if a.unpriced or b.unpriced %}
+    <p style="font-size:0.8rem;margin:0.25rem 0 0.75rem;">
+        <span style="background:#fff3cd;color:#856404;padding:0.15rem 0.5rem;border-radius:3px;font-weight:600;">unpriced</span>
+        cost is understated: no price is configured for
+        {% for m in a.unpriced_models %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% if a.unpriced_models and b.unpriced_models %}, {% endif %}{% for m in b.unpriced_models %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    </p>
+    {% endif %}
+
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th style="text-align:left;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">Metric</th>
+                <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">A</th>
+                <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">B</th>
+                <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">Δ (B − A)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in rows %}
+            <tr{% if loop.index0 == 8 %} style="border-top:2px solid #eee;"{% endif %}>
+                <td style="padding:0.35rem 0.5rem;">{{ r.label }}</td>
+                <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ r.a }}</td>
+                <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ r.b }}</td>
+                <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;color:#555;">{{ r.delta }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <p style="font-size:0.78rem;color:#777;margin:0.75rem 0 0;">
+        Coverage — latency samples / requests:
+        A {% if cmp.coverage.a.requests == 0 %}—{% else %}{{ cmp.coverage.a.latency_samples }} / {{ cmp.coverage.a.requests }}{% endif %},
+        B {% if cmp.coverage.b.requests == 0 %}—{% else %}{{ cmp.coverage.b.latency_samples }} / {{ cmp.coverage.b.requests }}{% endif %}.
+        Latency comes from the prompt log; an arm with fewer samples than requests was partly served from cache or logged without latency.
+    </p>
+    <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ cmp.ttft_note }}</p>
+    {% for c in cmp.caveats %}
+    <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ c }}</p>
+    {% endfor %}
+</div>
+
+<div class="stat-card">
+    <h3>Per request, A vs B</h3>
+    <div id="compare-bars-chart" data-chart-data="{{ bars_json }}" style="width:100%;height:240px;"></div>
+</div>
+
+<div class="stat-card">
+    <h3>Daily cost</h3>
+    <div id="compare-daily-chart" data-chart-data="{{ daily_json }}" style="width:100%;height:240px;"></div>
+</div>
+
+<div class="stat-card" style="grid-column:1/-1;">
+    <h3>Latency p50 / p95</h3>
+    <div id="compare-latency-chart" data-chart-data="{{ latency_json }}" style="width:100%;height:220px;"></div>
+</div>
+
+</div>
+{% endif %}

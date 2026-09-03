@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
+use axum::response::Html;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,7 @@ use crate::router::cost::CostCalculator;
 
 use super::attribution::window_range;
 use super::auth::AdminSession;
+use super::dashboard::{DashboardError, DashboardSession};
 
 /// Statements every comparison carries, in order. The page and the CLI print
 /// them verbatim; tests pin their presence, not their wording.
@@ -417,6 +419,307 @@ pub async fn get_compare(
 ) -> Result<Json<Comparison>, ApiError> {
     let sources = CompareSources::from_state(&state);
     Ok(Json(build_comparison(&sources, &q).await?))
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+/// Cap on picker options, matching the attribution facet limit.
+const FACET_LIMIT: i64 = 500;
+
+/// Selection echoed back into the page. Everything is optional so a bare
+/// `/admin/compare` renders the pickers with nothing chosen yet.
+#[derive(Debug, Default, Deserialize)]
+pub struct ComparePageQuery {
+    #[serde(default)]
+    pub dimension: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub a: String,
+    #[serde(default)]
+    pub b: String,
+    #[serde(default)]
+    pub window: String,
+}
+
+/// GET /admin/compare — pickers for one dimension plus an empty panel that
+/// HTMX fills from `/admin/compare/panels`.
+pub async fn get_compare_page(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    Query(q): Query<ComparePageQuery>,
+) -> Result<Html<String>, DashboardError> {
+    let dimension = if DIMENSIONS.contains(&q.dimension.as_str()) {
+        q.dimension.as_str()
+    } else {
+        "model"
+    };
+    let window = if WINDOWS.contains(&q.window.as_str()) {
+        q.window.as_str()
+    } else {
+        "all"
+    };
+    let db = &*state.db;
+    let internal = |_| DashboardError::Internal;
+
+    let mut keys: Vec<String> = Vec::new();
+    let mut key: Option<String> = None;
+    let values: Vec<String> = match dimension {
+        "model" => CostRepository::distinct_models_in_ledger(db).await.map_err(internal)?,
+        "provider" => CostRepository::distinct_providers_in_ledger(db)
+            .await
+            .map_err(internal)?,
+        "tag" => {
+            keys = CostRepository::distinct_attribution_tag_keys(db).await.map_err(internal)?;
+            // Only a key the ledger actually holds reaches the value query, so
+            // an arbitrary key from the URL is never interpolated anywhere.
+            let chosen = q.key.trim();
+            if keys.iter().any(|k| k == chosen) {
+                key = Some(chosen.to_string());
+                CostRepository::distinct_attribution_values(db, Some(chosen), FACET_LIMIT)
+                    .await
+                    .map_err(internal)?
+            } else {
+                Vec::new()
+            }
+        }
+        _ => CostRepository::distinct_recent_correlation_ids(db, FACET_LIMIT)
+            .await
+            .map_err(internal)?,
+    };
+
+    super::dashboard::render(
+        "compare.html",
+        minijinja::context! {
+            sel_dimension => dimension,
+            sel_key => key,
+            sel_a => q.a,
+            sel_b => q.b,
+            sel_window => window,
+            keys => keys,
+            values => values,
+            caveat_quality => CAVEAT_QUALITY,
+        },
+    )
+}
+
+/// One row of the metric table, pre-formatted so the template only prints.
+#[derive(Debug, Serialize)]
+struct MetricRow {
+    label: String,
+    a: String,
+    b: String,
+    delta: String,
+}
+
+fn fmt_opt<F: Fn(f64) -> String>(v: Option<f64>, f: F) -> String {
+    v.map(f).unwrap_or_else(|| "—".to_string())
+}
+
+fn fmt_delta<F: Fn(f64) -> String>(d: &Option<Delta>, f: F) -> String {
+    match d {
+        None => "—".to_string(),
+        Some(d) => {
+            let sign = if d.abs > 0.0 { "+" } else { "" };
+            match d.pct {
+                Some(pct) => format!("{sign}{} ({sign}{pct:.1}%)", f(d.abs)),
+                None => format!("{sign}{}", f(d.abs)),
+            }
+        }
+    }
+}
+
+fn fmt_count(v: f64) -> String {
+    format!("{}", v.round() as i64)
+}
+
+fn fmt_ms(v: f64) -> String {
+    format!("{:.0} ms", v)
+}
+
+fn fmt_rate(v: f64) -> String {
+    format!("{:.1}%", v * 100.0)
+}
+
+fn fmt_per_request(v: f64) -> String {
+    format!("{:.1}", v)
+}
+
+fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
+    let money = super::templates::fmt_money;
+    let (a, b, d) = (&c.a, &c.b, &c.delta);
+    let ms = |v: Option<i64>| fmt_opt(v.map(|v| v as f64), fmt_ms);
+    vec![
+        // Per-request figures first: they are what an experiment is judged on.
+        MetricRow {
+            label: "Cost per request".into(),
+            a: fmt_opt(a.cost_per_request, money),
+            b: fmt_opt(b.cost_per_request, money),
+            delta: fmt_delta(&d.cost_per_request, money),
+        },
+        MetricRow {
+            label: "Tokens in per request".into(),
+            a: fmt_opt(a.tokens_in_per_request, fmt_per_request),
+            b: fmt_opt(b.tokens_in_per_request, fmt_per_request),
+            delta: fmt_delta(&d.tokens_in_per_request, fmt_per_request),
+        },
+        MetricRow {
+            label: "Tokens out per request".into(),
+            a: fmt_opt(a.tokens_out_per_request, fmt_per_request),
+            b: fmt_opt(b.tokens_out_per_request, fmt_per_request),
+            delta: fmt_delta(&d.tokens_out_per_request, fmt_per_request),
+        },
+        MetricRow {
+            label: "Mean latency".into(),
+            a: fmt_opt(a.latency.mean_ms, fmt_ms),
+            b: fmt_opt(b.latency.mean_ms, fmt_ms),
+            delta: fmt_delta(&d.mean_ms, fmt_ms),
+        },
+        MetricRow {
+            label: "p50 latency".into(),
+            a: ms(a.latency.p50_ms),
+            b: ms(b.latency.p50_ms),
+            delta: fmt_delta(&d.p50_ms, fmt_ms),
+        },
+        MetricRow {
+            label: "p95 latency".into(),
+            a: ms(a.latency.p95_ms),
+            b: ms(b.latency.p95_ms),
+            delta: fmt_delta(&d.p95_ms, fmt_ms),
+        },
+        MetricRow {
+            label: "Cache hit rate".into(),
+            a: fmt_rate(a.hit_rate),
+            b: fmt_rate(b.hit_rate),
+            delta: fmt_delta(&d.hit_rate, fmt_rate),
+        },
+        MetricRow {
+            label: "Error rate".into(),
+            a: fmt_rate(a.error_rate),
+            b: fmt_rate(b.error_rate),
+            delta: fmt_delta(&d.error_rate, fmt_rate),
+        },
+        // Totals second: they mostly reflect how much traffic each arm saw.
+        MetricRow {
+            label: "Requests".into(),
+            a: a.requests.to_string(),
+            b: b.requests.to_string(),
+            delta: fmt_delta(&d.requests, fmt_count),
+        },
+        MetricRow {
+            label: "Total cost".into(),
+            a: money(a.cost_usd),
+            b: money(b.cost_usd),
+            delta: fmt_delta(&d.cost_usd, money),
+        },
+        MetricRow {
+            label: "Saved by cache".into(),
+            a: money(a.saved_usd),
+            b: money(b.saved_usd),
+            delta: "—".into(),
+        },
+        MetricRow {
+            label: "Tokens in".into(),
+            a: a.tokens_in.to_string(),
+            b: b.tokens_in.to_string(),
+            delta: fmt_delta(&d.tokens_in, fmt_count),
+        },
+        MetricRow {
+            label: "Tokens out".into(),
+            a: a.tokens_out.to_string(),
+            b: b.tokens_out.to_string(),
+            delta: fmt_delta(&d.tokens_out, fmt_count),
+        },
+        MetricRow {
+            label: "Cache hits".into(),
+            a: a.cache_hits.to_string(),
+            b: b.cache_hits.to_string(),
+            delta: "—".into(),
+        },
+        MetricRow {
+            label: "Failures".into(),
+            a: a.failures.to_string(),
+            b: b.failures.to_string(),
+            delta: "—".into(),
+        },
+    ]
+}
+
+/// Chart payloads. The chart legend shows the raw arm value, which is what
+/// the operator picked; the metric table carries the full `label`.
+fn chart_json(c: &Comparison) -> (String, String, String) {
+    let to_json = |v: serde_json::Value| serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+    let bars = |m: &ArmMetrics| {
+        serde_json::json!({
+            "label": m.value,
+            "requests": m.requests,
+            "cost_per_request": m.cost_per_request,
+            "tokens_in_per_request": m.tokens_in_per_request,
+            "tokens_out_per_request": m.tokens_out_per_request,
+            "mean_ms": m.latency.mean_ms,
+        })
+    };
+    let daily = |m: &ArmMetrics| {
+        serde_json::json!({
+            "label": m.value,
+            "requests": m.requests,
+            "series": m.by_day.iter().map(|row| serde_json::json!({
+                "day": row.key,
+                "cost_usd": row.totals.cost_usd,
+            })).collect::<Vec<_>>(),
+        })
+    };
+    let latency = |m: &ArmMetrics| {
+        serde_json::json!({
+            "label": m.value,
+            "samples": m.latency.samples,
+            "p50_ms": m.latency.p50_ms,
+            "p95_ms": m.latency.p95_ms,
+        })
+    };
+    (
+        to_json(serde_json::json!({ "a": bars(&c.a), "b": bars(&c.b) })),
+        to_json(serde_json::json!({ "a": daily(&c.a), "b": daily(&c.b) })),
+        to_json(serde_json::json!({ "a": latency(&c.a), "b": latency(&c.b) })),
+    )
+}
+
+/// GET /admin/compare/panels — the comparison itself, swapped into the page.
+///
+/// A rejected query renders as an inline message rather than an error page:
+/// the pickers are still on screen and the operator only needs to fix one.
+pub async fn get_compare_panels(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    Query(q): Query<CompareQuery>,
+) -> Result<Html<String>, DashboardError> {
+    let render_message = |message: String, hint: bool| {
+        super::dashboard::render(
+            "compare_panels.html",
+            minijinja::context! { message => message, hint => hint },
+        )
+    };
+    if q.a.trim().is_empty() || q.b.trim().is_empty() {
+        return render_message("Choose two arms to compare.".to_string(), true);
+    }
+    let sources = CompareSources::from_state(&state);
+    let comparison = match build_comparison(&sources, &q).await {
+        Ok(c) => c,
+        Err(CompareError::Invalid(msg)) => return render_message(msg, false),
+        Err(e) => return Err(e.into()),
+    };
+    let rows = metric_rows(&comparison);
+    let (bars_json, daily_json, latency_json) = chart_json(&comparison);
+    super::dashboard::render(
+        "compare_panels.html",
+        minijinja::context! {
+            cmp => minijinja::Value::from_serialize(&comparison),
+            rows => minijinja::Value::from_serialize(&rows),
+            bars_json => bars_json,
+            daily_json => daily_json,
+            latency_json => latency_json,
+        },
+    )
 }
 
 #[cfg(test)]
