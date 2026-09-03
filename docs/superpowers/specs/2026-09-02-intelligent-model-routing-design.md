@@ -299,9 +299,9 @@ state fed by 429 responses (member sidelined for `throttle_cooldown_secs`).
 This makes "local model busy" and "free tier throttled" visible to routing;
 neither exists today.
 
-**Counters are released by RAII, never by hand.** Acquiring capacity yields a
-guard whose `Drop` releases it, the way `ConcurrencyLimiter` yields an
-`OwnedSemaphorePermit` (`src/router/concurrency.rs`). Manual
+**The per-process counter is released by RAII, never by hand.** Acquiring
+capacity yields a guard whose `Drop` releases it, the way `ConcurrencyLimiter`
+yields an `OwnedSemaphorePermit` (`src/router/concurrency.rs`). Manual
 increment/decrement would leak on any early return — validation rejection,
 escalation, panic, client disconnect, streaming abort — and a leaked counter
 drifts to the cap and sidelines the member *permanently*. That failure is
@@ -309,6 +309,13 @@ invisible by construction, since overflow to the next tier is normal
 behaviour: a dead free tier looks like healthy overflow while quietly costing
 money. Saturation is also a metric, and idle in-flight counts are asserted zero
 at startup.
+
+**RAII does not carry over to a shared counter.** `Drop` is synchronous and a
+shared release is a network round trip, so the follow-on in §13.17 cannot
+reuse this discipline: it needs lease-scored entries whose expiry releases a
+slot without cooperation, plus a channel-fed releaser task. A killed replica
+must not leak its slot forever, and bare increment/decrement across processes
+would do exactly that.
 
 Deliberately unlike `ConcurrencyLimiter` in one respect: that component fixes
 a user's cap at first use and only a restart applies a change (documented
@@ -335,10 +342,45 @@ no equivalent, with consequences that differ in severity:
 | Session affinity | A pin only applies on ~1/N of requests, so prompt-cache warmth — the entire point of stickiness — is largely lost |
 | Circuit breaker | Each replica learns a provider is down independently: N × the failed requests before all replicas open |
 
-Single-replica deployments are unaffected. For multi-replica, capacity is the
-one that is actually incorrect rather than merely less effective, and it should
-share state through the same Redis store the cache already uses before any
-deployment relies on a local-model capacity cap. See §13.17.
+**Decision: shared capacity is deferred, and capacity caps are made mutually
+exclusive with multi-replica.** Build the per-process counter now behind a
+trait boundary so the shared implementation is a second impl rather than a
+rewrite, and treat single-replica as the supported configuration for a capped
+local model.
+
+The premise is that single-replica is the **shipped default, not an
+unreachable configuration**. `deploy/helm/modelrouter/values.yaml` ships
+`replicaCount: 1` with autoscaling disabled and a `ReadWriteOnce` volume, but
+`templates/hpa.yaml` ships with the chart and carries a maximum of three, and
+the README documents the Redis cache backend as shared across stateless
+replicas. Multi-replica is one flag away. This decision therefore withdraws an
+advertised posture — capacity caps or autoscaling, not both — until the
+follow-on lands, rather than deferring work nobody could reach.
+
+**The guard, and the input it reads.** A modelrouter process cannot observe its
+own replica count: no such field exists in `src/config/schema.rs`, and
+`deploy/helm/modelrouter/templates/deployment.yaml` injects none. The guard
+therefore reads a new operator-declared setting defaulting to 1, which the
+chart sets from `.Values.replicaCount` — and from the autoscaler's maximum when
+autoscaling is enabled — using the single-underscore environment form
+`docker-compose.yml` already uses correctly. Startup refuses when a nonzero
+capacity cap is configured and that value exceeds one, and the same check runs
+on an overlay write that raises a cap, since a start-time check alone would
+miss a cap raised at runtime.
+
+**What the guard does not cover.** It is operator-declared and checked at
+startup and on write, so an autoscaler that boots at one replica and scales out
+under load defeats it. That is a stated limitation of the deferral, not a
+covered case: the declared value is a contract with the operator, not an
+observation of the cluster.
+
+**What the follow-on needs**, recorded so it is not re-researched: lease-scored
+entries rather than bare increment/decrement, a `script` feature addition to
+the `redis` dependency pinned at `Cargo.toml` with `default-features = false`
+(so `EVALSHA` is unavailable today), and the channel-fed releaser task §4a
+names above. `build_store`'s silent fallback to the in-memory backend when
+`redis_url` is empty is the anti-pattern to avoid here: for a cache a silent
+degrade costs money, for a capacity gate it costs correctness.
 
 ### 4b. New supporting component: `MemberHealth`
 
@@ -1315,6 +1357,9 @@ Principle: smart routing degrades, never breaks.
   classification at zero added latency; a half-open probe recovers it.
 - Capacity guards: a request aborted at every early-return point releases its
   in-flight count; idle counters are zero.
+- Multi-replica guard: a nonzero capacity cap plus a declared replica count
+  above one refuses to start, naming both values; the same check fires on an
+  overlay write that raises a cap above the declared count.
 - Validity gate, per row of §4e: an out-of-range tier clamps, an unknown
   category becomes `other` without creating a stats cell, a bad
   `X-Routing-Objective` is 400, an unknown experiment variant is 400, a
@@ -1506,6 +1551,19 @@ out-of-process through the `http` plugin, which is what that escape hatch is
 for. WASM would give real sandboxing with fuel limits and no ABI problem; it is
 a project, not a section, and is listed in §12.
 
+**13.17 Shared routing state → deferred; capacity caps and multi-replica are
+mutually exclusive.** `ProviderCapacity` is incorrect per-replica, session
+affinity is merely degraded, and breaker state is slower to converge. Rejected:
+sharing capacity through the cache's Redis store now (costs a shared-counter
+abstraction, a `script` feature addition to the pinned `redis` dependency, and a
+releaser task, before anyone has asked to scale); sharing all three (pays round
+trips on the affinity hot path for a degradation, not a defect). Taken: build
+the per-process counter behind a trait seam, guard with an operator-declared
+replica count, and record the shared implementation as a follow-on (§4a). The
+guard is a contract with the operator, not an observation — an autoscaler that
+scales out after boot defeats it, and that limitation is stated rather than
+papered over.
+
 ### Still open
 
 **13.10 Whose budget do shadow tokens land on?** Shadow requests are real
@@ -1525,16 +1583,6 @@ shared deployment.
 Open: what a sane non-zero default is, whether the queue is per member or per
 provider, and whether a queued request should be pre-empted when a cheaper
 member frees up elsewhere in the tier.
-
-**13.17 How much routing state must be shared across replicas?**
-`ProviderCapacity` is incorrect per-replica (§4a), session affinity is merely
-degraded, and breaker state is slower to converge. Options: (a) share capacity
-only, via the Redis store the cache already uses, and document the other two as
-single-replica-preferred; (b) share all three; (c) leave it and constrain
-capacity caps to single-replica deployments. (a) fixes the one that is wrong
-without paying round trips on the affinity hot path, and is the likely answer —
-but it needs a decision before anyone runs multiple replicas against a capped
-local model.
 
 **13.14 Where exactly does the secrets line fall in `[providers.*]`?** A
 provider block mixes a secret (`api_key`) with operational knobs (`api_base`,
@@ -1576,6 +1624,16 @@ operator decision on pricing:
   `MemberHealth` façade (R2 §4.8); `ProviderCapacity` reconfiguration
   behaviour contrasted with `ConcurrencyLimiter` (R2 §4.9).
 - PR #46 recorded as a ship-blocking dependency (§2).
+
+**Revision 12 (2026-09-02)** — the §13 open questions resolved against the
+codebase:
+
+- **13.17 shared capacity → deferred behind a trait seam**, with capacity caps
+  and multi-replica made mutually exclusive by an operator-declared replica
+  count. §4a records the guard, the input it reads (a process cannot observe
+  its own replica count), what the guard does not cover, and what the follow-on
+  needs. The RAII release discipline is corrected: it holds for the per-process
+  counter and cannot carry over to a shared one, because `Drop` is synchronous.
 
 **Revision 11 (2026-09-02)** — the sequence reconciled with the live handler:
 
