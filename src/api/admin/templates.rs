@@ -168,7 +168,42 @@ pub fn build_env() -> Environment<'static> {
     )
     .expect("models.html template is valid");
 
+    env.add_template_owned(
+        "webhooks.html",
+        include_str!("../../../templates/admin/webhooks.html").to_string(),
+    )
+    .expect("webhooks.html template is valid");
+
     env
+}
+
+#[cfg(test)]
+mod registration_tests {
+    /// Every file under `templates/admin/` must be registered above.
+    ///
+    /// `include_str!` is per-file, so a page can be added with a working
+    /// route and a nav link while its template is never added to the
+    /// environment — the route then 500s on first visit and nothing in the
+    /// build says so (issue #54, `/admin/webhooks`). This walks the directory
+    /// at test time so the next omission fails `cargo test` instead.
+    #[test]
+    fn every_admin_template_file_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/admin");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("templates/admin is readable") {
+            let name = entry.expect("dir entry").file_name().to_string_lossy().to_string();
+            if !name.ends_with(".html") {
+                continue;
+            }
+            if super::env().get_template(&name).is_err() {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "templates on disk but not registered in templates.rs: {missing:?}"
+        );
+    }
 }
 
 
