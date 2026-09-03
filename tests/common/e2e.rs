@@ -55,6 +55,9 @@ pub struct RouterOptions {
     /// Overrides the generated secret. Used by the tests that assert the
     /// startup guard refuses empty and placeholder values.
     pub jwt_secret: Option<String>,
+    /// `[server] request_body_limit_mb`. `None` leaves the line out so the
+    /// config default applies.
+    pub request_body_limit_mb: Option<usize>,
 }
 
 impl RouterOptions {
@@ -63,7 +66,13 @@ impl RouterOptions {
             provider_base_url: provider_base_url.into(),
             cache_enabled: false,
             jwt_secret: None,
+            request_body_limit_mb: None,
         }
+    }
+
+    pub fn with_request_body_limit_mb(mut self, mb: usize) -> Self {
+        self.request_body_limit_mb = Some(mb);
+        self
     }
 
     pub fn with_cache(mut self) -> Self {
@@ -84,12 +93,16 @@ impl RouterOptions {
 pub fn render_config(dir: &Path, port: u16, opts: &RouterOptions) -> String {
     let db_path = dir.join("router.db");
     let secret = opts.jwt_secret.clone().unwrap_or_else(random_secret);
+    let body_limit = opts
+        .request_body_limit_mb
+        .map(|mb| format!("request_body_limit_mb = {mb}\n"))
+        .unwrap_or_default();
     format!(
         r#"
 [server]
 host = "127.0.0.1"
 port = {port}
-
+{body_limit}
 [database]
 path = "{db}"
 
@@ -115,6 +128,7 @@ store_prompts = true
         base = opts.provider_base_url,
         secret = secret,
         cache = opts.cache_enabled,
+        body_limit = body_limit,
     )
 }
 
@@ -132,8 +146,10 @@ impl RouterProcess {
     /// Used by the `init` regression test, which must serve the config `init`
     /// itself produced rather than one the fixture wrote.
     pub async fn start_with_config(config_path: PathBuf, dir: TempDir) -> Self {
+        // `init` writes the default port; pass a free one so this never
+        // collides with a developer's running server or a parallel test.
         let port = free_port();
-        Self::spawn(dir, config_path, port).await
+        Self::spawn(dir, config_path, port, Some(port)).await
     }
 
     /// Start the binary and wait until it answers `/health`.
@@ -143,24 +159,37 @@ impl RouterProcess {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, render_config(dir.path(), port, &opts))
             .expect("write config");
-        Self::spawn(dir, config_path, port).await
+        Self::spawn(dir, config_path, port, None).await
     }
 
-    async fn spawn(dir: TempDir, config_path: PathBuf, port: u16) -> Self {
+    /// Start with `--port` naming a port the config does *not*, so a test can
+    /// assert the flag wins. The config carries a second free port that is
+    /// never used.
+    pub async fn start_with_port_flag(opts: RouterOptions) -> Self {
+        let dir = tempfile::tempdir().expect("temp dir for router state");
+        let config_port = free_port();
+        let flag_port = free_port();
+        assert_ne!(config_port, flag_port, "two calls to free_port() returned the same port");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, render_config(dir.path(), config_port, &opts))
+            .expect("write config");
+        Self::spawn(dir, config_path, flag_port, Some(flag_port)).await
+    }
 
+    async fn spawn(dir: TempDir, config_path: PathBuf, port: u16, port_flag: Option<u16>) -> Self {
         let log = std::fs::File::create(dir.path().join("serve.log")).expect("create log");
         let err = log.try_clone().expect("clone log handle");
 
-        // `serve` binds from its own --host/--port flags, which carry clap
-        // defaults, so `[server] port` in the config is ignored entirely (see
-        // docs/testing/e2e-harness.md, "Defects this tier found"). Pass the
-        // port explicitly rather than relying on config that has no effect.
-        let child = Command::new(BIN)
-            .arg("serve")
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
+        // No --host/--port unless a test asks for it: the binary must take
+        // them from `[server]` in the config it was given. Until #55 the flags
+        // carried clap defaults that always won, and this fixture had to pass
+        // the port explicitly for anything to work.
+        let mut cmd = Command::new(BIN);
+        cmd.arg("serve");
+        if let Some(p) = port_flag {
+            cmd.arg("--port").arg(p.to_string());
+        }
+        let child = cmd
             .env("MODELROUTER_CONFIG", &config_path)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
@@ -207,6 +236,10 @@ impl RouterProcess {
 
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub fn db_path(&self) -> PathBuf {
