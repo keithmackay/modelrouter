@@ -75,6 +75,20 @@ Models are resolved in this order:
 2. Split on `/` — e.g. `anthropic/claude-opus-4-5` routes to the `anthropic` provider
 3. Fall back to `routing.default_provider`
 
+## Privacy: no downstream application names
+
+modelrouter is public. Never name a specific application, customer, team or
+organisation that uses it — in code, comments, commit messages, docs, specs,
+migrations, tests or issues. That includes internal repo paths, private issue
+numbers, and dated incident references that identify a deployment.
+
+Write "the pilot application", "a downstream caller", "one production caller",
+and describe the engineering fact the name was standing in for. The rationale
+survives; the identity does not.
+
+Before committing: `grep -rniI --exclude-dir=target <name> .` for any name you
+touched. Git history is public too, so catch it before the commit, not after.
+
 ## Dev Conventions
 
 - Use `cargo` for all Rust commands
