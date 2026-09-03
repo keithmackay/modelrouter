@@ -3,8 +3,14 @@
 use async_trait::async_trait;
 
 use crate::db::models::{NewPrompt, Prompt};
-use crate::db::repositories::prompts::PromptRepository;
+use crate::db::repositories::costs::ArmFilter;
+use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
+use super::costs::attribution_predicate;
 use super::{PostgresDb, now_utc};
+
+/// Rows that carry a real latency measurement. Cache hits are logged with
+/// `0` (or `NULL`), and would otherwise pull every percentile toward zero.
+const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
 
 #[async_trait]
 impl PromptRepository for PostgresDb {
@@ -111,5 +117,76 @@ impl PromptRepository for PostgresDb {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn latency_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        let (predicate, binds) = arm_predicate(filter);
+        let n = binds.len();
+        let where_clause = format!(
+            "{} AND created_at >= ${} AND created_at < ${} AND {}",
+            predicate,
+            n + 1,
+            n + 2,
+            LATENCY_SAMPLE
+        );
+
+        // AVG over BIGINT yields NUMERIC in Postgres; cast so sqlx decodes f64.
+        let sql = format!(
+            "SELECT COUNT(*), AVG(latency_ms)::float8 FROM prompts WHERE {}",
+            where_clause
+        );
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let (samples, mean_ms) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        if samples == 0 {
+            return Ok(LatencySummary::default());
+        }
+
+        // Nearest-rank percentiles: one indexed fetch each, offset computed
+        // here and bound rather than done in SQL.
+        let sql = format!(
+            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms ASC LIMIT 1 OFFSET ${}",
+            where_clause,
+            n + 3
+        );
+        let percentile = |q_frac: f64| {
+            let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
+            let sql = sql.clone();
+            let binds = binds.clone();
+            async move {
+                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+                for b in binds {
+                    q = q.bind(b);
+                }
+                let (v,) = q
+                    .bind(start)
+                    .bind(end)
+                    .bind(offset)
+                    .fetch_one(&self.pool)
+                    .await?;
+                anyhow::Ok(v)
+            }
+        };
+        let p50_ms = percentile(0.5).await?;
+        let p95_ms = percentile(0.95).await?;
+
+        Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
+    }
+}
+
+/// Predicate for a comparison arm against `prompts`. Model arms match the
+/// model actually served (`routed_model`), not the alias the caller asked for.
+fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
+    match filter {
+        ArmFilter::Model(m) => ("routed_model = $1".to_string(), vec![m.clone()]),
+        ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
+        ArmFilter::Attribution(f) => attribution_predicate(f),
     }
 }

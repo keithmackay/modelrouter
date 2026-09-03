@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 
 use crate::db::models::{NewRequestFailure, RequestFailure};
+use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::failures::FailureRepository;
+use super::costs::attribution_predicate;
 use super::{SqliteDb, now_utc};
 
 /// Columns selected when reading a failure row back.
@@ -75,5 +77,114 @@ impl FailureRepository for SqliteDb {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn count_for_arm(&self, filter: &ArmFilter, start: &str, end: &str) -> anyhow::Result<i64> {
+        let (predicate, binds) = arm_predicate(filter);
+        let sql = format!(
+            "SELECT COUNT(*) FROM request_failures \
+             WHERE {} AND created_at >= ? AND created_at < ?",
+            predicate
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let (count,) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(count)
+    }
+}
+
+/// Predicate for a comparison arm against `request_failures`. A request that
+/// failed before routing has no `routed_model`, so model arms fall back to
+/// the model the caller asked for.
+fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
+    match filter {
+        ArmFilter::Model(m) => (
+            "COALESCE(routed_model, request_model) = ?".to_string(),
+            vec![m.clone()],
+        ),
+        ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
+        ArmFilter::Attribution(f) => attribution_predicate(f),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::repositories::costs::{ArmFilter, AttributionFilter};
+    use crate::db::sqlite::SqliteDb;
+
+    const W_START: &str = "2026-03-01T00:00:00Z";
+    const W_END: &str = "2026-04-01T00:00:00Z";
+
+    async fn make_db() -> SqliteDb {
+        let db = SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        db
+    }
+
+    /// Failure row with an explicit `created_at` (the repository's `create`
+    /// stamps "now", which would fall outside the test window).
+    async fn insert_failure(
+        db: &SqliteDb,
+        request_model: &str,
+        routed_model: Option<&str>,
+        provider: Option<&str>,
+        run: Option<&str>,
+        tags: &str,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO request_failures (endpoint, request_model, routed_model, provider, \
+             stage, error_message, attempts, attribution_correlation_id, attribution_tags, \
+             created_at) VALUES ('/v1/chat/completions', ?, ?, ?, 'provider', 'boom', 1, ?, ?, ?)",
+        )
+        .bind(request_model)
+        .bind(routed_model)
+        .bind(provider)
+        .bind(run)
+        .bind(tags)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn count_for_arm_model_falls_back_to_request_model() {
+        let db = make_db().await;
+        insert_failure(&db, "alias", Some("X"), Some("p"), None, "{}", "2026-03-02T00:00:00Z").await;
+        insert_failure(&db, "X", Some("X"), Some("p"), None, "{}", "2026-03-03T00:00:00Z").await;
+        insert_failure(&db, "X", None, None, None, "{}", "2026-03-04T00:00:00Z").await; // failed before routing
+        insert_failure(&db, "Y", Some("Y"), Some("p"), None, "{}", "2026-03-05T00:00:00Z").await;
+        insert_failure(&db, "X", Some("X"), Some("p"), None, "{}", "2026-04-01T00:00:00Z").await; // outside
+
+        let x = db.count_for_arm(&ArmFilter::Model("X".into()), W_START, W_END).await.unwrap();
+        assert_eq!(x, 3);
+        let y = db.count_for_arm(&ArmFilter::Model("Y".into()), W_START, W_END).await.unwrap();
+        assert_eq!(y, 1);
+        let z = db.count_for_arm(&ArmFilter::Model("Z".into()), W_START, W_END).await.unwrap();
+        assert_eq!(z, 0);
+    }
+
+    #[tokio::test]
+    async fn count_for_arm_provider_tag_and_run() {
+        let db = make_db().await;
+        insert_failure(&db, "X", Some("X"), Some("p1"), Some("run-1"), r#"{"arm":"a"}"#, "2026-03-02T00:00:00Z").await;
+        insert_failure(&db, "X", Some("X"), Some("p1"), Some("run-10"), r#"{"arm":"a"}"#, "2026-03-03T00:00:00Z").await;
+        insert_failure(&db, "X", Some("X"), Some("p2"), None, r#"{"arm":"b"}"#, "2026-03-04T00:00:00Z").await;
+        insert_failure(&db, "X", None, None, None, "{}", "2026-03-05T00:00:00Z").await;
+
+        let p1 = db.count_for_arm(&ArmFilter::Provider("p1".into()), W_START, W_END).await.unwrap();
+        assert_eq!(p1, 2);
+
+        let tag = ArmFilter::Attribution(AttributionFilter::Tag { key: "arm".into(), value: "a".into() });
+        assert_eq!(db.count_for_arm(&tag, W_START, W_END).await.unwrap(), 2);
+        let tag_b = ArmFilter::Attribution(AttributionFilter::Tag { key: "arm".into(), value: "b".into() });
+        assert_eq!(db.count_for_arm(&tag_b, W_START, W_END).await.unwrap(), 1);
+
+        let run = ArmFilter::Attribution(AttributionFilter::CorrelationId("run-1".into()));
+        assert_eq!(db.count_for_arm(&run, W_START, W_END).await.unwrap(), 1);
     }
 }

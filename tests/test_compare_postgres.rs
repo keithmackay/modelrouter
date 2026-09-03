@@ -14,6 +14,8 @@
 
 use modelrouter::db::postgres::PostgresDb;
 use modelrouter::db::repositories::costs::{ArmFilter, AttributionFilter, CostRepository};
+use modelrouter::db::repositories::failures::FailureRepository;
+use modelrouter::db::repositories::prompts::{LatencySummary, PromptRepository};
 
 const W_START: &str = "2026-03-01T00:00:00Z";
 const W_END: &str = "2026-04-01T00:00:00Z";
@@ -205,4 +207,108 @@ async fn recent_correlation_ids_and_providers_pickers() {
     assert!(providers.windows(2).all(|w| w[0] <= w[1]), "providers must be sorted");
 
     cleanup_user(&db, user).await;
+}
+
+// ---- latency and failures (prompts / request_failures) ----------------------
+
+async fn insert_prompt(db: &PostgresDb, user_id: i64, routed_model: &str, latency_ms: Option<i64>, created_at: &str) {
+    sqlx::query(
+        "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, \
+         prompt_tokens, completion_tokens, cost_usd, latency_ms, tags, attribution_tags, created_at) \
+         VALUES ($1, 'req', $2, 'p', '[]', 0, 0, 0.0, $3, '[]', '{}', $4)",
+    )
+    .bind(user_id)
+    .bind(routed_model)
+    .bind(latency_ms)
+    .bind(created_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_failure(
+    db: &PostgresDb,
+    user_id: i64,
+    request_model: &str,
+    routed_model: Option<&str>,
+    tags: &str,
+    created_at: &str,
+) {
+    sqlx::query(
+        "INSERT INTO request_failures (user_id, endpoint, request_model, routed_model, provider, \
+         stage, error_message, attempts, attribution_tags, created_at) \
+         VALUES ($1, '/v1/chat/completions', $2, $3, 'p', 'provider', 'boom', 1, $4, $5)",
+    )
+    .bind(user_id)
+    .bind(request_model)
+    .bind(routed_model)
+    .bind(tags)
+    .bind(created_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+async fn cleanup_user_all(db: &PostgresDb, user_id: i64) {
+    sqlx::query("DELETE FROM request_failures WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM prompts WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    cleanup_user(db, user_id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn latency_summary_percentiles_use_bound_offsets() {
+    let db = connect().await;
+    let user = create_user(&db, &token("u")).await;
+    let model = token("model");
+
+    for (i, ms) in [100, 200, 300, 400, 1000].iter().enumerate() {
+        let ts = format!("2026-03-{:02}T00:00:00Z", i + 2);
+        insert_prompt(&db, user, &model, Some(*ms), &ts).await;
+    }
+    insert_prompt(&db, user, &model, Some(0), "2026-03-10T00:00:00Z").await; // cache hit
+    insert_prompt(&db, user, &model, None, "2026-03-11T00:00:00Z").await; // no measurement
+
+    let s = db.latency_summary(&ArmFilter::Model(model.clone()), W_START, W_END).await.unwrap();
+    assert_eq!(s.samples, 5);
+    assert_eq!(s.mean_ms, Some(400.0));
+    assert_eq!(s.p50_ms, Some(300));
+    assert_eq!(s.p95_ms, Some(1000));
+
+    let empty = db.latency_summary(&ArmFilter::Model(token("absent")), W_START, W_END).await.unwrap();
+    assert_eq!(empty, LatencySummary::default());
+
+    cleanup_user_all(&db, user).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn failure_count_for_arm_falls_back_to_request_model() {
+    let db = connect().await;
+    let user = create_user(&db, &token("u")).await;
+    let x = token("model-x");
+    let y = token("model-y");
+    let arm_value = token("arm");
+
+    insert_failure(&db, user, "alias", Some(&x), "{}", "2026-03-02T00:00:00Z").await;
+    insert_failure(&db, user, &x, Some(&x), "{}", "2026-03-03T00:00:00Z").await;
+    insert_failure(&db, user, &x, None, &format!(r#"{{"arm":"{}"}}"#, arm_value), "2026-03-04T00:00:00Z").await;
+    insert_failure(&db, user, &y, Some(&y), "{}", "2026-03-05T00:00:00Z").await;
+    insert_failure(&db, user, &x, Some(&x), "{}", "2026-04-01T00:00:00Z").await; // outside
+
+    assert_eq!(db.count_for_arm(&ArmFilter::Model(x.clone()), W_START, W_END).await.unwrap(), 3);
+    assert_eq!(db.count_for_arm(&ArmFilter::Model(y.clone()), W_START, W_END).await.unwrap(), 1);
+
+    let tag = ArmFilter::Attribution(AttributionFilter::Tag { key: "arm".to_string(), value: arm_value });
+    assert_eq!(db.count_for_arm(&tag, W_START, W_END).await.unwrap(), 1);
+
+    cleanup_user_all(&db, user).await;
 }
