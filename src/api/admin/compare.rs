@@ -23,7 +23,7 @@ use crate::api::app::{AppState, DatabaseProvider};
 use crate::api::error::ApiError;
 use crate::db::models::{Experiment, ExperimentStatus};
 use crate::db::repositories::costs::{
-    ArmFilter, AttributionBreakdownRow, AttributionFilter, CostRepository,
+    ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals, CostRepository,
 };
 use crate::db::repositories::experiments::{ExperimentRepository, ExperimentStatusFilter};
 use crate::db::repositories::failures::FailureRepository;
@@ -52,6 +52,10 @@ pub const TTFT_NOTE: &str =
 
 pub const DIMENSIONS: [&str; 5] = ["model", "provider", "tag", "run", "variant"];
 pub const WINDOWS: [&str; 4] = ["all", "daily", "weekly", "monthly"];
+/// Longest arm value accepted. Wider than every ingest bound in
+/// `api::attribution` (correlation ids and tag values stop at 128) so any
+/// recorded value can still be queried, while junk is refused before SQL.
+pub const MAX_ARM_LEN: usize = 256;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
@@ -109,6 +113,14 @@ impl CompareQuery {
         if a == b {
             return Err(CompareError::Invalid("a and b must differ".to_string()));
         }
+        for (name, value) in [("a", a), ("b", b)] {
+            if value.chars().count() > MAX_ARM_LEN {
+                return Err(CompareError::Invalid(format!(
+                    "{} must be at most {} characters",
+                    name, MAX_ARM_LEN
+                )));
+            }
+        }
         let window = self.window.trim();
         if !WINDOWS.contains(&window) {
             return Err(CompareError::Invalid(format!(
@@ -131,6 +143,12 @@ impl CompareQuery {
                         "attribution tag key must contain only letters, digits, '_', '-', '.' or ':'"
                             .to_string(),
                     ));
+                }
+                if key.chars().count() > crate::api::attribution::MAX_TAG_KEY_LEN {
+                    return Err(CompareError::Invalid(format!(
+                        "key must be at most {} characters",
+                        crate::api::attribution::MAX_TAG_KEY_LEN
+                    )));
                 }
                 Some(key.to_string())
             }
@@ -274,8 +292,9 @@ pub struct ArmMetrics {
     /// `failures / (requests + failures)`; `0.0` when both are zero.
     pub error_rate: f64,
     pub latency: LatencySummary,
-    /// True when any model in the arm has no pricing entry, so `cost_usd` is
-    /// incomplete.
+    /// True when any model in the arm is unpriced — it has no pricing entry
+    /// now, or its ledger rows carry tokens but no spend (recorded before a
+    /// price existed) — so `cost_usd` is incomplete.
     pub unpriced: bool,
     pub unpriced_models: Vec<String>,
     pub by_day: Vec<AttributionBreakdownRow>,
@@ -427,6 +446,13 @@ pub struct Comparison {
 ///
 /// Every query is bounded: window-limited, aggregate-only, and percentiles are
 /// single-row offset lookups (see `PromptRepository::latency_summary`).
+///
+/// Concurrency: the two arms run together and each fans out five queries, so
+/// one comparison can hold up to ten pool connections at once — the sqlx
+/// default pool size. Each query acquires and releases its own connection and
+/// none waits on another while holding one, so a smaller pool only queues the
+/// surplus; it cannot deadlock. Lower the pool and this is the first admin
+/// page that will feel it.
 pub async fn build_comparison(
     sources: &CompareSources,
     query: &CompareQuery,
@@ -486,6 +512,13 @@ async fn load_experiment(
     Ok(ComparedExperiment::from_experiment(&exp))
 }
 
+/// Rows that consumed tokens on a real provider call yet recorded no spend
+/// were priced at zero when written — the model had no price at the time.
+/// Cache hits are excluded: they legitimately carry tokens at zero cost.
+fn recorded_unpriced(t: &AttributionTotals) -> bool {
+    t.cost_usd == 0.0 && t.requests > t.cache_hits && t.tokens_in + t.tokens_out > 0
+}
+
 async fn arm_metrics(
     sources: &CompareSources,
     filter: &ArmFilter,
@@ -508,7 +541,7 @@ async fn arm_metrics(
     let error_rate = if attempts == 0 { 0.0 } else { failures as f64 / attempts as f64 };
     let unpriced_models: Vec<String> = by_model
         .iter()
-        .filter(|row| !sources.cost_calc.has_price(&row.key))
+        .filter(|row| !sources.cost_calc.has_price(&row.key) || recorded_unpriced(&row.totals))
         .map(|row| row.key.clone())
         .collect();
 
