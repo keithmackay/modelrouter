@@ -207,6 +207,20 @@ pub fn build_router(state: AppState) -> axum::Router {
             axum::routing::put(crate::api::admin::aliases::upsert_alias_api)
                 .delete(crate::api::admin::aliases::delete_alias_api),
         )
+        // Controlled experiments (spec §7a)
+        .route(
+            "/admin/api/experiments",
+            get(crate::api::admin::experiments::list_experiments_api)
+                .post(crate::api::admin::experiments::create_experiment_api),
+        )
+        .route(
+            "/admin/api/experiments/:id",
+            get(crate::api::admin::experiments::get_experiment_api),
+        )
+        .route(
+            "/admin/api/experiments/:id/close",
+            post(crate::api::admin::experiments::close_experiment_api),
+        )
         .route("/admin/api/admins", get(list_admins).post(create_admin))
         .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
