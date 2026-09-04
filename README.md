@@ -324,7 +324,9 @@ curl http://localhost:8080/health   # → {"status":"ok"}
 The first admin must be created via the CLI. All subsequent admin management is available in the web UI.
 
 ```bash
-modelrouter admin create --name ops --password <strong-password> --role superadmin
+modelrouter admin create --name ops --role superadmin
+# Password: (prompted on the terminal — there is no --password flag, so the
+#            secret never lands in shell history or the process list)
 # Admin 'ops' created (id=1, role=superadmin)
 ```
 
