@@ -119,6 +119,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler, search::search,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
+        feedback,
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user,
@@ -183,6 +184,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/search", post(search))
+        .route("/v1/feedback", post(feedback::post_feedback))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))

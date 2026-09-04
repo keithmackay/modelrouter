@@ -4,6 +4,7 @@ pub mod mcp;
 pub mod images;
 pub mod responses;
 pub mod embeddings;
+pub mod feedback;
 pub mod health;
 pub mod messages;
 pub mod models;
