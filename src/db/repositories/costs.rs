@@ -55,6 +55,31 @@ impl AttributionFilter {
     }
 }
 
+/// One "arm" of a side-by-side comparison: a slice of the ledger selected by
+/// model, provider, or caller-supplied attribution. Every backend applies the
+/// same window predicate (`created_at >= start AND created_at < end`) on top.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArmFilter {
+    /// Exact match on the ledger `model` column.
+    Model(String),
+    /// Exact match on the ledger `provider` column.
+    Provider(String),
+    /// Attribution match (correlation id or tag), same semantics as
+    /// [`AttributionFilter`].
+    Attribution(AttributionFilter),
+}
+
+impl ArmFilter {
+    /// Human-readable label, used by the dashboard and CLI.
+    pub fn label(&self) -> String {
+        match self {
+            ArmFilter::Model(m) => format!("model={}", m),
+            ArmFilter::Provider(p) => format!("provider={}", p),
+            ArmFilter::Attribution(f) => f.label(),
+        }
+    }
+}
+
 /// Spend *and* savings for one slice of attributed usage.
 ///
 /// `cost_usd` is what was actually paid; `saved_usd` is what the response cache
@@ -164,6 +189,11 @@ pub trait CostRepository: Send + Sync {
     async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>>;
     /// Distinct non-null model values present in the cost ledger, sorted.
     async fn distinct_models_in_ledger(&self) -> anyhow::Result<Vec<String>>;
+    /// Distinct non-null provider values present in the cost ledger, sorted.
+    async fn distinct_providers_in_ledger(&self) -> anyhow::Result<Vec<String>>;
+    /// Non-empty correlation ids ordered by most recent ledger row first,
+    /// capped at `limit` — populates the "recent runs" picker.
+    async fn distinct_recent_correlation_ids(&self, limit: i64) -> anyhow::Result<Vec<String>>;
     /// Daily spend series: returns (date_str, cost_usd) pairs grouped by calendar day.
     /// `filter_user_ids`: None = all users; Some(&[]) = empty result.
     /// `start`/`end`: ISO 8601 UTC timestamps (inclusive start, exclusive end).
@@ -231,4 +261,25 @@ pub trait CostRepository: Send + Sync {
         key: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<String>>;
+    /// Totals for one comparison arm within `[start, end)`.
+    async fn arm_totals(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals>;
+    /// Per-model breakdown for one comparison arm, highest spend first.
+    async fn arm_by_model(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    /// Per-calendar-day breakdown for one comparison arm, ascending by day.
+    async fn arm_by_day(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
 }

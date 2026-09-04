@@ -163,6 +163,18 @@ pub fn build_env() -> Environment<'static> {
     .expect("reports_panels.html template is valid");
 
     env.add_template_owned(
+        "compare.html",
+        include_str!("../../../templates/admin/compare.html").to_string(),
+    )
+    .expect("compare.html template is valid");
+
+    env.add_template_owned(
+        "compare_panels.html",
+        include_str!("../../../templates/admin/compare_panels.html").to_string(),
+    )
+    .expect("compare_panels.html template is valid");
+
+    env.add_template_owned(
         "models.html",
         include_str!("../../../templates/admin/models.html").to_string(),
     )

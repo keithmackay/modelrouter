@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::db::models::{NewRequestFailure, RequestFailure};
+use crate::db::repositories::costs::ArmFilter;
 
 /// Persistence for requests that failed.
 ///
@@ -15,4 +16,8 @@ pub trait FailureRepository: Send + Sync {
     /// Failure counts grouped by stage, newest window first — the shape an
     /// operator actually wants ("what is failing, and where").
     async fn count_by_stage(&self) -> anyhow::Result<Vec<(String, i64)>>;
+    /// Failures for one comparison arm within `[start, end)`. Model arms match
+    /// `COALESCE(routed_model, request_model)` because a request that failed
+    /// before routing has no routed model.
+    async fn count_for_arm(&self, filter: &ArmFilter, start: &str, end: &str) -> anyhow::Result<i64>;
 }

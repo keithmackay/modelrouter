@@ -1,0 +1,309 @@
+{% if message %}
+<div class="stat-card" style="padding:1.25rem;">
+    {% if hint %}
+    <p style="color:#777;text-align:center;margin:0;">{{ message }}</p>
+    {% else %}
+    <p style="color:#c0392b;margin:0;"><strong>Invalid comparison:</strong> {{ message }}</p>
+    {% endif %}
+</div>
+{% else %}
+{% set a = cmp.a %}
+{% set b = cmp.b %}
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;">
+
+<div class="stat-card" style="grid-column:1/-1;">
+    <h3 style="margin-top:0;">
+        A: <code>{{ a.label }}</code>
+        <span style="color:#999;font-weight:normal;">vs</span>
+        B: <code>{{ b.label }}</code>
+        <span style="font-size:0.75rem;color:#999;font-weight:normal;margin-left:0.5rem;">
+            {% if cmp.window == "all" %}all time{% else %}{{ cmp.window }} · {{ cmp.start|fmt_ts }} → {{ cmp.end|fmt_ts }}{% endif %}
+        </span>
+    </h3>
+
+    {% if a.requests == 0 or b.requests == 0 %}
+    <p style="color:#999;font-size:0.85rem;">
+        No data for
+        {% if a.requests == 0 and b.requests == 0 %}either arm{% elif a.requests == 0 %}arm A{% else %}arm B{% endif %}
+        in this window: the ledger has no rows matching it. Per-request figures show a dash.
+    </p>
+    {% endif %}
+
+    {% if a.unpriced or b.unpriced %}
+    <p style="font-size:0.8rem;margin:0.25rem 0 0.75rem;">
+        <span style="background:#fff3cd;color:#856404;padding:0.15rem 0.5rem;border-radius:3px;font-weight:600;">unpriced</span>
+        cost is understated: no price is configured for
+        {% for m in a.unpriced_models %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% if a.unpriced_models and b.unpriced_models %}, {% endif %}{% for m in b.unpriced_models %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    </p>
+    {% endif %}
+
+    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+        <thead>
+            <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
+                <th style="text-align:left;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">Metric</th>
+                <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">A</th>
+                <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">B</th>
+                <th style="text-align:right;padding:0.4rem 0.5rem;border-bottom:1px solid #eee;">Δ (B − A)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in rows %}
+            <tr{% if loop.index0 == 8 %} style="border-top:2px solid #eee;"{% endif %}>
+                <td style="padding:0.35rem 0.5rem;">{{ r.label }}</td>
+                <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ r.a }}</td>
+                <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ r.b }}</td>
+                <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;color:#555;">{{ r.delta }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <p style="font-size:0.78rem;color:#777;margin:0.75rem 0 0;">
+        Coverage — latency samples / requests:
+        A {% if cmp.coverage.a.requests == 0 %}—{% else %}{{ cmp.coverage.a.latency_samples }} / {{ cmp.coverage.a.requests }}{% endif %},
+        B {% if cmp.coverage.b.requests == 0 %}—{% else %}{{ cmp.coverage.b.latency_samples }} / {{ cmp.coverage.b.requests }}{% endif %}.
+        Latency comes from the prompt log; an arm with fewer samples than requests was partly served from cache or logged without latency.
+    </p>
+    <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ cmp.ttft_note }}</p>
+    {% for c in cmp.caveats %}
+    <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ c }}</p>
+    {% endfor %}
+</div>
+
+<div class="stat-card">
+    <h3>Per request, A vs B</h3>
+    <div id="compare-bars-chart" data-chart-data="{{ bars_json }}" style="width:100%;height:240px;"></div>
+</div>
+
+<div class="stat-card">
+    <h3>Daily cost</h3>
+    <div id="compare-daily-chart" data-chart-data="{{ daily_json }}" style="width:100%;height:240px;"></div>
+</div>
+
+<div class="stat-card" style="grid-column:1/-1;">
+    <h3>Latency p50 / p95</h3>
+    <div id="compare-latency-chart" data-chart-data="{{ latency_json }}" style="width:100%;height:220px;"></div>
+</div>
+
+</div>
+{% endif %}
+
+<script>
+(function() {
+    var BLUE = '#1a1a2e', TEAL = '#4ecdc4', ORANGE = '#e8703a', GRAY = '#999';
+
+    function clearSvg(el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+    }
+
+    function noData(el, text) {
+        clearSvg(el);
+        var p = document.createElement('p');
+        p.setAttribute('style', 'color:#999;text-align:center;padding-top:2rem;font-size:0.85rem;');
+        p.textContent = text || 'No data';
+        el.appendChild(p);
+    }
+
+    // Parse the escaped JSON the template put on the element, or null.
+    function chartData(el) {
+        var raw = el.getAttribute('data-chart-data');
+        try { return JSON.parse(raw); } catch(e) { return null; }
+    }
+
+    function frame(el, margin, H) {
+        var W = el.offsetWidth || 320;
+        var svg = d3.select(el).append('svg')
+            .attr('width', W).attr('height', H)
+            .append('g').attr('transform', 'translate(' + margin.left + ',' + margin.top + ')');
+        return { svg: svg, w: W - margin.left - margin.right, h: H - margin.top - margin.bottom };
+    }
+
+    function legend(svg, x, y, entries) {
+        var g = svg.append('g').attr('transform', 'translate(' + x + ',' + y + ')');
+        entries.forEach(function(e, i) {
+            var row = g.append('g').attr('transform', 'translate(' + (i * 110) + ',0)');
+            row.append('rect').attr('width', 12).attr('height', 12).attr('fill', e.color);
+            row.append('text').attr('x', 16).attr('y', 10).style('font-size', '0.7rem')
+                .text(e.label.length > 14 ? e.label.slice(0, 13) + '…' : e.label);
+        });
+    }
+
+    function fmtMoney(v) {
+        if (v >= 1) return '$' + v.toFixed(2);
+        if (v >= 0.01) return '$' + v.toFixed(4);
+        return (v * 100).toFixed(4) + 'c';
+    }
+    function fmtNum(v) { return d3.format(',.1f')(v); }
+    function fmtMs(v) { return d3.format(',.0f')(v) + ' ms'; }
+
+    // Per-request cost, tokens in/out and mean latency, A beside B. Each
+    // metric is normalised to its own A/B maximum so four unrelated units
+    // share one panel; the true value is written above each bar.
+    function initBarsChart() {
+        var el = document.getElementById('compare-bars-chart');
+        if (!el || typeof d3 === 'undefined') return;
+        clearSvg(el);
+        var data = chartData(el);
+        if (!data || !data.a || !data.b) { noData(el); return; }
+        if (!data.a.requests || !data.b.requests) { noData(el); return; }
+
+        var metrics = [
+            { key: 'cost_per_request',       label: 'Cost / req',   fmt: fmtMoney },
+            { key: 'tokens_in_per_request',  label: 'Tokens in',    fmt: fmtNum },
+            { key: 'tokens_out_per_request', label: 'Tokens out',   fmt: fmtNum },
+            { key: 'mean_ms',                label: 'Mean latency', fmt: fmtMs }
+        ];
+        var arms = [{ id: 'a', color: BLUE, label: data.a.label }, { id: 'b', color: TEAL, label: data.b.label }];
+
+        var f = frame(el, {top:28, right:10, bottom:30, left:10}, 240);
+        var x0 = d3.scaleBand().domain(metrics.map(function(m) { return m.key; })).range([0, f.w]).padding(0.25);
+        var x1 = d3.scaleBand().domain(['a', 'b']).range([0, x0.bandwidth()]).padding(0.1);
+        var y = d3.scaleLinear().domain([0, 1]).range([f.h, 0]);
+
+        f.svg.append('g').attr('transform', 'translate(0,' + f.h + ')')
+            .call(d3.axisBottom(x0).tickFormat(function(k) {
+                return metrics.filter(function(m) { return m.key === k; })[0].label;
+            }))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        metrics.forEach(function(m) {
+            var va = data.a[m.key], vb = data.b[m.key];
+            var max = Math.max(va == null ? 0 : va, vb == null ? 0 : vb);
+            arms.forEach(function(arm) {
+                var v = arm.id === 'a' ? va : vb;
+                var norm = (v == null || max <= 0) ? 0 : v / max;
+                var bx = x0(m.key) + x1(arm.id);
+                f.svg.append('rect')
+                    .attr('x', bx).attr('width', x1.bandwidth())
+                    .attr('y', y(norm)).attr('height', f.h - y(norm))
+                    .attr('fill', v == null ? GRAY : arm.color);
+                f.svg.append('text')
+                    .attr('x', bx + x1.bandwidth() / 2).attr('y', y(norm) - 4)
+                    .attr('text-anchor', 'middle').style('font-size', '0.65rem').attr('fill', '#555')
+                    .text(v == null ? '—' : m.fmt(v));
+            });
+        });
+        legend(f.svg, 0, -24, arms);
+    }
+
+    // Daily cost of both arms over the window, one line each.
+    function initDailyChart() {
+        var el = document.getElementById('compare-daily-chart');
+        if (!el || typeof d3 === 'undefined') return;
+        clearSvg(el);
+        var data = chartData(el);
+        if (!data || !data.a || !data.b) { noData(el); return; }
+        if (!data.a.requests || !data.b.requests) { noData(el); return; }
+
+        var parseDate = d3.timeParse('%Y-%m-%d');
+        function points(arm) {
+            return (arm.series || []).map(function(d) { return { date: parseDate(d.day), v: d.cost_usd }; })
+                .filter(function(p) { return p.date; });
+        }
+        var pa = points(data.a), pb = points(data.b);
+        var all = pa.concat(pb);
+        if (all.length === 0) { noData(el); return; }
+
+        var f = frame(el, {top:28, right:20, bottom:36, left:60}, 240);
+        var x = d3.scaleTime().domain(d3.extent(all, function(p) { return p.date; })).range([0, f.w]);
+        var y = d3.scaleLinear().domain([0, (d3.max(all, function(p) { return p.v; }) || 1) * 1.05]).range([f.h, 0]);
+
+        f.svg.append('g').attr('transform', 'translate(0,' + f.h + ')')
+            // Whole days only: a short series otherwise gets sub-day ticks that
+            // all print the same date.
+            .call(d3.axisBottom(x).ticks(d3.timeDay.every(Math.max(1, Math.ceil(d3.timeDay.count(x.domain()[0], x.domain()[1]) / 6)))).tickFormat(d3.timeFormat('%m/%d')))
+            .selectAll('text').style('font-size', '0.7rem');
+        f.svg.append('g')
+            .call(d3.axisLeft(y).ticks(5).tickFormat(function(d) { return '$' + d.toFixed(2); }))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        var line = d3.line().x(function(p) { return x(p.date); }).y(function(p) { return y(p.v); });
+        [{ pts: pa, color: BLUE }, { pts: pb, color: TEAL }].forEach(function(s) {
+            if (s.pts.length === 0) return;
+            f.svg.append('path').datum(s.pts)
+                .attr('fill', 'none').attr('stroke', s.color).attr('stroke-width', 2).attr('d', line);
+            // A single day has no line to see; mark the point.
+            f.svg.selectAll(null).data(s.pts).enter().append('circle')
+                .attr('cx', function(p) { return x(p.date); }).attr('cy', function(p) { return y(p.v); })
+                .attr('r', s.pts.length === 1 ? 4 : 2.5).attr('fill', s.color);
+        });
+        legend(f.svg, 0, -24, [{ label: data.a.label, color: BLUE }, { label: data.b.label, color: TEAL }]);
+    }
+
+    // p50 and p95 for each arm as paired bars, in milliseconds.
+    function initLatencyChart() {
+        var el = document.getElementById('compare-latency-chart');
+        if (!el || typeof d3 === 'undefined') return;
+        clearSvg(el);
+        var data = chartData(el);
+        if (!data || !data.a || !data.b) { noData(el); return; }
+        if (!data.a.samples && !data.b.samples) { noData(el, 'No latency samples'); return; }
+
+        var arms = [
+            { id: 'a', label: data.a.label, samples: data.a.samples, p50: data.a.p50_ms, p95: data.a.p95_ms },
+            { id: 'b', label: data.b.label, samples: data.b.samples, p50: data.b.p50_ms, p95: data.b.p95_ms }
+        ];
+        var f = frame(el, {top:28, right:20, bottom:30, left:60}, 220);
+        var x0 = d3.scaleBand().domain(['a', 'b']).range([0, f.w]).padding(0.35);
+        var x1 = d3.scaleBand().domain(['p50', 'p95']).range([0, x0.bandwidth()]).padding(0.1);
+        var max = d3.max(arms, function(a) { return Math.max(a.p50 || 0, a.p95 || 0); }) || 1;
+        var y = d3.scaleLinear().domain([0, max * 1.15]).range([f.h, 0]);
+
+        f.svg.append('g').attr('transform', 'translate(0,' + f.h + ')')
+            .call(d3.axisBottom(x0).tickFormat(function(id) {
+                var a = arms.filter(function(a) { return a.id === id; })[0];
+                return (id.toUpperCase() + ': ' + a.label).slice(0, 28);
+            }))
+            .selectAll('text').style('font-size', '0.7rem');
+        f.svg.append('g')
+            .call(d3.axisLeft(y).ticks(5).tickFormat(function(d) { return d + ' ms'; }))
+            .selectAll('text').style('font-size', '0.7rem');
+
+        arms.forEach(function(arm) {
+            if (!arm.samples) {
+                f.svg.append('text')
+                    .attr('x', x0(arm.id) + x0.bandwidth() / 2).attr('y', f.h - 8)
+                    .attr('text-anchor', 'middle').attr('fill', GRAY).style('font-size', '0.75rem')
+                    .text('no latency samples');
+                return;
+            }
+            ['p50', 'p95'].forEach(function(q) {
+                var v = arm[q];
+                if (v == null) return;
+                var bx = x0(arm.id) + x1(q);
+                f.svg.append('rect')
+                    .attr('x', bx).attr('width', x1.bandwidth())
+                    .attr('y', y(v)).attr('height', f.h - y(v))
+                    .attr('fill', q === 'p50' ? BLUE : ORANGE);
+                f.svg.append('text')
+                    .attr('x', bx + x1.bandwidth() / 2).attr('y', y(v) - 4)
+                    .attr('text-anchor', 'middle').style('font-size', '0.65rem').attr('fill', '#555')
+                    .text(q + ' ' + fmtMs(v));
+            });
+        });
+        legend(f.svg, 0, -24, [{ label: 'p50', color: BLUE }, { label: 'p95', color: ORANGE }]);
+    }
+
+    function initCharts() {
+        initBarsChart();
+        initDailyChart();
+        initLatencyChart();
+    }
+
+    // This script arrives with every htmx swap into #panels. htmx dispatches
+    // htmx:afterSwap before this settle-time script executes, so the FIRST
+    // swap's afterSwap has already fired by the time we get here -- render
+    // directly just this once, then let the listener handle every later
+    // swap (it's already bound before any subsequent afterSwap fires).
+    if (!window.__compareChartsBound) {
+        window.__compareChartsBound = true;
+        initCharts();
+        document.addEventListener('htmx:afterSwap', function(e) {
+            if (e.detail && e.detail.target && e.detail.target.id === 'panels') {
+                initCharts();
+            }
+        });
+    }
+})();
+</script>

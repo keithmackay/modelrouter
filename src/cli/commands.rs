@@ -454,6 +454,28 @@ pub enum ReportCommands {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+    /// Compare two experiment arms side by side (same query as
+    /// `GET /admin/api/compare` and the dashboard's Compare page)
+    Compare {
+        /// Partition traffic by `model`, `provider`, `tag` or `run`
+        /// (attribution correlation id)
+        #[arg(long)]
+        dimension: String,
+        /// Attribution tag key; required with `--dimension tag`
+        #[arg(long)]
+        key: Option<String>,
+        /// Arm A value (a model, provider, tag value or correlation id)
+        #[arg(long)]
+        a: String,
+        /// Arm B value
+        #[arg(long)]
+        b: String,
+        /// Time window: daily | weekly | monthly | alltime  [default: monthly]
+        #[arg(long, default_value = "monthly")]
+        window: String,
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Usage report with flexible scope/window/granularity
     Usage {
         // Granularity (exactly one required)

@@ -288,16 +288,10 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             // Prompt-log store (issue #29): a dedicated SQLite file when
             // configured, else the main DB. Restart-scoped by design.
-            let prompt_db: Arc<dyn crate::api::app::DatabaseProvider> =
-                match settings.storage.prompt_db_path.as_deref() {
-                    Some(path) => {
-                        let pdb = crate::db::sqlite::SqliteDb::connect(path).await?;
-                        crate::db::migrations::run_migrations(&pdb.pool).await?;
-                        tracing::info!(path, "prompt log using dedicated database");
-                        Arc::new(pdb)
-                    }
-                    None => db.clone(),
-                };
+            let prompt_db = open_prompt_db(&settings, &db).await?;
+            if let Some(path) = settings.storage.prompt_db_path.as_deref() {
+                tracing::info!(path, "prompt log using dedicated database");
+            }
 
             // Prompt-log retention: purge on an hourly check against the LIVE
             // policy, so a retention set in the GUI applies within the hour.
@@ -969,6 +963,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                         },
                         format,
                     );
+                }
+                ReportCommands::Compare { dimension, key, a, b, window, format } => {
+                    let query = crate::api::admin::compare::CompareQuery {
+                        dimension,
+                        key: key.unwrap_or_default(),
+                        a,
+                        b,
+                        // `alltime` is the CLI's spelling of the API's `all`.
+                        window: if window == "alltime" { "all".to_string() } else { window },
+                    };
+                    report_compare(db, &settings, &query, format).await?;
                 }
                 ReportCommands::Usage {
                     total, subtotal, detail,
@@ -1772,6 +1777,147 @@ fn parse_attribution_filter(
     })
 }
 
+/// One line of the `report compare` table: a metric with both arms and B−A.
+#[derive(serde::Serialize)]
+struct CompareRow {
+    metric: String,
+    a: String,
+    b: String,
+    delta: String,
+    percent: String,
+}
+
+/// The prompt-log store: a dedicated SQLite file when `[storage]
+/// prompt_db_path` is set, else the main database. `serve` and `report
+/// compare` open it the same way.
+async fn open_prompt_db(
+    settings: &crate::config::schema::Settings,
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+) -> anyhow::Result<Arc<dyn crate::api::app::DatabaseProvider>> {
+    Ok(match settings.storage.prompt_db_path.as_deref() {
+        Some(path) => {
+            let pdb = crate::db::sqlite::SqliteDb::connect(path).await?;
+            crate::db::migrations::run_migrations(&pdb.pool).await?;
+            Arc::new(pdb)
+        }
+        None => db.clone(),
+    })
+}
+
+/// `report compare`: build the comparison from the CLI's own sources — the
+/// main database, the dedicated prompt database when one is configured, and
+/// the configured pricing — and print it. Never constructs an `AppState`.
+async fn report_compare(
+    db: crate::db::sqlite::SqliteDb,
+    settings: &crate::config::schema::Settings,
+    query: &crate::api::admin::compare::CompareQuery,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::api::admin::compare::{build_comparison, CompareSources};
+
+    // Validate before opening anything else, so a typo fails fast.
+    query.validate()?;
+
+    let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+    let prompt_db = open_prompt_db(settings, &db).await?;
+    let sources = CompareSources {
+        db,
+        prompt_db,
+        cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing)),
+    };
+    let comparison = build_comparison(&sources, query).await?;
+    // Like `print_rows`: a closed pipe (`| head`) is not an error.
+    match write_comparison(&comparison, format, &mut std::io::stdout()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Render a comparison: the full JSON document (identical to the endpoint's)
+/// or a metric-per-row table/CSV with the coverage line and caveats beneath.
+fn write_comparison(
+    c: &crate::api::admin::compare::Comparison,
+    format: OutputFormat,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    use crate::api::admin::compare::{sign_prefix, Delta};
+    use crate::report::formatter::write_rows;
+
+    if matches!(format, OutputFormat::Json) {
+        return writeln!(out, "{}", serde_json::to_string_pretty(c)?);
+    }
+    let table = matches!(format, OutputFormat::Table);
+
+    let dash = "-".to_string();
+    let usd = |v: f64| format!("{:.4}", v);
+    let one = |v: f64| format!("{:.1}", v);
+    let pct = |v: f64| format!("{:.1}%", v * 100.0);
+    let int = |v: i64| v.to_string();
+    let opt = |v: Option<f64>, f: &dyn Fn(f64) -> String| v.map(f).unwrap_or_else(|| dash.clone());
+    let opt_i = |v: Option<i64>| v.map(|v| v.to_string()).unwrap_or_else(|| dash.clone());
+    // Deltas are signed so the direction reads without the A and B columns.
+    let delta = |d: Option<Delta>, f: &dyn Fn(f64) -> String| match d {
+        Some(d) => {
+            let abs = format!("{}{}", sign_prefix(d.abs), f(d.abs));
+            let pct = d.pct.map(|p| format!("{}{:.1}%", sign_prefix(p), p));
+            (abs, pct.unwrap_or_else(|| dash.clone()))
+        }
+        None => (dash.clone(), dash.clone()),
+    };
+    let row = |metric: &str, a: String, b: String, d: (String, String)| CompareRow {
+        metric: metric.to_string(),
+        a,
+        b,
+        delta: d.0,
+        percent: d.1,
+    };
+    let (a, b, d) = (&c.a, &c.b, &c.delta);
+
+    let rows = vec![
+        row("Requests", int(a.requests), int(b.requests), delta(d.requests, &|v| format!("{:.0}", v))),
+        row("Cost / request (USD)", opt(a.cost_per_request, &usd), opt(b.cost_per_request, &usd), delta(d.cost_per_request, &usd)),
+        row("Tokens in / request", opt(a.tokens_in_per_request, &one), opt(b.tokens_in_per_request, &one), delta(d.tokens_in_per_request, &one)),
+        row("Tokens out / request", opt(a.tokens_out_per_request, &one), opt(b.tokens_out_per_request, &one), delta(d.tokens_out_per_request, &one)),
+        row(&format!("Mean latency (ms, n={} / n={})", a.latency.samples, b.latency.samples), opt(a.latency.mean_ms, &one), opt(b.latency.mean_ms, &one), delta(d.mean_ms, &one)),
+        row("p50 latency (ms)", opt_i(a.latency.p50_ms), opt_i(b.latency.p50_ms), delta(d.p50_ms, &one)),
+        row("p95 latency (ms)", opt_i(a.latency.p95_ms), opt_i(b.latency.p95_ms), delta(d.p95_ms, &one)),
+        row("Cache hit rate", pct(a.hit_rate), pct(b.hit_rate), delta(d.hit_rate, &pct)),
+        row("Error rate", pct(a.error_rate), pct(b.error_rate), delta(d.error_rate, &pct)),
+        row("Total cost (USD)", usd(a.cost_usd), usd(b.cost_usd), delta(d.cost_usd, &usd)),
+        row("Total tokens in", int(a.tokens_in), int(b.tokens_in), delta(d.tokens_in, &|v| format!("{:.0}", v))),
+        row("Total tokens out", int(a.tokens_out), int(b.tokens_out), delta(d.tokens_out, &|v| format!("{:.0}", v))),
+        row("Cache hits", int(a.cache_hits), int(b.cache_hits), (dash.clone(), dash.clone())),
+        row("Failures", int(a.failures), int(b.failures), (dash.clone(), dash.clone())),
+    ];
+    if table {
+        writeln!(out, "Compare by {}: A = {}  B = {}  (window: {})", c.dimension, a.label, b.label, c.window)?;
+    }
+    write_rows(
+        &rows,
+        &["Metric", "A", "B", "Delta (B-A)", "Change"],
+        |r| vec![r.metric.clone(), r.a.clone(), r.b.clone(), r.delta.clone(), r.percent.clone()],
+        format,
+        out,
+    )?;
+    if table {
+        writeln!(
+            out,
+            "Coverage: A {} latency samples of {} requests; B {} of {}.",
+            c.coverage.a.latency_samples, c.coverage.a.requests, c.coverage.b.latency_samples, c.coverage.b.requests
+        )?;
+        for (name, m) in [("A", a), ("B", b)] {
+            if m.unpriced {
+                writeln!(out, "Unpriced: arm {} includes {} — its cost figures are incomplete.", name, m.unpriced_models.join(", "))?;
+            }
+        }
+        writeln!(out, "{}", c.ttft_note)?;
+        for caveat in c.caveats {
+            writeln!(out, "Note: {}", caveat)?;
+        }
+    }
+    Ok(())
+}
+
 async fn report_attribution(
     db: &crate::db::sqlite::SqliteDb,
     filter: &crate::db::repositories::costs::AttributionFilter,
@@ -1953,6 +2099,136 @@ mod attribution_cli_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::api::admin::compare::{build_comparison, CompareQuery, CompareSources};
+    use crate::db::models::{NewCostLedgerEntry, NewPrompt};
+    use crate::db::repositories::costs::CostRepository;
+    use crate::db::repositories::prompts::PromptRepository;
+
+    async fn seeded_sources() -> CompareSources {
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        crate::db::repositories::users::UserRepository::create(
+            &db,
+            crate::db::models::NewUser { name: "u".into(), email: None },
+        )
+        .await
+        .unwrap();
+        for (model, latency) in [("m1", 100), ("m1", 300), ("m2", 50)] {
+            CostRepository::create(&db, NewCostLedgerEntry {
+                user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
+                project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+            }).await.unwrap();
+            PromptRepository::create(&db, NewPrompt {
+                user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
+                provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
+                prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+                cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+            }).await.unwrap();
+        }
+        let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+        CompareSources {
+            prompt_db: db.clone(),
+            db,
+            cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&[])),
+        }
+    }
+
+    fn query() -> CompareQuery {
+        CompareQuery {
+            dimension: "model".into(),
+            key: String::new(),
+            a: "m1".into(),
+            b: "m2".into(),
+            window: "all".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_json_output_is_the_endpoint_document() {
+        let sources = seeded_sources().await;
+        let comparison = build_comparison(&sources, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Json, &mut out).unwrap();
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, serde_json::to_value(&comparison).unwrap());
+        assert_eq!(printed["a"]["requests"], 2);
+        assert_eq!(printed["b"]["latency"]["p95_ms"], 50);
+    }
+
+    #[tokio::test]
+    async fn compare_table_shows_sample_counts_badge_and_caveats() {
+        let sources = seeded_sources().await;
+        let comparison = build_comparison(&sources, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("A = model=m1"), "{}", text);
+        assert!(text.contains("n=2"), "{}", text);
+        assert!(text.contains("n=1"), "{}", text);
+        assert!(text.contains("Coverage: A 2 latency samples of 2 requests; B 1 of 1."), "{}", text);
+        assert!(text.contains("Unpriced: arm A includes m1"), "{}", text);
+        assert!(text.contains("quality"), "{}", text);
+        assert!(text.contains("stream: false"), "{}", text);
+        assert!(text.contains("not recorded"), "{}", text);
+        assert!(text.contains("p95 latency"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn compare_table_zero_delta_has_no_plus_sign() {
+        // A and B are seeded identically, so every delta -- including
+        // requests -- is exactly zero. `sign_prefix` only emits `+` for
+        // v > 0.0, so the rendered table must show `0.0%`, never `+0.0%`.
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        crate::db::repositories::users::UserRepository::create(
+            &db,
+            crate::db::models::NewUser { name: "u".into(), email: None },
+        )
+        .await
+        .unwrap();
+        for model in ["m1", "m2"] {
+            CostRepository::create(&db, NewCostLedgerEntry {
+                user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
+                project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+            }).await.unwrap();
+            PromptRepository::create(&db, NewPrompt {
+                user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
+                provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
+                prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+                cost_usd: 0.0, latency_ms: Some(100), tags: "[]".into(), project: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+            }).await.unwrap();
+        }
+        let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+        let sources = CompareSources {
+            prompt_db: db.clone(),
+            db,
+            cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&[])),
+        };
+        let comparison = build_comparison(&sources, &query()).await.unwrap();
+        assert_eq!(comparison.a.requests, comparison.b.requests, "fixture must have equal A/B requests");
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("0.0%"), "{}", text);
+        assert!(!text.contains("+0.0%"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn compare_invalid_dimension_fails_with_the_validation_message() {
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        let settings = crate::config::schema::Settings::default();
+        let mut q = query();
+        q.dimension = "pair".into();
+        let err = report_compare(db, &settings, &q, OutputFormat::Table).await.unwrap_err();
+        assert!(err.to_string().starts_with("dimension must be one of"), "{}", err);
+    }
+
     #[test]
     fn config_dir_permission_mode() {
         // 0o700 = rwx for owner only

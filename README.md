@@ -1203,6 +1203,12 @@ and on `/admin/reports`, where picking an attribution value swaps the panels
 for an attributed-usage view (spend, savings, cache-hit rate, per-model and
 per-day breakdowns).
 
+To compare two arms of an experiment — two tag values, two correlation ids,
+two models or two providers — use `GET /admin/api/compare`, `modelrouter
+report compare`, or the `/admin/compare` page. [docs/experiments.md](docs/experiments.md)
+walks a client application through labelling traffic, retrieving the
+comparison, and reading it.
+
 Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
 
 ### OTel observability stack

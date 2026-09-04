@@ -28,6 +28,7 @@ modelrouter user create --name alice
 modelrouter user list
 modelrouter budget set --user alice --limit 10.0 --window monthly
 modelrouter report cost [--user] [--window] [--format table|csv|json]
+modelrouter report compare --dimension model|provider|tag|run [--key <tag-key>] --a <arm> --b <arm> [--window] [--format table|csv|json]
 modelrouter webhook list
 modelrouter webhook add --name <name> --url <url> [--events completion] [--secret-header-name <h>] [--secret-header-value <v>]
 modelrouter webhook delete --id <id>
@@ -54,6 +55,8 @@ modelrouter install-service  (macOS/Linux)
 | `GET /admin/stats` | Usage stats (admin JWT required) |
 | `GET /admin/budgets` | List budget rules (admin JWT required) |
 | `GET /admin/audit` | Audit log (admin JWT required) |
+| `GET /admin/api/compare` | Two-arm comparison by model, provider, tag or run (admin JWT required; see `docs/experiments.md`) |
+| `GET /admin/compare` | Comparison page (admin dashboard) |
 | `GET /admin/webhooks` | Webhook management page (admin dashboard) |
 | `GET /admin/api/webhooks` | List webhook backends (admin JWT required) |
 | `POST /admin/api/webhooks` | Create webhook backend (superadmin JWT required) |
