@@ -37,6 +37,7 @@ async fn speech_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    crate::api::routes::completions::reject_experiment_header("/v1/audio/speech", &headers)?;
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
 
@@ -235,6 +236,10 @@ async fn transcriptions_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    crate::api::routes::completions::reject_experiment_header(
+        "/v1/audio/transcriptions",
+        &headers,
+    )?;
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
 

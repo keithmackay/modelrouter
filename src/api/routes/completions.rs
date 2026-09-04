@@ -6,11 +6,33 @@ use tracing::Instrument;
 
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
+    config::schema::StorageConfig,
     db::{
         models::{NewCostLedgerEntry, NewPrompt},
     },
-    router::policy::PolicyDecision,
+    router::{experiments::BindError, policy::PolicyDecision},
 };
+
+/// Log a refused experiment header under one stable event name, then hand the
+/// error on to become the 400. Every refusal — a bind that failed here or the
+/// header on an endpoint that does not run experiments — goes through this so
+/// rejections can be counted from the logs without any metric plumbing.
+pub(crate) fn experiment_bind_rejected(endpoint: &'static str, err: BindError) -> ApiError {
+    tracing::warn!(endpoint, error = %err, "experiment_bind_rejected");
+    ApiError::from(err)
+}
+
+/// Refuse `x-modelrouter-experiment` on an endpoint that does not run
+/// experiments. Called first thing by every `/v1` handler other than chat
+/// completions, so a caller who sets the header by mistake gets a 400 rather
+/// than unmarked traffic.
+pub fn reject_experiment_header(
+    endpoint: &'static str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), ApiError> {
+    crate::router::experiments::reject_header(headers)
+        .map_err(|e| experiment_bind_rejected(endpoint, e))
+}
 
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -61,21 +83,89 @@ async fn chat_completions_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
-    // Config-level gate (issue #4) rides the same rail as x-no-log: both mean
-    // "record cost, skip the prompt row".
-    let skip_log = should_skip_logging(&headers) || !state.storage.load().store_prompts;
+    let x_no_log = should_skip_logging(&headers);
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
     // Read attribution from the request as it arrived: pipeline hooks may
     // rewrite the body, and attribution describes the caller's intent, not the
     // rewritten request.
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    // Experiment binding (spec §7a). `None` when the header is absent, in
+    // which case nothing below changes. A bound request is pinned to its
+    // variant's `provider/model`, so the adaptive layers — complexity
+    // downgrade, load balancer, session affinity, response cache, fallback —
+    // all stand aside: an experiment measures the pinned model, not the
+    // router's opinion of it.
+    let binding = state
+        .experiments
+        .bind(
+            &headers,
+            &body,
+            attribution.correlation_id.as_deref(),
+            user.id,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|e| experiment_bind_rejected("/v1/chat/completions", e))?;
+    let experiment_id = binding.as_ref().map(|b| b.experiment_id);
+    let experiment_variant = binding.as_ref().map(|b| b.variant.clone());
+    let retain_content = binding.as_ref().is_some_and(|b| b.retain_content);
+
+    // Config-level gate (issue #4) rides the same rail as x-no-log: both mean
+    // "record cost, skip the prompt row". A retaining experiment overrides the
+    // config gate — its prompt rows are the experiment's evidence — but never
+    // x-no-log, which is the caller's own request. Callback egress stays on
+    // `skip_log`: an experiment retaining content locally does not widen what
+    // leaves the router.
+    let global_storage = state.storage.load();
+    let skip_log = x_no_log || !global_storage.store_prompts;
+    let write_prompt = !x_no_log && (global_storage.store_prompts || retain_content);
+    // The storage policy the prompt row is redacted under: the operator's,
+    // with content storage forced on for a retaining binding.
+    let effective_storage = if retain_content {
+        StorageConfig {
+            store_prompts: true,
+            store_prompt_content: true,
+            ..(**global_storage).clone()
+        }
+    } else {
+        (**global_storage).clone()
+    };
+    drop(global_storage);
+
     let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
     let messages_for_complexity = body["messages"].as_array().cloned().unwrap_or_default();
-    let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
+    let model = match &binding {
+        // The overlay wins where it names the requested model; a name it does
+        // not map routes as usual (and is still stamped). Neither is downgraded.
+        Some(b) => b
+            .overlay
+            .get(&requested_model)
+            .cloned()
+            .unwrap_or_else(|| requested_model.clone()),
+        None => state
+            .complexity_router
+            .maybe_downgrade(&requested_model, &messages_for_complexity),
+    };
+    if let Some(b) = &binding {
+        tracing::info!(
+            experiment_id = b.experiment_id,
+            variant = b.variant.as_str(),
+            requested_model = requested_model.as_str(),
+            model = model.as_str(),
+            "request bound to experiment variant"
+        );
+    }
+    // What the rows record as the request model. Under a binding that is the
+    // name the caller sent: the overlay is the experiment's doing, and the
+    // comparison later runs on the caller's name.
+    let logged_model = if binding.is_some() {
+        requested_model.clone()
+    } else {
+        model.clone()
+    };
     let stream = body["stream"].as_bool().unwrap_or(false);
 
     // The response-cache lookup happens further down, after the policy check and
@@ -203,9 +293,15 @@ async fn chat_completions_inner(
 
     // Check load balancer: if `model` is a named pool, override provider + model.
     // Operator-disabled entries are skipped when selecting (issue #5).
-    let lb_choice = state
-        .load_balancer
-        .resolve_available(&model, |p, m| state.router.is_available(p, m));
+    // A bound request never consults the pool: a pool picks per request, and
+    // an experiment must pin one concrete model.
+    let lb_choice = if binding.is_some() {
+        None
+    } else {
+        state
+            .load_balancer
+            .resolve_available(&model, |p, m| state.router.is_available(p, m))
+    };
     let (provider_name, canonical_model) = if let Some((lb_provider, lb_model)) = lb_choice {
         tracing::info!(
             pool = model.as_str(),
@@ -214,6 +310,10 @@ async fn chat_completions_inner(
             "load balancer selected provider"
         );
         (lb_provider, lb_model)
+    } else if binding.is_some() && state.load_balancer.is_pool(&model) {
+        return Err(ApiError::InvalidRequest(format!(
+            "'{model}' is a load balancer pool; experiments must pin a concrete provider/model"
+        )));
     } else if state.load_balancer.is_pool(&model) {
         // A pool exists but every member is disabled — say so rather than
         // silently falling through to the default model.
@@ -225,8 +325,12 @@ async fn chat_completions_inner(
         state.router.resolve(&model)
     };
 
-    // Session stickiness — pin this session to the resolved provider
-    let (provider_name, canonical_model) = if let Some(session_id) = body["session_id"].as_str() {
+    // Session stickiness — pin this session to the resolved provider. A bound
+    // request neither reads nor writes a pin: the variant already fixed the
+    // model, and a pin left behind would steer the session's unbound
+    // requests to it.
+    let session_for_affinity = body["session_id"].as_str().filter(|_| binding.is_none());
+    let (provider_name, canonical_model) = if let Some(session_id) = session_for_affinity {
         use crate::router::session_affinity::resolve_with_pin;
         let skip_affinity = should_skip_affinity(&headers);
         let pin = if skip_affinity {
@@ -259,8 +363,10 @@ async fn chat_completions_inner(
 
     // ── Response cache ───────────────────────────────────────────────────────
     // Eligibility is conservative (see `router::cache`): streaming and
-    // nondeterministic sampling are never served from cache.
-    let cache_key = if state.policy.cache_enabled(&user, &canonical_model)
+    // nondeterministic sampling are never served from cache, and neither is
+    // a bound request — a cached answer says nothing about the pinned model.
+    let cache_key = if binding.is_none()
+        && state.policy.cache_enabled(&user, &canonical_model)
         && state.response_cache.completion_eligible(&body)
     {
         Some(crate::router::cache::completion_cache_key(&canonical_model, &body))
@@ -358,13 +464,16 @@ async fn chat_completions_inner(
                 api_key_id: user.api_key_id,
                 user_project: attribution.project_or(user.api_key_project.clone()),
                 user_name: user.name.clone(),
-                model: model.clone(),
+                model: logged_model.clone(),
                 canonical_model: canonical_model.clone(),
                 provider: provider_name.clone(),
                 messages_json,
                 start,
-                skip_log,
+                write_prompt,
+                storage: effective_storage,
                 attribution: attribution.clone(),
+                experiment_id,
+                experiment_variant,
             },
         );
 
@@ -376,13 +485,21 @@ async fn chat_completions_inner(
     let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model.clone();
     let mut current_provider = provider_name.clone();
+    // No fallback for a bound request: the pinned model failing is the
+    // experiment's result, and a substitute answering would be recorded
+    // against the variant that did not answer.
+    let next_fallback = |model: &str| {
+        if binding.is_some() {
+            None
+        } else {
+            next_available_fallback(&state, model)
+        }
+    };
     let result = loop {
         if state.circuit_breaker.is_open(&current_provider) {
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
             let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
-            if let Some((next_provider, next_canonical)) =
-                next_available_fallback(&state, &current_model)
-            {
+            if let Some((next_provider, next_canonical)) = next_fallback(&current_model) {
                 current_model = next_canonical;
                 current_provider = next_provider;
                 continue;
@@ -444,9 +561,7 @@ async fn chat_completions_inner(
                     error = %e,
                     "Provider call failed, checking fallback chain"
                 );
-                if let Some((next_provider, next_canonical)) =
-                    next_available_fallback(&state, &current_model)
-                {
+                if let Some((next_provider, next_canonical)) = next_fallback(&current_model) {
                     current_model = next_canonical;
                     current_provider = next_provider;
                     tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
@@ -514,7 +629,7 @@ async fn chat_completions_inner(
 
     // Fire-and-forget: log prompt + cost
     let state_clone = state.clone();
-    let model_clone = model.clone();
+    let model_clone = logged_model.clone();
     let canonical_clone = current_model.clone();
     let provider_clone = current_provider.clone();
     let messages_json = serde_json::to_string(
@@ -536,7 +651,7 @@ async fn chat_completions_inner(
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
     tokio::spawn(async move {
-        if !skip_log_clone {
+        if write_prompt {
             let prompt = NewPrompt {
                 user_id,
                 session_id: None,
@@ -556,11 +671,11 @@ async fn chat_completions_inner(
                 project: user_project.clone(),
                 attribution_correlation_id: attr_correlation.clone(),
                 attribution_tags: attr_tags.clone(),
-                experiment_id: None,
-                experiment_variant: None,
+                experiment_id,
+                experiment_variant: experiment_variant.clone(),
             };
             let mut prompt = prompt;
-            crate::db::prompt_store::redact_prompt_content(&state_clone.storage.load(), &mut prompt);
+            crate::db::prompt_store::redact_prompt_content(&effective_storage, &mut prompt);
             match PromptRepository::create(&*state_clone.prompt_db, prompt).await {
                 Ok(saved_prompt) => {
                     let ledger = NewCostLedgerEntry {
@@ -575,28 +690,36 @@ async fn chat_completions_inner(
                         api_key_id,
                         attribution_correlation_id: attr_correlation.clone(),
                         attribution_tags: attr_tags.clone(),
-                        experiment_id: None,
-                        experiment_variant: None,
+                        experiment_id,
+                        experiment_variant: experiment_variant.clone(),
                         tokens_estimated: false,
                     };
                     if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                         tracing::error!("Failed to record cost: {}", e);
                     }
-                    let mut event = crate::callbacks::CallbackEvent {
-                        trace_id: format!("{}", saved_prompt.id),
-                        user_id,
-                        model: canonical_clone.clone(),
-                        provider: provider_clone.clone(),
-                        input: serde_json::from_str(&messages_json).unwrap_or(serde_json::Value::Null),
-                        output: response_clone.clone(),
-                        prompt_tokens,
-                        completion_tokens,
-                        cost_usd: cost,
-                        latency_ms,
-                    };
-                    // The row above was redacted; the egress must be too (issue #53).
-                    crate::db::prompt_store::redact_callback_content(&state_clone.storage.load(), &mut event);
-                    state_clone.callbacks.dispatch(event);
+                    // A row written only because a retaining experiment asked
+                    // for it does not open the operator's egress gate.
+                    if !skip_log_clone {
+                        let mut event = crate::callbacks::CallbackEvent {
+                            trace_id: format!("{}", saved_prompt.id),
+                            user_id,
+                            model: canonical_clone.clone(),
+                            provider: provider_clone.clone(),
+                            input: serde_json::from_str(&messages_json)
+                                .unwrap_or(serde_json::Value::Null),
+                            output: response_clone.clone(),
+                            prompt_tokens,
+                            completion_tokens,
+                            cost_usd: cost,
+                            latency_ms,
+                        };
+                        // The row above was redacted; the egress must be too (issue #53).
+                        crate::db::prompt_store::redact_callback_content(
+                            &state_clone.storage.load(),
+                            &mut event,
+                        );
+                        state_clone.callbacks.dispatch(event);
+                    }
                 }
                 Err(e) => tracing::error!("Failed to record prompt: {}", e),
             }
@@ -614,8 +737,8 @@ async fn chat_completions_inner(
                 api_key_id,
                 attribution_correlation_id: attr_correlation.clone(),
                 attribution_tags: attr_tags.clone(),
-                experiment_id: None,
-                experiment_variant: None,
+                experiment_id,
+                experiment_variant: experiment_variant.clone(),
                 tokens_estimated: false,
             };
             if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
@@ -796,8 +919,15 @@ struct StreamLogCtx {
     provider: String,
     messages_json: String,
     start: Instant,
-    skip_log: bool,
+    /// See `write_prompt` in the handler: the prompt-row gate, with a
+    /// retaining experiment already folded in.
+    write_prompt: bool,
+    /// The policy the prompt row is redacted under (content storage forced on
+    /// for a retaining binding), fixed at request time.
+    storage: StorageConfig,
     attribution: crate::api::attribution::Attribution,
+    experiment_id: Option<i64>,
+    experiment_variant: Option<String>,
 }
 
 /// Usage as the provider reported it inside a streamed chunk (OpenAI shape:
@@ -999,6 +1129,8 @@ impl StreamLogger {
                     attribution_correlation_id: ctx.attribution.correlation_id.clone(),
                     attribution_tags: ctx.attribution.tags_json(),
                     latency_ms: Some(settlement.latency_ms),
+                    experiment_id: ctx.experiment_id,
+                    experiment_variant: ctx.experiment_variant.clone(),
                 };
                 let err = ApiError::ProviderError(anyhow::anyhow!("{message}"));
                 crate::api::failure_log::record_failure(&ctx.state, failure_ctx, &err).await;
@@ -1036,12 +1168,12 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
         api_key_id: ctx.api_key_id,
         attribution_correlation_id: attr_correlation.clone(),
         attribution_tags: attr_tags.clone(),
-        experiment_id: None,
-        experiment_variant: None,
+        experiment_id: ctx.experiment_id,
+        experiment_variant: ctx.experiment_variant.clone(),
         tokens_estimated: s.tokens_estimated,
     };
 
-    let prompt_id = if ctx.skip_log {
+    let prompt_id = if !ctx.write_prompt {
         // Skip logging but still record cost for budget enforcement
         None
     } else {
@@ -1064,10 +1196,10 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
             project: ctx.user_project.clone(),
             attribution_correlation_id: attr_correlation,
             attribution_tags: attr_tags,
-            experiment_id: None,
-            experiment_variant: None,
+            experiment_id: ctx.experiment_id,
+            experiment_variant: ctx.experiment_variant.clone(),
         };
-        crate::db::prompt_store::redact_prompt_content(&ctx.state.storage.load(), &mut prompt);
+        crate::db::prompt_store::redact_prompt_content(&ctx.storage, &mut prompt);
         match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
             Ok(saved) => Some(saved.id),
             Err(e) => {

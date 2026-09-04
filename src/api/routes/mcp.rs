@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -51,10 +51,26 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// The experiment header refused in this module's error shape; MCP handlers
+/// do not speak `ApiError`.
+fn reject_experiment_header(
+    endpoint: &'static str,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    crate::api::routes::completions::reject_experiment_header(endpoint, headers).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })
+}
+
 pub async fn list_mcp_servers(
     _user: AuthenticatedUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_experiment_header("/v1/mcp/servers", &headers)?;
     let servers = state.db.list_mcp_servers().await.map_err(|e| {
         tracing::error!(error = %e, "Failed to list MCP servers");
         (
@@ -68,8 +84,10 @@ pub async fn list_mcp_servers(
 pub async fn create_mcp_server(
     user: AuthenticatedUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateMcpServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    reject_experiment_header("/v1/mcp/servers", &headers)?;
     let server = state.db.create_mcp_server(NewMcpServer {
         name: req.name,
         url: req.url,
@@ -96,7 +114,9 @@ pub async fn get_mcp_server(
     _user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_experiment_header("/v1/mcp/servers/:id", &headers)?;
     match state.db.get_mcp_server(id).await {
         Ok(Some(server)) => Ok(Json(serde_json::json!(server))),
         Ok(None) => Err((
@@ -152,8 +172,10 @@ pub async fn update_mcp_server(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
     Json(req): Json<UpdateMcpServerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_experiment_header("/v1/mcp/servers/:id", &headers)?;
     require_owner(&state, id, user.0.id).await?;
     match state.db.update_mcp_server(id, req.name, req.url, req.description, req.enabled).await {
         Ok(Some(server)) => Ok(Json(serde_json::json!(server))),
@@ -175,7 +197,9 @@ pub async fn delete_mcp_server(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    reject_experiment_header("/v1/mcp/servers/:id", &headers)?;
     require_owner(&state, id, user.0.id).await?;
     match state.db.delete_mcp_server(id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
@@ -196,8 +220,10 @@ pub async fn delete_mcp_server(
 pub async fn discover_mcp_tools(
     _user: AuthenticatedUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_experiment_header("/v1/mcp/discover", &headers)?;
     let servers = state.db.list_mcp_servers().await.map_err(|e| {
         tracing::error!(error = %e, "Failed to list MCP servers for discover");
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "internal error" })))

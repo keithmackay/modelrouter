@@ -47,8 +47,10 @@ pub const MAX_NOTE_LEN: usize = 1024;
 pub async fn post_feedback(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<RunOutcome>, ApiError> {
+    crate::api::routes::completions::reject_experiment_header("/v1/feedback", &headers)?;
     let user = user.0;
     let obj = body
         .as_object()

@@ -62,6 +62,7 @@ async fn embeddings_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    crate::api::routes::completions::reject_experiment_header("/v1/embeddings", &headers)?;
     let user = user.0;
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let attr_correlation = attribution.correlation_id.clone();

@@ -29,6 +29,10 @@ async fn image_generations_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    crate::api::routes::completions::reject_experiment_header(
+        "/v1/images/generations",
+        &headers,
+    )?;
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;

@@ -1,16 +1,20 @@
 use axum::{extract::State, Json};
 use serde_json::{json, Value};
 
-use crate::api::app::AppState;
+use crate::api::{app::AppState, error::ApiError};
 
 /// `GET /v1/models`.
 ///
 /// Lists the providers this router can reach plus every registered model, with
 /// anything an operator has disabled omitted (issue #5) — a disabled entity must
 /// not advertise itself as available.
-pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+pub async fn list_models(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, ApiError> {
     use crate::db::repositories::models::ModelRepository;
 
+    crate::api::routes::completions::reject_experiment_header("/v1/models", &headers)?;
     let availability = state.router.availability();
 
     let mut models: Vec<Value> = state
@@ -73,5 +77,5 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
         }));
     }
 
-    Json(json!({"object": "list", "data": models}))
+    Ok(Json(json!({"object": "list", "data": models})))
 }
