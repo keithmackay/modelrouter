@@ -1,4 +1,3 @@
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{extract::State, response::{IntoResponse, Response}, Json};
@@ -349,6 +348,8 @@ async fn chat_completions_inner(
         )
         .unwrap_or_default();
 
+        // The streaming path has no fallback loop, so the resolved pair is
+        // also the pair that answers.
         let logged_stream = log_streaming_request(
             sse_stream,
             StreamLogCtx {
@@ -469,9 +470,14 @@ async fn chat_completions_inner(
         }
     };
 
+    // From here on `current_model`/`current_provider` are the pair that
+    // actually answered. After a fallback they differ from what was first
+    // resolved, and pricing, the prompt and ledger rows and the response's
+    // `model` must all name the answering model — a row priced at the primary's
+    // rate for tokens the fallback produced misstates spend.
     let latency_ms = start.elapsed().as_millis() as i64;
     let cost = state.cost_calc.calculate_with_cache(
-        &canonical_model,
+        &current_model,
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -480,19 +486,22 @@ async fn chat_completions_inner(
 
     span.record("cost.usd", cost);
     span.record("tokens.prompt", result.prompt_tokens as u64);
+    // Re-recorded so a fallback shows in the trace as well as the rows.
+    span.record("model", current_model.as_str());
+    span.record("provider", current_provider.as_str());
 
     #[cfg(feature = "otel")]
     {
-        crate::telemetry::metrics::record_request(&canonical_model, &provider_name, "ok");
+        crate::telemetry::metrics::record_request(&current_model, &current_provider, "ok");
         crate::telemetry::metrics::record_tokens(
-            &canonical_model, &provider_name,
+            &current_model, &current_provider,
             result.prompt_tokens, result.completion_tokens,
         );
         crate::telemetry::metrics::record_cost(
-            &canonical_model, &provider_name, user.id, cost,
+            &current_model, &current_provider, user.id, cost,
         );
         crate::telemetry::metrics::record_duration(
-            &canonical_model, &provider_name, false, latency_ms as f64,
+            &current_model, &current_provider, false, latency_ms as f64,
         );
     }
 
@@ -506,8 +515,8 @@ async fn chat_completions_inner(
     // Fire-and-forget: log prompt + cost
     let state_clone = state.clone();
     let model_clone = model.clone();
-    let canonical_clone = canonical_model.clone();
-    let provider_clone = provider_name.clone();
+    let canonical_clone = current_model.clone();
+    let provider_clone = current_provider.clone();
     let messages_json = serde_json::to_string(
         &body["messages"].as_array().cloned().unwrap_or_default(),
     )
@@ -638,7 +647,7 @@ async fn chat_completions_inner(
             .await;
     }
 
-    let mut response = Json(build_openai_response(request_id, &canonical_model, &result)).into_response();
+    let mut response = Json(build_openai_response(request_id, &current_model, &result)).into_response();
     response
         .headers_mut()
         .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
@@ -775,6 +784,7 @@ fn record_cache_hit(
     });
 }
 
+#[derive(Clone)]
 struct StreamLogCtx {
     state: AppState,
     user_id: i64,
@@ -790,167 +800,319 @@ struct StreamLogCtx {
     attribution: crate::api::attribution::Attribution,
 }
 
-/// Wraps an SSE stream so that, when the terminal `[DONE]` chunk passes through,
-/// a tokio task is spawned to record the prompt and cost in the DB.
+/// Usage as the provider reported it inside a streamed chunk (OpenAI shape:
+/// `prompt_tokens` is the whole prompt, `cached_tokens` the subset served from
+/// the provider's prompt cache).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+}
+
+/// What one SSE chunk contributed to a stream's accounting.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SseChunkInfo {
+    /// Delta text from every `data:` line in the chunk, concatenated.
+    pub text: String,
+    /// The last `usage` object in the chunk, if any line carried one.
+    pub usage: Option<ReportedUsage>,
+    /// The last non-null `finish_reason` in the chunk.
+    pub finish_reason: Option<String>,
+    /// Whether the terminal `[DONE]` marker was in this chunk.
+    pub done: bool,
+}
+
+/// Read everything the ledger cares about out of one SSE chunk. A chunk may
+/// carry several `data:` lines (the terminal chunk usually carries the last
+/// delta, the usage-bearing chunk and `[DONE]` together), so every line is
+/// examined rather than just the first.
+pub fn parse_sse_chunk(chunk: &[u8]) -> SseChunkInfo {
+    let mut info = SseChunkInfo::default();
+    let Ok(text) = std::str::from_utf8(chunk) else {
+        return info;
+    };
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            info.done = true;
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+            info.text.push_str(content);
+        }
+        if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
+            info.finish_reason = Some(reason.to_string());
+        }
+        // OpenAI sends `"usage": null` on every chunk but the last when
+        // `include_usage` is set; only an object with both counts is usage.
+        let usage = &json["usage"];
+        if let (Some(prompt), Some(completion)) = (
+            usage["prompt_tokens"].as_u64(),
+            usage["completion_tokens"].as_u64(),
+        ) {
+            info.usage = Some(ReportedUsage {
+                prompt_tokens: prompt as u32,
+                completion_tokens: completion as u32,
+                cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0) as u32,
+            });
+        }
+    }
+    info
+}
+
+/// Running totals for one stream, folded from each chunk as it passes.
+#[derive(Default)]
+struct StreamAcc {
+    content: String,
+    usage: Option<ReportedUsage>,
+    finish_reason: Option<String>,
+    /// Set once a ledger write has been spawned so the drop guard never writes
+    /// a second row for the same stream.
+    recorded: bool,
+}
+
+/// Token counts and cost settled for one stream, ready to write.
+struct StreamSettlement {
+    content: String,
+    finish_reason: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_read_tokens: u32,
+    /// True when the provider never reported usage and the counts above are
+    /// the character-count estimate.
+    tokens_estimated: bool,
+    cost: f64,
+    latency_ms: i64,
+}
+
+/// Owns the accounting for one streamed response and writes it exactly once:
+/// when `[DONE]` passes, when the provider errors mid-stream, or — via `Drop` —
+/// when the body is dropped before either (the client went away, or the
+/// provider closed the connection without a terminal chunk). Before the guard
+/// an early end left no ledger row at all, so the tokens already streamed were
+/// never charged against any budget.
+struct StreamLogger {
+    ctx: StreamLogCtx,
+    acc: StreamAcc,
+}
+
+impl StreamLogger {
+    fn observe(&mut self, chunk_result: anyhow::Result<bytes::Bytes>) -> anyhow::Result<bytes::Bytes> {
+        match &chunk_result {
+            Ok(chunk) => {
+                let info = parse_sse_chunk(chunk);
+                self.acc.content.push_str(&info.text);
+                if info.usage.is_some() {
+                    self.acc.usage = info.usage;
+                }
+                if info.finish_reason.is_some() {
+                    self.acc.finish_reason = info.finish_reason;
+                }
+                if info.done {
+                    self.record(None);
+                }
+            }
+            Err(e) => self.record(Some(e.to_string())),
+        }
+        chunk_result
+    }
+
+    /// Provider-reported usage when the stream carried it; otherwise the
+    /// character-count estimate, flagged as such.
+    fn settle(&self, finish_reason: String) -> StreamSettlement {
+        let content = self.acc.content.clone();
+        let (prompt_tokens, completion_tokens, cache_read_tokens, tokens_estimated) =
+            match self.acc.usage {
+                Some(u) => (u.prompt_tokens, u.completion_tokens, u.cached_tokens, false),
+                None => (
+                    (self.ctx.messages_json.chars().count() / 4) as u32,
+                    (content.chars().count() / 4) as u32,
+                    0,
+                    true,
+                ),
+            };
+        // `calculate_with_cache` wants the non-cached share of the prompt;
+        // OpenAI's `prompt_tokens` includes the cached tokens.
+        let cost = self.ctx.state.cost_calc.calculate_with_cache(
+            &self.ctx.canonical_model,
+            prompt_tokens.saturating_sub(cache_read_tokens),
+            completion_tokens,
+            cache_read_tokens,
+            0,
+        );
+        StreamSettlement {
+            content,
+            finish_reason,
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            tokens_estimated,
+            cost,
+            latency_ms: self.ctx.start.elapsed().as_millis() as i64,
+        }
+    }
+
+    /// Spawn the ledger write. `provider_error` is set when the stream broke
+    /// with an error, which additionally records a failure at stage `provider`
+    /// so the break is diagnosable alongside non-streaming provider failures.
+    fn record(&mut self, provider_error: Option<String>) {
+        if self.acc.recorded {
+            return;
+        }
+        self.acc.recorded = true;
+
+        let finish_reason = match &provider_error {
+            Some(_) => "error".to_string(),
+            None => self
+                .acc
+                .finish_reason
+                .clone()
+                .unwrap_or_else(|| "stop".to_string()),
+        };
+        let settlement = self.settle(finish_reason);
+        let ctx = self.ctx.clone();
+
+        // `Drop` runs wherever the body is released; without a runtime there
+        // is nothing to spawn onto, and panicking in Drop would abort.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("streaming ledger write skipped: no tokio runtime");
+            return;
+        };
+        handle.spawn(async move {
+            if let Some(message) = provider_error {
+                let failure_ctx = crate::api::failure_log::FailureContext {
+                    endpoint: "/v1/chat/completions",
+                    request_model: ctx.model.clone(),
+                    routed_model: Some(ctx.canonical_model.clone()),
+                    provider: Some(ctx.provider.clone()),
+                    user_id: Some(ctx.user_id),
+                    api_key_id: ctx.api_key_id,
+                    project: ctx.user_project.clone(),
+                    attribution_correlation_id: ctx.attribution.correlation_id.clone(),
+                    attribution_tags: ctx.attribution.tags_json(),
+                    latency_ms: Some(settlement.latency_ms),
+                };
+                let err = ApiError::ProviderError(anyhow::anyhow!("{message}"));
+                crate::api::failure_log::record_failure(&ctx.state, failure_ctx, &err).await;
+            }
+            write_stream_ledger(ctx, settlement).await;
+        });
+    }
+}
+
+impl Drop for StreamLogger {
+    fn drop(&mut self) {
+        if !self.acc.recorded {
+            self.acc.finish_reason = Some("aborted".to_string());
+            self.record(None);
+        }
+    }
+}
+
+/// Persist one streamed response: prompt row (unless logging is skipped),
+/// ledger row, lifecycle hooks. Mirrors the non-streaming write.
+async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
+    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+
+    let attr_correlation = ctx.attribution.correlation_id.clone();
+    let attr_tags = ctx.attribution.tags_json();
+    let ledger = NewCostLedgerEntry {
+        user_id: ctx.user_id,
+        prompt_id: None,
+        model: ctx.canonical_model.clone(),
+        provider: ctx.provider.clone(),
+        project: ctx.user_project.clone(),
+        tokens_in: s.prompt_tokens as i64,
+        tokens_out: s.completion_tokens as i64,
+        cost_usd: s.cost,
+        api_key_id: ctx.api_key_id,
+        attribution_correlation_id: attr_correlation.clone(),
+        attribution_tags: attr_tags.clone(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: s.tokens_estimated,
+    };
+
+    let prompt_id = if ctx.skip_log {
+        // Skip logging but still record cost for budget enforcement
+        None
+    } else {
+        let mut prompt = NewPrompt {
+            user_id: ctx.user_id,
+            session_id: None,
+            request_model: ctx.model.clone(),
+            routed_model: ctx.canonical_model.clone(),
+            provider: ctx.provider.clone(),
+            messages: ctx.messages_json.clone(),
+            response: Some(s.content),
+            finish_reason: Some(s.finish_reason),
+            prompt_tokens: s.prompt_tokens as i64,
+            completion_tokens: s.completion_tokens as i64,
+            cache_read_tokens: s.cache_read_tokens as i64,
+            cache_write_tokens: 0,
+            cost_usd: s.cost,
+            latency_ms: Some(s.latency_ms),
+            tags: "[]".to_string(),
+            project: ctx.user_project.clone(),
+            attribution_correlation_id: attr_correlation,
+            attribution_tags: attr_tags,
+            experiment_id: None,
+            experiment_variant: None,
+        };
+        crate::db::prompt_store::redact_prompt_content(&ctx.state.storage.load(), &mut prompt);
+        match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
+            Ok(saved) => Some(saved.id),
+            Err(e) => {
+                tracing::error!("Failed to log streaming prompt: {}", e);
+                None
+            }
+        }
+    };
+
+    let ledger = NewCostLedgerEntry { prompt_id, ..ledger };
+    if let Err(e) = CostRepository::create(&*ctx.state.db, ledger).await {
+        tracing::error!("Failed to log streaming cost: {}", e);
+    }
+
+    // Fire on_response_sent lifecycle hooks
+    for hook in &ctx.state.settings.hooks.lifecycle {
+        if hook.event == "on_response_sent" {
+            let payload = crate::hooks::lifecycle::response_sent_payload(
+                &ctx.user_name,
+                &ctx.model,
+                &ctx.canonical_model,
+                s.cost,
+                s.latency_ms,
+            );
+            crate::hooks::lifecycle::fire(hook, payload);
+        }
+    }
+}
+
+/// Wraps an SSE stream so its prompt and cost are recorded in the DB: on the
+/// terminal `[DONE]` chunk, on a provider error, or when the body is dropped
+/// early. See [`StreamLogger`].
 fn log_streaming_request(
     stream: crate::providers::adapter::SseStream,
     ctx: StreamLogCtx,
 ) -> impl futures::Stream<Item = anyhow::Result<bytes::Bytes>> + Send {
     use futures::StreamExt;
 
-    let accumulated = Arc::new(Mutex::new(String::new()));
-    let accumulated_clone = accumulated.clone();
-
-    let cost_calc = ctx.state.cost_calc.clone();
-    let db = ctx.state.db.clone();
-    let prompt_db = ctx.state.prompt_db.clone();
-    let storage = ctx.state.storage.clone();
-    let lifecycle_hooks = ctx.state.settings.hooks.lifecycle.clone();
-    let user_id = ctx.user_id;
-    let api_key_id = ctx.api_key_id;
-    let user_project = ctx.user_project;
-    let user_name = ctx.user_name;
-    let model = ctx.model;
-    let canonical_model = ctx.canonical_model;
-    let provider = ctx.provider;
-    let messages_json = ctx.messages_json;
-    let start = ctx.start;
-    let skip_log = ctx.skip_log;
-    let attr_correlation = ctx.attribution.correlation_id.clone();
-    let attr_tags = ctx.attribution.tags_json();
-
-    stream.map(move |chunk_result| {
-        if let Ok(ref chunk) = chunk_result {
-            if let Some(text) = extract_text_from_sse(chunk) {
-                if let Ok(mut acc) = accumulated_clone.lock() {
-                    acc.push_str(&text);
-                }
-            }
-
-            // Detect end of stream
-            let is_done = std::str::from_utf8(chunk)
-                .map(|s| s.contains("[DONE]"))
-                .unwrap_or(false);
-
-            if is_done {
-                let content = accumulated_clone
-                    .lock()
-                    .map(|a| a.clone())
-                    .unwrap_or_default();
-                let completion_tokens = (content.chars().count() / 4) as u32;
-                let prompt_tokens = (messages_json.chars().count() / 4) as u32;
-                let cost = cost_calc.calculate(&canonical_model, prompt_tokens, completion_tokens);
-                let latency_ms = start.elapsed().as_millis() as i64;
-
-                let db_c = db.clone();
-                let prompt_db_c = prompt_db.clone();
-                let storage_c = storage.clone();
-                let model_c = model.clone();
-                let canonical_c = canonical_model.clone();
-                let provider_c = provider.clone();
-                let messages_c = messages_json.clone();
-                let user_name_c = user_name.clone();
-                let lifecycle_hooks_c = lifecycle_hooks.clone();
-                let user_project_c = user_project.clone();
-                let attr_correlation_c = attr_correlation.clone();
-                let attr_tags_c = attr_tags.clone();
-
-                tokio::spawn(async move {
-                    use crate::db::repositories::{
-                        costs::CostRepository, prompts::PromptRepository,
-                    };
-
-                    let model_c_ref = model_c.clone();
-                    if !skip_log {
-                        let prompt = NewPrompt {
-                            user_id,
-                            session_id: None,
-                            request_model: model_c,
-                            routed_model: canonical_c.clone(),
-                            provider: provider_c.clone(),
-                            messages: messages_c,
-                            response: Some(content),
-                            finish_reason: Some("stop".to_string()),
-                            prompt_tokens: prompt_tokens as i64,
-                            completion_tokens: completion_tokens as i64,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
-                            cost_usd: cost,
-                            latency_ms: Some(latency_ms),
-                            tags: "[]".to_string(),
-                            project: user_project_c.clone(),
-                            attribution_correlation_id: attr_correlation_c.clone(),
-                            attribution_tags: attr_tags_c.clone(),
-                            experiment_id: None,
-                            experiment_variant: None,
-                        };
-                        let mut prompt = prompt;
-                        crate::db::prompt_store::redact_prompt_content(&storage_c.load(), &mut prompt);
-                        match PromptRepository::create(&*prompt_db_c, prompt).await {
-                            Ok(saved) => {
-                                let entry = NewCostLedgerEntry {
-                                    user_id,
-                                    prompt_id: Some(saved.id),
-                                    model: canonical_c.clone(),
-                                    provider: provider_c,
-                                    project: user_project_c.clone(),
-                                    tokens_in: prompt_tokens as i64,
-                                    tokens_out: completion_tokens as i64,
-                                    cost_usd: cost,
-                                    api_key_id,
-                                    attribution_correlation_id: attr_correlation_c.clone(),
-                                    attribution_tags: attr_tags_c.clone(),
-                                    experiment_id: None,
-                                    experiment_variant: None,
-                                    tokens_estimated: false,
-                                };
-                                if let Err(e) = CostRepository::create(&*db_c, entry).await {
-                                    tracing::error!("Failed to log streaming cost: {}", e);
-                                }
-                            }
-                            Err(e) => tracing::error!("Failed to log streaming prompt: {}", e),
-                        }
-                    } else {
-                        // Skip logging but still record cost for budget enforcement
-                        let entry = NewCostLedgerEntry {
-                            user_id,
-                            prompt_id: None,
-                            model: canonical_c.clone(),
-                            provider: provider_c,
-                            project: user_project_c.clone(),
-                            tokens_in: prompt_tokens as i64,
-                            tokens_out: completion_tokens as i64,
-                            cost_usd: cost,
-                            api_key_id,
-                            attribution_correlation_id: attr_correlation_c.clone(),
-                            attribution_tags: attr_tags_c.clone(),
-                            experiment_id: None,
-                            experiment_variant: None,
-                            tokens_estimated: false,
-                        };
-                        if let Err(e) = CostRepository::create(&*db_c, entry).await {
-                            tracing::error!("Failed to log streaming cost: {}", e);
-                        }
-                    }
-
-                    // Fire on_response_sent lifecycle hooks
-                    for hook in &lifecycle_hooks_c {
-                        if hook.event == "on_response_sent" {
-                            let payload = crate::hooks::lifecycle::response_sent_payload(
-                                &user_name_c,
-                                &model_c_ref,
-                                &canonical_c,
-                                cost,
-                                latency_ms,
-                            );
-                            crate::hooks::lifecycle::fire(hook, payload);
-                        }
-                    }
-                });
-            }
-        }
-        chunk_result
-    })
+    let mut logger = StreamLogger {
+        ctx,
+        acc: StreamAcc::default(),
+    };
+    // The closure owns the logger, so dropping the mapped stream drops the
+    // logger and its guard fires.
+    stream.map(move |chunk_result| logger.observe(chunk_result))
 }
 
 fn build_normalized_request(
@@ -1098,6 +1260,38 @@ mod openai_response_tests {
             &result,
         );
         assert_eq!(response["model"], "gpt-4o-2026-01-01");
+    }
+}
+
+#[cfg(test)]
+mod sse_chunk_tests {
+    use super::{parse_sse_chunk, ReportedUsage};
+
+    #[test]
+    fn reads_text_usage_finish_reason_and_done_from_one_chunk() {
+        let chunk = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let info = parse_sse_chunk(chunk.as_bytes());
+        assert_eq!(info.text, "Hello");
+        assert_eq!(info.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            info.usage,
+            Some(ReportedUsage { prompt_tokens: 12, completion_tokens: 2, cached_tokens: 4 })
+        );
+        assert!(info.done);
+    }
+
+    #[test]
+    fn usage_null_is_not_usage() {
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\n";
+        let info = parse_sse_chunk(chunk);
+        assert_eq!(info.usage, None);
+        assert!(!info.done);
     }
 }
 

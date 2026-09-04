@@ -240,15 +240,19 @@ impl ProviderAdapter for AnthropicAdapter {
             anyhow::bail!("Anthropic returned {}: {}", status, text);
         }
 
+        // One translator per stream: usage arrives split across events
+        // (`message_start` carries input tokens, `message_delta` output
+        // tokens), so the final OpenAI chunk needs state from earlier lines.
+        let mut translator = AnthropicSseTranslator::new();
         let stream = resp
             .bytes_stream()
             .map_err(|e| anyhow::anyhow!("Stream error: {}", e))
-            .map_ok(|chunk| {
+            .map_ok(move |chunk| {
                 // Translate Anthropic SSE lines to OpenAI-compatible format
                 let text = String::from_utf8_lossy(&chunk);
                 let mut out = String::new();
                 for line in text.lines() {
-                    if let Some(translated) = translate_anthropic_sse(line) {
+                    if let Some(translated) = translator.translate_line(line) {
                         out.push_str(&String::from_utf8_lossy(&translated));
                     }
                 }
@@ -259,36 +263,97 @@ impl ProviderAdapter for AnthropicAdapter {
     }
 }
 
-fn translate_anthropic_sse(line: &str) -> Option<Bytes> {
-    if !line.starts_with("data: ") {
-        return None;
+/// Translates one Anthropic SSE stream into OpenAI-shaped chunks.
+///
+/// Stateful because Anthropic reports usage in two places: `message_start`
+/// carries `input_tokens` (and `cache_read_input_tokens`), `message_delta`
+/// carries `output_tokens`. Both are folded into a `usage` object on the final
+/// chunk — the shape OpenAI emits with `stream_options.include_usage` — so the
+/// streaming ledger can record what the provider counted rather than an
+/// estimate.
+#[derive(Debug, Default)]
+pub struct AnthropicSseTranslator {
+    input_tokens: u32,
+    cache_read_input_tokens: u32,
+    output_tokens: u32,
+    /// True once any `usage` object has been seen; without one the final chunk
+    /// carries no `usage` and the ledger falls back to its estimate.
+    saw_usage: bool,
+}
+
+impl AnthropicSseTranslator {
+    pub fn new() -> Self {
+        Self::default()
     }
-    let json_str = &line["data: ".len()..];
-    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    match v["type"].as_str()? {
-        "content_block_delta" => {
-            if v["delta"]["type"] == "text_delta" {
-                let text = v["delta"]["text"].as_str()?;
-                let chunk = serde_json::json!({
-                    "id": "chatcmpl-stream",
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
-                });
-                Some(Bytes::from(format!("data: {}\n\n", chunk)))
-            } else {
+
+    fn absorb_usage(&mut self, usage: &serde_json::Value) {
+        if !usage.is_object() {
+            return;
+        }
+        self.saw_usage = true;
+        if let Some(n) = usage["input_tokens"].as_u64() {
+            self.input_tokens = n as u32;
+        }
+        if let Some(n) = usage["cache_read_input_tokens"].as_u64() {
+            self.cache_read_input_tokens = n as u32;
+        }
+        if let Some(n) = usage["output_tokens"].as_u64() {
+            self.output_tokens = n as u32;
+        }
+    }
+
+    /// Translate a single SSE line. Returns the OpenAI-shaped bytes to forward,
+    /// or `None` for lines that carry nothing the client needs (event names,
+    /// pings, block boundaries).
+    pub fn translate_line(&mut self, line: &str) -> Option<Bytes> {
+        if !line.starts_with("data: ") {
+            return None;
+        }
+        let json_str = &line["data: ".len()..];
+        let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+        match v["type"].as_str()? {
+            "message_start" => {
+                self.absorb_usage(&v["message"]["usage"]);
                 None
             }
+            "content_block_delta" => {
+                if v["delta"]["type"] == "text_delta" {
+                    let text = v["delta"]["text"].as_str()?;
+                    let chunk = serde_json::json!({
+                        "id": "chatcmpl-stream",
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                    });
+                    Some(Bytes::from(format!("data: {}\n\n", chunk)))
+                } else {
+                    None
+                }
+            }
+            "message_delta" => {
+                self.absorb_usage(&v["usage"]);
+                let mut chunk = serde_json::json!({
+                    "id": "chatcmpl-stream",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                });
+                if self.saw_usage {
+                    // OpenAI's `prompt_tokens` is the whole prompt, cached
+                    // tokens included; `cached_tokens` names the subset.
+                    let prompt_tokens = self.input_tokens + self.cache_read_input_tokens;
+                    chunk["usage"] = serde_json::json!({
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": self.output_tokens,
+                        "total_tokens": prompt_tokens + self.output_tokens,
+                        "prompt_tokens_details": {
+                            "cached_tokens": self.cache_read_input_tokens
+                        }
+                    });
+                }
+                let done = "data: [DONE]\n\n";
+                Some(Bytes::from(format!("data: {}\n\n{}", chunk, done)))
+            }
+            _ => None,
         }
-        "message_delta" => {
-            let chunk = serde_json::json!({
-                "id": "chatcmpl-stream",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            });
-            let done = "data: [DONE]\n\n";
-            Some(Bytes::from(format!("data: {}\n\n{}", chunk, done)))
-        }
-        _ => None,
     }
 }
 
@@ -343,6 +408,66 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0]["role"], "user");
         assert_eq!(filtered[1]["role"], "assistant");
+    }
+}
+
+#[cfg(test)]
+mod sse_translator_tests {
+    use super::AnthropicSseTranslator;
+
+    fn lines(t: &mut AnthropicSseTranslator, raw: &[&str]) -> String {
+        raw.iter()
+            .filter_map(|l| t.translate_line(l))
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn folds_message_start_and_delta_usage_into_final_chunk() {
+        let mut t = AnthropicSseTranslator::new();
+        let out = lines(
+            &mut t,
+            &[
+                "event: message_start",
+                r#"data: {"type":"message_start","message":{"usage":{"input_tokens":40,"cache_read_input_tokens":10,"output_tokens":1}}}"#,
+                r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+        );
+        let final_chunk = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .next_back()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(final_chunk).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 50);
+        assert_eq!(v["usage"]["completion_tokens"], 7);
+        assert_eq!(v["usage"]["total_tokens"], 57);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 10);
+        assert!(out.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn text_deltas_pass_through_and_omit_usage_when_none_was_reported() {
+        let mut t = AnthropicSseTranslator::new();
+        let out = lines(
+            &mut t,
+            &[
+                r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ],
+        );
+        let chunks: Vec<serde_json::Value> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect();
+        assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "Hello");
+        assert!(chunks[1].get("usage").is_none());
     }
 }
 
