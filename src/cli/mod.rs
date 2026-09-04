@@ -293,31 +293,30 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tracing::info!(path, "prompt log using dedicated database");
             }
 
-            // Prompt-log retention: purge on an hourly check against the LIVE
-            // policy, so a retention set in the GUI applies within the hour.
+            // Prompt-log retention: an hourly tick against the LIVE policy, so
+            // a retention set in the GUI applies within the hour.
             // retention_days == 0 (the default) means keep forever — deletion
-            // is strictly opt-in. Failures are logged, never fatal.
+            // is strictly opt-in. The rows of a retaining experiment are
+            // exempt while its content window is open, and once it has
+            // elapsed they are redacted in place (spec §7c); that half runs
+            // on every tick whatever the global retention says. The
+            // experiment list is read from the main database, the prompt rows
+            // live in the prompt store. Failures are logged, never fatal.
             {
-                let purge_db = prompt_db.clone();
-                let purge_storage = storage_live.clone();
+                let tick_db = db.clone();
+                let tick_prompt_db = prompt_db.clone();
+                let tick_storage = storage_live.clone();
                 tokio::spawn(async move {
                     loop {
-                        let retention_days = purge_storage.load().prompt_retention_days;
-                        if retention_days > 0 {
-                            let cutoff = (chrono::Utc::now()
-                                - chrono::Duration::days(retention_days as i64))
-                            .to_rfc3339();
-                            use crate::db::repositories::prompts::PromptRepository;
-                            match PromptRepository::purge_older_than(&*purge_db, &cutoff).await {
-                                Ok(n) if n > 0 => {
-                                    tracing::info!(deleted = n, retention_days, "prompt-log retention purge")
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "prompt-log retention purge failed")
-                                }
-                            }
-                        }
+                        let retention_days = tick_storage.load().prompt_retention_days;
+                        crate::db::retention::run_retention_tick(
+                            &*tick_db,
+                            &*tick_db,
+                            &*tick_prompt_db,
+                            retention_days,
+                            chrono::Utc::now(),
+                        )
+                        .await;
                         tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
                     }
                 });

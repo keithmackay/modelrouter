@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::db::models::{NewPrompt, Prompt};
+use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
 use super::costs::attribution_predicate;
@@ -9,6 +10,10 @@ use super::{SqliteDb, now_utc};
 /// Rows that carry a real latency measurement. Cache hits are logged with
 /// `0` (or `NULL`), and would otherwise pull every percentile toward zero.
 const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
+
+/// Experiment ids bound per `DELETE ... IN (...)` statement in
+/// `purge_older_than_except`, well under SQLite's bound-parameter limit.
+const PURGE_ID_CHUNK: usize = 500;
 
 /// Columns selected when reading a prompt row back.
 const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
@@ -115,6 +120,66 @@ impl PromptRepository for SqliteDb {
             .bind(cutoff_rfc3339)
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn purge_older_than_except(
+        &self,
+        cutoff_rfc3339: &str,
+        except_experiment_ids: &[i64],
+    ) -> anyhow::Result<u64> {
+        if except_experiment_ids.is_empty() {
+            return PromptRepository::purge_older_than(self, cutoff_rfc3339).await;
+        }
+        // Unstamped rows first, then the stamped ones by experiment. Deleting
+        // by a positive `IN` list of the experiments that are NOT protected
+        // keeps the statement correct when the list has to be chunked (a
+        // `NOT IN` split across chunks would delete a protected row in the
+        // chunk that does not name it).
+        let result = sqlx::query(
+            "DELETE FROM prompts WHERE created_at < ? AND experiment_id IS NULL",
+        )
+        .bind(cutoff_rfc3339)
+        .execute(&self.pool)
+        .await?;
+        let mut deleted = result.rows_affected();
+
+        let stamped: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT experiment_id FROM prompts \
+             WHERE created_at < ? AND experiment_id IS NOT NULL",
+        )
+        .bind(cutoff_rfc3339)
+        .fetch_all(&self.pool)
+        .await?;
+        let expendable: Vec<i64> = stamped
+            .into_iter()
+            .map(|(id,)| id)
+            .filter(|id| !except_experiment_ids.contains(id))
+            .collect();
+        for chunk in expendable.chunks(PURGE_ID_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM prompts WHERE created_at < ? AND experiment_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql).bind(cutoff_rfc3339);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            deleted += q.execute(&self.pool).await?.rows_affected();
+        }
+        Ok(deleted)
+    }
+
+    async fn redact_experiment_content(&self, experiment_id: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE prompts SET messages = ?, response = NULL \
+             WHERE experiment_id = ? AND (messages != ? OR response IS NOT NULL)",
+        )
+        .bind(CONTENT_NOT_STORED)
+        .bind(experiment_id)
+        .bind(CONTENT_NOT_STORED)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -404,6 +469,121 @@ mod tests {
         let r = db.latency_summary(&run, W_START, W_END).await.unwrap();
         assert_eq!(r.samples, 1);
         assert_eq!(r.p50_ms, Some(100));
+    }
+
+    // ---- retention -----------------------------------------------------------
+
+    /// A prompt row with content, stamped with `experiment_id`.
+    async fn insert_stamped_row(db: &SqliteDb, experiment_id: Option<i64>, created_at: &str) -> i64 {
+        let r = sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, response, \
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, tags, attribution_tags, \
+             experiment_id, experiment_variant, created_at) \
+             VALUES (1, 'req', 'X', 'p', '[{\"role\":\"user\",\"content\":\"hello\"}]', 'world', \
+             10, 20, 0.01, 300, '[]', '{}', ?, ?, ?)",
+        )
+        .bind(experiment_id)
+        .bind(experiment_id.map(|_| "control"))
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        r.last_insert_rowid()
+    }
+
+    async fn exists(db: &SqliteDb, id: i64) -> bool {
+        PromptRepository::find_by_id(db, id).await.unwrap().is_some()
+    }
+
+    const OLD: &str = "2026-01-01T00:00:00Z";
+    const NEW: &str = "2026-03-15T00:00:00Z";
+    const CUTOFF: &str = "2026-03-01T00:00:00Z";
+
+    #[tokio::test]
+    async fn purge_older_than_except_spares_the_listed_experiments() {
+        let db = make_db().await;
+        let old_plain = insert_stamped_row(&db, None, OLD).await;
+        let old_kept = insert_stamped_row(&db, Some(7), OLD).await;
+        let old_kept_too = insert_stamped_row(&db, Some(8), OLD).await;
+        let old_gone = insert_stamped_row(&db, Some(9), OLD).await;
+        let new_plain = insert_stamped_row(&db, None, NEW).await;
+        let new_gone_exp = insert_stamped_row(&db, Some(9), NEW).await;
+
+        let n = db.purge_older_than_except(CUTOFF, &[7, 8]).await.unwrap();
+        assert_eq!(n, 2);
+        assert!(!exists(&db, old_plain).await);
+        assert!(exists(&db, old_kept).await);
+        assert!(exists(&db, old_kept_too).await);
+        assert!(!exists(&db, old_gone).await);
+        assert!(exists(&db, new_plain).await);
+        assert!(exists(&db, new_gone_exp).await);
+
+        // Nothing old and unprotected is left: a second call is a no-op.
+        assert_eq!(db.purge_older_than_except(CUTOFF, &[7, 8]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_except_with_no_exceptions_is_a_plain_purge() {
+        let db = make_db().await;
+        let old_plain = insert_stamped_row(&db, None, OLD).await;
+        let old_exp = insert_stamped_row(&db, Some(7), OLD).await;
+        let new_exp = insert_stamped_row(&db, Some(7), NEW).await;
+
+        assert_eq!(db.purge_older_than_except(CUTOFF, &[]).await.unwrap(), 2);
+        assert!(!exists(&db, old_plain).await);
+        assert!(!exists(&db, old_exp).await);
+        assert!(exists(&db, new_exp).await);
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_except_handles_more_experiments_than_one_chunk() {
+        let db = make_db().await;
+        // Old rows for more distinct experiments than fit one IN-list chunk,
+        // every other one protected.
+        let total = PURGE_ID_CHUNK as i64 * 2 + 3;
+        let mut rows = Vec::new();
+        for id in 1..=total {
+            rows.push((id, insert_stamped_row(&db, Some(id), OLD).await));
+        }
+        let protected: Vec<i64> = (1..=total).filter(|id| id % 2 == 0).collect();
+
+        let n = db.purge_older_than_except(CUTOFF, &protected).await.unwrap();
+        assert_eq!(n as i64, total - protected.len() as i64);
+        for (id, row) in rows {
+            assert_eq!(exists(&db, row).await, id % 2 == 0, "experiment {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn redact_experiment_content_is_scoped_and_idempotent() {
+        let db = make_db().await;
+        let target = insert_stamped_row(&db, Some(7), OLD).await;
+        let target_new = insert_stamped_row(&db, Some(7), NEW).await;
+        let other = insert_stamped_row(&db, Some(8), OLD).await;
+        let plain = insert_stamped_row(&db, None, OLD).await;
+
+        assert_eq!(db.redact_experiment_content(7).await.unwrap(), 2);
+        for id in [target, target_new] {
+            let row = PromptRepository::find_by_id(&db, id).await.unwrap().unwrap();
+            assert_eq!(row.messages, CONTENT_NOT_STORED);
+            assert_eq!(row.response, None);
+            // Everything the results page reads survives.
+            assert_eq!(row.latency_ms, Some(300));
+            assert_eq!(row.prompt_tokens, 10);
+            assert_eq!(row.completion_tokens, 20);
+            assert_eq!(row.cost_usd, 0.01);
+            assert_eq!(row.experiment_id, Some(7));
+            assert_eq!(row.experiment_variant.as_deref(), Some("control"));
+        }
+        for id in [other, plain] {
+            let row = PromptRepository::find_by_id(&db, id).await.unwrap().unwrap();
+            assert!(row.messages.contains("hello"));
+            assert_eq!(row.response.as_deref(), Some("world"));
+        }
+
+        // Already redacted rows are not rewritten.
+        assert_eq!(db.redact_experiment_content(7).await.unwrap(), 0);
+        assert_eq!(db.redact_experiment_content(99).await.unwrap(), 0);
     }
 
     #[test]

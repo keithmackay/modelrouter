@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 
 use crate::db::models::{NewPrompt, Prompt};
+use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
 use super::costs::attribution_predicate;
@@ -11,6 +12,10 @@ use super::{PostgresDb, now_utc};
 /// Rows that carry a real latency measurement. Cache hits are logged with
 /// `0` (or `NULL`), and would otherwise pull every percentile toward zero.
 const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
+
+/// Experiment ids bound per `DELETE ... IN (...)` statement in
+/// `purge_older_than_except`.
+const PURGE_ID_CHUNK: usize = 500;
 
 #[async_trait]
 impl PromptRepository for PostgresDb {
@@ -123,6 +128,68 @@ impl PromptRepository for PostgresDb {
             .bind(cutoff_rfc3339)
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn purge_older_than_except(
+        &self,
+        cutoff_rfc3339: &str,
+        except_experiment_ids: &[i64],
+    ) -> anyhow::Result<u64> {
+        if except_experiment_ids.is_empty() {
+            return PromptRepository::purge_older_than(self, cutoff_rfc3339).await;
+        }
+        // Unstamped rows first, then the stamped ones by experiment. Deleting
+        // by a positive `IN` list of the experiments that are NOT protected
+        // keeps the statement correct when the list has to be chunked (a
+        // `NOT IN` split across chunks would delete a protected row in the
+        // chunk that does not name it).
+        let result = sqlx::query(
+            "DELETE FROM prompts WHERE created_at < $1 AND experiment_id IS NULL",
+        )
+        .bind(cutoff_rfc3339)
+        .execute(&self.pool)
+        .await?;
+        let mut deleted = result.rows_affected();
+
+        let stamped: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT experiment_id FROM prompts \
+             WHERE created_at < $1 AND experiment_id IS NOT NULL",
+        )
+        .bind(cutoff_rfc3339)
+        .fetch_all(&self.pool)
+        .await?;
+        let expendable: Vec<i64> = stamped
+            .into_iter()
+            .map(|(id,)| id)
+            .filter(|id| !except_experiment_ids.contains(id))
+            .collect();
+        for chunk in expendable.chunks(PURGE_ID_CHUNK) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("${}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM prompts WHERE created_at < $1 AND experiment_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql).bind(cutoff_rfc3339);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            deleted += q.execute(&self.pool).await?.rows_affected();
+        }
+        Ok(deleted)
+    }
+
+    async fn redact_experiment_content(&self, experiment_id: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE prompts SET messages = $1, response = NULL \
+             WHERE experiment_id = $2 AND (messages != $1 OR response IS NOT NULL)",
+        )
+        .bind(CONTENT_NOT_STORED)
+        .bind(experiment_id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 

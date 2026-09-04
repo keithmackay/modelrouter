@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
+use modelrouter::callbacks::{CallbackBackend, CallbackDispatcher, CallbackEvent};
 use modelrouter::config::schema::{
     CacheConfig, LbPoolEntry, LbStrategy, LoadBalancerConfig, PricingEntry, Settings,
     StorageConfig,
@@ -24,6 +25,7 @@ use modelrouter::db::models::{
     CostLedgerEntry, ExperimentVariants, NewExperiment, Prompt, RequestFailure, RunStamp,
     VariantTarget,
 };
+use modelrouter::db::prompt_store::CONTENT_NOT_STORED;
 use modelrouter::db::repositories::costs::CostRepository;
 use modelrouter::db::repositories::experiments::ExperimentRepository;
 use modelrouter::db::repositories::failures::FailureRepository;
@@ -93,10 +95,23 @@ impl ProviderAdapter for RecordingAdapter {
     }
 }
 
+/// A callback backend that keeps every event it is handed, so a test can
+/// assert that the observability egress stayed shut.
+struct RecordingBackend {
+    events: Arc<Mutex<Vec<CallbackEvent>>>,
+}
+
+impl CallbackBackend for RecordingBackend {
+    fn send(&self, event: CallbackEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
 struct Harness {
     server: TestServer,
     db: Arc<dyn DatabaseProvider>,
     calls: Arc<Mutex<Vec<String>>>,
+    events: Arc<Mutex<Vec<CallbackEvent>>>,
     fail_models: Arc<Mutex<HashSet<String>>>,
     router: Arc<RequestRouter>,
     session_affinity: Arc<SessionAffinityMap>,
@@ -187,11 +202,40 @@ impl Harness {
     async fn prompts(&self) -> Vec<Prompt> {
         PromptRepository::list(&*self.db, 100, 0).await.unwrap()
     }
+
+    /// Callback events dispatched so far.
+    fn events(&self) -> Vec<CallbackEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Dispatch follows the ledger write in the same task, so poll briefly
+    /// rather than assume the row and the event land together.
+    async fn wait_for_events(&self, want: usize) -> Vec<CallbackEvent> {
+        for _ in 0..200 {
+            let events = self.events();
+            if events.len() >= want {
+                return events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {want} callback events");
+    }
+
+    /// The prompt row of one run; call after `wait_for_run`, which follows the
+    /// row insert on every logging path.
+    async fn prompt_for_run(&self, correlation_id: &str) -> Prompt {
+        self.prompts()
+            .await
+            .into_iter()
+            .find(|p| p.attribution_correlation_id.as_deref() == Some(correlation_id))
+            .unwrap_or_else(|| panic!("no prompt row for {correlation_id}"))
+    }
 }
 
 struct Options {
     cache: bool,
     store_prompts: bool,
+    store_prompt_content: bool,
     pool: bool,
 }
 
@@ -200,6 +244,7 @@ impl Default for Options {
         Self {
             cache: false,
             store_prompts: true,
+            store_prompt_content: true,
             pool: false,
         }
     }
@@ -262,8 +307,10 @@ async fn build_app(opts: Options) -> Harness {
     let experiments = Arc::new(ExperimentRegistry::default());
     let storage = StorageConfig {
         store_prompts: opts.store_prompts,
+        store_prompt_content: opts.store_prompt_content,
         ..Default::default()
     };
+    let events = Arc::new(Mutex::new(Vec::new()));
 
     let state = AppState {
         settings: settings.clone(),
@@ -306,7 +353,9 @@ async fn build_app(opts: Options) -> Harness {
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(storage)),
         prompt_db: db.clone(),
         app_metrics: None,
-        callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        callbacks: Arc::new(CallbackDispatcher::new(vec![Box::new(RecordingBackend {
+            events: events.clone(),
+        })])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: experiments.clone(),
@@ -315,6 +364,7 @@ async fn build_app(opts: Options) -> Harness {
         server: TestServer::new(build_router(state)).unwrap(),
         db,
         calls,
+        events,
         fail_models,
         router,
         session_affinity,
@@ -849,4 +899,136 @@ async fn retaining_binding_writes_the_prompt_row_with_content_when_storage_is_of
     let stamp = h.wait_for_run(1, "run-4").await;
     assert_eq!(stamp.experiment_id, Some(retaining));
     assert_eq!(h.prompts().await.len(), 1);
+}
+
+#[tokio::test]
+async fn retaining_binding_stores_content_when_content_storage_is_off() {
+    let h = build_app(Options {
+        store_prompt_content: false,
+        ..Default::default()
+    })
+    .await;
+    let plain = h.seed_experiment(vec![], false).await;
+    let retaining = h.seed_experiment(vec![], true).await;
+
+    // Unbound: the operator's policy, a redacted row.
+    let resp = complete(&h, TOKEN_A, None, &chat_body("planner", "run-1")).await;
+    assert_eq!(resp.status_code(), 200);
+    h.wait_for_run(1, "run-1").await;
+    let row = h.prompt_for_run("run-1").await;
+    assert_eq!(row.messages, CONTENT_NOT_STORED);
+    assert_eq!(row.response, None);
+
+    // Bound to a non-retaining experiment: stamped, still redacted.
+    let resp = complete(
+        &h,
+        TOKEN_A,
+        Some(&format!("{plain}:candidate")),
+        &chat_body("planner", "run-2"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200);
+    h.wait_for_run(1, "run-2").await;
+    let row = h.prompt_for_run("run-2").await;
+    assert_eq!(row.experiment_id, Some(plain));
+    assert_eq!(row.messages, CONTENT_NOT_STORED);
+    assert_eq!(row.response, None);
+
+    // Bound to a retaining experiment: full messages and response.
+    let resp = complete(
+        &h,
+        TOKEN_A,
+        Some(&format!("{retaining}:candidate")),
+        &chat_body("planner", "run-3"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200);
+    h.wait_for_run(1, "run-3").await;
+    let row = h.prompt_for_run("run-3").await;
+    assert_eq!(row.experiment_id, Some(retaining));
+    assert_eq!(row.experiment_variant.as_deref(), Some("candidate"));
+    assert!(row.messages.contains("plan the week"), "{}", row.messages);
+    assert_eq!(row.response.as_deref(), Some("answer from model-b"));
+    assert!(row.latency_ms.is_some());
+
+    // The same on the streaming path, written once `[DONE]` has passed.
+    let mut body = chat_body("planner", "run-4");
+    body["stream"] = json!(true);
+    let resp = complete(&h, TOKEN_A, Some(&format!("{retaining}:candidate")), &body).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert!(resp.text().contains("data: [DONE]"));
+    h.wait_for_run(1, "run-4").await;
+    let row = h.prompt_for_run("run-4").await;
+    assert_eq!(row.experiment_id, Some(retaining));
+    assert!(row.messages.contains("plan the week"), "{}", row.messages);
+    assert_eq!(row.response.as_deref(), Some("answer from model-b"));
+    assert_eq!(row.prompt_tokens, 10);
+    assert_eq!(row.completion_tokens, 20);
+
+    // A streaming request bound to the non-retaining experiment is redacted.
+    let mut body = chat_body("planner", "run-5");
+    body["stream"] = json!(true);
+    let resp = complete(&h, TOKEN_A, Some(&format!("{plain}:candidate")), &body).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    h.wait_for_run(1, "run-5").await;
+    let row = h.prompt_for_run("run-5").await;
+    assert_eq!(row.experiment_id, Some(plain));
+    assert_eq!(row.messages, CONTENT_NOT_STORED);
+    assert_eq!(row.response, None);
+
+    // x-no-log still wins over retention on the streaming path too.
+    let mut body = chat_body("planner", "run-6");
+    body["stream"] = json!(true);
+    let resp = h
+        .server
+        .post("/v1/chat/completions")
+        .add_header(bearer(TOKEN_A).0, bearer(TOKEN_A).1)
+        .add_header(
+            experiment_header(&format!("{retaining}:candidate")).0,
+            experiment_header(&format!("{retaining}:candidate")).1,
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-no-log"),
+            axum::http::HeaderValue::from_static("true"),
+        )
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let stamp = h.wait_for_run(1, "run-6").await;
+    assert_eq!(stamp.experiment_id, Some(retaining));
+    assert_eq!(h.prompts().await.len(), 5);
+}
+
+#[tokio::test]
+async fn retaining_binding_never_opens_the_callback_egress() {
+    // With storage on, the recorder proves the egress is wired.
+    let h = build_app(Options::default()).await;
+    let resp = complete(&h, TOKEN_A, None, &chat_body("planner", "run-0")).await;
+    assert_eq!(resp.status_code(), 200);
+    h.wait_for_run(1, "run-0").await;
+    let events = h.wait_for_events(1).await;
+    assert_eq!(events[0].output, "answer from model-a");
+
+    // With `store_prompts = false`, a retaining binding writes its prompt row
+    // with content and nothing leaves the router.
+    let h = build_app(Options {
+        store_prompts: false,
+        ..Default::default()
+    })
+    .await;
+    let retaining = h.seed_experiment(vec![], true).await;
+    let resp = complete(
+        &h,
+        TOKEN_A,
+        Some(&format!("{retaining}:candidate")),
+        &chat_body("planner", "run-1"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200);
+    let stamp = h.wait_for_run(1, "run-1").await;
+    assert_eq!(stamp.experiment_id, Some(retaining));
+    let row = h.prompt_for_run("run-1").await;
+    assert!(row.messages.contains("plan the week"));
+    assert_eq!(row.response.as_deref(), Some("answer from model-b"));
+    assert!(h.events().is_empty(), "{:?}", h.events().len());
 }

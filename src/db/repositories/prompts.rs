@@ -40,6 +40,20 @@ pub trait PromptRepository: Send + Sync {
     /// rows deleted. The caller computes the cutoff (retention policy lives in
     /// config, not in the repository).
     async fn purge_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64>;
+    /// `purge_older_than` that leaves the rows of the listed experiments in
+    /// place — the retaining experiments whose content window is still open
+    /// (spec §7c). An empty list is a plain purge. Returns rows deleted.
+    async fn purge_older_than_except(
+        &self,
+        cutoff_rfc3339: &str,
+        except_experiment_ids: &[i64],
+    ) -> anyhow::Result<u64>;
+    /// Replace the stored content of every row stamped with the experiment by
+    /// the placeholder `redact_prompt_content` writes (`messages` set to
+    /// `CONTENT_NOT_STORED`, `response` nulled), keeping the ids, timestamps,
+    /// tokens, latency and experiment stamp the results page reads.
+    /// Idempotent: returns the number of rows that still held content.
+    async fn redact_experiment_content(&self, experiment_id: i64) -> anyhow::Result<u64>;
     /// Latency samples, mean and nearest-rank p50/p95 for one comparison arm
     /// within `[start, end)`. Model arms match `routed_model`.
     async fn latency_summary(
