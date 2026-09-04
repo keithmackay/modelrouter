@@ -108,6 +108,9 @@ pub struct AppState {
     #[cfg(not(feature = "prometheus"))]
     pub app_metrics: Option<std::convert::Infallible>,
     pub oidc_state: Arc<crate::api::admin::oidc::OidcStateStore>,
+    /// Live snapshot of the `experiments` table (spec §7a); requests bind
+    /// against it without touching the database.
+    pub experiments: Arc<crate::router::experiments::ExperimentRegistry>,
 }
 
 pub fn build_router(state: AppState) -> axum::Router {

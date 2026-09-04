@@ -73,6 +73,7 @@ async fn build_test_server_with_db(
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     TestServer::new(build_router(state)).unwrap()
@@ -180,6 +181,7 @@ async fn login_success_sets_cookie() {
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -250,6 +252,7 @@ async fn superadmin_only_admins_page() {
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();

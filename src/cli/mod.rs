@@ -371,6 +371,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                 db.list_enabled_webhooks().await.unwrap_or_default()
             };
 
+            // Experiment registry (spec §7a): load once before serving so the
+            // first request can bind; the tick below keeps it fresh.
+            let experiments = Arc::new(crate::router::experiments::ExperimentRegistry::default());
+            match experiments.load_from(&*db).await {
+                Ok(()) if !experiments.is_empty() => {
+                    tracing::info!(count = experiments.len(), "loaded experiments")
+                }
+                Ok(()) => {}
+                Err(e) => tracing::warn!(error = %e, "experiment registry load failed"),
+            }
+
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
                 live_settings: live_settings.clone(),
@@ -441,6 +452,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
                 app_metrics,
                 oidc_state,
+                experiments,
             };
             // Seed DB model aliases and failover chains into live router/fallback
             {
@@ -470,6 +482,45 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     state.fallback.update_db_chains(db_chains);
                 }
+            }
+
+            // Experiment lifecycle tick (spec §7a): every minute close the
+            // experiments whose `expires_at` has passed, audit each close as
+            // actor `system`, then reload the registry so admin writes made
+            // from another process are picked up too. Binding already refuses
+            // an expired experiment per request, so this is bookkeeping, not
+            // enforcement. Failures are logged, never fatal.
+            {
+                let tick_db = state.db.clone();
+                let tick_registry = state.experiments.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        let now = chrono::Utc::now();
+                        match tick_db.close_expired(now.timestamp(), &now.to_rfc3339()).await {
+                            Ok(ids) => {
+                                for id in ids {
+                                    tracing::info!(experiment_id = id, "experiment auto-closed on expiry");
+                                    crate::api::admin::audit::audit(
+                                        &tick_db,
+                                        None,
+                                        "system",
+                                        "experiment.close",
+                                        Some(id.to_string()),
+                                        None,
+                                        Some(serde_json::json!({"status": "closed", "reason": "expired"}).to_string()),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "experiment auto-close failed"),
+                        }
+                        if let Err(e) = tick_registry.load_from(&*tick_db).await {
+                            tracing::warn!(error = %e, "experiment registry reload failed");
+                        }
+                    }
+                });
             }
 
             // Background sweeper for session affinity TTL eviction
