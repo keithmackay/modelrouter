@@ -224,6 +224,27 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
     .unwrap();
 }
 
+async fn seed_cache_hit(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64, i64)) {
+    CostRepository::create_cache_hit(
+        &**db,
+        NewCostLedgerEntry {
+            user_id: 1,
+            prompt_id: None,
+            model: s.model.to_string(),
+            provider: s.provider.to_string(),
+            project: None,
+            tokens_in: tokens.0,
+            tokens_out: tokens.1,
+            cost_usd: 0.0,
+            api_key_id: None,
+            attribution_correlation_id: Some(s.run.to_string()),
+            attribution_tags: s.tags.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: Option<i64>) {
     PromptRepository::create(
         &**db,
@@ -528,6 +549,39 @@ async fn unpriced_model_badges_only_its_own_arm() {
 }
 
 #[tokio::test]
+async fn rows_recorded_before_a_price_existed_are_flagged_unpriced() {
+    // mock-model is priced now, but this row carries tokens and zero spend:
+    // it was written when no price existed, so the arm's cost is incomplete.
+    let (server, db, settings) = build_app().await;
+    let a = Seed { model: "mock-model", provider: "mock", run: "run-a", tags: r#"{"arm":"a"}"# };
+    let b = Seed { model: "mock-model", provider: "mock", run: "run-b", tags: r#"{"arm":"b"}"# };
+    seed_ledger(&db, &a, (10, 20), 0.0).await;
+    seed_ledger(&db, &b, (10, 20), 0.03).await;
+
+    let (status, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["a"]["unpriced"], true);
+    assert_eq!(body["a"]["unpriced_models"], json!(["mock-model"]));
+    assert_eq!(body["b"]["unpriced"], false);
+}
+
+#[tokio::test]
+async fn cache_hits_at_zero_cost_are_not_unpriced() {
+    // A cache hit is usage without spend by design; it must not trip the
+    // historical-unpriced trigger.
+    let (server, db, settings) = build_app().await;
+    let a = Seed { model: "mock-model", provider: "mock", run: "run-a", tags: r#"{"arm":"a"}"# };
+    let b = Seed { model: "mock-model", provider: "mock", run: "run-b", tags: r#"{"arm":"b"}"# };
+    seed_cache_hit(&db, &a, (10, 20)).await;
+    seed_ledger(&db, &b, (10, 20), 0.03).await;
+
+    let (status, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["a"]["cache_hits"], 1);
+    assert_eq!(body["a"]["unpriced"], false);
+}
+
+#[tokio::test]
 async fn a_failure_raises_only_that_arms_error_rate() {
     let (server, db, settings) = build_app().await;
     drive(&server, "mock/mock-model", "a", 3).await;
@@ -558,7 +612,19 @@ async fn malformed_queries_are_400_and_name_the_field() {
         ("dimension=model&a=x&b=y&window=hourly", "window"),
         ("a=x&b=y", "dimension"),
     ];
+    let long = "x".repeat(257);
+    let long_key = "k".repeat(65);
+    let long_cases = [
+        (format!("dimension=model&a={}&b=y", long), "a must be at most 256"),
+        (format!("dimension=run&a=x&b={}", long), "b must be at most 256"),
+        (format!("dimension=tag&key={}&a=x&b=y", long_key), "key must be at most 64"),
+    ];
+    let cases = cases
+        .iter()
+        .map(|(q, n)| (q.to_string(), *n))
+        .chain(long_cases.iter().map(|(q, n)| (q.clone(), *n)));
     for (query, needle) in cases {
+        let query = query.as_str();
         let (status, body) = compare(&server, &settings, query).await;
         assert_eq!(status, 400, "{} -> {}", query, body);
         let msg = body["error"]["message"].as_str().unwrap();
