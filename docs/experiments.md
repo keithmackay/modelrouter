@@ -683,7 +683,7 @@ Authorization: Bearer <jwt>
 |---|---|---|
 | `dimension` | yes | `model`, `provider`, `tag`, `run`, `variant` |
 | `key` | for `tag` and `variant` | the attribution tag key to partition on, or the experiment id; ignored otherwise |
-| `a`, `b` | yes | the two arm values; must differ |
+| `a`, `b` | yes | the two arm values; must differ; ≤ 256 characters |
 | `window` | no | `daily`, `weekly`, `monthly` (default), `all` |
 
 A malformed query returns `400` with a message naming the field
@@ -814,9 +814,12 @@ Note: This comparison has no quality column. …
 Note: Streamed responses record estimated or zero tokens …
 ```
 
-`--format csv` writes the table rows as CSV; `--format json` writes the
-endpoint document verbatim, so a script can consume either source the same
-way. `--window alltime` is accepted as a synonym for `all`. An invalid query
+`--format csv` writes the table rows as CSV. The prose beneath the table is
+not repeated there, but the data it summarises is: the `Latency samples` and
+`Unpriced models` rows carry each arm's latency denominator and unpriced
+models, so a spreadsheet sees the same caveats the table does. `--format json`
+writes the endpoint document verbatim, so a script can consume either source
+the same way. `--window alltime` is accepted as a synonym for `all`. An invalid query
 prints the same message the endpoint would return and exits 1.
 
 ### 4. View it on the dashboard
@@ -833,10 +836,14 @@ table. Two things to look for before believing a number:
   request count comes from the cost ledger. When the prompt log is off, or
   stores fewer rows than the ledger, the latency figures describe a
   subset, and the page says so.
-- **An "unpriced" badge on an arm** means at least one model in that arm has
-  no entry in `[pricing]`, so its cost is recorded as zero and every cost
-  figure for that arm is an undercount. Add the price and the ledger rows
-  are *not* recomputed — fix pricing before the experiment, not after.
+- **An "unpriced" badge on an arm** means at least one model in that arm is
+  missing a price: either it has no entry in `[pricing]` now, or its ledger
+  rows consumed tokens on real provider calls yet recorded zero spend, which
+  is what a model looks like when it was priced only after the traffic ran.
+  Either way every cost figure for that arm is an undercount. Adding the
+  price does *not* recompute the ledger — fix pricing before the experiment,
+  not after — and the badge keeps flagging the historical rows until they
+  age out of the window.
 
 ### 5. Reading the result
 
