@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewPrompt, Prompt};
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
-use super::costs::attribution_predicate;
+use super::costs::arm_predicate;
 use super::{SqliteDb, now_utc};
 
 /// Rows that carry a real latency measurement. Cache hits are logged with
@@ -120,7 +120,8 @@ impl PromptRepository for SqliteDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary> {
-        let (predicate, binds) = arm_predicate(filter);
+        // Model arms match the model actually served, not the alias asked for.
+        let (predicate, binds) = arm_predicate(filter, "routed_model");
         let where_clause = format!(
             "{} AND created_at >= ? AND created_at < ? AND {}",
             predicate, LATENCY_SAMPLE
@@ -185,15 +186,6 @@ impl PromptRepository for SqliteDb {
     }
 }
 
-/// Predicate for a comparison arm against `prompts`. Model arms match the
-/// model actually served (`routed_model`), not the alias the caller asked for.
-fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
-    match filter {
-        ArmFilter::Model(m) => ("routed_model = ?".to_string(), vec![m.clone()]),
-        ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
-        ArmFilter::Attribution(f) => attribution_predicate(f),
-    }
-}
 
 #[cfg(test)]
 mod tests {

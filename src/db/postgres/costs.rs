@@ -567,38 +567,6 @@ impl CostRepository for PostgresDb {
         }).collect())
     }
 
-    // ── Attribution-filtered usage ────────────────────────────────────────────
-
-    async fn attribution_totals(
-        &self,
-        filter: &AttributionFilter,
-        start: &str,
-        end: &str,
-    ) -> anyhow::Result<AttributionTotals> {
-        let (predicate, binds) = attribution_predicate(filter);
-        self.totals_where(&predicate, binds, start, end).await
-    }
-
-    async fn attribution_by_model(
-        &self,
-        filter: &AttributionFilter,
-        start: &str,
-        end: &str,
-    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
-        let (predicate, binds) = attribution_predicate(filter);
-        self.by_model_where(&predicate, binds, start, end).await
-    }
-
-    async fn attribution_by_day(
-        &self,
-        filter: &AttributionFilter,
-        start: &str,
-        end: &str,
-    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
-        let (predicate, binds) = attribution_predicate(filter);
-        self.by_day_where(&predicate, binds, start, end).await
-    }
-
     async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT jsonb_object_keys(attribution_tags::jsonb) AS k \
@@ -646,7 +614,7 @@ impl CostRepository for PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<AttributionTotals> {
-        let (predicate, binds) = arm_predicate(filter);
+        let (predicate, binds) = arm_predicate(filter, "model");
         self.totals_where(&predicate, binds, start, end).await
     }
 
@@ -656,7 +624,7 @@ impl CostRepository for PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
-        let (predicate, binds) = arm_predicate(filter);
+        let (predicate, binds) = arm_predicate(filter, "model");
         self.by_model_where(&predicate, binds, start, end).await
     }
 
@@ -666,7 +634,7 @@ impl CostRepository for PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
-        let (predicate, binds) = arm_predicate(filter);
+        let (predicate, binds) = arm_predicate(filter, "model");
         self.by_day_where(&predicate, binds, start, end).await
     }
 }
@@ -798,10 +766,13 @@ pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<
     }
 }
 
-/// SQL predicate plus its bound values for a comparison arm against the ledger.
-fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
+/// SQL predicate plus its bound values for a comparison arm. `model_column`
+/// is the expression a model arm matches against — each table names the
+/// served model differently (`model` here, `routed_model` in `prompts`,
+/// `COALESCE(routed_model, request_model)` in `request_failures`).
+pub(crate) fn arm_predicate(filter: &ArmFilter, model_column: &str) -> (String, Vec<String>) {
     match filter {
-        ArmFilter::Model(m) => ("model = $1".to_string(), vec![m.clone()]),
+        ArmFilter::Model(m) => (format!("{} = $1", model_column), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
     }

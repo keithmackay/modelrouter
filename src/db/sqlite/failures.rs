@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewRequestFailure, RequestFailure};
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::failures::FailureRepository;
-use super::costs::attribution_predicate;
+use super::costs::arm_predicate;
 use super::{SqliteDb, now_utc};
 
 /// Columns selected when reading a failure row back.
@@ -80,7 +80,9 @@ impl FailureRepository for SqliteDb {
     }
 
     async fn count_for_arm(&self, filter: &ArmFilter, start: &str, end: &str) -> anyhow::Result<i64> {
-        let (predicate, binds) = arm_predicate(filter);
+        // A request that failed before routing has no routed_model, so model
+        // arms fall back to the model the caller asked for.
+        let (predicate, binds) = arm_predicate(filter, "COALESCE(routed_model, request_model)");
         let sql = format!(
             "SELECT COUNT(*) FROM request_failures \
              WHERE {} AND created_at >= ? AND created_at < ?",
@@ -95,19 +97,6 @@ impl FailureRepository for SqliteDb {
     }
 }
 
-/// Predicate for a comparison arm against `request_failures`. A request that
-/// failed before routing has no `routed_model`, so model arms fall back to
-/// the model the caller asked for.
-fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
-    match filter {
-        ArmFilter::Model(m) => (
-            "COALESCE(routed_model, request_model) = ?".to_string(),
-            vec![m.clone()],
-        ),
-        ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
-        ArmFilter::Attribution(f) => attribution_predicate(f),
-    }
-}
 
 #[cfg(test)]
 mod tests {

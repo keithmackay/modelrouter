@@ -229,7 +229,9 @@ pub trait CostRepository: Send + Sync {
     //
     // These let a consuming app ask "what did *my* unit of work cost, and what
     // did the router save me on it" without keeping a parallel cost model.
-    // `start`/`end` are ISO 8601 UTC (inclusive start, exclusive end).
+    // `start`/`end` are ISO 8601 UTC (inclusive start, exclusive end). An
+    // attribution filter is one kind of comparison arm, so these delegate to
+    // the `arm_*` queries below rather than each backend implementing both.
 
     /// Spend, savings, tokens, requests and cache hits for one attribution value.
     async fn attribution_totals(
@@ -237,21 +239,27 @@ pub trait CostRepository: Send + Sync {
         filter: &AttributionFilter,
         start: &str,
         end: &str,
-    ) -> anyhow::Result<AttributionTotals>;
+    ) -> anyhow::Result<AttributionTotals> {
+        self.arm_totals(&ArmFilter::Attribution(filter.clone()), start, end).await
+    }
     /// Same aggregates broken down by model, largest spend first.
     async fn attribution_by_model(
         &self,
         filter: &AttributionFilter,
         start: &str,
         end: &str,
-    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        self.arm_by_model(&ArmFilter::Attribution(filter.clone()), start, end).await
+    }
     /// Same aggregates broken down by calendar day, ascending.
     async fn attribution_by_day(
         &self,
         filter: &AttributionFilter,
         start: &str,
         end: &str,
-    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        self.arm_by_day(&ArmFilter::Attribution(filter.clone()), start, end).await
+    }
     /// Distinct tag keys present in the ledger, sorted — populates the pickers.
     async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>>;
     /// Distinct values in the ledger for one tag key (or, when `key` is None,
