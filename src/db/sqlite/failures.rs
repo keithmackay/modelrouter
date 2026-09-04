@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::db::models::{NewRequestFailure, RequestFailure};
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::failures::FailureRepository;
+use crate::db::repositories::failures::{ExperimentRunFailures, FailureRepository};
 use super::costs::attribution_predicate;
 use super::{SqliteDb, now_utc};
 
@@ -109,6 +109,30 @@ impl FailureRepository for SqliteDb {
         .await?;
         Ok(row.is_some())
     }
+
+    async fn experiment_run_failures(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunFailures>> {
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, i64, String, String)>(
+            "SELECT user_id, attribution_correlation_id, experiment_variant, COUNT(*), \
+                    MIN(created_at), MAX(created_at) \
+             FROM request_failures \
+             WHERE experiment_id = ? AND user_id IS NOT NULL \
+               AND attribution_correlation_id IS NOT NULL \
+             GROUP BY user_id, attribution_correlation_id, experiment_variant \
+             ORDER BY user_id ASC, attribution_correlation_id ASC, experiment_variant ASC",
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, variant, failures, first_at, last_at)| {
+                ExperimentRunFailures { user_id, correlation_id, variant, failures, first_at, last_at }
+            })
+            .collect())
+    }
 }
 
 /// Predicate for a comparison arm against `request_failures`. A request that
@@ -122,6 +146,10 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ),
         ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => (
+            "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
+            vec![experiment_id.to_string(), variant.clone()],
+        ),
     }
 }
 
@@ -253,5 +281,76 @@ mod tests {
         assert_eq!(row.experiment_id, Some(4));
         assert_eq!(row.experiment_variant.as_deref(), Some("control"));
         assert_eq!(db.list(10, 0).await.unwrap()[0].experiment_id, Some(4));
+    }
+
+    async fn insert_experiment_failure(
+        db: &SqliteDb,
+        user_id: Option<i64>,
+        run: Option<&str>,
+        experiment: (i64, &str),
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO request_failures (user_id, endpoint, request_model, stage, error_message, \
+             attempts, attribution_correlation_id, attribution_tags, experiment_id, \
+             experiment_variant, created_at) \
+             VALUES (?, '/v1/chat/completions', 'req', 'provider', 'boom', 1, ?, '{}', ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(run)
+        .bind(experiment.0)
+        .bind(experiment.1)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_run_failures_group_by_run_and_variant() {
+        let db = make_db().await;
+        for (id, name) in [(1, "alice"), (2, "bob")] {
+            sqlx::query("INSERT INTO users (id, name, created_at) VALUES (?, ?, '2025-01-01T00:00:00Z')")
+                .bind(id)
+                .bind(name)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        insert_experiment_failure(&db, Some(1), Some("a"), (7, "control"), "2026-03-02T00:00:00Z").await;
+        insert_experiment_failure(&db, Some(1), Some("a"), (7, "control"), "2026-03-04T00:00:00Z").await;
+        insert_experiment_failure(&db, Some(1), Some("a"), (7, "candidate"), "2026-03-03T00:00:00Z").await;
+        insert_experiment_failure(&db, Some(2), Some("a"), (7, "control"), "2026-03-05T00:00:00Z").await;
+        // Without a user or a correlation id there is no run to attach to.
+        insert_experiment_failure(&db, None, Some("a"), (7, "control"), "2026-03-05T00:00:00Z").await;
+        insert_experiment_failure(&db, Some(1), None, (7, "control"), "2026-03-05T00:00:00Z").await;
+        insert_experiment_failure(&db, Some(1), Some("a"), (8, "control"), "2026-03-05T00:00:00Z").await;
+
+        let rows = db.experiment_run_failures(7).await.unwrap();
+        let summary: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}/{}/{}:{} {}..{}",
+                    r.user_id,
+                    r.correlation_id,
+                    r.variant.as_deref().unwrap_or("-"),
+                    r.failures,
+                    r.first_at,
+                    r.last_at
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "1/a/candidate:1 2026-03-03T00:00:00Z..2026-03-03T00:00:00Z",
+                "1/a/control:2 2026-03-02T00:00:00Z..2026-03-04T00:00:00Z",
+                "2/a/control:1 2026-03-05T00:00:00Z..2026-03-05T00:00:00Z",
+            ]
+        );
+
+        let variant = ArmFilter::Variant { experiment_id: 7, variant: "control".to_string() };
+        assert_eq!(db.count_for_arm(&variant, W_START, W_END).await.unwrap(), 5);
     }
 }

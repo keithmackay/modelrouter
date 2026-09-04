@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
+use crate::db::repositories::prompts::{ExperimentRunLatency, LatencySummary, PromptRepository};
 use super::costs::attribution_predicate;
 use super::{PostgresDb, now_utc};
 
@@ -271,6 +271,41 @@ impl PromptRepository for PostgresDb {
 
         Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
     }
+
+    async fn experiment_run_latency(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunLatency>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, COUNT(*), AVG(latency_ms)::float8 \
+             FROM prompts \
+             WHERE experiment_id = $1 AND attribution_correlation_id IS NOT NULL AND {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY user_id ASC, attribution_correlation_id ASC",
+            LATENCY_SAMPLE
+        );
+        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, samples, mean_ms)| ExperimentRunLatency {
+                user_id, correlation_id, samples, mean_ms,
+            })
+            .collect())
+    }
+
+    async fn experiment_content_bytes(&self, experiment_id: i64) -> anyhow::Result<i64> {
+        let (bytes,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(octet_length(messages) + octet_length(COALESCE(response, ''))), 0)::BIGINT \
+             FROM prompts WHERE experiment_id = $1",
+        )
+        .bind(experiment_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(bytes)
+    }
 }
 
 /// Predicate for a comparison arm against `prompts`. Model arms match the
@@ -280,5 +315,9 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ArmFilter::Model(m) => ("routed_model = $1".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => (
+            "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
+            vec![experiment_id.to_string(), variant.clone()],
+        ),
     }
 }

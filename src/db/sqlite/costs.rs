@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
-    CacheUsageSummary, CostRepository,
+    CacheUsageSummary, CostRepository, ExperimentRunRow, ExperimentRunKey,
+    ExperimentUnboundRow, ExperimentVariantModelRow, ExperimentVariantTotals,
 };
 use super::{SqliteDb, now_utc};
 
@@ -690,7 +691,186 @@ impl CostRepository for SqliteDb {
         let (predicate, binds) = arm_predicate(filter);
         self.by_day_where(&predicate, binds, start, end).await
     }
+
+    // ── Experiment results ───────────────────────────────────────────────────
+
+    async fn experiment_variant_totals(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantTotals>> {
+        let sql = format!(
+            "SELECT COALESCE(experiment_variant, ''), {} FROM cost_ledger \
+             WHERE experiment_id = ? \
+             GROUP BY experiment_variant ORDER BY experiment_variant ASC",
+            EXPERIMENT_TOTALS_SELECT
+        );
+        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(variant, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows)| {
+                ExperimentVariantTotals {
+                    variant, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_variant_models(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantModelRow>> {
+        let sql = format!(
+            "SELECT COALESCE(experiment_variant, ''), model, {} FROM cost_ledger \
+             WHERE experiment_id = ? \
+             GROUP BY experiment_variant, model \
+             ORDER BY experiment_variant ASC, SUM(cost_usd) DESC, model ASC",
+            EXPERIMENT_TOTALS_SELECT
+        );
+        type Row = (String, String, i64, f64, f64, i64, i64, i64);
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(variant, model, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows)| {
+                ExperimentVariantModelRow {
+                    variant, model, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_runs(
+        &self,
+        experiment_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunRow>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, {}, \
+                    COUNT(DISTINCT experiment_variant), {}, \
+                    MIN(created_at), MAX(created_at) AS last_at \
+             FROM cost_ledger c \
+             WHERE {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY last_at DESC, user_id ASC, attribution_correlation_id ASC \
+             LIMIT ? OFFSET ?",
+            RUN_VARIANT_SUBQUERY, EXPERIMENT_TOTALS_SELECT, RUN_ROWS_WHERE
+        );
+        type Row = (i64, String, String, i64, i64, f64, f64, i64, i64, i64, String, String);
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(experiment_id)
+            .bind(experiment_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    user_id, correlation_id, variant, variant_count, requests, cost_usd, saved_usd,
+                    tokens_in, tokens_out, estimated_rows, first_at, last_at,
+                )| ExperimentRunRow {
+                    user_id, correlation_id, variant, variant_count, requests, cost_usd, saved_usd,
+                    tokens_in, tokens_out, estimated_rows, first_at, last_at,
+                },
+            )
+            .collect())
+    }
+
+    async fn experiment_run_count(&self, experiment_id: i64) -> anyhow::Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM cost_ledger c WHERE {} \
+             GROUP BY user_id, attribution_correlation_id)",
+            RUN_ROWS_WHERE
+        );
+        let (count,): (i64,) = sqlx::query_as(&sql)
+            .bind(experiment_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    async fn experiment_run_keys(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunKey>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, {}, COUNT(DISTINCT experiment_variant), \
+                    COUNT(*), MIN(created_at), MAX(created_at) \
+             FROM cost_ledger c WHERE {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY user_id ASC, attribution_correlation_id ASC",
+            RUN_VARIANT_SUBQUERY, RUN_ROWS_WHERE
+        );
+        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(&sql)
+            .bind(experiment_id)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, variant, n, requests, first_at, last_at)| {
+                ExperimentRunKey {
+                    user_id, correlation_id, variant, mixed: n > 1, requests, first_at, last_at,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_unbound_requests(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentUnboundRow>> {
+        let rows = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT u.user_id, u.attribution_correlation_id, COUNT(*) FROM cost_ledger u \
+             WHERE u.experiment_id IS NULL AND u.attribution_correlation_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM cost_ledger b WHERE b.experiment_id = ? \
+                           AND b.user_id = u.user_id \
+                           AND b.attribution_correlation_id = u.attribution_correlation_id) \
+             GROUP BY u.user_id, u.attribution_correlation_id \
+             ORDER BY u.user_id ASC, u.attribution_correlation_id ASC",
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, requests)| ExperimentUnboundRow {
+                user_id, correlation_id, requests,
+            })
+            .collect())
+    }
 }
+
+/// Aggregates over stamped rows; order matches [`ExperimentTotalsRow`] after
+/// the grouping columns.
+const EXPERIMENT_TOTALS_SELECT: &str = "COUNT(*), COALESCE(SUM(cost_usd), 0.0), \
+                                        COALESCE(SUM(saved_usd), 0.0), \
+                                        COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0), \
+                                        COALESCE(SUM(tokens_estimated), 0)";
+
+/// Rows that form runs: stamped with the experiment (first `?`) and carrying
+/// a correlation id. Aliased `c` so the variant subquery can correlate.
+const RUN_ROWS_WHERE: &str = "c.experiment_id = ? AND c.attribution_correlation_id IS NOT NULL";
+
+/// The run's variant: its earliest stamped row by `created_at`, then id —
+/// the rule `run_stamp` applies. A correlated subquery rather than SQLite's
+/// bare-column-beside-MIN() shortcut: that shortcut follows the *last*
+/// min()/max() in the select list, and the run query also takes
+/// `MAX(created_at)`. Takes the experiment id as its own `?`.
+const RUN_VARIANT_SUBQUERY: &str =
+    "(SELECT COALESCE(e.experiment_variant, '') FROM cost_ledger e \
+      WHERE e.experiment_id = ? AND e.user_id = c.user_id \
+        AND e.attribution_correlation_id = c.attribution_correlation_id \
+      ORDER BY e.created_at ASC, e.id ASC LIMIT 1)";
+
+type ExperimentTotalsRow = (String, i64, f64, f64, i64, i64, i64);
 
 impl SqliteDb {
     /// `SELECT totals FROM cost_ledger WHERE {predicate} AND window`, with
@@ -804,11 +984,18 @@ pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<
 }
 
 /// SQL predicate plus its bound values for a comparison arm against the ledger.
+///
+/// Binds are strings; the experiment id is cast back to an integer in SQL so
+/// the comparison never relies on column affinity.
 fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
     match filter {
         ArmFilter::Model(m) => ("model = ?".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => (
+            "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
+            vec![experiment_id.to_string(), variant.clone()],
+        ),
     }
 }
 
@@ -1210,5 +1397,145 @@ mod tests {
         assert_eq!(hit.experiment_id, Some(4));
         assert!(hit.cache_hit);
         assert!(hit.tokens_estimated);
+    }
+
+    /// Stamped row with explicit figures for the experiment aggregates.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_experiment_row(
+        db: &SqliteDb,
+        user_id: i64,
+        run: &str,
+        experiment: Option<(i64, &str)>,
+        model: &str,
+        cost: f64,
+        tokens: (i64, i64),
+        estimated: bool,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, tokens_in, tokens_out, \
+             cost_usd, saved_usd, attribution_correlation_id, experiment_id, experiment_variant, \
+             tokens_estimated, created_at) \
+             VALUES (?, NULL, ?, 'p', ?, ?, ?, 0.0, ?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(model)
+        .bind(tokens.0)
+        .bind(tokens.1)
+        .bind(cost)
+        .bind(run)
+        .bind(experiment.map(|(id, _)| id))
+        .bind(experiment.map(|(_, v)| v))
+        .bind(estimated)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Experiment 7: run `a` mixed (control first, then candidate), run `b`
+    /// candidate with an estimated row and an unbound turn, run `b` under
+    /// user 2 as a separate run, and unrelated rows for experiment 8.
+    async fn experiment_db() -> SqliteDb {
+        let db = stamp_db().await;
+        let rows = [
+            (1, "a", Some((7, "control")), "m1", 0.01, (10, 5), false, "2026-03-02T00:00:00Z"),
+            (1, "a", Some((7, "candidate")), "m2", 0.02, (20, 10), false, "2026-03-03T00:00:00Z"),
+            (1, "b", Some((7, "candidate")), "m2", 0.04, (40, 20), true, "2026-03-04T00:00:00Z"),
+            (1, "b", None, "m2", 9.0, (900, 900), false, "2026-03-05T00:00:00Z"),
+            (2, "b", Some((7, "control")), "m1", 0.08, (80, 40), false, "2026-03-01T00:00:00Z"),
+            (1, "z", Some((8, "control")), "m1", 5.0, (1, 1), false, "2026-03-06T00:00:00Z"),
+            (1, "none", None, "m1", 5.0, (1, 1), false, "2026-03-06T00:00:00Z"),
+        ];
+        for (user, run, experiment, model, cost, tokens, estimated, at) in rows {
+            let experiment: Option<(i64, &str)> = experiment;
+            insert_experiment_row(&db, user, run, experiment, model, cost, tokens, estimated, at)
+                .await;
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn experiment_variant_totals_follow_each_rows_variant() {
+        let db = experiment_db().await;
+        let totals = db.experiment_variant_totals(7).await.unwrap();
+        let labels: Vec<&str> = totals.iter().map(|t| t.variant.as_str()).collect();
+        assert_eq!(labels, ["candidate", "control"]);
+        let candidate = &totals[0];
+        assert_eq!(candidate.requests, 2);
+        assert!((candidate.cost_usd - 0.06).abs() < 1e-9);
+        assert_eq!((candidate.tokens_in, candidate.tokens_out), (60, 30));
+        assert_eq!(candidate.estimated_rows, 1);
+        let control = &totals[1];
+        assert_eq!(control.requests, 2);
+        assert!((control.cost_usd - 0.09).abs() < 1e-9);
+        assert_eq!(control.estimated_rows, 0);
+        assert!(db.experiment_variant_totals(9).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn experiment_variant_models_split_by_model() {
+        let db = experiment_db().await;
+        let rows = db.experiment_variant_models(7).await.unwrap();
+        let keys: Vec<(&str, &str, i64)> = rows
+            .iter()
+            .map(|r| (r.variant.as_str(), r.model.as_str(), r.requests))
+            .collect();
+        assert_eq!(keys, [("candidate", "m2", 2), ("control", "m1", 2)]);
+        assert_eq!(rows[0].estimated_rows, 1);
+        assert_eq!(rows[0].tokens_in, 60);
+    }
+
+    #[tokio::test]
+    async fn experiment_runs_take_the_earliest_variant_and_flag_mixed() {
+        let db = experiment_db().await;
+        assert_eq!(db.experiment_run_count(7).await.unwrap(), 3);
+        assert_eq!(db.experiment_run_count(9).await.unwrap(), 0);
+
+        let runs = db.experiment_runs(7, 10, 0).await.unwrap();
+        let order: Vec<(i64, &str)> = runs.iter().map(|r| (r.user_id, r.correlation_id.as_str())).collect();
+        assert_eq!(order, [(1, "b"), (1, "a"), (2, "b")], "last stamped activity first");
+
+        let a = &runs[1];
+        assert_eq!(a.variant, "control", "earliest stamped row wins");
+        assert!(a.mixed());
+        assert_eq!(a.variant_count, 2);
+        assert_eq!(a.requests, 2);
+        assert!((a.cost_usd - 0.03).abs() < 1e-9);
+        assert_eq!((a.first_at.as_str(), a.last_at.as_str()), ("2026-03-02T00:00:00Z", "2026-03-03T00:00:00Z"));
+
+        let b = &runs[0];
+        assert_eq!(b.variant, "candidate");
+        assert!(!b.mixed());
+        assert_eq!(b.requests, 1, "the unbound turn is not a stamped request");
+        assert!((b.cost_usd - 0.04).abs() < 1e-9);
+        assert_eq!(b.estimated_rows, 1);
+        assert_eq!(b.last_at, "2026-03-04T00:00:00Z", "the unbound turn does not extend the span");
+
+        let page = db.experiment_runs(7, 1, 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].correlation_id, "a");
+
+        let keys = db.experiment_run_keys(7).await.unwrap();
+        let summary: Vec<(i64, &str, &str, bool, i64)> = keys
+            .iter()
+            .map(|k| (k.user_id, k.correlation_id.as_str(), k.variant.as_str(), k.mixed, k.requests))
+            .collect();
+        assert_eq!(
+            summary,
+            [(1, "a", "control", true, 2), (1, "b", "candidate", false, 1), (2, "b", "control", false, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn experiment_unbound_requests_share_a_bound_runs_key() {
+        let db = experiment_db().await;
+        let unbound = db.experiment_unbound_requests(7).await.unwrap();
+        let rows: Vec<(i64, &str, i64)> = unbound
+            .iter()
+            .map(|u| (u.user_id, u.correlation_id.as_str(), u.requests))
+            .collect();
+        assert_eq!(rows, [(1, "b", 1)], "run `none` has no bound row and is not counted");
+        assert!(db.experiment_unbound_requests(8).await.unwrap().is_empty());
     }
 }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::db::models::{NewRequestFailure, RequestFailure};
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::failures::FailureRepository;
+use crate::db::repositories::failures::{ExperimentRunFailures, FailureRepository};
 use super::costs::attribution_predicate;
 use super::{PostgresDb, now_utc};
 
@@ -108,6 +108,30 @@ impl FailureRepository for PostgresDb {
         .await?;
         Ok(row.is_some())
     }
+
+    async fn experiment_run_failures(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunFailures>> {
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, i64, String, String)>(
+            "SELECT user_id, attribution_correlation_id, experiment_variant, COUNT(*), \
+                    MIN(created_at), MAX(created_at) \
+             FROM request_failures \
+             WHERE experiment_id = $1 AND user_id IS NOT NULL \
+               AND attribution_correlation_id IS NOT NULL \
+             GROUP BY user_id, attribution_correlation_id, experiment_variant \
+             ORDER BY user_id ASC, attribution_correlation_id ASC, experiment_variant ASC",
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, variant, failures, first_at, last_at)| {
+                ExperimentRunFailures { user_id, correlation_id, variant, failures, first_at, last_at }
+            })
+            .collect())
+    }
 }
 
 /// Predicate for a comparison arm against `request_failures`. A request that
@@ -121,5 +145,9 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ),
         ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => (
+            "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
+            vec![experiment_id.to_string(), variant.clone()],
+        ),
     }
 }

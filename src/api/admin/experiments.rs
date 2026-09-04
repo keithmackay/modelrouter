@@ -14,8 +14,14 @@
 //! missing or mistyped field is a 400 naming that field, and so `expires_at`
 //! and `content_retention_days` are never defaulted: the caller must write
 //! `0` to mean never.
+//!
+//! Results (R14) are one document assembled by [`build_results`] from the
+//! ledger, the prompt log, the failure log and the outcome table, the way
+//! `compare::build_comparison` is shared by the JSON endpoint, the dashboard
+//! and the CLI; nothing downstream computes a figure of its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
@@ -23,18 +29,25 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::audit::audit;
 use crate::api::{
     admin::auth::{AdminSession, SuperAdminSession},
-    app::AppState,
+    app::{AppState, DatabaseProvider},
     error::ApiError,
 };
-use crate::db::models::{Experiment, ExperimentVariants, NewExperiment, VariantTarget};
+use crate::db::models::{Experiment, ExperimentVariants, NewExperiment, RunOutcome, VariantTarget};
+use crate::db::repositories::costs::{
+    ArmFilter, CostRepository, ExperimentRunKey, ExperimentRunRow,
+};
 use crate::db::repositories::experiments::{ExperimentRepository, ExperimentStatusFilter};
+use crate::db::repositories::failures::FailureRepository;
+use crate::db::repositories::outcomes::OutcomeRepository;
+use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
 use crate::db::repositories::users::UserRepository;
+use crate::router::cost::CostCalculator;
 use crate::router::experiments::{is_valid_label, MAX_LABEL_LEN};
 
 /// Bounds on a create request. Labels are further limited to
@@ -465,6 +478,729 @@ pub async fn close_experiment_api(
     Ok(Json(after))
 }
 
+// ── Results (spec §7a, R14) ───────────────────────────────────────────────────
+
+/// Page bounds for the per-run list.
+pub const DEFAULT_RUN_LIMIT: i64 = 200;
+pub const MAX_RUN_LIMIT: i64 = 1000;
+
+/// Window handed to `latency_summary` for a whole experiment: every row.
+/// `created_at` is RFC3339 text, so string bounds order correctly.
+const ALL_TIME_START: &str = "1970-01-01T00:00:00Z";
+const ALL_TIME_END: &str = "9999-12-31T23:59:59Z";
+
+/// Everything the results builder reads. The handler takes it from
+/// `AppState`; the CLI assembles it from settings without an `AppState`.
+#[derive(Clone)]
+pub struct ExperimentSources {
+    /// Experiments, ledger, failure log and outcomes.
+    pub db: Arc<dyn DatabaseProvider>,
+    /// Prompt log, which may live in a separate database.
+    pub prompt_db: Arc<dyn DatabaseProvider>,
+    pub cost_calc: Arc<CostCalculator>,
+}
+
+impl ExperimentSources {
+    pub fn from_state(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+            prompt_db: state.prompt_db.clone(),
+            cost_calc: state.cost_calc.clone(),
+        }
+    }
+}
+
+/// One page of the run list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunPage {
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Default for RunPage {
+    fn default() -> Self {
+        RunPage { limit: DEFAULT_RUN_LIMIT, offset: 0 }
+    }
+}
+
+impl RunPage {
+    /// Parse the raw query values; an absent or empty value takes the
+    /// default, anything else must be an integer in range. Errors name the
+    /// field so the endpoint's 400 can repeat them verbatim.
+    pub fn parse(limit: Option<&str>, offset: Option<&str>) -> Result<RunPage, String> {
+        let limit = match limit.map(str::trim) {
+            None | Some("") => DEFAULT_RUN_LIMIT,
+            Some(raw) => raw
+                .parse::<i64>()
+                .ok()
+                .filter(|n| (1..=MAX_RUN_LIMIT).contains(n))
+                .ok_or_else(|| format!("limit must be an integer between 1 and {MAX_RUN_LIMIT}"))?,
+        };
+        let offset = match offset.map(str::trim) {
+            None | Some("") => 0,
+            Some(raw) => raw
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| "offset must be an integer of at least 0".to_string())?,
+        };
+        Ok(RunPage { limit, offset })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResultsError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Db(#[from] anyhow::Error),
+}
+
+impl From<ResultsError> for ApiError {
+    fn from(e: ResultsError) -> Self {
+        match e {
+            ResultsError::Invalid(msg) => ApiError::InvalidRequest(msg),
+            ResultsError::Db(err) => {
+                tracing::error!(error = %err, "experiment results query failed");
+                ApiError::Internal
+            }
+        }
+    }
+}
+
+impl From<ResultsError> for super::dashboard::DashboardError {
+    fn from(e: ResultsError) -> Self {
+        use super::dashboard::DashboardError;
+        match e {
+            ResultsError::Invalid(msg) => DashboardError::BadRequest(msg),
+            ResultsError::Db(err) => {
+                tracing::error!(error = %err, "experiment results query failed");
+                DashboardError::Internal
+            }
+        }
+    }
+}
+
+/// Prompt and completion tokens, with their sum for convenience.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct TokenTotals {
+    pub prompt: i64,
+    pub completion: i64,
+    pub total: i64,
+}
+
+impl TokenTotals {
+    fn new(prompt: i64, completion: i64) -> Self {
+        TokenTotals { prompt, completion, total: prompt + completion }
+    }
+
+    fn add(&mut self, other: TokenTotals) {
+        self.prompt += other.prompt;
+        self.completion += other.completion;
+        self.total += other.total;
+    }
+}
+
+/// Latency of one run: only rows with a positive `latency_ms` count, the
+/// [`LatencySummary`] rule. Absent (`null`) when there are no samples.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct RunLatency {
+    pub samples: i64,
+    pub mean_ms: f64,
+}
+
+/// Outcome feedback aggregated over a set of runs. Rates and means are
+/// `None` rather than zero when nothing was reported, so an arm with no
+/// feedback is not mistaken for one that always failed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct OutcomeStats {
+    /// Runs with any outcome reported.
+    pub reported: i64,
+    pub success: i64,
+    pub failure: i64,
+    /// `success / reported`.
+    pub success_rate: Option<f64>,
+    pub mean_score: Option<f64>,
+    pub score_samples: i64,
+    pub mean_rating: Option<f64>,
+    pub rating_samples: i64,
+}
+
+impl OutcomeStats {
+    fn add(&mut self, o: &RunOutcome) {
+        self.reported += 1;
+        if o.outcome == "success" {
+            self.success += 1;
+        } else {
+            self.failure += 1;
+        }
+        if let Some(score) = o.score {
+            self.mean_score = Some(running_mean(self.mean_score, self.score_samples, score));
+            self.score_samples += 1;
+        }
+        if let Some(rating) = o.rating {
+            self.mean_rating =
+                Some(running_mean(self.mean_rating, self.rating_samples, rating as f64));
+            self.rating_samples += 1;
+        }
+        self.success_rate = Some(self.success as f64 / self.reported as f64);
+    }
+}
+
+fn running_mean(mean: Option<f64>, n: i64, value: f64) -> f64 {
+    let mean = mean.unwrap_or(0.0);
+    mean + (value - mean) / (n as f64 + 1.0)
+}
+
+/// One model's share of a variant's stamped requests.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VariantModelMetrics {
+    pub model: String,
+    pub requests: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens: TokenTotals,
+    pub estimated_rows: i64,
+    /// No pricing entry, so `cost_usd` was recorded as zero.
+    pub unpriced: bool,
+}
+
+/// Figures divided by the variant's run count; absent when it has no runs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct PerRunFigures {
+    pub turns: f64,
+    pub cost_usd: f64,
+    pub tokens: f64,
+    pub span_secs: f64,
+}
+
+/// Figures divided by the variant's request count; absent when it has none.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct PerRequestFigures {
+    pub cost_usd: f64,
+    pub tokens_in: f64,
+    pub tokens_out: f64,
+}
+
+/// Aggregates for one variant.
+///
+/// Attribution follows KTD7: run-level figures (`runs`, `mixed_runs`,
+/// `turns`, `unbound_requests`, span, outcomes) belong to the variant of the
+/// run's earliest stamped row; request-level figures (`requests`, cost,
+/// tokens, `estimated_rows`, `failures`, latency, the model breakdown) belong
+/// to the variant stamped on each row. The request-level columns therefore
+/// always sum to the experiment's totals; a mixed run's figures are split.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VariantResults {
+    pub label: String,
+    pub runs: i64,
+    /// Runs attributed here that were also seen under another variant.
+    pub mixed_runs: i64,
+    pub requests: i64,
+    /// Ledger rows sharing one of this variant's runs' keys with no
+    /// experiment id — turns sent without the header. Counted, never merged.
+    pub unbound_requests: i64,
+    /// Stamped requests of the runs attributed to this variant.
+    pub turns: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens: TokenTotals,
+    /// Rows whose token counts were estimated locally rather than reported.
+    pub estimated_rows: i64,
+    pub failures: i64,
+    /// Latency over the variant's prompt rows; `null` with `latency_samples`
+    /// of 0 when none carry a measurement (prompt rows are written only
+    /// where storage or retention allows).
+    pub latency: Option<LatencySummary>,
+    pub latency_samples: i64,
+    pub per_run: Option<PerRunFigures>,
+    pub per_request: Option<PerRequestFigures>,
+    pub models: Vec<VariantModelMetrics>,
+    /// True when any model in the variant has no pricing entry.
+    pub unpriced: bool,
+    pub unpriced_models: Vec<String>,
+    pub outcomes: OutcomeStats,
+    /// Sum of the attributed runs' spans; feeds `per_run.span_secs`.
+    #[serde(skip)]
+    span_secs: f64,
+}
+
+impl VariantResults {
+    fn empty(label: &str) -> Self {
+        VariantResults {
+            label: label.to_string(),
+            runs: 0,
+            mixed_runs: 0,
+            requests: 0,
+            unbound_requests: 0,
+            turns: 0,
+            cost_usd: 0.0,
+            saved_usd: 0.0,
+            tokens: TokenTotals::default(),
+            estimated_rows: 0,
+            failures: 0,
+            latency: None,
+            latency_samples: 0,
+            per_run: None,
+            per_request: None,
+            models: Vec::new(),
+            unpriced: false,
+            unpriced_models: Vec::new(),
+            outcomes: OutcomeStats::default(),
+            span_secs: 0.0,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.per_run = (self.runs > 0).then(|| {
+            let n = self.runs as f64;
+            PerRunFigures {
+                turns: self.turns as f64 / n,
+                cost_usd: self.cost_usd / n,
+                tokens: self.tokens.total as f64 / n,
+                span_secs: self.span_secs / n,
+            }
+        });
+        self.per_request = (self.requests > 0).then(|| {
+            let n = self.requests as f64;
+            PerRequestFigures {
+                cost_usd: self.cost_usd / n,
+                tokens_in: self.tokens.prompt as f64 / n,
+                tokens_out: self.tokens.completion as f64 / n,
+            }
+        });
+        self.unpriced = !self.unpriced_models.is_empty();
+    }
+}
+
+/// The whole experiment. Run-level and request-level columns are sums of the
+/// per-variant ones, so the two views always agree.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ExperimentTotals {
+    pub runs: i64,
+    /// Runs seen under more than one variant, each counted once.
+    pub mixed_runs: i64,
+    pub requests: i64,
+    pub unbound_requests: i64,
+    pub turns: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens: TokenTotals,
+    pub estimated_rows: i64,
+    pub failures: i64,
+    pub latency_samples: i64,
+    pub outcomes: OutcomeStats,
+}
+
+/// The reported outcome of one run, as it appears on the run's row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunOutcomeView {
+    pub outcome: String,
+    pub score: Option<f64>,
+    pub rating: Option<i64>,
+    pub note: Option<String>,
+    pub reported_at: String,
+}
+
+impl From<&RunOutcome> for RunOutcomeView {
+    fn from(o: &RunOutcome) -> Self {
+        RunOutcomeView {
+            outcome: o.outcome.clone(),
+            score: o.score,
+            rating: o.rating,
+            note: o.note.clone(),
+            reported_at: o.updated_at.clone(),
+        }
+    }
+}
+
+/// One run: every request sharing `(user_id, correlation_id)`.
+///
+/// `turns` is how many requests the run took (spec §7a), read from the ledger
+/// so it is counted even where prompt rows are not stored; at the run level
+/// it therefore equals `requests`. The two diverge only in the per-variant
+/// view, where `requests` follows each row's variant and `turns` the run's.
+/// A run whose every request failed has no ledger rows and appears with
+/// `turns: 0` and its failure count; its span comes from the failure rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunResult {
+    pub user_id: i64,
+    pub correlation_id: String,
+    /// Variant of the earliest stamped row.
+    pub variant: String,
+    /// Seen under more than one variant.
+    pub mixed: bool,
+    pub requests: i64,
+    pub unbound_requests: i64,
+    pub turns: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens: TokenTotals,
+    pub estimated_rows: i64,
+    pub failures: i64,
+    pub latency: Option<RunLatency>,
+    pub latency_samples: i64,
+    /// Seconds between the earliest and latest stamped rows.
+    pub span_secs: f64,
+    pub first_at: String,
+    pub last_at: String,
+    pub outcome: Option<RunOutcomeView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunsPage {
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub items: Vec<RunResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExperimentResults {
+    pub experiment: Experiment,
+    /// RFC3339; a closed experiment's figures are not frozen (a later price
+    /// or purge change can move them), so the document says when it was read.
+    pub computed_at: String,
+    pub variants: Vec<VariantResults>,
+    pub totals: ExperimentTotals,
+    /// Stored prompt and response bytes for the experiment; only present
+    /// when it retains content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_content_bytes: Option<i64>,
+    pub runs: RunsPage,
+}
+
+type RunKey = (i64, String);
+
+/// What the builder knows about every run before paging: its variant, the
+/// figures attributed at run level, and whether it has ledger rows at all.
+#[derive(Debug, Clone)]
+struct RunIndex {
+    variant: String,
+    mixed: bool,
+    requests: i64,
+    first_at: String,
+    last_at: String,
+    /// False for a run known only from failure rows.
+    in_ledger: bool,
+}
+
+/// The variant's slot, created empty on first sight.
+fn slot<'a>(
+    variants: &'a mut BTreeMap<String, VariantResults>,
+    label: &str,
+) -> &'a mut VariantResults {
+    if !variants.contains_key(label) {
+        variants.insert(label.to_string(), VariantResults::empty(label));
+    }
+    variants.get_mut(label).expect("inserted above")
+}
+
+fn key_of(user_id: i64, correlation_id: &str) -> RunKey {
+    (user_id, correlation_id.to_string())
+}
+
+/// Seconds between two RFC3339 timestamps; zero when either fails to parse.
+fn span_secs(first_at: &str, last_at: &str) -> f64 {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (parse(first_at), parse(last_at)) {
+        (Some(a), Some(b)) => (b - a).num_milliseconds().max(0) as f64 / 1000.0,
+        _ => 0.0,
+    }
+}
+
+/// Assemble the results document for experiment `id`.
+///
+/// Runs are grouped in SQL by user and correlation id over the ledger; prompt
+/// rows, failure rows and outcomes are fetched per experiment and joined here
+/// by that key, because the prompt log may be a separate database. The run
+/// list is ordered by last ledger activity, newest first; runs with no
+/// ledger rows (every request failed) follow, newest failure first.
+pub async fn build_results(
+    sources: &ExperimentSources,
+    id: i64,
+    page: RunPage,
+) -> Result<ExperimentResults, ResultsError> {
+    let db = &*sources.db;
+    let experiment = ExperimentRepository::get(db, id)
+        .await?
+        .ok_or_else(|| ResultsError::Invalid(format!("no experiment with id {id}")))?;
+
+    let (variant_totals, variant_models, run_keys, ledger_total, page_rows, unbound) =
+        tokio::try_join!(
+            CostRepository::experiment_variant_totals(db, id),
+            CostRepository::experiment_variant_models(db, id),
+            CostRepository::experiment_run_keys(db, id),
+            CostRepository::experiment_run_count(db, id),
+            CostRepository::experiment_runs(db, id, page.limit, page.offset),
+            CostRepository::experiment_unbound_requests(db, id),
+        )?;
+    let (failures, outcomes, run_latency) = tokio::try_join!(
+        FailureRepository::experiment_run_failures(db, id),
+        OutcomeRepository::for_experiment(db, id),
+        PromptRepository::experiment_run_latency(&*sources.prompt_db, id),
+    )?;
+    let retained_content_bytes = if experiment.retain_content {
+        Some(PromptRepository::experiment_content_bytes(&*sources.prompt_db, id).await?)
+    } else {
+        None
+    };
+
+    // ── Run index: ledger runs, then runs known only from failures ──────────
+    let mut index: BTreeMap<RunKey, RunIndex> = run_keys
+        .into_iter()
+        .map(|k: ExperimentRunKey| {
+            (
+                key_of(k.user_id, &k.correlation_id),
+                RunIndex {
+                    variant: k.variant,
+                    mixed: k.mixed,
+                    requests: k.requests,
+                    first_at: k.first_at,
+                    last_at: k.last_at,
+                    in_ledger: true,
+                },
+            )
+        })
+        .collect();
+
+    let mut failures_by_key: HashMap<RunKey, i64> = HashMap::new();
+    let mut failures_by_variant: BTreeMap<String, i64> = BTreeMap::new();
+    for f in &failures {
+        let key = key_of(f.user_id, &f.correlation_id);
+        *failures_by_key.entry(key.clone()).or_default() += f.failures;
+        *failures_by_variant
+            .entry(f.variant.clone().unwrap_or_default())
+            .or_default() += f.failures;
+        match index.get_mut(&key) {
+            Some(run) if run.in_ledger => {}
+            Some(run) => {
+                // A second variant group of a failure-only run.
+                if f.first_at < run.first_at {
+                    run.first_at = f.first_at.clone();
+                    run.variant = f.variant.clone().unwrap_or_default();
+                }
+                if f.last_at > run.last_at {
+                    run.last_at = f.last_at.clone();
+                }
+                run.mixed = true;
+            }
+            None => {
+                index.insert(
+                    key,
+                    RunIndex {
+                        variant: f.variant.clone().unwrap_or_default(),
+                        mixed: false,
+                        requests: 0,
+                        first_at: f.first_at.clone(),
+                        last_at: f.last_at.clone(),
+                        in_ledger: false,
+                    },
+                );
+            }
+        }
+    }
+
+    let unbound_by_key: HashMap<RunKey, i64> = unbound
+        .into_iter()
+        .map(|u| (key_of(u.user_id, &u.correlation_id), u.requests))
+        .collect();
+    let latency_by_key: HashMap<RunKey, RunLatency> = run_latency
+        .into_iter()
+        .filter(|l| l.samples > 0)
+        .map(|l| {
+            (
+                key_of(l.user_id, &l.correlation_id),
+                RunLatency { samples: l.samples, mean_ms: l.mean_ms.unwrap_or(0.0) },
+            )
+        })
+        .collect();
+    let outcomes_by_key: HashMap<RunKey, RunOutcome> = outcomes
+        .into_iter()
+        .map(|o| (key_of(o.user_id, &o.attribution_correlation_id), o))
+        .collect();
+
+    // ── Per-variant aggregates ──────────────────────────────────────────────
+    // Declared labels first so a variant with no traffic still appears; any
+    // label found on a row but not declared (a variant that no longer exists
+    // is impossible today, but the rows are the record) is added after.
+    let mut variants: BTreeMap<String, VariantResults> = experiment
+        .variants
+        .keys()
+        .map(|label| (label.clone(), VariantResults::empty(label)))
+        .collect();
+
+    for t in &variant_totals {
+        let v = slot(&mut variants, &t.variant);
+        v.requests += t.requests;
+        v.cost_usd += t.cost_usd;
+        v.saved_usd += t.saved_usd;
+        v.tokens.add(TokenTotals::new(t.tokens_in, t.tokens_out));
+        v.estimated_rows += t.estimated_rows;
+    }
+    for m in &variant_models {
+        let unpriced = !sources.cost_calc.has_price(&m.model);
+        let v = slot(&mut variants, &m.variant);
+        if unpriced && !v.unpriced_models.contains(&m.model) {
+            v.unpriced_models.push(m.model.clone());
+        }
+        v.models.push(VariantModelMetrics {
+            model: m.model.clone(),
+            requests: m.requests,
+            cost_usd: m.cost_usd,
+            saved_usd: m.saved_usd,
+            tokens: TokenTotals::new(m.tokens_in, m.tokens_out),
+            estimated_rows: m.estimated_rows,
+            unpriced,
+        });
+    }
+    for (label, n) in &failures_by_variant {
+        slot(&mut variants, label).failures += n;
+    }
+    for (key, run) in &index {
+        let v = slot(&mut variants, &run.variant);
+        v.runs += 1;
+        v.mixed_runs += i64::from(run.mixed);
+        v.turns += run.requests;
+        v.unbound_requests += unbound_by_key.get(key).copied().unwrap_or(0);
+        v.span_secs += span_secs(&run.first_at, &run.last_at);
+    }
+    for (key, o) in &outcomes_by_key {
+        // The run's variant from the ledger wins; the stamp on the outcome is
+        // the same rule applied at feedback time and covers a run whose rows
+        // have since been purged.
+        let label = index
+            .get(key)
+            .map(|r| r.variant.clone())
+            .or_else(|| o.experiment_variant.clone())
+            .unwrap_or_default();
+        slot(&mut variants, &label).outcomes.add(o);
+    }
+    for label in variants.keys().cloned().collect::<Vec<_>>() {
+        let filter = ArmFilter::Variant { experiment_id: id, variant: label.clone() };
+        let summary = PromptRepository::latency_summary(
+            &*sources.prompt_db,
+            &filter,
+            ALL_TIME_START,
+            ALL_TIME_END,
+        )
+        .await?;
+        let v = slot(&mut variants, &label);
+        v.latency_samples = summary.samples;
+        v.latency = (summary.samples > 0).then_some(summary);
+        v.finish();
+    }
+
+    // ── Totals ──────────────────────────────────────────────────────────────
+    let mut totals = ExperimentTotals::default();
+    for v in variants.values() {
+        totals.runs += v.runs;
+        totals.mixed_runs += v.mixed_runs;
+        totals.requests += v.requests;
+        totals.unbound_requests += v.unbound_requests;
+        totals.turns += v.turns;
+        totals.cost_usd += v.cost_usd;
+        totals.saved_usd += v.saved_usd;
+        totals.tokens.add(v.tokens);
+        totals.estimated_rows += v.estimated_rows;
+        totals.failures += v.failures;
+        totals.latency_samples += v.latency_samples;
+    }
+    for o in outcomes_by_key.values() {
+        totals.outcomes.add(o);
+    }
+
+    // ── Run page ────────────────────────────────────────────────────────────
+    let run_result = |key: &RunKey, run: &RunIndex, row: Option<&ExperimentRunRow>| RunResult {
+        user_id: key.0,
+        correlation_id: key.1.clone(),
+        variant: run.variant.clone(),
+        mixed: run.mixed,
+        requests: run.requests,
+        unbound_requests: unbound_by_key.get(key).copied().unwrap_or(0),
+        turns: run.requests,
+        cost_usd: row.map(|r| r.cost_usd).unwrap_or(0.0),
+        saved_usd: row.map(|r| r.saved_usd).unwrap_or(0.0),
+        tokens: row
+            .map(|r| TokenTotals::new(r.tokens_in, r.tokens_out))
+            .unwrap_or_default(),
+        estimated_rows: row.map(|r| r.estimated_rows).unwrap_or(0),
+        failures: failures_by_key.get(key).copied().unwrap_or(0),
+        latency: latency_by_key.get(key).copied(),
+        latency_samples: latency_by_key.get(key).map(|l| l.samples).unwrap_or(0),
+        span_secs: span_secs(&run.first_at, &run.last_at),
+        first_at: run.first_at.clone(),
+        last_at: run.last_at.clone(),
+        outcome: outcomes_by_key.get(key).map(RunOutcomeView::from),
+    };
+
+    let mut items: Vec<RunResult> = page_rows
+        .iter()
+        .map(|row| {
+            let key = key_of(row.user_id, &row.correlation_id);
+            // The page and the index are separate reads; a run that landed
+            // between them is described from its page row alone.
+            let fallback = RunIndex {
+                variant: row.variant.clone(),
+                mixed: row.mixed(),
+                requests: row.requests,
+                first_at: row.first_at.clone(),
+                last_at: row.last_at.clone(),
+                in_ledger: true,
+            };
+            let run = index.get(&key).unwrap_or(&fallback);
+            run_result(&key, run, Some(row))
+        })
+        .collect();
+
+    let mut failure_only: Vec<(&RunKey, &RunIndex)> =
+        index.iter().filter(|(_, r)| !r.in_ledger).collect();
+    failure_only.sort_by(|a, b| b.1.last_at.cmp(&a.1.last_at).then_with(|| a.0.cmp(b.0)));
+    let total = ledger_total + failure_only.len() as i64;
+    let room = (page.limit - items.len() as i64).max(0) as usize;
+    if room > 0 {
+        let skip = (page.offset - ledger_total).max(0) as usize;
+        items.extend(
+            failure_only
+                .into_iter()
+                .skip(skip)
+                .take(room)
+                .map(|(key, run)| run_result(key, run, None)),
+        );
+    }
+
+    Ok(ExperimentResults {
+        experiment,
+        computed_at: chrono::Utc::now().to_rfc3339(),
+        variants: variants.into_values().collect(),
+        totals,
+        retained_content_bytes,
+        runs: RunsPage { total, limit: page.limit, offset: page.offset, items },
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResultsQuery {
+    #[serde(default)]
+    pub limit: Option<String>,
+    #[serde(default)]
+    pub offset: Option<String>,
+}
+
+/// GET /admin/api/experiments/:id/results?limit=&offset=
+pub async fn get_experiment_results_api(
+    State(state): State<AppState>,
+    _session: AdminSession,
+    Path(id): Path<String>,
+    Query(q): Query<ResultsQuery>,
+) -> Result<Json<ExperimentResults>, ApiError> {
+    let id = parse_id(&id)?;
+    let page = RunPage::parse(q.limit.as_deref(), q.offset.as_deref())
+        .map_err(ApiError::InvalidRequest)?;
+    let sources = ExperimentSources::from_state(&state);
+    Ok(Json(build_results(&sources, id, page).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +1307,60 @@ mod tests {
         assert!(parse_create(&b, now()).unwrap_err().starts_with("content_retention_days"));
         b["content_retention_days"] = json!("30");
         assert!(parse_create(&b, now()).unwrap_err().starts_with("content_retention_days"));
+    }
+
+    #[test]
+    fn run_page_defaults_bounds_and_names_the_field() {
+        assert_eq!(RunPage::parse(None, None).unwrap(), RunPage::default());
+        assert_eq!(RunPage::parse(Some(""), Some(" ")).unwrap(), RunPage::default());
+        assert_eq!(
+            RunPage::parse(Some("1"), Some("1")).unwrap(),
+            RunPage { limit: 1, offset: 1 }
+        );
+        assert_eq!(RunPage::parse(Some("1000"), None).unwrap().limit, MAX_RUN_LIMIT);
+        for bad in ["0", "1001", "-1", "ten", "1.5"] {
+            assert!(RunPage::parse(Some(bad), None).unwrap_err().starts_with("limit"), "{bad}");
+        }
+        for bad in ["-1", "x", "0.5"] {
+            assert!(RunPage::parse(None, Some(bad)).unwrap_err().starts_with("offset"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn span_is_seconds_between_timestamps_and_zero_when_unparseable() {
+        assert_eq!(span_secs("2026-01-01T00:00:00Z", "2026-01-01T00:01:30Z"), 90.0);
+        assert_eq!(span_secs("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00.500Z"), 0.5);
+        assert_eq!(span_secs("2026-01-01T00:01:00Z", "2026-01-01T00:00:00Z"), 0.0);
+        assert_eq!(span_secs("nope", "2026-01-01T00:00:00Z"), 0.0);
+    }
+
+    #[test]
+    fn outcome_stats_average_only_what_was_reported() {
+        let outcome = |outcome: &str, score: Option<f64>, rating: Option<i64>| RunOutcome {
+            user_id: 1,
+            attribution_correlation_id: "r".into(),
+            outcome: outcome.into(),
+            score,
+            rating,
+            note: None,
+            experiment_id: None,
+            experiment_variant: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let mut stats = OutcomeStats::default();
+        assert_eq!(stats.success_rate, None);
+        stats.add(&outcome("success", Some(1.0), Some(5)));
+        stats.add(&outcome("failure", None, Some(2)));
+        stats.add(&outcome("success", Some(0.5), None));
+        assert_eq!(stats.reported, 3);
+        assert_eq!(stats.success, 2);
+        assert_eq!(stats.failure, 1);
+        assert!((stats.success_rate.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(stats.mean_score, Some(0.75));
+        assert_eq!(stats.score_samples, 2);
+        assert_eq!(stats.mean_rating, Some(3.5));
+        assert_eq!(stats.rating_samples, 2);
     }
 
     #[test]

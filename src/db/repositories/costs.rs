@@ -67,6 +67,9 @@ pub enum ArmFilter {
     /// Attribution match (correlation id or tag), same semantics as
     /// [`AttributionFilter`].
     Attribution(AttributionFilter),
+    /// Rows stamped with one variant of one experiment (spec §7a): exact
+    /// match on `experiment_id` and `experiment_variant`.
+    Variant { experiment_id: i64, variant: String },
 }
 
 impl ArmFilter {
@@ -76,6 +79,9 @@ impl ArmFilter {
             ArmFilter::Model(m) => format!("model={}", m),
             ArmFilter::Provider(p) => format!("provider={}", p),
             ArmFilter::Attribution(f) => f.label(),
+            ArmFilter::Variant { experiment_id, variant } => {
+                format!("experiment={}:{}", experiment_id, variant)
+            }
         }
     }
 }
@@ -113,6 +119,94 @@ pub struct AttributionBreakdownRow {
     pub key: String,
     #[serde(flatten)]
     pub totals: AttributionTotals,
+}
+
+// ── Experiment results (spec §7a) ─────────────────────────────────────────────
+//
+// A run is every ledger row sharing `(user_id, attribution_correlation_id)`.
+// Its variant is the variant of its earliest stamped row (by `created_at`,
+// then id — the same rule as `CostRepository::run_stamp`); a run whose rows
+// were stamped with more than one variant is *mixed*. Request-level figures
+// are grouped by each row's own variant so they always sum to the experiment's
+// totals; run-level attribution happens in Rust from [`ExperimentRunKey`].
+
+/// Request-level aggregates for one variant: every ledger row stamped with it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExperimentVariantTotals {
+    pub variant: String,
+    pub requests: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    /// Rows whose token counts were estimated locally (`tokens_estimated`).
+    pub estimated_rows: i64,
+}
+
+/// One model's share of one variant's stamped rows.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExperimentVariantModelRow {
+    pub variant: String,
+    pub model: String,
+    pub requests: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub estimated_rows: i64,
+}
+
+/// One run of an experiment, aggregated over its stamped ledger rows.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExperimentRunRow {
+    pub user_id: i64,
+    pub correlation_id: String,
+    /// Variant of the earliest stamped row.
+    pub variant: String,
+    /// Distinct variants seen on the run; more than one means mixed.
+    pub variant_count: i64,
+    pub requests: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub estimated_rows: i64,
+    /// `created_at` of the earliest and latest stamped rows (RFC3339).
+    pub first_at: String,
+    pub last_at: String,
+}
+
+impl ExperimentRunRow {
+    pub fn mixed(&self) -> bool {
+        self.variant_count > 1
+    }
+}
+
+/// The key, variant and run-level figures of one run — the light row the
+/// results builder loads for *every* run of an experiment so run-level
+/// attribution (run counts, turns, span, and the join to prompt rows,
+/// failures and outcomes) happens in Rust, while [`ExperimentRunRow`] carries
+/// the heavier per-run aggregates one page at a time.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExperimentRunKey {
+    pub user_id: i64,
+    pub correlation_id: String,
+    /// Variant of the earliest stamped row.
+    pub variant: String,
+    pub mixed: bool,
+    /// Stamped ledger rows on the run.
+    pub requests: i64,
+    pub first_at: String,
+    pub last_at: String,
+}
+
+/// Ledger rows with no experiment id that share a bound run's key: turns the
+/// client sent without the header. Counted beside the run, never merged.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExperimentUnboundRow {
+    pub user_id: i64,
+    pub correlation_id: String,
+    pub requests: i64,
 }
 
 #[async_trait]
@@ -287,4 +381,42 @@ pub trait CostRepository: Send + Sync {
         start: &str,
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+
+    // ── Experiment results (spec §7a) ──────────────────────────────────────
+
+    /// Request-level totals per variant, every row stamped with the
+    /// experiment, sorted by variant.
+    async fn experiment_variant_totals(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantTotals>>;
+    /// Per-variant, per-model breakdown of the stamped rows; sorted by
+    /// variant, then highest spend first.
+    async fn experiment_variant_models(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantModelRow>>;
+    /// One page of runs, most recent activity first (ties broken by user and
+    /// correlation id so paging is stable).
+    async fn experiment_runs(
+        &self,
+        experiment_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunRow>>;
+    /// Number of runs — distinct `(user_id, correlation_id)` — stamped with
+    /// the experiment.
+    async fn experiment_run_count(&self, experiment_id: i64) -> anyhow::Result<i64>;
+    /// Key, variant, mixed flag, request count and span of every run,
+    /// unpaginated, sorted by user and correlation id.
+    async fn experiment_run_keys(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunKey>>;
+    /// Unstamped rows sharing a run's key, counted per run; runs with none
+    /// are absent.
+    async fn experiment_unbound_requests(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentUnboundRow>>;
 }

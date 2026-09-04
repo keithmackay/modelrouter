@@ -1,6 +1,7 @@
 //! Experiment administration (spec §7a): create / list / get / close through
-//! `/admin/api/experiments`, the pricing gate, audit rows, admin auth, and the
-//! no-restart effect on the live registry.
+//! `/admin/api/experiments`, the pricing gate, audit rows, admin auth, the
+//! no-restart effect on the live registry, and the results document served
+//! by `GET /admin/api/experiments/:id/results`.
 
 mod common;
 
@@ -23,6 +24,9 @@ struct Harness {
     server: TestServer,
     settings: Arc<Settings>,
     db: Arc<dyn DatabaseProvider>,
+    /// The same database as `db`, kept concrete so a test can pin a row's
+    /// `created_at` (the repositories always stamp "now").
+    sqlite: modelrouter::db::sqlite::SqliteDb,
     experiments: Arc<ExperimentRegistry>,
 }
 
@@ -62,6 +66,7 @@ async fn build_server() -> Harness {
         .model_aliases
         .insert("mystery".to_string(), "openai/gpt-unpriced".to_string());
     let settings = Arc::new(base);
+    let sqlite = db.clone();
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
     let router = Arc::new(RequestRouter::new(settings.clone()));
     let experiments = Arc::new(ExperimentRegistry::default());
@@ -121,6 +126,7 @@ async fn build_server() -> Harness {
         server: TestServer::new(build_router(state)).unwrap(),
         settings,
         db,
+        sqlite,
         experiments,
     }
 }
@@ -547,4 +553,603 @@ async fn a_created_experiment_binds_without_a_restart() {
         .bind(&headers, &json!({}), Some("run-1"), 1, chrono::Utc::now().timestamp())
         .unwrap_err();
     assert_eq!(err, modelrouter::router::experiments::BindError::Closed(id));
+}
+
+// ── Results ───────────────────────────────────────────────────────────────────
+
+mod seed {
+    use super::*;
+    use modelrouter::db::models::{
+        FailureStage, NewCostLedgerEntry, NewPrompt, NewRequestFailure, NewRunOutcome, NewUser,
+    };
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::failures::FailureRepository;
+    use modelrouter::db::repositories::outcomes::OutcomeRepository;
+    use modelrouter::db::repositories::prompts::PromptRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    pub const ALICE: i64 = 1;
+
+    /// A second user, so a correlation id can be shared across users.
+    pub async fn bob(h: &Harness) -> i64 {
+        UserRepository::create(&*h.db, NewUser { name: "bob".to_string(), email: None })
+            .await
+            .unwrap()
+            .id
+    }
+
+    pub struct Row<'a> {
+        pub user: i64,
+        pub run: &'a str,
+        /// `None` is a turn sent without the experiment header.
+        pub variant: Option<&'a str>,
+        pub model: &'a str,
+        pub cost: f64,
+        pub tokens: (i64, i64),
+        pub estimated: bool,
+        /// RFC3339 `created_at` to pin the row to.
+        pub at: &'a str,
+    }
+
+    impl<'a> Row<'a> {
+        pub fn new(user: i64, run: &'a str, variant: Option<&'a str>, at: &'a str) -> Self {
+            Row {
+                user,
+                run,
+                variant,
+                model: "openai/gpt-4o-mini",
+                cost: 0.01,
+                tokens: (100, 50),
+                estimated: false,
+                at,
+            }
+        }
+    }
+
+    /// One ledger row, pinned to `row.at`. Returns its id.
+    pub async fn ledger(h: &Harness, experiment: i64, row: Row<'_>) -> i64 {
+        let entry = CostRepository::create(
+            &*h.db,
+            NewCostLedgerEntry {
+                user_id: row.user,
+                prompt_id: None,
+                model: row.model.to_string(),
+                provider: "openai".to_string(),
+                project: None,
+                tokens_in: row.tokens.0,
+                tokens_out: row.tokens.1,
+                cost_usd: row.cost,
+                api_key_id: None,
+                attribution_correlation_id: Some(row.run.to_string()),
+                attribution_tags: "{}".to_string(),
+                experiment_id: row.variant.map(|_| experiment),
+                experiment_variant: row.variant.map(str::to_string),
+                tokens_estimated: row.estimated,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE cost_ledger SET created_at = ? WHERE id = ?")
+            .bind(row.at)
+            .bind(entry.id)
+            .execute(&h.sqlite.pool)
+            .await
+            .unwrap();
+        entry.id
+    }
+
+    /// One prompt row with a latency measurement.
+    pub async fn prompt(h: &Harness, experiment: i64, user: i64, run: &str, variant: &str, latency_ms: i64) {
+        PromptRepository::create(
+            &*h.db,
+            NewPrompt {
+                user_id: user,
+                session_id: None,
+                request_model: "fast".to_string(),
+                routed_model: "openai/gpt-4o-mini".to_string(),
+                provider: "openai".to_string(),
+                messages: "[{\"role\":\"user\",\"content\":\"hi\"}]".to_string(),
+                response: Some("hello".to_string()),
+                finish_reason: Some("stop".to_string()),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                latency_ms: Some(latency_ms),
+                tags: "{}".to_string(),
+                project: None,
+                attribution_correlation_id: Some(run.to_string()),
+                attribution_tags: "{}".to_string(),
+                experiment_id: Some(experiment),
+                experiment_variant: Some(variant.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// One failed request of a run, pinned to `at`.
+    pub async fn failure(h: &Harness, experiment: i64, user: i64, run: &str, variant: &str, at: &str) {
+        let row = FailureRepository::create(
+            &*h.db,
+            NewRequestFailure {
+                user_id: Some(user),
+                api_key_id: None,
+                endpoint: "/v1/chat/completions".to_string(),
+                request_model: "fast".to_string(),
+                routed_model: Some("openai/gpt-4o-mini".to_string()),
+                provider: Some("openai".to_string()),
+                stage: FailureStage::Provider,
+                status_code: Some(502),
+                error_message: "upstream".to_string(),
+                attempts: 1,
+                latency_ms: None,
+                project: None,
+                attribution_correlation_id: Some(run.to_string()),
+                attribution_tags: "{}".to_string(),
+                experiment_id: Some(experiment),
+                experiment_variant: Some(variant.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE request_failures SET created_at = ? WHERE id = ?")
+            .bind(at)
+            .bind(row.id)
+            .execute(&h.sqlite.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Report `(outcome, score, rating)` for a run of `variant`.
+    pub async fn outcome(
+        h: &Harness,
+        experiment: i64,
+        user: i64,
+        run: &str,
+        variant: &str,
+        report: (&str, Option<f64>, Option<i64>),
+    ) {
+        OutcomeRepository::upsert(
+            &*h.db,
+            NewRunOutcome {
+                user_id: user,
+                attribution_correlation_id: run.to_string(),
+                outcome: report.0.to_string(),
+                score: report.1,
+                rating: report.2,
+                note: None,
+                experiment_id: Some(experiment),
+                experiment_variant: Some(variant.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// GET the results of experiment `id` (any id text) with `query` pairs.
+async fn results_response(h: &Harness, id: &str, query: &[(&str, &str)]) -> axum_test::TestResponse {
+    let (hk, hv) = bearer(&jwt(&h.settings, "admin"));
+    let mut req = h
+        .server
+        .get(&format!("/admin/api/experiments/{id}/results"))
+        .add_header(hk, hv);
+    for (k, v) in query {
+        req = req.add_query_param(k, v);
+    }
+    req.await
+}
+
+async fn results(h: &Harness, experiment: i64) -> Value {
+    let res = results_response(h, &experiment.to_string(), &[]).await;
+    res.assert_status_ok();
+    res.json::<Value>()
+}
+
+fn variant<'a>(doc: &'a Value, label: &str) -> &'a Value {
+    doc["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["label"] == label)
+        .unwrap_or_else(|| panic!("no variant {label} in {doc}"))
+}
+
+fn run<'a>(doc: &'a Value, user: i64, correlation_id: &str) -> &'a Value {
+    doc["runs"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["user_id"] == user && r["correlation_id"] == correlation_id)
+        .unwrap_or_else(|| panic!("no run {user}/{correlation_id} in {doc}"))
+}
+
+fn approx(v: &Value, expected: f64) -> bool {
+    (v.as_f64().unwrap() - expected).abs() < 1e-9
+}
+
+const T0: &str = "2026-09-01T10:00:00Z";
+const T1: &str = "2026-09-01T10:00:30Z";
+const T2: &str = "2026-09-01T10:02:00Z";
+const T3: &str = "2026-09-01T11:00:00Z";
+const T4: &str = "2026-09-01T11:00:10Z";
+
+/// Two variants, two runs each: the whole document from the ledger up.
+#[tokio::test]
+async fn results_aggregate_two_variants_over_two_runs_each() {
+    let h = build_server().await;
+    let id = create(&h, &body("r")).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::{Row, ALICE};
+
+    // control/c1: two turns 30s apart; control/c2: one turn.
+    seed::ledger(&h, id, Row { cost: 0.01, tokens: (100, 50), ..Row::new(ALICE, "c1", Some("control"), T0) }).await;
+    seed::ledger(&h, id, Row { cost: 0.02, tokens: (200, 100), ..Row::new(ALICE, "c1", Some("control"), T1) }).await;
+    seed::ledger(&h, id, Row { cost: 0.03, tokens: (300, 150), ..Row::new(ALICE, "c2", Some("control"), T2) }).await;
+    // candidate/k1: one turn on a different model; candidate/k2: two turns 10s apart.
+    let haiku = |run, at| Row {
+        model: "anthropic/claude-haiku-4-5",
+        cost: 0.005,
+        tokens: (100, 20),
+        ..Row::new(ALICE, run, Some("candidate"), at)
+    };
+    seed::ledger(&h, id, haiku("k1", T3)).await;
+    seed::ledger(&h, id, haiku("k2", T3)).await;
+    seed::ledger(&h, id, haiku("k2", T4)).await;
+    // Prompt rows only for control (candidate has none).
+    seed::prompt(&h, id, ALICE, "c1", "control", 100).await;
+    seed::prompt(&h, id, ALICE, "c1", "control", 300).await;
+    seed::prompt(&h, id, ALICE, "c2", "control", 500).await;
+    // Outcomes: control 1/2 succeeded, candidate 2/2; ratings on three runs.
+    seed::outcome(&h, id, ALICE, "c1", "control", ("success", Some(0.9), Some(4))).await;
+    seed::outcome(&h, id, ALICE, "c2", "control", ("failure", None, Some(2))).await;
+    seed::outcome(&h, id, ALICE, "k1", "candidate", ("success", Some(0.7), None)).await;
+    seed::outcome(&h, id, ALICE, "k2", "candidate", ("success", Some(0.5), Some(5))).await;
+
+    let doc = results(&h, id).await;
+    assert_eq!(doc["experiment"]["id"], id);
+    assert_eq!(doc["experiment"]["name"], "r");
+    assert!(chrono::DateTime::parse_from_rfc3339(doc["computed_at"].as_str().unwrap()).is_ok());
+    assert!(doc.get("retained_content_bytes").is_none(), "not retaining content");
+
+    let control = variant(&doc, "control");
+    assert_eq!(control["runs"], 2);
+    assert_eq!(control["requests"], 3);
+    assert_eq!(control["turns"], 3);
+    assert_eq!(control["mixed_runs"], 0);
+    assert!(approx(&control["cost_usd"], 0.06));
+    assert_eq!(control["tokens"]["prompt"], 600);
+    assert_eq!(control["tokens"]["completion"], 300);
+    assert_eq!(control["tokens"]["total"], 900);
+    assert!(approx(&control["per_run"]["turns"], 1.5));
+    assert!(approx(&control["per_run"]["cost_usd"], 0.03));
+    assert!(approx(&control["per_run"]["span_secs"], 15.0), "{}", control["per_run"]);
+    assert!(approx(&control["per_request"]["cost_usd"], 0.02));
+    assert_eq!(control["latency_samples"], 3);
+    assert!(approx(&control["latency"]["mean_ms"], 300.0), "{}", control["latency"]);
+    assert_eq!(control["models"].as_array().unwrap().len(), 1);
+    assert_eq!(control["models"][0]["model"], "openai/gpt-4o-mini");
+    assert_eq!(control["models"][0]["requests"], 3);
+    assert_eq!(control["unpriced"], false);
+    assert_eq!(control["outcomes"]["reported"], 2);
+    assert!(approx(&control["outcomes"]["success_rate"], 0.5));
+    assert!(approx(&control["outcomes"]["mean_rating"], 3.0));
+    assert_eq!(control["outcomes"]["rating_samples"], 2);
+    assert!(approx(&control["outcomes"]["mean_score"], 0.9));
+
+    let candidate = variant(&doc, "candidate");
+    assert_eq!(candidate["runs"], 2);
+    assert_eq!(candidate["requests"], 3);
+    assert!(approx(&candidate["cost_usd"], 0.015));
+    assert_eq!(candidate["tokens"]["total"], 360);
+    assert!(approx(&candidate["per_run"]["span_secs"], 5.0));
+    assert_eq!(candidate["latency"], Value::Null);
+    assert_eq!(candidate["latency_samples"], 0);
+    assert_eq!(candidate["models"][0]["model"], "anthropic/claude-haiku-4-5");
+    assert!(approx(&candidate["outcomes"]["success_rate"], 1.0));
+    assert!(approx(&candidate["outcomes"]["mean_rating"], 5.0));
+    assert!(approx(&candidate["outcomes"]["mean_score"], 0.6));
+
+    let totals = &doc["totals"];
+    assert_eq!(totals["runs"], 4);
+    assert_eq!(totals["requests"], 6);
+    assert_eq!(totals["turns"], 6);
+    assert!(approx(&totals["cost_usd"], 0.075));
+    assert_eq!(totals["tokens"]["total"], 1260);
+    assert_eq!(totals["latency_samples"], 3);
+    assert_eq!(totals["outcomes"]["reported"], 4);
+    assert!(approx(&totals["outcomes"]["success_rate"], 0.75));
+
+    // Runs: newest activity first, every figure on the row.
+    let runs = &doc["runs"];
+    assert_eq!(runs["total"], 4);
+    assert_eq!(runs["limit"], 200);
+    assert_eq!(runs["offset"], 0);
+    let order: Vec<&str> = runs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["correlation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["k2", "k1", "c2", "c1"]);
+    let c1 = run(&doc, ALICE, "c1");
+    assert_eq!(c1["variant"], "control");
+    assert_eq!(c1["mixed"], false);
+    assert_eq!(c1["requests"], 2);
+    assert_eq!(c1["turns"], 2);
+    assert!(approx(&c1["cost_usd"], 0.03));
+    assert_eq!(c1["tokens"]["total"], 450);
+    assert!(approx(&c1["span_secs"], 30.0));
+    assert_eq!(c1["first_at"], T0);
+    assert_eq!(c1["last_at"], T1);
+    assert_eq!(c1["latency_samples"], 2);
+    assert!(approx(&c1["latency"]["mean_ms"], 200.0));
+    assert_eq!(c1["outcome"]["outcome"], "success");
+    assert_eq!(c1["outcome"]["rating"], 4);
+    assert_eq!(c1["failures"], 0);
+    let k1 = run(&doc, ALICE, "k1");
+    assert_eq!(k1["latency"], Value::Null);
+    assert_eq!(k1["latency_samples"], 0);
+    assert!(approx(&k1["span_secs"], 0.0));
+}
+
+/// A run seen under two variants is flagged, counted once, attributed at run
+/// level to its earliest variant, and split at request level.
+#[tokio::test]
+async fn a_mixed_run_is_flagged_and_split_by_level() {
+    let h = build_server().await;
+    let id = create(&h, &body("mixed")).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::{Row, ALICE};
+    seed::ledger(&h, id, Row { cost: 0.01, ..Row::new(ALICE, "m", Some("control"), T0) }).await;
+    seed::ledger(&h, id, Row { cost: 0.02, ..Row::new(ALICE, "m", Some("candidate"), T1) }).await;
+    seed::ledger(&h, id, Row { cost: 0.04, ..Row::new(ALICE, "m", Some("candidate"), T2) }).await;
+    seed::outcome(&h, id, ALICE, "m", "control", ("success", None, None)).await;
+
+    let doc = results(&h, id).await;
+    let m = run(&doc, ALICE, "m");
+    assert_eq!(m["mixed"], true);
+    assert_eq!(m["variant"], "control");
+    assert_eq!(m["requests"], 3);
+    assert!(approx(&m["cost_usd"], 0.07));
+
+    let control = variant(&doc, "control");
+    assert_eq!(control["runs"], 1);
+    assert_eq!(control["mixed_runs"], 1);
+    assert_eq!(control["turns"], 3, "turns follow the run");
+    assert_eq!(control["requests"], 1, "requests follow the row");
+    assert!(approx(&control["cost_usd"], 0.01));
+    assert!(approx(&control["per_run"]["span_secs"], 120.0));
+    assert_eq!(control["outcomes"]["reported"], 1);
+
+    let candidate = variant(&doc, "candidate");
+    assert_eq!(candidate["runs"], 0);
+    assert_eq!(candidate["mixed_runs"], 0);
+    assert_eq!(candidate["turns"], 0);
+    assert_eq!(candidate["requests"], 2);
+    assert!(approx(&candidate["cost_usd"], 0.06));
+    assert_eq!(candidate["per_run"], Value::Null);
+    assert_eq!(candidate["outcomes"]["reported"], 0);
+    assert_eq!(candidate["outcomes"]["success_rate"], Value::Null);
+
+    assert_eq!(doc["totals"]["runs"], 1);
+    assert_eq!(doc["totals"]["mixed_runs"], 1);
+    assert_eq!(doc["totals"]["requests"], 3);
+    assert_eq!(doc["runs"]["total"], 1);
+}
+
+/// The run key is `(user, correlation id)`: the same id under two users is
+/// two runs.
+#[tokio::test]
+async fn the_same_correlation_id_under_two_users_is_two_runs() {
+    let h = build_server().await;
+    let id = create(&h, &body("users")).await.json::<Value>()["id"].as_i64().unwrap();
+    let bob = seed::bob(&h).await;
+    use seed::{Row, ALICE};
+    seed::ledger(&h, id, Row::new(ALICE, "shared", Some("control"), T0)).await;
+    seed::ledger(&h, id, Row::new(bob, "shared", Some("control"), T1)).await;
+
+    let doc = results(&h, id).await;
+    assert_eq!(doc["runs"]["total"], 2);
+    assert_eq!(variant(&doc, "control")["runs"], 2);
+    assert_eq!(run(&doc, ALICE, "shared")["turns"], 1);
+    assert_eq!(run(&doc, bob, "shared")["turns"], 1);
+}
+
+/// A turn sent without the header shares the run's key but carries no
+/// experiment id: it raises `unbound_requests` and nothing else.
+#[tokio::test]
+async fn a_header_less_turn_is_counted_as_unbound_not_merged() {
+    let h = build_server().await;
+    let id = create(&h, &body("unbound")).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::{Row, ALICE};
+    seed::ledger(&h, id, Row { cost: 0.01, ..Row::new(ALICE, "u", Some("control"), T0) }).await;
+    seed::ledger(&h, id, Row { cost: 0.50, tokens: (9000, 9000), ..Row::new(ALICE, "u", None, T1) }).await;
+    seed::ledger(&h, id, Row { cost: 0.50, tokens: (9000, 9000), ..Row::new(ALICE, "u", None, T2) }).await;
+    // A header-less run with no bound rows is not this experiment's at all.
+    seed::ledger(&h, id, Row::new(ALICE, "other", None, T2)).await;
+
+    let doc = results(&h, id).await;
+    let u = run(&doc, ALICE, "u");
+    assert_eq!(u["unbound_requests"], 2);
+    assert_eq!(u["requests"], 1);
+    assert_eq!(u["turns"], 1);
+    assert!(approx(&u["cost_usd"], 0.01));
+    assert_eq!(u["tokens"]["total"], 150);
+    assert_eq!(u["last_at"], T0, "unbound rows do not extend the span");
+    let control = variant(&doc, "control");
+    assert_eq!(control["unbound_requests"], 2);
+    assert_eq!(control["requests"], 1);
+    assert_eq!(control["turns"], 1);
+    assert!(approx(&control["cost_usd"], 0.01));
+    assert_eq!(doc["totals"]["unbound_requests"], 2);
+    assert_eq!(doc["totals"]["requests"], 1);
+    assert_eq!(doc["runs"]["total"], 1);
+}
+
+/// A row whose tokens were estimated locally raises `estimated_rows` at
+/// every level.
+#[tokio::test]
+async fn an_estimated_row_is_counted() {
+    let h = build_server().await;
+    let id = create(&h, &body("est")).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::{Row, ALICE};
+    seed::ledger(&h, id, Row::new(ALICE, "e", Some("control"), T0)).await;
+    seed::ledger(&h, id, Row { estimated: true, ..Row::new(ALICE, "e", Some("control"), T1) }).await;
+    seed::ledger(&h, id, Row::new(ALICE, "f", Some("candidate"), T2)).await;
+
+    let doc = results(&h, id).await;
+    assert_eq!(run(&doc, ALICE, "e")["estimated_rows"], 1);
+    assert_eq!(run(&doc, ALICE, "f")["estimated_rows"], 0);
+    let control = variant(&doc, "control");
+    assert_eq!(control["estimated_rows"], 1);
+    assert_eq!(control["models"][0]["estimated_rows"], 1);
+    assert_eq!(variant(&doc, "candidate")["estimated_rows"], 0);
+    assert_eq!(doc["totals"]["estimated_rows"], 1);
+}
+
+/// A run whose every request failed has no ledger rows; it still appears,
+/// with its failures and no turns. Failures on a run with ledger rows are
+/// counted beside them.
+#[tokio::test]
+async fn a_failure_only_run_appears_with_no_turns() {
+    let h = build_server().await;
+    let id = create(&h, &body("fail")).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::{Row, ALICE};
+    seed::ledger(&h, id, Row::new(ALICE, "ok", Some("control"), T0)).await;
+    seed::failure(&h, id, ALICE, "ok", "control", T1).await;
+    seed::failure(&h, id, ALICE, "dead", "candidate", T2).await;
+    seed::failure(&h, id, ALICE, "dead", "candidate", T3).await;
+    seed::outcome(&h, id, ALICE, "dead", "candidate", ("failure", None, Some(1))).await;
+
+    let doc = results(&h, id).await;
+    assert_eq!(doc["runs"]["total"], 2);
+    let order: Vec<&str> = doc["runs"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["correlation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["ok", "dead"], "ledger runs first, then failure-only runs");
+    let dead = run(&doc, ALICE, "dead");
+    assert_eq!(dead["turns"], 0);
+    assert_eq!(dead["requests"], 0);
+    assert_eq!(dead["failures"], 2);
+    assert_eq!(dead["variant"], "candidate");
+    assert!(approx(&dead["cost_usd"], 0.0));
+    assert!(approx(&dead["span_secs"], 3480.0));
+    assert_eq!(dead["first_at"], T2);
+    assert_eq!(dead["last_at"], T3);
+    assert_eq!(dead["outcome"]["outcome"], "failure");
+    let ok = run(&doc, ALICE, "ok");
+    assert_eq!(ok["turns"], 1);
+    assert_eq!(ok["failures"], 1);
+
+    let candidate = variant(&doc, "candidate");
+    assert_eq!(candidate["runs"], 1);
+    assert_eq!(candidate["turns"], 0);
+    assert_eq!(candidate["failures"], 2);
+    assert_eq!(candidate["outcomes"]["failure"], 1);
+    assert!(approx(&candidate["outcomes"]["success_rate"], 0.0));
+    let control = variant(&doc, "control");
+    assert_eq!(control["runs"], 1);
+    assert_eq!(control["failures"], 1);
+    assert_eq!(doc["totals"]["runs"], 2);
+    assert_eq!(doc["totals"]["failures"], 3);
+}
+
+/// `retain_content` adds the stored bytes; declared variants with no traffic
+/// still appear, empty.
+#[tokio::test]
+async fn retained_content_bytes_appear_only_when_retaining() {
+    let h = build_server().await;
+    let mut retaining = body("keep");
+    retaining["retain_content"] = json!(true);
+    retaining["expires_at"] = json!("2999-01-01T00:00:00Z");
+    retaining["content_retention_days"] = json!(30);
+    let id = create(&h, &retaining).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::ALICE;
+    seed::prompt(&h, id, ALICE, "p", "control", 10).await;
+
+    let doc = results(&h, id).await;
+    let messages = "[{\"role\":\"user\",\"content\":\"hi\"}]".len() + "hello".len();
+    assert_eq!(doc["retained_content_bytes"], messages as i64);
+    assert_eq!(doc["totals"]["runs"], 0, "prompt rows alone make no run");
+    assert_eq!(variant(&doc, "control")["latency_samples"], 1);
+    let candidate = variant(&doc, "candidate");
+    assert_eq!(candidate["runs"], 0);
+    assert_eq!(candidate["requests"], 0);
+    assert_eq!(candidate["models"], json!([]));
+}
+
+/// `limit` and `offset` page the run list; `total` is the whole count.
+#[tokio::test]
+async fn runs_are_paged_with_limit_and_offset() {
+    let h = build_server().await;
+    let id = create(&h, &body("page")).await.json::<Value>()["id"].as_i64().unwrap();
+    use seed::{Row, ALICE};
+    seed::ledger(&h, id, Row::new(ALICE, "first", Some("control"), T0)).await;
+    seed::ledger(&h, id, Row::new(ALICE, "second", Some("control"), T1)).await;
+    seed::ledger(&h, id, Row::new(ALICE, "third", Some("candidate"), T2)).await;
+    seed::failure(&h, id, ALICE, "dead", "candidate", T3).await;
+
+    let h = &h;
+    let page = move |q: &'static [(&'static str, &'static str)]| async move {
+        let res = results_response(h, &id.to_string(), q).await;
+        res.assert_status_ok();
+        res.json::<Value>()
+    };
+
+    let doc = page(&[("limit", "1"), ("offset", "1")]).await;
+    assert_eq!(doc["runs"]["total"], 4);
+    assert_eq!(doc["runs"]["limit"], 1);
+    assert_eq!(doc["runs"]["offset"], 1);
+    let items = doc["runs"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["correlation_id"], "second");
+    // Aggregates are not paged.
+    assert_eq!(doc["totals"]["runs"], 4);
+    assert_eq!(variant(&doc, "control")["runs"], 2);
+
+    // The page straddles the ledger runs and the failure-only tail.
+    let doc = page(&[("limit", "2"), ("offset", "2")]).await;
+    let ids: Vec<&str> = doc["runs"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["correlation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["first", "dead"]);
+
+    let doc = page(&[("offset", "3")]).await;
+    assert_eq!(doc["runs"]["limit"], 200);
+    assert_eq!(doc["runs"]["items"][0]["correlation_id"], "dead");
+    assert_eq!(doc["runs"]["items"].as_array().unwrap().len(), 1);
+
+    let doc = page(&[("offset", "4")]).await;
+    assert_eq!(doc["runs"]["items"], json!([]));
+    assert_eq!(doc["runs"]["total"], 4);
+}
+
+#[tokio::test]
+async fn results_errors_name_the_offending_field() {
+    let h = build_server().await;
+    let id = create(&h, &body("bad")).await.json::<Value>()["id"].as_i64().unwrap();
+
+    let id = id.to_string();
+    assert_bad_request(&results_response(&h, "999", &[]).await, &["999"]);
+    assert_bad_request(&results_response(&h, "abc", &[]).await, &["id"]);
+    for bad in ["0", "1001", "-1", "ten"] {
+        let res = results_response(&h, &id, &[("limit", bad)]).await;
+        assert_bad_request(&res, &["limit"]);
+    }
+    for bad in ["-1", "x"] {
+        let res = results_response(&h, &id, &[("offset", bad)]).await;
+        assert_bad_request(&res, &["offset"]);
+    }
+    // Any admin session reads; no session does not.
+    h.server
+        .get(&format!("/admin/api/experiments/{id}/results"))
+        .await
+        .assert_status_unauthorized();
 }

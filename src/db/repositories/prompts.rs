@@ -29,6 +29,18 @@ impl LatencySummary {
     }
 }
 
+/// Latency of one experiment run, from the prompt rows stamped with the
+/// experiment that share its `(user_id, correlation_id)` key. Follows the
+/// [`LatencySummary`] sampling rule: only positive `latency_ms` counts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ExperimentRunLatency {
+    pub user_id: i64,
+    pub correlation_id: String,
+    pub samples: i64,
+    /// `None` when there are no samples.
+    pub mean_ms: Option<f64>,
+}
+
 #[async_trait]
 pub trait PromptRepository: Send + Sync {
     async fn create(&self, prompt: NewPrompt) -> anyhow::Result<Prompt>;
@@ -62,4 +74,13 @@ pub trait PromptRepository: Send + Sync {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary>;
+    /// Latency samples and mean per run of an experiment, unpaginated; runs
+    /// with no prompt rows are absent.
+    async fn experiment_run_latency(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunLatency>>;
+    /// Bytes of stored `messages` and `response` across the experiment's
+    /// prompt rows — what content retention (spec §7c) is holding.
+    async fn experiment_content_bytes(&self, experiment_id: i64) -> anyhow::Result<i64>;
 }

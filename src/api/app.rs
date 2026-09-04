@@ -221,6 +221,10 @@ pub fn build_router(state: AppState) -> axum::Router {
             "/admin/api/experiments/:id/close",
             post(crate::api::admin::experiments::close_experiment_api),
         )
+        .route(
+            "/admin/api/experiments/:id/results",
+            get(crate::api::admin::experiments::get_experiment_results_api),
+        )
         .route("/admin/api/admins", get(list_admins).post(create_admin))
         .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))

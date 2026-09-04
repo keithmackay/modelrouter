@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
-    CacheUsageSummary, CostRepository,
+    CacheUsageSummary, CostRepository, ExperimentRunRow, ExperimentRunKey,
+    ExperimentUnboundRow, ExperimentVariantModelRow, ExperimentVariantTotals,
 };
 use super::{PostgresDb, now_utc};
 
@@ -694,7 +695,186 @@ impl CostRepository for PostgresDb {
         let (predicate, binds) = arm_predicate(filter);
         self.by_day_where(&predicate, binds, start, end).await
     }
+
+    // ── Experiment results ───────────────────────────────────────────────────
+
+    async fn experiment_variant_totals(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantTotals>> {
+        let sql = format!(
+            "SELECT COALESCE(experiment_variant, ''), {} FROM cost_ledger \
+             WHERE experiment_id = $1 \
+             GROUP BY experiment_variant ORDER BY experiment_variant ASC",
+            EXPERIMENT_TOTALS_SELECT
+        );
+        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(variant, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows)| {
+                ExperimentVariantTotals {
+                    variant, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_variant_models(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantModelRow>> {
+        let sql = format!(
+            "SELECT COALESCE(experiment_variant, ''), model, {} FROM cost_ledger \
+             WHERE experiment_id = $1 \
+             GROUP BY experiment_variant, model \
+             ORDER BY experiment_variant ASC, SUM(cost_usd) DESC, model ASC",
+            EXPERIMENT_TOTALS_SELECT
+        );
+        type Row = (String, String, i64, f64, f64, i64, i64, i64);
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(variant, model, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows)| {
+                ExperimentVariantModelRow {
+                    variant, model, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_runs(
+        &self,
+        experiment_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunRow>> {
+        // `$1` is the experiment id for both the subquery and the outer
+        // predicate; `$2`/`$3` are the page.
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, {}, \
+                    COUNT(DISTINCT experiment_variant), {}, \
+                    MIN(created_at), MAX(created_at) AS last_at \
+             FROM cost_ledger c \
+             WHERE {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY last_at DESC, user_id ASC, attribution_correlation_id ASC \
+             LIMIT $2 OFFSET $3",
+            RUN_VARIANT_SUBQUERY, EXPERIMENT_TOTALS_SELECT, RUN_ROWS_WHERE
+        );
+        type Row = (i64, String, String, i64, i64, f64, f64, i64, i64, i64, String, String);
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(experiment_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    user_id, correlation_id, variant, variant_count, requests, cost_usd, saved_usd,
+                    tokens_in, tokens_out, estimated_rows, first_at, last_at,
+                )| ExperimentRunRow {
+                    user_id, correlation_id, variant, variant_count, requests, cost_usd, saved_usd,
+                    tokens_in, tokens_out, estimated_rows, first_at, last_at,
+                },
+            )
+            .collect())
+    }
+
+    async fn experiment_run_count(&self, experiment_id: i64) -> anyhow::Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM cost_ledger c WHERE {} \
+             GROUP BY user_id, attribution_correlation_id) runs",
+            RUN_ROWS_WHERE
+        );
+        let (count,): (i64,) = sqlx::query_as(&sql)
+            .bind(experiment_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    async fn experiment_run_keys(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunKey>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, {}, COUNT(DISTINCT experiment_variant), \
+                    COUNT(*), MIN(created_at), MAX(created_at) \
+             FROM cost_ledger c WHERE {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY user_id ASC, attribution_correlation_id ASC",
+            RUN_VARIANT_SUBQUERY, RUN_ROWS_WHERE
+        );
+        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, variant, n, requests, first_at, last_at)| {
+                ExperimentRunKey {
+                    user_id, correlation_id, variant, mixed: n > 1, requests, first_at, last_at,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_unbound_requests(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentUnboundRow>> {
+        let rows = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT u.user_id, u.attribution_correlation_id, COUNT(*) FROM cost_ledger u \
+             WHERE u.experiment_id IS NULL AND u.attribution_correlation_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM cost_ledger b WHERE b.experiment_id = $1 \
+                           AND b.user_id = u.user_id \
+                           AND b.attribution_correlation_id = u.attribution_correlation_id) \
+             GROUP BY u.user_id, u.attribution_correlation_id \
+             ORDER BY u.user_id ASC, u.attribution_correlation_id ASC",
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, requests)| ExperimentUnboundRow {
+                user_id, correlation_id, requests,
+            })
+            .collect())
+    }
 }
+
+/// Aggregates over stamped rows; order matches [`ExperimentTotalsRow`] after
+/// the grouping columns. `SUM` over BIGINT yields NUMERIC in Postgres, so the
+/// token sums are cast back; `tokens_estimated` is BOOLEAN, hence the CASE.
+const EXPERIMENT_TOTALS_SELECT: &str = "COUNT(*), COALESCE(SUM(cost_usd), 0.0), \
+                                        COALESCE(SUM(saved_usd), 0.0), \
+                                        COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                                        COALESCE(SUM(tokens_out), 0)::BIGINT, \
+                                        COALESCE(SUM(CASE WHEN tokens_estimated THEN 1 ELSE 0 END), 0)::BIGINT";
+
+/// Rows that form runs: stamped with the experiment (`$1`) and carrying a
+/// correlation id. Aliased `c` so the variant subquery can correlate.
+const RUN_ROWS_WHERE: &str = "c.experiment_id = $1 AND c.attribution_correlation_id IS NOT NULL";
+
+/// The run's variant: its earliest stamped row by `created_at`, then id —
+/// the rule `run_stamp` applies. A correlated subquery keeps the SQLite and
+/// Postgres shapes identical; `$1` is the experiment id.
+const RUN_VARIANT_SUBQUERY: &str =
+    "(SELECT COALESCE(e.experiment_variant, '') FROM cost_ledger e \
+      WHERE e.experiment_id = $1 AND e.user_id = c.user_id \
+        AND e.attribution_correlation_id = c.attribution_correlation_id \
+      ORDER BY e.created_at ASC, e.id ASC LIMIT 1)";
+
+type ExperimentTotalsRow = (String, i64, f64, f64, i64, i64, i64);
 
 impl PostgresDb {
     /// `SELECT totals FROM cost_ledger WHERE {predicate} AND window`. The
@@ -824,10 +1004,17 @@ pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<
 }
 
 /// SQL predicate plus its bound values for a comparison arm against the ledger.
+///
+/// Binds are strings (sqlx declares them as TEXT), so the experiment id is
+/// cast back to BIGINT in SQL.
 fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
     match filter {
         ArmFilter::Model(m) => ("model = $1".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => (
+            "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
+            vec![experiment_id.to_string(), variant.clone()],
+        ),
     }
 }

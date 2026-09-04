@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
+use crate::db::repositories::prompts::{ExperimentRunLatency, LatencySummary, PromptRepository};
 use super::costs::attribution_predicate;
 use super::{SqliteDb, now_utc};
 
@@ -252,6 +252,41 @@ impl PromptRepository for SqliteDb {
 
         Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
     }
+
+    async fn experiment_run_latency(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunLatency>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, COUNT(*), AVG(latency_ms) FROM prompts \
+             WHERE experiment_id = ? AND attribution_correlation_id IS NOT NULL AND {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY user_id ASC, attribution_correlation_id ASC",
+            LATENCY_SAMPLE
+        );
+        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, samples, mean_ms)| ExperimentRunLatency {
+                user_id, correlation_id, samples, mean_ms,
+            })
+            .collect())
+    }
+
+    async fn experiment_content_bytes(&self, experiment_id: i64) -> anyhow::Result<i64> {
+        let (bytes,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(LENGTH(CAST(messages AS BLOB)) \
+                                 + LENGTH(CAST(COALESCE(response, '') AS BLOB))), 0) \
+             FROM prompts WHERE experiment_id = ?",
+        )
+        .bind(experiment_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(bytes)
+    }
 }
 
 /// Predicate for a comparison arm against `prompts`. Model arms match the
@@ -261,6 +296,10 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ArmFilter::Model(m) => ("routed_model = ?".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => (
+            "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
+            vec![experiment_id.to_string(), variant.clone()],
+        ),
     }
 }
 
@@ -596,5 +635,65 @@ mod tests {
         assert_eq!(LatencySummary::nearest_rank_offset(0, 0.5), 0);
         assert_eq!(LatencySummary::nearest_rank_offset(3, 1.0), 2);
         assert_eq!(LatencySummary::nearest_rank_offset(3, 0.0), 0);
+    }
+
+    async fn insert_experiment_prompt(
+        db: &SqliteDb,
+        run: &str,
+        experiment: (i64, &str),
+        latency_ms: Option<i64>,
+        messages: &str,
+        response: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, response, \
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, tags, \
+             attribution_correlation_id, attribution_tags, experiment_id, experiment_variant, \
+             created_at) \
+             VALUES (1, 'req', 'X', 'p', ?, ?, 0, 0, 0.0, ?, '[]', ?, '{}', ?, ?, '2026-03-02T00:00:00Z')",
+        )
+        .bind(messages)
+        .bind(response)
+        .bind(latency_ms)
+        .bind(run)
+        .bind(experiment.0)
+        .bind(experiment.1)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_run_latency_averages_positive_samples_per_run() {
+        let db = make_db().await;
+        insert_experiment_prompt(&db, "a", (7, "control"), Some(100), "[]", None).await;
+        insert_experiment_prompt(&db, "a", (7, "control"), Some(300), "[]", None).await;
+        insert_experiment_prompt(&db, "a", (7, "control"), None, "[]", None).await;
+        insert_experiment_prompt(&db, "b", (7, "candidate"), Some(0), "[]", None).await;
+        insert_experiment_prompt(&db, "c", (8, "control"), Some(50), "[]", None).await;
+
+        let rows = db.experiment_run_latency(7).await.unwrap();
+        assert_eq!(rows.len(), 1, "run b has no positive sample: {rows:?}");
+        assert_eq!((rows[0].user_id, rows[0].correlation_id.as_str()), (1, "a"));
+        assert_eq!(rows[0].samples, 2);
+        assert_eq!(rows[0].mean_ms, Some(200.0));
+
+        let variant = ArmFilter::Variant { experiment_id: 7, variant: "control".to_string() };
+        let summary = db.latency_summary(&variant, "1970-01-01T00:00:00Z", "9999-12-31T00:00:00Z").await.unwrap();
+        assert_eq!(summary.samples, 2);
+        assert_eq!(summary.mean_ms, Some(200.0));
+        assert_eq!(variant.label(), "experiment=7:control");
+    }
+
+    #[tokio::test]
+    async fn experiment_content_bytes_sum_messages_and_responses() {
+        let db = make_db().await;
+        insert_experiment_prompt(&db, "a", (7, "control"), None, "[\"héllo\"]", Some("ok")).await;
+        insert_experiment_prompt(&db, "b", (7, "candidate"), None, "[]", None).await;
+        insert_experiment_prompt(&db, "c", (8, "control"), None, "[\"other\"]", Some("no")).await;
+
+        let expected = ("[\"héllo\"]".len() + "ok".len() + "[]".len()) as i64;
+        assert_eq!(db.experiment_content_bytes(7).await.unwrap(), expected);
+        assert_eq!(db.experiment_content_bytes(9).await.unwrap(), 0);
     }
 }
