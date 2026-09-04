@@ -9,7 +9,8 @@ use super::{SqliteDb, now_utc};
 /// Columns selected when reading a failure row back.
 const FAILURE_COLUMNS: &str = "id, user_id, api_key_id, endpoint, request_model, routed_model, \
                                provider, stage, status_code, error_message, attempts, latency_ms, \
-                               project, attribution_correlation_id, attribution_tags, created_at";
+                               project, attribution_correlation_id, attribution_tags, \
+                               experiment_id, experiment_variant, created_at";
 
 #[async_trait]
 impl FailureRepository for SqliteDb {
@@ -19,8 +20,9 @@ impl FailureRepository for SqliteDb {
             r#"INSERT INTO request_failures (
                 user_id, api_key_id, endpoint, request_model, routed_model, provider,
                 stage, status_code, error_message, attempts, latency_ms, project,
-                attribution_correlation_id, attribution_tags, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                attribution_correlation_id, attribution_tags,
+                experiment_id, experiment_variant, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(failure.user_id)
         .bind(failure.api_key_id)
@@ -36,6 +38,8 @@ impl FailureRepository for SqliteDb {
         .bind(&failure.project)
         .bind(&failure.attribution_correlation_id)
         .bind(&failure.attribution_tags)
+        .bind(failure.experiment_id)
+        .bind(&failure.experiment_variant)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -92,6 +96,18 @@ impl FailureRepository for SqliteDb {
         }
         let (count,) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
         Ok(count)
+    }
+
+    async fn has_rows_for_user(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM request_failures \
+             WHERE user_id = ? AND attribution_correlation_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(correlation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
     }
 }
 
@@ -186,5 +202,56 @@ mod tests {
 
         let run = ArmFilter::Attribution(AttributionFilter::CorrelationId("run-1".into()));
         assert_eq!(db.count_for_arm(&run, W_START, W_END).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn has_rows_for_user_matches_user_and_correlation_id() {
+        let db = make_db().await;
+        sqlx::query("INSERT INTO users (id, name, enabled, created_at, metadata) VALUES (1, 'alice', 1, '2026-01-01T00:00:00Z', '{}')")
+            .execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO request_failures (user_id, endpoint, request_model, stage, error_message, \
+             attempts, attribution_correlation_id, attribution_tags, created_at) \
+             VALUES (1, '/v1/chat/completions', 'X', 'provider', 'boom', 1, 'run-1', '{}', \
+                     '2026-03-02T00:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(db.has_rows_for_user(1, "run-1").await.unwrap());
+        assert!(!db.has_rows_for_user(2, "run-1").await.unwrap());
+        assert!(!db.has_rows_for_user(1, "run-2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_writes_and_reads_back_experiment_columns() {
+        let db = make_db().await;
+        sqlx::query("INSERT INTO users (id, name, enabled, created_at, metadata) VALUES (1, 'alice', 1, '2026-01-01T00:00:00Z', '{}')")
+            .execute(&db.pool).await.unwrap();
+        let row = db
+            .create(crate::db::models::NewRequestFailure {
+                user_id: Some(1),
+                api_key_id: None,
+                endpoint: "/v1/chat/completions".into(),
+                request_model: "X".into(),
+                routed_model: None,
+                provider: None,
+                stage: crate::db::models::FailureStage::Resolve,
+                status_code: None,
+                error_message: "boom".into(),
+                attempts: 1,
+                latency_ms: None,
+                project: None,
+                attribution_correlation_id: Some("run-1".into()),
+                attribution_tags: "{}".into(),
+                experiment_id: Some(4),
+                experiment_variant: Some("control".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.experiment_id, Some(4));
+        assert_eq!(row.experiment_variant.as_deref(), Some("control"));
+        assert_eq!(db.list(10, 0).await.unwrap()[0].experiment_id, Some(4));
     }
 }

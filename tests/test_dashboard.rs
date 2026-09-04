@@ -295,6 +295,8 @@ async fn failures_page_lists_captured_failures_by_stage() {
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -373,6 +375,9 @@ async fn seed_compare_ledger(
                 api_key_id: None,
                 attribution_correlation_id: Some(format!("run-{model}")),
                 attribution_tags: tags.to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             },
         )
         .await

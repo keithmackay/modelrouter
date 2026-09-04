@@ -171,6 +171,8 @@ async fn speech_inner(
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
+            experiment_id: None,
+            experiment_variant: None,
         };
         // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
@@ -196,6 +198,9 @@ async fn speech_inner(
                     api_key_id,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
+                    experiment_id: None,
+                    experiment_variant: None,
+                    tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record speech cost: {e}");
@@ -384,6 +389,8 @@ async fn transcriptions_inner(
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
+            experiment_id: None,
+            experiment_variant: None,
         };
         // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
@@ -409,6 +416,9 @@ async fn transcriptions_inner(
                     api_key_id,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
+                    experiment_id: None,
+                    experiment_variant: None,
+                    tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record transcription cost: {e}");

@@ -228,6 +228,8 @@ async fn search_inner(
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
+            experiment_id: None,
+            experiment_variant: None,
         };
         // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
@@ -253,6 +255,9 @@ async fn search_inner(
                     api_key_id,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
+                    experiment_id: None,
+                    experiment_variant: None,
+                    tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record search cost: {}", e);
@@ -311,6 +316,9 @@ fn record_search_cache_hit(
         api_key_id: user.api_key_id,
         attribution_correlation_id: attribution.correlation_id.clone(),
         attribution_tags: attribution.tags_json(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
     };
     tokio::spawn(async move {
         if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {

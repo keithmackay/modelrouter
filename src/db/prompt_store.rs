@@ -81,6 +81,8 @@ mod tests {
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "[]".into(),
+            experiment_id: None,
+            experiment_variant: None,
         }
     }
 

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
+use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
     CacheUsageSummary, CostRepository,
@@ -19,12 +19,14 @@ impl CostRepository for PostgresDb {
         let row = sqlx::query_as::<_, CostLedgerEntry>(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
-                                        attribution_correlation_id, attribution_tags)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                        attribution_correlation_id, attribution_tags,
+                                        experiment_id, experiment_variant, tokens_estimated)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
                          cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags"#,
+                         attribution_correlation_id, attribution_tags,
+                         experiment_id, experiment_variant, tokens_estimated"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -38,6 +40,9 @@ impl CostRepository for PostgresDb {
         .bind(&now)
         .bind(&entry.attribution_correlation_id)
         .bind(&entry.attribution_tags)
+        .bind(entry.experiment_id)
+        .bind(&entry.experiment_variant)
+        .bind(entry.tokens_estimated)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -50,12 +55,14 @@ impl CostRepository for PostgresDb {
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
-                                        attribution_correlation_id, attribution_tags)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12)
+                                        attribution_correlation_id, attribution_tags,
+                                        experiment_id, experiment_variant, tokens_estimated)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
                          cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags"#,
+                         attribution_correlation_id, attribution_tags,
+                         experiment_id, experiment_variant, tokens_estimated"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -69,6 +76,9 @@ impl CostRepository for PostgresDb {
         .bind(entry.cost_usd)
         .bind(&entry.attribution_correlation_id)
         .bind(&entry.attribution_tags)
+        .bind(entry.experiment_id)
+        .bind(&entry.experiment_variant)
+        .bind(entry.tokens_estimated)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -473,6 +483,21 @@ impl CostRepository for PostgresDb {
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn run_stamp(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<Option<RunStamp>> {
+        // Stamped rows sort first, then the earliest wins; a run whose rows are
+        // all unstamped therefore yields (NULL, NULL) rather than no row.
+        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT experiment_id, experiment_variant FROM cost_ledger \
+             WHERE user_id = $1 AND attribution_correlation_id = $2 \
+             ORDER BY (experiment_id IS NULL), created_at, id LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(correlation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(experiment_id, experiment_variant)| RunStamp { experiment_id, experiment_variant }))
     }
 
     async fn list_daily_spend(

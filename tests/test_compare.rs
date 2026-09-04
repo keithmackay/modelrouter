@@ -218,6 +218,9 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
             api_key_id: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await
@@ -246,6 +249,8 @@ async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: O
             project: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -270,6 +275,8 @@ async fn seed_failure(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>) {
             project: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await

@@ -14,7 +14,8 @@ const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
 const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
                               messages, response, finish_reason, prompt_tokens, completion_tokens, \
                               cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, tags, \
-                              project, attribution_correlation_id, attribution_tags, created_at";
+                              project, attribution_correlation_id, attribution_tags, \
+                              experiment_id, experiment_variant, created_at";
 
 #[async_trait]
 impl PromptRepository for SqliteDb {
@@ -26,8 +27,9 @@ impl PromptRepository for SqliteDb {
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
                 cost_usd, latency_ms, tags, project,
-                attribution_correlation_id, attribution_tags, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                attribution_correlation_id, attribution_tags,
+                experiment_id, experiment_variant, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -47,6 +49,8 @@ impl PromptRepository for SqliteDb {
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
         .bind(&prompt.attribution_tags)
+        .bind(prompt.experiment_id)
+        .bind(&prompt.experiment_variant)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -236,6 +240,8 @@ mod tests {
                 project: None,
                 attribution_correlation_id: None,
                 attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
             },
         )
         .await
@@ -274,6 +280,8 @@ mod tests {
                 project: None,
                 attribution_correlation_id: None,
                 attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
             },
         )
         .await

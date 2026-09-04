@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
+use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
     CacheUsageSummary, CostRepository,
@@ -11,7 +11,8 @@ use super::{SqliteDb, now_utc};
 const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, \
                               tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
                               cache_hit, saved_usd, attribution_correlation_id, \
-                              attribution_tags";
+                              attribution_tags, experiment_id, experiment_variant, \
+                              tokens_estimated";
 
 #[async_trait]
 impl CostRepository for SqliteDb {
@@ -20,8 +21,9 @@ impl CostRepository for SqliteDb {
         let result = sqlx::query(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
-                                        attribution_correlation_id, attribution_tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        attribution_correlation_id, attribution_tags,
+                                        experiment_id, experiment_variant, tokens_estimated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -35,6 +37,9 @@ impl CostRepository for SqliteDb {
         .bind(&now)
         .bind(&entry.attribution_correlation_id)
         .bind(&entry.attribution_tags)
+        .bind(entry.experiment_id)
+        .bind(&entry.experiment_variant)
+        .bind(entry.tokens_estimated)
         .execute(&self.pool)
         .await?;
 
@@ -57,8 +62,9 @@ impl CostRepository for SqliteDb {
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
-                                        attribution_correlation_id, attribution_tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?)"#,
+                                        attribution_correlation_id, attribution_tags,
+                                        experiment_id, experiment_variant, tokens_estimated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -72,6 +78,9 @@ impl CostRepository for SqliteDb {
         .bind(entry.cost_usd)
         .bind(&entry.attribution_correlation_id)
         .bind(&entry.attribution_tags)
+        .bind(entry.experiment_id)
+        .bind(&entry.experiment_variant)
+        .bind(entry.tokens_estimated)
         .execute(&self.pool)
         .await?;
 
@@ -410,6 +419,21 @@ impl CostRepository for SqliteDb {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn run_stamp(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<Option<RunStamp>> {
+        // Stamped rows sort first, then the earliest wins; a run whose rows are
+        // all unstamped therefore yields (NULL, NULL) rather than no row.
+        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT experiment_id, experiment_variant FROM cost_ledger \
+             WHERE user_id = ? AND attribution_correlation_id = ? \
+             ORDER BY (experiment_id IS NULL), created_at, id LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(correlation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(experiment_id, experiment_variant)| RunStamp { experiment_id, experiment_variant }))
     }
 
     async fn list_daily_spend(
@@ -1089,5 +1113,102 @@ mod tests {
 
         let all = db.distinct_recent_correlation_ids(10).await.unwrap();
         assert_eq!(all, vec!["new".to_string(), "mid".to_string(), "old".to_string()]);
+    }
+
+    // ---- experiment stamps ------------------------------------------------
+
+    async fn insert_stamped_row(
+        db: &SqliteDb,
+        user_id: i64,
+        run: &str,
+        experiment: Option<(i64, &str)>,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, tokens_in, tokens_out, \
+             cost_usd, attribution_correlation_id, experiment_id, experiment_variant, created_at) \
+             VALUES (?, NULL, 'm', 'p', 1, 1, 0.0, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(run)
+        .bind(experiment.map(|(id, _)| id))
+        .bind(experiment.map(|(_, v)| v))
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn stamp_db() -> SqliteDb {
+        let db = arm_db().await;
+        sqlx::query("INSERT INTO users (id, name, enabled, created_at, metadata) VALUES (2, 'bob', 1, '2026-01-01T00:00:00Z', '{}')")
+            .execute(&db.pool).await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn run_stamp_is_the_earliest_stamped_row() {
+        let db = stamp_db().await;
+        // An unstamped row first, then two stamped rows out of insertion order.
+        insert_stamped_row(&db, 1, "run-1", None, "2026-03-01T00:00:00Z").await;
+        insert_stamped_row(&db, 1, "run-1", Some((7, "candidate")), "2026-03-03T00:00:00Z").await;
+        insert_stamped_row(&db, 1, "run-1", Some((7, "control")), "2026-03-02T00:00:00Z").await;
+        // Same correlation id under another user must not leak across.
+        insert_stamped_row(&db, 2, "run-1", Some((8, "other")), "2026-03-01T00:00:00Z").await;
+
+        let stamp = db.run_stamp(1, "run-1").await.unwrap();
+        assert_eq!(
+            stamp,
+            Some(RunStamp { experiment_id: Some(7), experiment_variant: Some("control".into()) })
+        );
+        let other = db.run_stamp(2, "run-1").await.unwrap();
+        assert_eq!(other.unwrap().experiment_id, Some(8));
+    }
+
+    #[tokio::test]
+    async fn run_stamp_ties_break_on_id() {
+        let db = stamp_db().await;
+        insert_stamped_row(&db, 1, "run-1", Some((7, "first")), "2026-03-01T00:00:00Z").await;
+        insert_stamped_row(&db, 1, "run-1", Some((7, "second")), "2026-03-01T00:00:00Z").await;
+        let stamp = db.run_stamp(1, "run-1").await.unwrap().unwrap();
+        assert_eq!(stamp.experiment_variant.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn run_stamp_unstamped_rows_and_no_rows() {
+        let db = stamp_db().await;
+        insert_stamped_row(&db, 1, "run-1", None, "2026-03-01T00:00:00Z").await;
+        assert_eq!(db.run_stamp(1, "run-1").await.unwrap(), Some(RunStamp::default()));
+        assert_eq!(db.run_stamp(1, "run-2").await.unwrap(), None);
+        assert_eq!(db.run_stamp(2, "run-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn create_writes_and_reads_back_experiment_columns() {
+        let db = arm_db().await;
+        let entry = NewCostLedgerEntry {
+            user_id: 1,
+            prompt_id: None,
+            model: "m".into(),
+            provider: "p".into(),
+            project: None,
+            tokens_in: 1,
+            tokens_out: 1,
+            cost_usd: 0.1,
+            api_key_id: None,
+            attribution_correlation_id: Some("run-1".into()),
+            attribution_tags: "{}".into(),
+            experiment_id: Some(4),
+            experiment_variant: Some("control".into()),
+            tokens_estimated: true,
+        };
+        let row = db.create(entry.clone()).await.unwrap();
+        assert_eq!(row.experiment_id, Some(4));
+        assert_eq!(row.experiment_variant.as_deref(), Some("control"));
+        assert!(row.tokens_estimated);
+        let hit = db.create_cache_hit(entry).await.unwrap();
+        assert_eq!(hit.experiment_id, Some(4));
+        assert!(hit.cache_hit);
+        assert!(hit.tokens_estimated);
     }
 }

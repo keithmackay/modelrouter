@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
+use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelSummaryRow {
@@ -194,6 +194,11 @@ pub trait CostRepository: Send + Sync {
     /// Non-empty correlation ids ordered by most recent ledger row first,
     /// capped at `limit` — populates the "recent runs" picker.
     async fn distinct_recent_correlation_ids(&self, limit: i64) -> anyhow::Result<Vec<String>>;
+    /// Experiment binding of a run: the experiment and variant of the
+    /// earliest stamped ledger row (by `created_at`, then id) for this user
+    /// and correlation id. `Some(RunStamp { None, None })` when the run has
+    /// ledger rows but none is stamped; `None` when it has no rows at all.
+    async fn run_stamp(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<Option<RunStamp>>;
     /// Daily spend series: returns (date_str, cost_usd) pairs grouped by calendar day.
     /// `filter_user_ids`: None = all users; Some(&[]) = empty result.
     /// `start`/`end`: ISO 8601 UTC timestamps (inclusive start, exclusive end).

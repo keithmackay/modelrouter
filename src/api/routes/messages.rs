@@ -47,6 +47,8 @@ async fn log_messages_cost(
         project: project.clone(),
         attribution_correlation_id: attribution.correlation_id.clone(),
         attribution_tags: attribution.tags_json(),
+        experiment_id: None,
+        experiment_variant: None,
     };
     // Storage policy (issue #4): the prompt row is optional; the cost row is not.
     let stored = match crate::db::prompt_store::apply_storage_policy(&state.storage.load(), prompt) {
@@ -71,6 +73,9 @@ async fn log_messages_cost(
         api_key_id,
         attribution_correlation_id: attribution.correlation_id.clone(),
         attribution_tags: attribution.tags_json(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
     };
     if let Err(e) = CostRepository::create(&*state.db, ledger).await {
         tracing::error!("Failed to record cost: {}", e);
@@ -413,6 +418,8 @@ async fn anthropic_messages_inner(
             project: project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
+            experiment_id: None,
+            experiment_variant: None,
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
@@ -438,6 +445,9 @@ async fn anthropic_messages_inner(
                     api_key_id: api_key_id_c,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
+                    experiment_id: None,
+                    experiment_variant: None,
+                    tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);

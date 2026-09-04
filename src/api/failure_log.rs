@@ -153,6 +153,8 @@ pub async fn record_failure(state: &AppState, ctx: FailureContext, err: &ApiErro
         project: ctx.project,
         attribution_correlation_id: ctx.attribution_correlation_id,
         attribution_tags: ctx.attribution_tags,
+        experiment_id: None,
+        experiment_variant: None,
     };
 
     if let Err(e) = FailureRepository::create(&*state.db, record).await {

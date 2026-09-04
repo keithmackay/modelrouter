@@ -2066,6 +2066,9 @@ mod attribution_cli_tests {
                 api_key_id: None,
                 attribution_correlation_id: Some("run-7".to_string()),
                 attribution_tags: r#"{"engagement":"eng-1"}"#.to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             },
         )
         .await
@@ -2119,6 +2122,9 @@ mod tests {
                 user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
                 project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2126,6 +2132,8 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
             }).await.unwrap();
         }
         let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
@@ -2194,6 +2202,9 @@ mod tests {
                 user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
                 project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2201,6 +2212,8 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(100), tags: "[]".into(), project: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
             }).await.unwrap();
         }
         let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);

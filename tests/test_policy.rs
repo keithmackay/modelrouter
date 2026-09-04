@@ -212,6 +212,8 @@ async fn budget_exceeded_returns_deny() {
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -232,6 +234,9 @@ async fn budget_exceeded_returns_deny() {
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await
@@ -307,6 +312,8 @@ async fn test_policy_token_limit_under_budget() {
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -327,6 +334,9 @@ async fn test_policy_token_limit_under_budget() {
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await
@@ -402,6 +412,8 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -422,6 +434,9 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await

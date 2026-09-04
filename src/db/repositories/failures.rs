@@ -20,4 +20,7 @@ pub trait FailureRepository: Send + Sync {
     /// `COALESCE(routed_model, request_model)` because a request that failed
     /// before routing has no routed model.
     async fn count_for_arm(&self, filter: &ArmFilter, start: &str, end: &str) -> anyhow::Result<i64>;
+    /// Whether any failure was recorded for this user and correlation id —
+    /// enough for a run with no ledger rows to still count as having happened.
+    async fn has_rows_for_user(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<bool>;
 }

@@ -547,6 +547,8 @@ async fn chat_completions_inner(
                 project: user_project.clone(),
                 attribution_correlation_id: attr_correlation.clone(),
                 attribution_tags: attr_tags.clone(),
+                experiment_id: None,
+                experiment_variant: None,
             };
             let mut prompt = prompt;
             crate::db::prompt_store::redact_prompt_content(&state_clone.storage.load(), &mut prompt);
@@ -564,6 +566,9 @@ async fn chat_completions_inner(
                         api_key_id,
                         attribution_correlation_id: attr_correlation.clone(),
                         attribution_tags: attr_tags.clone(),
+                        experiment_id: None,
+                        experiment_variant: None,
+                        tokens_estimated: false,
                     };
                     if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                         tracing::error!("Failed to record cost: {}", e);
@@ -600,6 +605,9 @@ async fn chat_completions_inner(
                 api_key_id,
                 attribution_correlation_id: attr_correlation.clone(),
                 attribution_tags: attr_tags.clone(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             };
             if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                 tracing::error!("Failed to record cost: {}", e);
@@ -718,6 +726,9 @@ fn record_cache_hit(
             api_key_id: ctx.api_key_id,
             attribution_correlation_id: ctx.attribution.correlation_id.clone(),
             attribution_tags: ctx.attribution.tags_json(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         };
 
         let prompt_id = if ctx.skip_log {
@@ -743,6 +754,8 @@ fn record_cache_hit(
                 project: ctx.user_project.clone(),
                 attribution_correlation_id: ctx.attribution.correlation_id.clone(),
                 attribution_tags: ctx.attribution.tags_json(),
+                experiment_id: None,
+                experiment_variant: None,
             };
             let mut prompt = prompt;
             crate::db::prompt_store::redact_prompt_content(&state.storage.load(), &mut prompt);
@@ -868,6 +881,8 @@ fn log_streaming_request(
                             project: user_project_c.clone(),
                             attribution_correlation_id: attr_correlation_c.clone(),
                             attribution_tags: attr_tags_c.clone(),
+                            experiment_id: None,
+                            experiment_variant: None,
                         };
                         let mut prompt = prompt;
                         crate::db::prompt_store::redact_prompt_content(&storage_c.load(), &mut prompt);
@@ -885,6 +900,9 @@ fn log_streaming_request(
                                     api_key_id,
                                     attribution_correlation_id: attr_correlation_c.clone(),
                                     attribution_tags: attr_tags_c.clone(),
+                                    experiment_id: None,
+                                    experiment_variant: None,
+                                    tokens_estimated: false,
                                 };
                                 if let Err(e) = CostRepository::create(&*db_c, entry).await {
                                     tracing::error!("Failed to log streaming cost: {}", e);
@@ -906,6 +924,9 @@ fn log_streaming_request(
                             api_key_id,
                             attribution_correlation_id: attr_correlation_c.clone(),
                             attribution_tags: attr_tags_c.clone(),
+                            experiment_id: None,
+                            experiment_variant: None,
+                            tokens_estimated: false,
                         };
                         if let Err(e) = CostRepository::create(&*db_c, entry).await {
                             tracing::error!("Failed to log streaming cost: {}", e);

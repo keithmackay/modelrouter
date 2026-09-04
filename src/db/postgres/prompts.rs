@@ -22,14 +22,16 @@ impl PromptRepository for PostgresDb {
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
                 cost_usd, latency_ms, tags, project,
-                attribution_correlation_id, attribution_tags, created_at
+                attribution_correlation_id, attribution_tags,
+                experiment_id, experiment_variant, created_at
                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19)
+                         $17, $18, $19, $20, $21)
                RETURNING id, user_id, session_id, request_model, routed_model, provider,
                          messages, response, finish_reason, prompt_tokens, completion_tokens,
                          cache_read_tokens, cache_write_tokens,
                          cost_usd, latency_ms, tags, project,
-                         attribution_correlation_id, attribution_tags, created_at"#,
+                         attribution_correlation_id, attribution_tags,
+                      experiment_id, experiment_variant, created_at"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -49,6 +51,8 @@ impl PromptRepository for PostgresDb {
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
         .bind(&prompt.attribution_tags)
+        .bind(prompt.experiment_id)
+        .bind(&prompt.experiment_variant)
         .bind(&now)
         .fetch_one(&self.pool)
         .await?;
@@ -61,7 +65,8 @@ impl PromptRepository for PostgresDb {
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project,
-                      attribution_correlation_id, attribution_tags, created_at
+                      attribution_correlation_id, attribution_tags,
+                      experiment_id, experiment_variant, created_at
                FROM prompts WHERE id = $1"#,
         )
         .bind(id)
@@ -76,7 +81,8 @@ impl PromptRepository for PostgresDb {
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project,
-                      attribution_correlation_id, attribution_tags, created_at
+                      attribution_correlation_id, attribution_tags,
+                      experiment_id, experiment_variant, created_at
                FROM prompts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2"#,
         )
         .bind(user_id)
@@ -92,7 +98,8 @@ impl PromptRepository for PostgresDb {
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, tags, project,
-                      attribution_correlation_id, attribution_tags, created_at
+                      attribution_correlation_id, attribution_tags,
+                      experiment_id, experiment_variant, created_at
                FROM prompts ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
         )
         .bind(limit)

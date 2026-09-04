@@ -9,7 +9,8 @@ use crate::{
         admin_users::AdminUserRepository, aliases::AliasRepository, api_keys::ApiKeyRepository,
         app_settings::AppSettingsRepository,
         audit::AuditRepository,
-        budgets::BudgetRepository, costs::CostRepository, failures::FailureRepository,
+        budgets::BudgetRepository, costs::CostRepository, experiments::ExperimentRepository,
+        failures::FailureRepository, outcomes::OutcomeRepository,
         hooks::HookRepository,
         groups::GroupRepository,
         webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
@@ -29,6 +30,8 @@ pub trait DatabaseProvider:
     + SessionRepository
     + PromptRepository
     + CostRepository
+    + ExperimentRepository
+    + OutcomeRepository
     + FailureRepository
     + BudgetRepository
     + AuditRepository
@@ -53,6 +56,8 @@ impl<T> DatabaseProvider for T where
         + SessionRepository
         + PromptRepository
         + CostRepository
+        + ExperimentRepository
+        + OutcomeRepository
         + FailureRepository
         + BudgetRepository
         + AuditRepository
