@@ -447,6 +447,7 @@ mod accounting {
             callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
             guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
             oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+            experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
         };
         let server = if real_port {
             // A real socket, so a test can read the body chunk by chunk and

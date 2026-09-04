@@ -127,6 +127,7 @@ async fn build_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
         callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
     (TestServer::new(build_router(state)).unwrap(), db)
 }

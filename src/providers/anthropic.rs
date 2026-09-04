@@ -438,8 +438,7 @@ mod sse_translator_tests {
         let final_chunk = out
             .lines()
             .filter_map(|l| l.strip_prefix("data: "))
-            .filter(|d| *d != "[DONE]")
-            .next_back()
+            .rfind(|d| *d != "[DONE]")
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(final_chunk).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
