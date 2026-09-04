@@ -1834,7 +1834,10 @@ async fn report_compare(
 }
 
 /// Render a comparison: the full JSON document (identical to the endpoint's)
-/// or a metric-per-row table/CSV with the coverage line and caveats beneath.
+/// or a metric-per-row table/CSV. The honesty data — latency sample counts
+/// and unpriced models — are rows in both, so a CSV consumer sees them too;
+/// only the prose (coverage sentence, TTFT note, caveats) is table-only, since
+/// it is constant text documented in `docs/experiments.md`.
 fn write_comparison(
     c: &crate::api::admin::compare::Comparison,
     format: OutputFormat,
@@ -1871,6 +1874,9 @@ fn write_comparison(
         delta: d.0,
         percent: d.1,
     };
+    let unpriced = |m: &crate::api::admin::compare::ArmMetrics| {
+        if m.unpriced { m.unpriced_models.join(", ") } else { dash.clone() }
+    };
     let (a, b, d) = (&c.a, &c.b, &c.delta);
 
     let rows = vec![
@@ -1888,6 +1894,10 @@ fn write_comparison(
         row("Total tokens out", int(a.tokens_out), int(b.tokens_out), delta(d.tokens_out, &|v| format!("{:.0}", v))),
         row("Cache hits", int(a.cache_hits), int(b.cache_hits), (dash.clone(), dash.clone())),
         row("Failures", int(a.failures), int(b.failures), (dash.clone(), dash.clone())),
+        // Latency and cost have different denominators; carry both so a CSV
+        // reader can see how much of each arm the latency figures cover.
+        row("Latency samples", int(a.latency.samples), int(b.latency.samples), (dash.clone(), dash.clone())),
+        row("Unpriced models", unpriced(a), unpriced(b), (dash.clone(), dash.clone())),
     ];
     if table {
         writeln!(out, "Compare by {}: A = {}  B = {}  (window: {})", c.dimension, a.label, b.label, c.window)?;
@@ -2174,6 +2184,20 @@ mod tests {
         assert!(text.contains("stream: false"), "{}", text);
         assert!(text.contains("not recorded"), "{}", text);
         assert!(text.contains("p95 latency"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn compare_csv_carries_latency_samples_and_unpriced_models() {
+        // CSV has no room for the prose beneath the table, so the honesty
+        // data rides along as ordinary metric rows instead.
+        let sources = seeded_sources().await;
+        let comparison = build_comparison(&sources, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Csv, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Latency samples,2,1,-,-"), "{}", text);
+        assert!(text.contains("Unpriced models,m1,m2,-,-"), "{}", text);
+        assert!(!text.contains("Coverage:"), "{}", text);
     }
 
     #[tokio::test]
