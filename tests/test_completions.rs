@@ -124,20 +124,6 @@ async fn valid_request_returns_200() {
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
 }
 
-#[test]
-fn extract_text_from_sse_chunk_returns_delta_content() {
-    let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n";
-    let result = modelrouter::api::routes::completions::extract_text_from_sse(chunk);
-    assert_eq!(result, Some("Hello".to_string()));
-}
-
-#[test]
-fn extract_text_from_done_returns_empty() {
-    let chunk = b"data: [DONE]\n\n";
-    let result = modelrouter::api::routes::completions::extract_text_from_sse(chunk);
-    assert!(result.is_none());
-}
-
 struct BlockAllGuardrail;
 
 #[async_trait::async_trait]
@@ -261,7 +247,6 @@ mod accounting {
     use modelrouter::config::schema::{PricingEntry, Settings, StorageConfig};
     use modelrouter::db::models::{NewApiKey, NewUser};
     use modelrouter::db::repositories::api_keys::ApiKeyRepository;
-    use modelrouter::db::repositories::costs::CostRepository;
     use modelrouter::db::repositories::failures::FailureRepository;
     use modelrouter::db::repositories::prompts::PromptRepository;
     use modelrouter::db::repositories::users::UserRepository;
@@ -279,7 +264,6 @@ mod accounting {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    const FOREVER: &str = "2999-01-01T00:00:00Z";
 
     /// One scripted stream chunk: bytes to yield, an error to raise, or a
     /// stall that never resolves (so a client can abandon the response).
@@ -478,22 +462,6 @@ mod accounting {
         })
     }
 
-    /// Ledger writes are fire-and-forget, so poll rather than sleep.
-    async fn wait_for_ledger_rows(
-        db: &Arc<dyn DatabaseProvider>,
-        want: usize,
-    ) -> Vec<modelrouter::db::models::CostLedgerEntry> {
-        for _ in 0..200 {
-            let rows = CostRepository::list_cost_entries_before(&**db, FOREVER)
-                .await
-                .unwrap();
-            if rows.len() >= want {
-                return rows;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {want} cost-ledger rows");
-    }
 
     fn close_to(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -516,7 +484,7 @@ mod accounting {
         let body: serde_json::Value = resp.json();
         assert_eq!(body["model"], "mini-model", "the response names the model that answered");
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].model, "mini-model");
         assert_eq!(ledger[0].provider, "backup");
@@ -546,7 +514,7 @@ mod accounting {
         assert_eq!(resp.status_code(), 200);
         assert_eq!(resp.json::<serde_json::Value>()["model"], "big-model");
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert_eq!(ledger[0].model, "big-model");
         assert_eq!(ledger[0].provider, "primary");
         assert!(close_to(ledger[0].cost_usd, 0.15), "cost was {}", ledger[0].cost_usd);
@@ -573,7 +541,7 @@ mod accounting {
         assert_eq!(resp.status_code(), 200);
         assert!(resp.text().contains("Hello"));
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert_eq!(ledger[0].model, "big-model");
         assert_eq!(ledger[0].provider, "primary");
         assert_eq!(ledger[0].tokens_in, 40);
@@ -600,7 +568,7 @@ mod accounting {
             .await;
         assert_eq!(resp.status_code(), 200);
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert!(ledger[0].tokens_estimated);
         // Twelve characters of output at four characters per token.
         assert_eq!(ledger[0].tokens_out, 3);
@@ -637,7 +605,7 @@ mod accounting {
             .await;
         assert_eq!(resp.status_code(), 200);
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert_eq!(ledger[0].tokens_in, 50, "input plus cache-read tokens");
         assert_eq!(ledger[0].tokens_out, 7);
         assert!(!ledger[0].tokens_estimated);
@@ -673,7 +641,7 @@ mod accounting {
             while body.next().await.is_some() {}
         }
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert_eq!(ledger.len(), 1);
         assert!(ledger[0].tokens_estimated);
         // "partial answer" is fourteen characters: three estimated tokens.
@@ -711,7 +679,7 @@ mod accounting {
         // dropped without ever seeing [DONE].
         drop(body);
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert_eq!(ledger.len(), 1);
         assert!(ledger[0].tokens_estimated);
         assert_eq!(ledger[0].tokens_out, 2);
@@ -733,7 +701,7 @@ mod accounting {
             .await;
         assert_eq!(resp.status_code(), 200);
 
-        let ledger = wait_for_ledger_rows(&db, 1).await;
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
         assert!(ledger[0].tokens_estimated);
         let prompts = PromptRepository::list(&*db, 10, 0).await.unwrap();
         assert_eq!(prompts[0].finish_reason.as_deref(), Some("aborted"));

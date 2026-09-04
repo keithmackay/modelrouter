@@ -6,18 +6,14 @@
 
 mod common;
 
+use common::{create_user, wait_for_ledger_rows, FOREVER};
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
-use modelrouter::api::auth::hash_token;
 use modelrouter::config::schema::{CacheConfig, PricingEntry, Settings};
-use modelrouter::db::models::{
-    FailureStage, NewApiKey, NewCostLedgerEntry, NewRequestFailure, NewUser,
-};
-use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+use modelrouter::db::models::{FailureStage, NewCostLedgerEntry, NewRequestFailure};
 use modelrouter::db::repositories::costs::CostRepository;
 use modelrouter::db::repositories::failures::FailureRepository;
 use modelrouter::db::repositories::outcomes::OutcomeRepository;
-use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::providers::{
     embed_registry::EmbeddingRegistry, registry::ProviderRegistry, search::SearchResultItem,
     search_registry::SearchRegistry,
@@ -30,38 +26,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const FOREVER: &str = "2999-01-01T00:00:00Z";
 /// Bearer token of the first user (id 1).
 const TOKEN_A: &str = "token-a";
 /// Bearer token of the second user (id 2).
 const TOKEN_B: &str = "token-b";
-
-async fn create_user(db: &impl DatabaseProvider, name: &str, token: &str) -> i64 {
-    UserRepository::create(
-        db,
-        NewUser {
-            name: name.to_string(),
-            email: None,
-        },
-    )
-    .await
-    .unwrap();
-    let user = UserRepository::find_by_name(db, name).await.unwrap().unwrap();
-    ApiKeyRepository::create_api_key(
-        db,
-        NewApiKey {
-            user_id: user.id,
-            key_hash: hash_token(token),
-            label: Some(name.to_string()),
-            expires_at: None,
-            project: None,
-            session_window_secs: None,
-        },
-    )
-    .await
-    .unwrap();
-    user.id
-}
 
 /// Two users with one key each, so cross-key scoping can be exercised.
 async fn build_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
@@ -139,27 +107,12 @@ fn bearer(token: &str) -> (axum::http::HeaderName, axum::http::HeaderValue) {
     )
 }
 
-/// Cost logging is fire-and-forget, so poll until the expected number of ledger
-/// rows exists rather than sleeping for a guessed interval.
-async fn wait_for_ledger_rows(db: &Arc<dyn DatabaseProvider>, want: i64) {
-    for _ in 0..200 {
-        let rows = CostRepository::list_cost_entries_before(&**db, FOREVER)
-            .await
-            .unwrap();
-        if rows.len() as i64 >= want {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for {} cost-ledger rows", want);
-}
-
 /// One completion through the proxy under `run`, then wait for its ledger row.
 async fn complete(server: &TestServer, db: &Arc<dyn DatabaseProvider>, token: &str, run: &str) {
     let before = CostRepository::list_cost_entries_before(&**db, FOREVER)
         .await
         .unwrap()
-        .len() as i64;
+        .len();
     let resp = server
         .post("/v1/chat/completions")
         .add_header(bearer(token).0, bearer(token).1)
@@ -170,7 +123,7 @@ async fn complete(server: &TestServer, db: &Arc<dyn DatabaseProvider>, token: &s
         }))
         .await;
     assert_eq!(resp.status_code(), 200);
-    wait_for_ledger_rows(db, before + 1).await;
+    wait_for_ledger_rows(&**db, before + 1).await;
 }
 
 /// A hand-built ledger row, optionally stamped with an experiment.

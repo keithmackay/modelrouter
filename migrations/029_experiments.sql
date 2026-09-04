@@ -76,3 +76,10 @@ CREATE INDEX IF NOT EXISTS idx_request_failures_experiment
 -- this index (023), prompts did not.
 CREATE INDEX IF NOT EXISTS idx_prompts_correlation
     ON prompts (attribution_correlation_id, created_at);
+
+-- Feedback looks a run up by (user, correlation id); correlation ids are
+-- caller-chosen and may repeat across users, so the user leads the index.
+CREATE INDEX IF NOT EXISTS idx_cost_ledger_user_correlation
+    ON cost_ledger (user_id, attribution_correlation_id);
+CREATE INDEX IF NOT EXISTS idx_request_failures_user_correlation
+    ON request_failures (user_id, attribution_correlation_id);

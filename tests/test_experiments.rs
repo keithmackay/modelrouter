@@ -10,26 +10,24 @@
 #[allow(dead_code)]
 mod common;
 
+use common::create_user;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
-use modelrouter::api::auth::hash_token;
 use modelrouter::config::schema::{
     CacheConfig, LbPoolEntry, LbStrategy, LoadBalancerConfig, PricingEntry, Settings,
     StorageConfig,
 };
 use modelrouter::db::models::{
-    CostLedgerEntry, ExperimentVariants, NewApiKey, NewExperiment, NewUser, Prompt,
-    RequestFailure, RunStamp, VariantTarget,
+    CostLedgerEntry, ExperimentVariants, NewExperiment, Prompt, RequestFailure, RunStamp,
+    VariantTarget,
 };
-use modelrouter::db::repositories::api_keys::ApiKeyRepository;
 use modelrouter::db::repositories::costs::CostRepository;
 use modelrouter::db::repositories::experiments::ExperimentRepository;
 use modelrouter::db::repositories::failures::FailureRepository;
 use modelrouter::db::repositories::prompts::PromptRepository;
-use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::providers::adapter::{
     CompletionResult, NormalizedRequest, ProviderAdapter, SseStream,
 };
@@ -44,7 +42,6 @@ use modelrouter::router::{
 };
 use serde_json::{json, Value};
 
-const FOREVER: &str = "2999-01-01T00:00:00Z";
 /// Bearer token of the first user (id 1).
 const TOKEN_A: &str = "token-a";
 /// Bearer token of the second user (id 2).
@@ -158,16 +155,7 @@ impl Harness {
 
     /// Cost logging is fire-and-forget, so poll rather than sleep.
     async fn wait_for_ledger_rows(&self, want: usize) -> Vec<CostLedgerEntry> {
-        for _ in 0..200 {
-            let rows = CostRepository::list_cost_entries_before(&*self.db, FOREVER)
-                .await
-                .unwrap();
-            if rows.len() >= want {
-                return rows;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {want} cost-ledger rows");
+        common::wait_for_ledger_rows(&*self.db, want).await
     }
 
     /// The ledger stamp for one run. Used where a row may carry no prompt id,
@@ -215,33 +203,6 @@ impl Default for Options {
             pool: false,
         }
     }
-}
-
-async fn create_user(db: &impl DatabaseProvider, name: &str, token: &str) -> i64 {
-    UserRepository::create(
-        db,
-        NewUser {
-            name: name.to_string(),
-            email: None,
-        },
-    )
-    .await
-    .unwrap();
-    let user = UserRepository::find_by_name(db, name).await.unwrap().unwrap();
-    ApiKeyRepository::create_api_key(
-        db,
-        NewApiKey {
-            user_id: user.id,
-            key_hash: hash_token(token),
-            label: Some(name.to_string()),
-            expires_at: None,
-            project: None,
-            session_window_secs: None,
-        },
-    )
-    .await
-    .unwrap();
-    user.id
 }
 
 /// Two users, a priced alias `planner` -> `mock/model-a`, a fallback chain

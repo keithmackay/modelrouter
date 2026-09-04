@@ -14,7 +14,10 @@ use axum::{extract::State, Json};
 use serde_json::Value;
 
 use crate::{
-    api::{app::AppState, attribution::MAX_CORRELATION_LEN, auth::AuthenticatedUser, error::ApiError},
+    api::{
+        app::AppState, attribution::validate_correlation_id_field, auth::AuthenticatedUser,
+        error::ApiError,
+    },
     db::{
         models::{NewRunOutcome, RunOutcome},
         repositories::{costs::CostRepository, failures::FailureRepository, outcomes::OutcomeRepository},
@@ -50,7 +53,7 @@ pub async fn post_feedback(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<RunOutcome>, ApiError> {
-    crate::api::routes::completions::reject_experiment_header("/v1/feedback", &headers)?;
+    crate::api::routes::reject_experiment_header("/v1/feedback", &headers)?;
     let user = user.0;
     let obj = body
         .as_object()
@@ -62,7 +65,7 @@ pub async fn post_feedback(
                 "correlation_id is required".to_string(),
             ))
         }
-        Some(Value::String(s)) => validate_correlation_id(s)?,
+        Some(Value::String(s)) => validate_correlation_id_field("correlation_id", s)?,
         Some(_) => {
             return Err(ApiError::InvalidRequest(
                 "correlation_id must be a string".to_string(),
@@ -175,40 +178,3 @@ pub async fn post_feedback(
     Ok(Json(row))
 }
 
-/// Same shape rules as `attribution.correlation_id`, so an id accepted on a
-/// request is accepted here and vice versa: non-empty after trimming, bounded
-/// length, printable ASCII.
-fn validate_correlation_id(raw: &str) -> Result<String, ApiError> {
-    let v = raw.trim();
-    if v.is_empty() {
-        return Err(ApiError::InvalidRequest(
-            "correlation_id must not be empty".to_string(),
-        ));
-    }
-    if v.chars().count() > MAX_CORRELATION_LEN {
-        return Err(ApiError::InvalidRequest(format!(
-            "correlation_id must be at most {} characters",
-            MAX_CORRELATION_LEN
-        )));
-    }
-    if !v.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-        return Err(ApiError::InvalidRequest(
-            "correlation_id contains unsupported characters".to_string(),
-        ));
-    }
-    Ok(v.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn correlation_id_is_trimmed_and_bounded() {
-        assert_eq!(validate_correlation_id("  run-1 ").unwrap(), "run-1");
-        assert!(validate_correlation_id("   ").is_err());
-        assert!(validate_correlation_id(&"x".repeat(MAX_CORRELATION_LEN)).is_ok());
-        assert!(validate_correlation_id(&"x".repeat(MAX_CORRELATION_LEN + 1)).is_err());
-        assert!(validate_correlation_id("a\nb").is_err());
-    }
-}

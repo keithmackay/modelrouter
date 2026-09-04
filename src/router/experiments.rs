@@ -346,6 +346,13 @@ fn is_label_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
 }
 
+/// Whether `label` is a legal variant label: `[A-Za-z0-9_.-]{1,64}`. The
+/// admin API checks labels at creation with the same rule the header parser
+/// applies, so a stored label is always bindable.
+pub fn is_valid_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= MAX_LABEL_LEN && label.bytes().all(is_label_byte)
+}
+
 /// FNV-1a, 64-bit. Stable across platforms and versions, which matters
 /// because a session's variant must not change over the experiment's life.
 fn fnv1a_64(bytes: &[u8]) -> u64 {

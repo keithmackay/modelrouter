@@ -35,7 +35,7 @@ use crate::api::{
 use crate::db::models::{Experiment, ExperimentVariants, NewExperiment, VariantTarget};
 use crate::db::repositories::experiments::{ExperimentRepository, ExperimentStatusFilter};
 use crate::db::repositories::users::UserRepository;
-use crate::router::experiments::MAX_LABEL_LEN;
+use crate::router::experiments::{is_valid_label, MAX_LABEL_LEN};
 
 /// Bounds on a create request. Labels are further limited to
 /// [`MAX_LABEL_LEN`] so they always fit the request header.
@@ -45,6 +45,8 @@ const MAX_VARIANTS: usize = 16;
 const MAX_OVERLAY_ENTRIES: usize = 32;
 const MAX_EXPR_LEN: usize = 128;
 const MAX_RETENTION_DAYS: i64 = 3650;
+/// Upper bound on `allowed_user_ids`; each id costs one lookup at creation.
+const MAX_ALLOWED_USERS: usize = 64;
 
 // ── Body validation ───────────────────────────────────────────────────────────
 
@@ -61,14 +63,6 @@ struct ParsedCreate {
     content_retention_days: i64,
 }
 
-/// Whether `label` is a legal variant label: `[A-Za-z0-9_.-]{1,64}`.
-fn label_ok(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= MAX_LABEL_LEN
-        && label
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
-}
 
 fn require<'a>(body: &'a Value, field: &str) -> Result<&'a Value, String> {
     match body.get(field) {
@@ -131,7 +125,7 @@ fn parse_create(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<Pars
     // duplicate silently; distinctness is re-checked as the BTreeMap fills.
     let mut variants: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for (label, overlay) in raw_variants {
-        if !label_ok(label) {
+        if !is_valid_label(label) {
             return Err(format!(
                 "variants: label '{label}' must match [A-Za-z0-9_.-]{{1,{MAX_LABEL_LEN}}}"
             ));
@@ -200,6 +194,11 @@ fn parse_create(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<Pars
             let arr = v
                 .as_array()
                 .ok_or_else(|| "allowed_user_ids must be an array of integers".to_string())?;
+            if arr.len() > MAX_ALLOWED_USERS {
+                return Err(format!(
+                    "allowed_user_ids must have at most {MAX_ALLOWED_USERS} entries"
+                ));
+            }
             let mut ids = Vec::with_capacity(arr.len());
             for item in arr {
                 let id = item
@@ -307,6 +306,13 @@ fn parse_id(id: &str) -> Result<i64, ApiError> {
         .ok_or_else(|| ApiError::InvalidRequest(format!("invalid experiment id: {id}")))
 }
 
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::Database(db)) if db.is_unique_violation()
+    )
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// POST /admin/api/experiments
@@ -317,16 +323,6 @@ pub async fn create_experiment_api(
 ) -> Result<impl IntoResponse, ApiError> {
     let now = chrono::Utc::now();
     let parsed = parse_create(&body, now).map_err(ApiError::InvalidRequest)?;
-
-    let existing = ExperimentRepository::list(&*state.db, ExperimentStatusFilter::All)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    if existing.iter().any(|e| e.name == parsed.name) {
-        return Err(ApiError::InvalidRequest(format!(
-            "name '{}' is already taken",
-            parsed.name
-        )));
-    }
 
     for id in &parsed.allowed_user_ids {
         let known = UserRepository::find_by_id(&*state.db, *id)
@@ -341,10 +337,11 @@ pub async fn create_experiment_api(
 
     let variants = gate_variants(&state, &parsed.variants).map_err(ApiError::InvalidRequest)?;
 
+    let name = parsed.name;
     let row = ExperimentRepository::create(
         &*state.db,
         NewExperiment {
-            name: parsed.name,
+            name: name.clone(),
             variants,
             allowed_user_ids: parsed.allowed_user_ids,
             feed_learning: parsed.feed_learning,
@@ -355,6 +352,10 @@ pub async fn create_experiment_api(
     )
     .await
     .map_err(|e| {
+        // `experiments.name` is UNIQUE; the constraint is the duplicate check.
+        if is_unique_violation(&e) {
+            return ApiError::InvalidRequest(format!("name '{name}' is already taken"));
+        }
         tracing::error!(error = %e, "failed to create experiment");
         ApiError::Internal
     })?;
@@ -487,12 +488,12 @@ mod tests {
 
     #[test]
     fn labels_follow_the_header_charset() {
-        assert!(label_ok("control"));
-        assert!(label_ok("v1.2_b-3"));
-        assert!(!label_ok(""));
-        assert!(!label_ok("has space"));
-        assert!(!label_ok("colon:no"));
-        assert!(!label_ok(&"x".repeat(MAX_LABEL_LEN + 1)));
+        assert!(is_valid_label("control"));
+        assert!(is_valid_label("v1.2_b-3"));
+        assert!(!is_valid_label(""));
+        assert!(!is_valid_label("has space"));
+        assert!(!is_valid_label("colon:no"));
+        assert!(!is_valid_label(&"x".repeat(MAX_LABEL_LEN + 1)));
     }
 
     #[test]

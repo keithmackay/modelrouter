@@ -57,7 +57,7 @@ fn reject_experiment_header(
     endpoint: &'static str,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    crate::api::routes::completions::reject_experiment_header(endpoint, headers).map_err(|e| {
+    crate::api::routes::reject_experiment_header(endpoint, headers).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),

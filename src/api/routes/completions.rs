@@ -10,29 +10,8 @@ use crate::{
     db::{
         models::{NewCostLedgerEntry, NewPrompt},
     },
-    router::{experiments::BindError, policy::PolicyDecision},
+    router::policy::PolicyDecision,
 };
-
-/// Log a refused experiment header under one stable event name, then hand the
-/// error on to become the 400. Every refusal — a bind that failed here or the
-/// header on an endpoint that does not run experiments — goes through this so
-/// rejections can be counted from the logs without any metric plumbing.
-pub(crate) fn experiment_bind_rejected(endpoint: &'static str, err: BindError) -> ApiError {
-    tracing::warn!(endpoint, error = %err, "experiment_bind_rejected");
-    ApiError::from(err)
-}
-
-/// Refuse `x-modelrouter-experiment` on an endpoint that does not run
-/// experiments. Called first thing by every `/v1` handler other than chat
-/// completions, so a caller who sets the header by mistake gets a 400 rather
-/// than unmarked traffic.
-pub fn reject_experiment_header(
-    endpoint: &'static str,
-    headers: &axum::http::HeaderMap,
-) -> Result<(), ApiError> {
-    crate::router::experiments::reject_header(headers)
-        .map_err(|e| experiment_bind_rejected(endpoint, e))
-}
 
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -105,7 +84,7 @@ async fn chat_completions_inner(
             user.id,
             chrono::Utc::now().timestamp(),
         )
-        .map_err(|e| experiment_bind_rejected("/v1/chat/completions", e))?;
+        .map_err(|e| super::experiment_bind_rejected("/v1/chat/completions", e))?;
     let experiment_id = binding.as_ref().map(|b| b.experiment_id);
     let experiment_variant = binding.as_ref().map(|b| b.variant.clone());
     let retain_content = binding.as_ref().is_some_and(|b| b.retain_content);
@@ -1347,24 +1326,6 @@ pub fn should_skip_logging(headers: &axum::http::HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-/// Extract text content from an SSE chunk for token estimation.
-/// Returns Some(text) for data chunks, None for [DONE] or invalid.
-pub fn extract_text_from_sse(chunk: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(chunk).ok()?;
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                return None;
-            }
-            if let Ok(json) = serde_json::from_str::<Value>(data) {
-                let content = json["choices"][0]["delta"]["content"].as_str()?;
-                return Some(content.to_string());
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

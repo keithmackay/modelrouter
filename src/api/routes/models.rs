@@ -14,7 +14,7 @@ pub async fn list_models(
 ) -> Result<Json<Value>, ApiError> {
     use crate::db::repositories::models::ModelRepository;
 
-    crate::api::routes::completions::reject_experiment_header("/v1/models", &headers)?;
+    crate::api::routes::reject_experiment_header("/v1/models", &headers)?;
     let availability = state.router.availability();
 
     let mut models: Vec<Value> = state

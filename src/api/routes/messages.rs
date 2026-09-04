@@ -121,7 +121,7 @@ async fn anthropic_messages_inner(
 ) -> Result<Response, ApiError> {
     use std::time::Instant;
 
-    crate::api::routes::completions::reject_experiment_header("/v1/messages", &headers)?;
+    crate::api::routes::reject_experiment_header("/v1/messages", &headers)?;
     let user = user.0;
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let requested_model = body["model"]

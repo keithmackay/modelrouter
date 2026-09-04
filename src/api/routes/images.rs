@@ -29,7 +29,7 @@ async fn image_generations_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
-    crate::api::routes::completions::reject_experiment_header(
+    crate::api::routes::reject_experiment_header(
         "/v1/images/generations",
         &headers,
     )?;
