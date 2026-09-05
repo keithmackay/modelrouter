@@ -20,6 +20,7 @@ fn router_with_aliases() -> RequestRouter {
         shortcuts: Default::default(),
         strict_model_resolution: false,
         default_search_engine: None,
+        search_fallback_chains: HashMap::new(),
     };
     RequestRouter::new(Arc::new(settings))
 }

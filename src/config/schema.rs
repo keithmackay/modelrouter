@@ -406,6 +406,12 @@ pub struct RoutingConfig {
     /// `strict_model_resolution` exists to prevent for chat models.
     #[serde(default)]
     pub default_search_engine: Option<String>,
+    /// Fallback chains for search engines (engine → ordered list of fallback engines).
+    /// Shape-consistent with `fallback_chains` for LLM routing. When a search request
+    /// fails due to provider error (timeout, 5xx, rate-limit), the chain is walked.
+    /// Caller errors (invalid query → 400) never trigger failover.
+    #[serde(default)]
+    pub search_fallback_chains: HashMap<String, Vec<String>>,
 }
 
 impl Default for RoutingConfig {
@@ -420,6 +426,7 @@ impl Default for RoutingConfig {
             shortcuts: RoutingShortcutsConfig::default(),
             strict_model_resolution: false,
             default_search_engine: None,
+            search_fallback_chains: HashMap::new(),
         }
     }
 }

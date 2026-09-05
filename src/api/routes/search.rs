@@ -181,13 +181,15 @@ async fn search_inner(
 
     if let Some(ref key) = cache_key {
         if let Some(payload) = state.response_cache.get_search(key, &pseudo_model).await {
-            tracing::info!(engine = engine.as_str(), "search cache hit");
+            // Cache hit: the cached payload already names the serving engine.
+            let cached_engine = payload["engine"].as_str().unwrap_or(&engine);
+            tracing::info!(engine = cached_engine, "search cache hit");
             let results_returned = payload["results"].as_array().map(|r| r.len()).unwrap_or(0) as i64;
             record_search_cache_hit(
                 &state,
                 &user,
                 &pseudo_model,
-                &engine,
+                cached_engine,
                 results_returned,
                 cost,
                 &attribution,
@@ -208,22 +210,79 @@ async fn search_inner(
         }
     }
 
-    let adapter = state
-        .search_registry
-        .get(&engine)
-        .map_err(ApiError::ProviderError)?;
-
+    // ── Fallback chain walk ──────────────────────────────────────────────────
+    // Try the primary engine, then walk the chain on provider errors (adapter/
+    // provider failures: timeouts, 5xx, rate-limit, connection issues). Do NOT
+    // fail over on caller errors (invalid query → 400). Skip chain entries that
+    // are unsupported/unconfigured. Return the last error if the chain exhausts.
     let req = SearchRequest {
         query: query.clone(),
         max_results,
     };
 
-    let start = Instant::now();
-    let result = adapter
-        .search(&req)
-        .await
-        .map_err(ApiError::ProviderError)?;
-    let latency_ms = start.elapsed().as_millis() as i64;
+    let chain = state
+        .settings
+        .routing
+        .search_fallback_chains
+        .get(&engine)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let mut engines_to_try = vec![engine.clone()];
+    engines_to_try.extend_from_slice(chain);
+
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut serving_engine = String::new();
+    let mut result = None;
+    let mut latency_ms = 0_i64;
+
+    for candidate in &engines_to_try {
+        if !crate::providers::search_registry::is_supported_engine(candidate) {
+            tracing::debug!(
+                engine = candidate,
+                "skipping unsupported engine in fallback chain"
+            );
+            continue;
+        }
+
+        let adapter = match state.search_registry.get(candidate) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(
+                    engine = candidate,
+                    error = %e,
+                    "skipping unconfigured engine in fallback chain"
+                );
+                continue;
+            }
+        };
+
+        let start = Instant::now();
+        match adapter.search(&req).await {
+            Ok(res) => {
+                latency_ms = start.elapsed().as_millis() as i64;
+                serving_engine = candidate.clone();
+                result = Some(res);
+                break;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                tracing::warn!(
+                    engine = candidate,
+                    error = %last_error.as_ref().unwrap(),
+                    "search engine failed, trying next in chain"
+                );
+            }
+        }
+    }
+
+    let result = result.ok_or_else(|| {
+        ApiError::ProviderError(
+            last_error.unwrap_or_else(|| {
+                anyhow::anyhow!("all engines in the fallback chain are unconfigured or unsupported")
+            }),
+        )
+    })?;
 
     let results_returned = result.results.len() as i64;
 
@@ -231,13 +290,14 @@ async fn search_inner(
     span.record("cost.usd", cost);
     span.record("results.count", results_returned);
 
+    // Metrics and cost tracking use the serving_engine, not the requested engine.
     #[cfg(feature = "otel")]
     {
-        crate::telemetry::metrics::record_request(&pseudo_model, &engine, "ok");
-        crate::telemetry::metrics::record_cost(&pseudo_model, &engine, user.id, cost);
+        crate::telemetry::metrics::record_request(&pseudo_model, &serving_engine, "ok");
+        crate::telemetry::metrics::record_cost(&pseudo_model, &serving_engine, user.id, cost);
         crate::telemetry::metrics::record_duration(
             &pseudo_model,
-            &engine,
+            &serving_engine,
             false,
             latency_ms as f64,
         );
@@ -245,13 +305,13 @@ async fn search_inner(
 
     #[cfg(feature = "prometheus")]
     if let Some(ref metrics) = state.app_metrics {
-        metrics.record_request(&pseudo_model, &engine, "ok");
-        metrics.record_cost(&pseudo_model, &engine, cost);
+        metrics.record_request(&pseudo_model, &serving_engine, "ok");
+        metrics.record_cost(&pseudo_model, &serving_engine, cost);
     }
 
     // Fire-and-forget cost recording
     let state_clone = state.clone();
-    let engine_clone = engine.clone();
+    let engine_clone = serving_engine.clone();
     let pseudo_model_clone = pseudo_model.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
@@ -312,7 +372,7 @@ async fn search_inner(
     });
 
     let payload = serde_json::json!({
-        "engine": result.engine,
+        "engine": serving_engine,
         "results": result.results,
         "usage": {
             "results": results_returned,
