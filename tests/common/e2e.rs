@@ -189,8 +189,15 @@ impl RouterProcess {
         if let Some(p) = port_flag {
             cmd.arg("--port").arg(p.to_string());
         }
+        // HOME must point at the fixture's own directory. `init` writes to the
+        // home directory and several defaults resolve under it, so a child that
+        // inherited the developer's real HOME would read and migrate their
+        // actual ~/.modelrouter/router.db — which is how this fixture used to
+        // fail against the state of the machine it ran on rather than against
+        // the config it was handed.
         let child = cmd
             .env("MODELROUTER_CONFIG", &config_path)
+            .env("HOME", dir.path())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
             .spawn()
