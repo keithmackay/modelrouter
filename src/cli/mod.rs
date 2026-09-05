@@ -1941,6 +1941,16 @@ fn write_comparison(
     ];
     if table {
         writeln!(out, "Compare by {}: A = {}  B = {}  (window: {})", c.dimension, a.label, b.label, c.window)?;
+        if let Some(exp) = &c.experiment {
+            writeln!(
+                out,
+                "Experiment: {} (#{}, {}{})",
+                exp.name,
+                exp.id,
+                exp.status.as_str(),
+                if exp.retain_content { ", retains content" } else { "" }
+            )?;
+        }
     }
     write_rows(
         &rows,
@@ -1963,6 +1973,9 @@ fn write_comparison(
         writeln!(out, "{}", c.ttft_note)?;
         for caveat in c.caveats {
             writeln!(out, "Note: {}", caveat)?;
+        }
+        if let Some(exp) = &c.experiment {
+            writeln!(out, "Note: {}", exp.stored_content_note)?;
         }
     }
     Ok(())
@@ -2279,6 +2292,133 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("0.0%"), "{}", text);
         assert!(!text.contains("+0.0%"), "{}", text);
+    }
+
+    /// An experiment with two variants and stamped ledger rows on each arm.
+    async fn seeded_variant_sources() -> (CompareSources, i64) {
+        use crate::db::repositories::experiments::ExperimentRepository;
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        crate::db::repositories::users::UserRepository::create(
+            &db,
+            crate::db::models::NewUser { name: "u".into(), email: None },
+        )
+        .await
+        .unwrap();
+        let mut variants: crate::db::models::ExperimentVariants = Default::default();
+        variants.insert("control".into(), Default::default());
+        variants.insert("candidate".into(), Default::default());
+        let exp = ExperimentRepository::create(&db, crate::db::models::NewExperiment {
+            name: "exp".into(),
+            variants,
+            allowed_user_ids: vec![],
+            feed_learning: false,
+            expires_at: 4_102_444_800,
+            retain_content: true,
+            content_retention_days: 0,
+        })
+        .await
+        .unwrap();
+        for (variant, latency) in [("control", 100), ("control", 300), ("candidate", 50)] {
+            CostRepository::create(&db, NewCostLedgerEntry {
+                user_id: 1, prompt_id: None, model: "m".into(), provider: "p".into(),
+                project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: Some(exp.id),
+                experiment_variant: Some(variant.into()),
+                tokens_estimated: false,
+            }).await.unwrap();
+            PromptRepository::create(&db, NewPrompt {
+                user_id: 1, session_id: None, request_model: "m".into(), routed_model: "m".into(),
+                provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
+                prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+                cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: Some(exp.id),
+                experiment_variant: Some(variant.into()),
+            }).await.unwrap();
+        }
+        let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+        let sources = CompareSources {
+            prompt_db: db.clone(),
+            db,
+            cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&[])),
+        };
+        (sources, exp.id)
+    }
+
+    fn variant_query(experiment: i64) -> CompareQuery {
+        CompareQuery {
+            dimension: "variant".into(),
+            key: experiment.to_string(),
+            a: "control".into(),
+            b: "candidate".into(),
+            window: "all".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_variant_json_carries_the_arms_and_the_experiment() {
+        let (sources, exp) = seeded_variant_sources().await;
+        let comparison = build_comparison(&sources, &variant_query(exp)).await.unwrap();
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Json, &mut out).unwrap();
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed["dimension"], "variant");
+        assert_eq!(printed["key"], exp.to_string());
+        assert_eq!(printed["a"]["label"], format!("experiment={exp}:control"));
+        assert_eq!(printed["a"]["requests"], 2);
+        assert_eq!(printed["a"]["latency"]["p95_ms"], 300);
+        assert_eq!(printed["b"]["label"], format!("experiment={exp}:candidate"));
+        assert_eq!(printed["b"]["requests"], 1);
+        assert_eq!(printed["experiment"]["name"], "exp");
+        assert_eq!(printed["experiment"]["retain_content"], true);
+        assert!(printed["caveats"][0].as_str().unwrap().contains("/admin/experiments"));
+    }
+
+    #[tokio::test]
+    async fn compare_variant_csv_and_table_carry_the_arms() {
+        let (sources, exp) = seeded_variant_sources().await;
+        let comparison = build_comparison(&sources, &variant_query(exp)).await.unwrap();
+
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Csv, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        let requests = csv.lines().find(|l| l.starts_with("Requests")).unwrap();
+        assert_eq!(requests, "Requests,2,1,-1,-50.0%", "{csv}");
+        assert!(csv.lines().any(|l| l.starts_with("p95 latency (ms),300,50,")), "{csv}");
+        assert!(!csv.contains("Note:"), "csv must be rows only: {csv}");
+
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(&format!("Compare by variant: A = experiment={exp}:control  B = experiment={exp}:candidate")), "{text}");
+        assert!(text.contains(&format!("Experiment: exp (#{exp}, active, retains content)")), "{text}");
+        assert!(text.contains("never purged"), "{text}");
+        assert!(text.contains("/admin/experiments"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn compare_variant_rejects_an_undeclared_label_and_an_unknown_experiment() {
+        let (sources, exp) = seeded_variant_sources().await;
+        let mut q = variant_query(exp);
+        q.b = "nope".into();
+        let err = build_comparison(&sources, &q).await.unwrap_err().to_string();
+        assert!(err.starts_with("b: ") && err.contains("nope"), "{err}");
+        let q = variant_query(exp + 1);
+        let err = build_comparison(&sources, &q).await.unwrap_err().to_string();
+        assert!(err.contains(&(exp + 1).to_string()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn compare_variant_with_a_bad_key_fails_before_opening_the_prompt_database() {
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        let settings = crate::config::schema::Settings::default();
+        let mut q = variant_query(1);
+        q.key = "one".into();
+        let err = report_compare(db, &settings, &q, OutputFormat::Table).await.unwrap_err();
+        assert!(err.to_string().starts_with("key must be an experiment id"), "{}", err);
     }
 
     #[tokio::test]

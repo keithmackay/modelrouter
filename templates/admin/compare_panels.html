@@ -69,6 +69,16 @@
     {% for c in cmp.caveats %}
     <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ c }}</p>
     {% endfor %}
+    {% if cmp.experiment %}
+    <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">
+        Experiment <strong>{{ cmp.experiment.name }}</strong> (#{{ cmp.experiment.id }}, {{ cmp.experiment.status }})
+        {% if cmp.experiment.retain_content %}
+        <span style="background:#e8f4fd;color:#1a5276;padding:0.15rem 0.5rem;border-radius:3px;font-weight:600;">retains content</span>
+        {% endif %}
+        — <a href="/admin/experiments">results page</a>.
+    </p>
+    <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ cmp.experiment.stored_content_note }}</p>
+    {% endif %}
 </div>
 
 <div class="stat-card">

@@ -1,8 +1,9 @@
 //! `GET /admin/api/compare`: two arms of an experiment side by side.
 //!
-//! Arms are formed client-side (a model per arm, a tag per request); the
-//! endpoint partitions what was recorded. Cost and tokens come from the ledger,
-//! latency from `prompts`, failures from `request_failures`.
+//! Arms are formed client-side (a model per arm, a tag per request) or, for
+//! the variant dimension, by the variant a request was bound to; the endpoint
+//! partitions what was recorded. Cost and tokens come from the ledger, latency
+//! from `prompts`, failures from `request_failures`.
 
 mod common;
 
@@ -12,10 +13,12 @@ use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
 use modelrouter::api::auth::hash_token;
 use modelrouter::config::schema::{CacheConfig, PricingEntry, Settings};
 use modelrouter::db::models::{
-    FailureStage, NewApiKey, NewCostLedgerEntry, NewPrompt, NewRequestFailure, NewUser,
+    ExperimentVariants, FailureStage, NewApiKey, NewCostLedgerEntry, NewExperiment, NewPrompt,
+    NewRequestFailure, NewUser,
 };
 use modelrouter::db::repositories::api_keys::ApiKeyRepository;
 use modelrouter::db::repositories::costs::CostRepository;
+use modelrouter::db::repositories::experiments::ExperimentRepository;
 use modelrouter::db::repositories::failures::FailureRepository;
 use modelrouter::db::repositories::prompts::PromptRepository;
 use modelrouter::db::repositories::users::UserRepository;
@@ -202,6 +205,18 @@ struct Seed<'a> {
     provider: &'a str,
     run: &'a str,
     tags: &'a str,
+    /// Experiment id and variant label the row was stamped with, if bound.
+    variant: Option<(i64, &'a str)>,
+}
+
+impl<'a> Seed<'a> {
+    fn experiment_id(&self) -> Option<i64> {
+        self.variant.map(|(id, _)| id)
+    }
+
+    fn experiment_variant(&self) -> Option<String> {
+        self.variant.map(|(_, label)| label.to_string())
+    }
 }
 
 async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64, i64), cost: f64) {
@@ -219,8 +234,8 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
             api_key_id: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
-            experiment_id: None,
-            experiment_variant: None,
+            experiment_id: s.experiment_id(),
+            experiment_variant: s.experiment_variant(),
             tokens_estimated: false,
         },
     )
@@ -250,8 +265,8 @@ async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: O
             project: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
-            experiment_id: None,
-            experiment_variant: None,
+            experiment_id: s.experiment_id(),
+            experiment_variant: s.experiment_variant(),
         },
     )
     .await
@@ -276,8 +291,8 @@ async fn seed_failure(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>) {
             project: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
-            experiment_id: None,
-            experiment_variant: None,
+            experiment_id: s.experiment_id(),
+            experiment_variant: s.experiment_variant(),
         },
     )
     .await
@@ -301,8 +316,10 @@ fn today() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
-const P1: Seed<'static> = Seed { model: "m1", provider: "p1", run: "run-1", tags: r#"{"arm":"x"}"# };
-const P2: Seed<'static> = Seed { model: "m2", provider: "p2", run: "run-2", tags: r#"{"arm":"y"}"# };
+const P1: Seed<'static> =
+    Seed { model: "m1", provider: "p1", run: "run-1", tags: r#"{"arm":"x"}"#, variant: None };
+const P2: Seed<'static> =
+    Seed { model: "m2", provider: "p2", run: "run-2", tags: r#"{"arm":"y"}"#, variant: None };
 
 /// Ledger, prompt and failure rows for two hand-built arms with numbers chosen
 /// so every derived figure is exact in binary floating point.
@@ -400,6 +417,7 @@ async fn provider_dimension_matches_the_expected_document() {
         "dimension": "provider",
         "key": null,
         "window": "all",
+        "experiment": null,
         "a": {
             "value": "p1", "label": "provider=p1",
             "requests": 4,
@@ -453,8 +471,8 @@ async fn provider_dimension_matches_the_expected_document() {
 #[tokio::test]
 async fn latency_and_failures_come_from_seeded_rows_per_arm() {
     let (server, db, settings) = build_app().await;
-    let a = Seed { model: "m", provider: "p", run: "r-a", tags: r#"{"arm":"a"}"# };
-    let b = Seed { model: "m", provider: "p", run: "r-b", tags: r#"{"arm":"b"}"# };
+    let a = Seed { model: "m", provider: "p", run: "r-a", tags: r#"{"arm":"a"}"#, variant: None };
+    let b = Seed { model: "m", provider: "p", run: "r-b", tags: r#"{"arm":"b"}"#, variant: None };
     for ms in [100, 200, 300, 400, 1000] {
         seed_prompt(&db, &a, Some(ms)).await;
         seed_ledger(&db, &a, (1, 1), 0.0).await;
@@ -541,7 +559,7 @@ async fn a_failure_raises_only_that_arms_error_rate() {
     drive(&server, "mock/mock-model", "a", 3).await;
     drive(&server, "mock/mock-model", "b", 3).await;
     wait_for_ledger_rows(&db, 6).await;
-    seed_failure(&db, &Seed { model: "mock-model", provider: "mock", run: "run-a", tags: r#"{"arm":"a"}"# }).await;
+    seed_failure(&db, &Seed { model: "mock-model", provider: "mock", run: "run-a", tags: r#"{"arm":"a"}"#, variant: None }).await;
 
     let (_, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
     assert_eq!(body["a"]["failures"], 1);
@@ -557,7 +575,8 @@ async fn a_failure_raises_only_that_arms_error_rate() {
 async fn malformed_queries_are_400_and_name_the_field() {
     let (server, _db, settings) = build_app().await;
     let cases = [
-        ("dimension=variant&a=x&b=y", "dimension"),
+        ("dimension=pair&a=x&b=y", "dimension"),
+        ("dimension=variant&a=x&b=y", "key"),
         ("dimension=model&b=y", "a"),
         ("dimension=model&a=x", "b"),
         ("dimension=model&a=x&b=x", "a and b"),
@@ -595,3 +614,251 @@ async fn requires_an_admin_jwt_and_accepts_viewers() {
     assert_eq!(resp.status_code(), 200);
 }
 
+
+// ── Variant dimension (spec §7a) ──────────────────────────────────────────────
+
+/// An experiment with the given labels; the overlay per variant is empty
+/// because the comparison reads stamped rows, never the overlay.
+async fn create_experiment(
+    db: &Arc<dyn DatabaseProvider>,
+    name: &str,
+    labels: &[&str],
+    retain_content: bool,
+) -> i64 {
+    let mut variants: ExperimentVariants = Default::default();
+    for label in labels {
+        variants.insert(label.to_string(), Default::default());
+    }
+    ExperimentRepository::create(
+        &**db,
+        NewExperiment {
+            name: name.to_string(),
+            variants,
+            allowed_user_ids: vec![],
+            feed_learning: false,
+            expires_at: if retain_content { 4_102_444_800 } else { 0 },
+            retain_content,
+            content_retention_days: if retain_content { 30 } else { 0 },
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+fn bound<'a>(experiment: i64, label: &'a str, run: &'a str) -> Seed<'a> {
+    Seed { model: "m", provider: "p", run, tags: "{}", variant: Some((experiment, label)) }
+}
+
+/// Experiment 1 (control, candidate) with traffic on both arms, beside rows of
+/// a second experiment and an unbound row that must not leak into either arm.
+async fn seed_two_variants(db: &Arc<dyn DatabaseProvider>) -> i64 {
+    let exp = create_experiment(db, "exp-1", &["control", "candidate"], false).await;
+    let other = create_experiment(db, "exp-2", &["control", "candidate"], false).await;
+    let control = bound(exp, "control", "run-c");
+    let candidate = bound(exp, "candidate", "run-d");
+    for _ in 0..3 {
+        seed_ledger(db, &control, (10, 20), 0.5).await;
+    }
+    for ms in [100, 200, 300] {
+        seed_prompt(db, &control, Some(ms)).await;
+    }
+    seed_failure(db, &control).await;
+    for _ in 0..2 {
+        seed_ledger(db, &candidate, (40, 80), 0.25).await;
+    }
+    seed_prompt(db, &candidate, Some(400)).await;
+    // Same label, other experiment; and an unbound row with the same run id.
+    seed_ledger(db, &bound(other, "control", "run-c"), (1000, 1000), 9.0).await;
+    seed_prompt(db, &bound(other, "control", "run-c"), Some(9000)).await;
+    seed_ledger(db, &Seed { variant: None, ..control }, (1000, 1000), 9.0).await;
+    exp
+}
+
+#[tokio::test]
+async fn variant_dimension_compares_two_variants_of_one_experiment() {
+    let (server, db, settings) = build_app().await;
+    let exp = seed_two_variants(&db).await;
+
+    let query = format!("dimension=variant&key={exp}&a=control&b=candidate&window=all");
+    let (status, body) = compare(&server, &settings, &query).await;
+    assert_eq!(status, 200, "{}", body);
+
+    assert_eq!(body["dimension"], "variant");
+    assert_eq!(body["key"], exp.to_string());
+    assert_eq!(body["a"]["value"], "control");
+    assert_eq!(body["a"]["label"], format!("experiment={exp}:control"));
+    assert_eq!(body["a"]["requests"], 3);
+    assert_eq!(body["a"]["tokens_in"], 30);
+    assert_eq!(body["a"]["tokens_out"], 60);
+    assert_eq!(body["a"]["cost_usd"], 1.5);
+    assert_eq!(body["a"]["failures"], 1);
+    assert_eq!(body["a"]["latency"], json!({ "samples": 3, "mean_ms": 200.0, "p50_ms": 200, "p95_ms": 300 }));
+    assert_eq!(body["b"]["label"], format!("experiment={exp}:candidate"));
+    assert_eq!(body["b"]["requests"], 2);
+    assert_eq!(body["b"]["tokens_in"], 80);
+    assert_eq!(body["b"]["cost_usd"], 0.5);
+    assert_eq!(body["b"]["failures"], 0);
+    assert_eq!(body["b"]["latency"]["samples"], 1);
+    assert_eq!(body["delta"]["requests"]["abs"], -1.0);
+    assert_eq!(body["coverage"]["a"], json!({ "requests": 3, "latency_samples": 3 }));
+
+    // The experiment rides along, and the quality caveat points at its results.
+    assert_eq!(body["experiment"]["id"], exp);
+    assert_eq!(body["experiment"]["name"], "exp-1");
+    assert_eq!(body["experiment"]["status"], "active");
+    assert_eq!(body["experiment"]["retain_content"], false);
+    let note = body["experiment"]["stored_content_note"].as_str().unwrap();
+    assert!(note.contains("does not retain content"), "{note}");
+    let caveats = body["caveats"].as_array().unwrap();
+    assert_eq!(caveats.len(), 2);
+    assert!(caveats[0].as_str().unwrap().contains("quality"), "{caveats:?}");
+    assert!(caveats[0].as_str().unwrap().contains("/admin/experiments"), "{caveats:?}");
+}
+
+#[tokio::test]
+async fn variant_dimension_reports_retained_content() {
+    let (server, db, settings) = build_app().await;
+    let exp = create_experiment(&db, "kept", &["x", "y"], true).await;
+    let (status, body) =
+        compare(&server, &settings, &format!("dimension=variant&key={exp}&a=x&b=y")).await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["experiment"]["retain_content"], true);
+    assert_eq!(body["experiment"]["content_retention_days"], 30);
+    let note = body["experiment"]["stored_content_note"].as_str().unwrap();
+    assert!(note.contains("retains content"), "{note}");
+    assert!(note.contains("30 days"), "{note}");
+    // Arms with no rows are still a valid comparison.
+    assert_eq!(body["a"]["requests"], 0);
+    assert_eq!(body["window"], "monthly");
+}
+
+#[tokio::test]
+async fn variant_label_not_declared_on_the_experiment_is_400_naming_the_label() {
+    let (server, db, settings) = build_app().await;
+    let exp = create_experiment(&db, "exp-1", &["control", "candidate"], false).await;
+    for (query, field) in [
+        (format!("dimension=variant&key={exp}&a=control&b=nope"), "b"),
+        (format!("dimension=variant&key={exp}&a=nope&b=control"), "a"),
+    ] {
+        let (status, body) = compare(&server, &settings, &query).await;
+        assert_eq!(status, 400, "{query} -> {body}");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with(field), "{query}: {msg:?}");
+        assert!(msg.contains("nope"), "{query}: {msg:?}");
+        assert!(msg.contains(&exp.to_string()), "{query}: {msg:?}");
+    }
+    // A label that fails the charset check never reaches the database and is
+    // not echoed.
+    let (status, body) =
+        compare(&server, &settings, &format!("dimension=variant&key={exp}&a=%3Cb%3E&b=control")).await;
+    assert_eq!(status, 400, "{body}");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.starts_with("a "), "{msg:?}");
+    assert!(!msg.contains("<b>"), "{msg:?}");
+}
+
+#[tokio::test]
+async fn variant_key_that_is_not_an_integer_is_400_naming_key() {
+    let (server, _db, settings) = build_app().await;
+    for key in ["abc", "1.5", "0", "-1", ""] {
+        let query = format!("dimension=variant&key={key}&a=control&b=candidate");
+        let (status, body) = compare(&server, &settings, &query).await;
+        assert_eq!(status, 400, "{query} -> {body}");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("key"), "{query}: {msg:?}");
+    }
+}
+
+#[tokio::test]
+async fn variant_unknown_experiment_is_400_naming_the_id() {
+    let (server, db, settings) = build_app().await;
+    create_experiment(&db, "exp-1", &["control", "candidate"], false).await;
+    let (status, body) =
+        compare(&server, &settings, "dimension=variant&key=42&a=control&b=candidate").await;
+    assert_eq!(status, 400, "{body}");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("42"), "{msg:?}");
+    assert!(msg.contains("key"), "{msg:?}");
+}
+
+fn session_cookie(settings: &Settings) -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    (
+        axum::http::header::COOKIE,
+        axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin_jwt(settings, "viewer")))
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn compare_page_lists_experiments_and_their_labels_for_the_variant_dimension() {
+    let (server, db, settings) = build_app().await;
+    let exp = seed_two_variants(&db).await;
+    let closed = create_experiment(&db, "old-one", &["p", "q"], true).await;
+    assert!(ExperimentRepository::close(&*db, closed, "2026-09-01T00:00:00Z").await.unwrap());
+
+    // No experiment chosen yet: the picker lists every experiment, closed ones
+    // marked, and the arm dropdowns are empty.
+    let page = server
+        .get("/admin/compare")
+        .add_raw_query_param("dimension=variant")
+        .add_header(session_cookie(&settings).0, session_cookie(&settings).1)
+        .await;
+    assert_eq!(page.status_code(), 200);
+    let body = page.text();
+    assert!(body.contains("name=\"key\""), "{body}");
+    assert!(body.contains(&format!("<option value=\"{exp}\" >exp-1</option>")), "{body}");
+    assert!(body.contains(&format!("<option value=\"{closed}\" >old-one (closed)</option>")), "{body}");
+    assert!(!body.contains("value=\"control\""), "{body}");
+    // minijinja escapes `/`, so match the caveat's wording rather than the path.
+    assert!(body.contains("on its results page"), "variant caveat missing: {body}");
+    assert!(body.contains("value=\"all\"     selected"), "window must default to all: {body}");
+
+    // With an experiment chosen, the arms are its labels and nothing else.
+    let page = server
+        .get("/admin/compare")
+        .add_raw_query_param(&format!("dimension=variant&key={exp}&a=control"))
+        .add_header(session_cookie(&settings).0, session_cookie(&settings).1)
+        .await;
+    assert_eq!(page.status_code(), 200);
+    let body = page.text();
+    assert!(body.contains(&format!("<option value=\"{exp}\" selected>exp-1</option>")), "{body}");
+    assert!(body.contains("<option value=\"control\" selected>control</option>"), "{body}");
+    assert!(body.contains("<option value=\"candidate\" >candidate</option>"), "{body}");
+    assert!(!body.contains("value=\"p\""), "labels of another experiment leaked: {body}");
+
+    // The panels carry the experiment line and the stored-content note.
+    let panels = server
+        .get("/admin/compare/panels")
+        .add_raw_query_param(&format!("dimension=variant&key={exp}&a=control&b=candidate&window=all"))
+        .add_header(session_cookie(&settings).0, session_cookie(&settings).1)
+        .await;
+    assert_eq!(panels.status_code(), 200, "{}", panels.text());
+    let body = panels.text();
+    assert!(body.contains(&format!("experiment={exp}:control")), "{body}");
+    assert!(body.contains("does not retain content"), "{body}");
+    assert!(body.contains("href=\"/admin/experiments\""), "{body}");
+    assert!(!body.contains("retains content</span>"), "{body}");
+
+    let panels = server
+        .get("/admin/compare/panels")
+        .add_raw_query_param(&format!("dimension=variant&key={closed}&a=p&b=q&window=all"))
+        .add_header(session_cookie(&settings).0, session_cookie(&settings).1)
+        .await;
+    assert_eq!(panels.status_code(), 200, "{}", panels.text());
+    let body = panels.text();
+    assert!(body.contains("retains content</span>"), "{body}");
+    assert!(body.contains("30 days"), "{body}");
+    assert!(body.contains("closed"), "{body}");
+
+    // A rejected query is an inline message, not an error page.
+    let panels = server
+        .get("/admin/compare/panels")
+        .add_raw_query_param(&format!("dimension=variant&key={exp}&a=control&b=nope&window=all"))
+        .add_header(session_cookie(&settings).0, session_cookie(&settings).1)
+        .await;
+    assert_eq!(panels.status_code(), 200);
+    let body = panels.text();
+    assert!(body.contains("Invalid comparison"), "{body}");
+    assert!(body.contains("no variant nope"), "{body}");
+}

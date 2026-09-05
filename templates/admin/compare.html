@@ -4,11 +4,12 @@
 <h1>Compare</h1>
 <p style="color:#666;font-size:0.85rem;margin-top:-0.5rem;margin-bottom:1rem;">
     Two arms of an experiment side by side: cost, tokens, cache hits, failures and latency.
-    Arms are chosen by the calling application (a model per arm, or a tag per request); this
-    page only partitions what was recorded.
+    Arms are chosen by the calling application (a model per arm, or a tag per request) or, for
+    a controlled experiment, by the variant each request was bound to; this page only
+    partitions what was recorded.
 </p>
 
-{# Dimension and tag key change which values exist, so they reload the page.
+{# Dimension, tag key and experiment change which values exist, so they reload the page.
    Arm values and the window only change the panels, so they swap #panels. #}
 <form method="get" action="/admin/compare"
     style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem;padding:1rem;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
@@ -20,6 +21,7 @@
             <option value="provider" {% if sel_dimension == "provider" %}selected{% endif %}>Provider</option>
             <option value="tag"      {% if sel_dimension == "tag"      %}selected{% endif %}>Attribution tag</option>
             <option value="run"      {% if sel_dimension == "run"      %}selected{% endif %}>Run (correlation id)</option>
+            <option value="variant"  {% if sel_dimension == "variant"  %}selected{% endif %}>Experiment variant</option>
         </select>
     </div>
     {% if sel_dimension == "tag" %}
@@ -30,6 +32,17 @@
             <option value="" {% if not sel_key %}selected{% endif %}>Choose a key…</option>
             {% for k in keys %}
             <option value="{{ k }}" {% if sel_key == k %}selected{% endif %}>{{ k }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    {% elif sel_dimension == "variant" %}
+    <div>
+        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Experiment</label>
+        <select name="key" id="cf-key" onchange="this.form.submit()"
+            style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+            <option value="" {% if not sel_key %}selected{% endif %}>Choose an experiment…</option>
+            {% for e in experiments %}
+            <option value="{{ e.id }}" {% if sel_key == e.id %}selected{% endif %}>{{ e.text }}</option>
             {% endfor %}
         </select>
     </div>
