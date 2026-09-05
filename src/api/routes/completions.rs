@@ -185,6 +185,20 @@ async fn chat_completions_inner(
         }
     }
 
+    // Validate that `tools` and `tool_choice` are not present (issue #41)
+    if let Some(tools) = body["tools"].as_array() {
+        if !tools.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "`tools` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+            ));
+        }
+    }
+    if body.get("tool_choice").is_some() {
+        return Err(ApiError::InvalidRequest(
+            "`tool_choice` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+        ));
+    }
+
     // Inject per-key metadata for pipeline hooks before running them
     let mut body = body;
     let session_window = user.session_window_secs.unwrap_or(28800);
