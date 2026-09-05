@@ -111,6 +111,7 @@ async fn test_app_full(
 
     let state = AppState {
         settings: settings.clone(),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
         db: db.clone(),
         pool: None,
         router,
@@ -577,6 +578,7 @@ async fn test_app_with_chain(
 
     let state = AppState {
         settings: settings.clone(),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
         db: db.clone(),
         pool: None,
         router,

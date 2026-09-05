@@ -123,6 +123,7 @@ async fn build_app(cache: CacheConfig) -> (TestServer, Arc<dyn DatabaseProvider>
         callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
     (
         TestServer::new(build_router(state)).unwrap(),
@@ -765,6 +766,9 @@ async fn health_probe_writes_empty_object_not_array() {
         api_key_id: None,
         attribution_correlation_id: None,
         attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
     };
     CostRepository::create(&db, entry).await.unwrap();
 

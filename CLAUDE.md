@@ -28,6 +28,11 @@ modelrouter user create --name alice
 modelrouter user list
 modelrouter budget set --user alice --limit 10.0 --window monthly
 modelrouter report cost [--user] [--window] [--format table|csv|json]
+modelrouter report compare --dimension model|provider|tag|run|variant [--key <tag-key|experiment-id>] --a <arm> --b <arm> [--window] [--format table|csv|json]
+modelrouter experiment add --name <n> --variant <label>=<key>:<target>[,...] ... --expires-at <RFC3339|never> --content-retention-days <n> [--retain-content] [--feed-learning] [--allow-user <name>]...
+modelrouter experiment list [--status active|closed|all] [--format table|csv|json]
+modelrouter experiment close --id <id>
+modelrouter experiment results --id <id> [--limit <1-1000>] [--offset <n>] [--format table|csv|json]
 modelrouter webhook list
 modelrouter webhook add --name <name> --url <url> [--events completion] [--secret-header-name <h>] [--secret-header-value <v>]
 modelrouter webhook delete --id <id>
@@ -49,12 +54,23 @@ modelrouter install-service  (macOS/Linux)
 |---|---|
 | `GET /health` | Liveness check |
 | `GET /v1/models` | List available models |
-| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible) |
+| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
+| `POST /v1/feedback` | Report a run's outcome by attribution correlation id (API key) |
 | `GET /admin/users` | List users (admin JWT required) |
 | `POST /admin/users` | Create user (superadmin JWT required) |
 | `GET /admin/stats` | Usage stats (admin JWT required) |
 | `GET /admin/budgets` | List budget rules (admin JWT required) |
 | `GET /admin/audit` | Audit log (admin JWT required) |
+| `GET /admin/api/compare` | Two-arm comparison by model, provider, tag, run or experiment variant (admin JWT required; see `docs/experiments.md`) |
+| `GET /admin/compare` | Comparison page (admin dashboard) |
+| `GET /admin/api/experiments` | List experiments, `?status=active\|closed\|all` (admin JWT required) |
+| `POST /admin/api/experiments` | Create an experiment; expiry and retention required, every target must be priced (superadmin JWT required) |
+| `GET /admin/api/experiments/:id` | One experiment (admin JWT required) |
+| `POST /admin/api/experiments/:id/close` | Close an experiment (superadmin JWT required) |
+| `GET /admin/api/experiments/:id/results` | Per-variant and per-run results, `?limit=&offset=` (admin JWT required) |
+| `GET /admin/experiments` | Experiments page (admin dashboard); `POST` creates from the form (superadmin session) |
+| `POST /admin/experiments/:id/close` | Close from the dashboard (superadmin session) |
+| `GET /admin/experiments/:id/panels` | Results panels for one experiment (admin dashboard) |
 | `GET /admin/webhooks` | Webhook management page (admin dashboard) |
 | `GET /admin/api/webhooks` | List webhook backends (admin JWT required) |
 | `POST /admin/api/webhooks` | Create webhook backend (superadmin JWT required) |

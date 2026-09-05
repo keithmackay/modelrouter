@@ -9,7 +9,8 @@ use crate::{
         admin_users::AdminUserRepository, aliases::AliasRepository, api_keys::ApiKeyRepository,
         app_settings::AppSettingsRepository,
         audit::AuditRepository,
-        budgets::BudgetRepository, costs::CostRepository, failures::FailureRepository,
+        budgets::BudgetRepository, costs::CostRepository, experiments::ExperimentRepository,
+        failures::FailureRepository, outcomes::OutcomeRepository,
         hooks::HookRepository,
         groups::GroupRepository,
         webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
@@ -29,6 +30,8 @@ pub trait DatabaseProvider:
     + SessionRepository
     + PromptRepository
     + CostRepository
+    + ExperimentRepository
+    + OutcomeRepository
     + FailureRepository
     + BudgetRepository
     + AuditRepository
@@ -53,6 +56,8 @@ impl<T> DatabaseProvider for T where
         + SessionRepository
         + PromptRepository
         + CostRepository
+        + ExperimentRepository
+        + OutcomeRepository
         + FailureRepository
         + BudgetRepository
         + AuditRepository
@@ -103,6 +108,9 @@ pub struct AppState {
     #[cfg(not(feature = "prometheus"))]
     pub app_metrics: Option<std::convert::Infallible>,
     pub oidc_state: Arc<crate::api::admin::oidc::OidcStateStore>,
+    /// Live snapshot of the `experiments` table (spec §7a); requests bind
+    /// against it without touching the database.
+    pub experiments: Arc<crate::router::experiments::ExperimentRegistry>,
 }
 
 pub fn build_router(state: AppState) -> axum::Router {
@@ -114,6 +122,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler, search::search,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
+        feedback,
     };
     use crate::api::admin::routes::{
         admin_login, list_users, create_user, update_user,
@@ -140,6 +149,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         get_budgets, post_create_budget, post_edit_budget, post_delete_budget,
     };
     use crate::api::admin::reports::{get_reports, get_reports_panels};
+    use crate::api::admin::compare::{get_compare_page, get_compare_panels};
     use crate::api::admin::models::{
         get_models, post_create_model, post_disable_model, post_enable_model,
         post_delete_model, post_set_failovers,
@@ -177,6 +187,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/search", post(search))
+        .route("/v1/feedback", post(feedback::post_feedback))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))
         .route("/admin/api/users", get(list_users).post(create_user))
@@ -196,6 +207,24 @@ pub fn build_router(state: AppState) -> axum::Router {
             axum::routing::put(crate::api::admin::aliases::upsert_alias_api)
                 .delete(crate::api::admin::aliases::delete_alias_api),
         )
+        // Controlled experiments (spec §7a)
+        .route(
+            "/admin/api/experiments",
+            get(crate::api::admin::experiments::list_experiments_api)
+                .post(crate::api::admin::experiments::create_experiment_api),
+        )
+        .route(
+            "/admin/api/experiments/:id",
+            get(crate::api::admin::experiments::get_experiment_api),
+        )
+        .route(
+            "/admin/api/experiments/:id/close",
+            post(crate::api::admin::experiments::close_experiment_api),
+        )
+        .route(
+            "/admin/api/experiments/:id/results",
+            get(crate::api::admin::experiments::get_experiment_results_api),
+        )
         .route("/admin/api/admins", get(list_admins).post(create_admin))
         .route("/admin/api/users/:id/keys", get(list_user_api_keys).post(create_user_api_key))
         .route("/admin/api/keys/:id/revoke", post(revoke_api_key_handler))
@@ -208,6 +237,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route(
             "/admin/api/usage/attribution/facets",
             get(crate::api::admin::attribution::get_attribution_facets),
+        )
+        .route(
+            "/admin/api/compare",
+            get(crate::api::admin::compare::get_compare),
         )
         .route("/admin/api/models/available", get(crate::api::admin::models::get_available_models))
         .route("/admin/api/cache/stats", get(crate::api::admin::cache::get_cache_stats))
@@ -257,6 +290,26 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/budgets/:id/delete", post(post_delete_budget))
         .route("/admin/reports", get(get_reports))
         .route("/admin/reports/panels", get(get_reports_panels))
+        .route("/admin/compare", get(get_compare_page))
+        .route("/admin/compare/panels", get(get_compare_panels))
+        // Experiments dashboard (spec §7a)
+        .route(
+            "/admin/experiments",
+            get(crate::api::admin::experiments::get_experiments_page)
+                .post(crate::api::admin::experiments::post_experiments_page),
+        )
+        .route(
+            "/admin/experiments/rows",
+            get(crate::api::admin::experiments::get_experiment_rows),
+        )
+        .route(
+            "/admin/experiments/:id/close",
+            post(crate::api::admin::experiments::post_close_experiment_page),
+        )
+        .route(
+            "/admin/experiments/:id/panels",
+            get(crate::api::admin::experiments::get_experiment_panels),
+        )
         .route("/admin/models", get(get_models).post(post_create_model))
         .route("/admin/models/:id/disable", post(post_disable_model))
         .route("/admin/models/:id/enable", post(post_enable_model))

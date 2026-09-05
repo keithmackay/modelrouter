@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -25,12 +26,100 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-/// One request the mock received, captured for later assertion.
+/// One request the mock received, captured for later assertion, together with
+/// what it served back.
+///
+/// Recording the served side is what lets a test compute the aggregates it
+/// expects without restating them as literals: the mock is the only authority
+/// on the token counts it invented, so a results assertion can be checked
+/// against them rather than against a number copied by hand.
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
     pub path: String,
     pub authorization: Option<String>,
     pub body: Value,
+    /// HTTP status served for this request.
+    pub served_status: u16,
+    /// Usage served back, when the response carried a `usage` block.
+    pub served_usage: Option<(u32, u32)>,
+}
+
+impl RecordedRequest {
+    /// Prompt tokens served, or 0 for an error response.
+    pub fn prompt_tokens(&self) -> u32 {
+        self.served_usage.map(|(p, _)| p).unwrap_or(0)
+    }
+
+    /// Completion tokens served, or 0 for an error response.
+    pub fn completion_tokens(&self) -> u32 {
+        self.served_usage.map(|(_, c)| c).unwrap_or(0)
+    }
+
+    /// Whether the mock answered this request successfully.
+    pub fn ok(&self) -> bool {
+        self.served_status == 200
+    }
+}
+
+/// A per-model behaviour profile, so an experiment produces data with real
+/// spread instead of one constant repeated N times.
+///
+/// The spread is deterministic, not random: each field varies by a jitter
+/// derived from a hash of the model name and that model's own call index, so
+/// a test sees the same sequence on every run and can predict none of it by
+/// accident. Two models given different centres therefore yield a stable,
+/// assertable *trend* — the point of running an experiment at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelProfile {
+    /// Prompt tokens as (centre, jitter): the served value lands in
+    /// `centre - jitter ..= centre + jitter`.
+    pub prompt_tokens: (u32, u32),
+    /// Completion tokens as (centre, jitter).
+    pub completion_tokens: (u32, u32),
+    /// Think-time before responding, as (centre_ms, jitter_ms). Kept small;
+    /// it is real wall-clock the router measures into `latency_ms`.
+    pub latency_ms: (u64, u64),
+    /// Every Nth call to this model fails with a 500. 0 disables failures.
+    pub fail_every: u32,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: (100, 0),
+            completion_tokens: (50, 0),
+            latency_ms: (0, 0),
+            fail_every: 0,
+        }
+    }
+}
+
+/// A 64-bit mixer (splitmix64 finaliser). Used instead of an RNG so the
+/// sequence depends only on (model, call index) and not on how the test's
+/// requests happened to interleave.
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Stable per-model seed, so two models never share a jitter sequence.
+fn model_seed(model: &str) -> u64 {
+    model.bytes().fold(0xCBF2_9CE4_8422_2325_u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01B3)
+    })
+}
+
+/// `centre` perturbed by up to `jitter` either way, deterministically.
+/// The result lands in `centre - jitter ..= centre + jitter`.
+fn jittered(centre: u64, jitter: u64, seed: u64, index: u64) -> u64 {
+    if jitter == 0 {
+        return centre;
+    }
+    let draw = mix(seed ^ index.wrapping_mul(0x2545_F491_4F6C_DD1D)) % (jitter * 2 + 1);
+    (centre + draw).saturating_sub(jitter)
 }
 
 impl RecordedRequest {
@@ -92,9 +181,39 @@ impl MockResponse {
 #[derive(Default)]
 struct MockState {
     requests: Vec<RecordedRequest>,
-    /// Responses returned in order; when empty the default is used.
+    /// Responses returned in order; when empty the profile, then the default,
+    /// decides. An explicitly queued response always wins, so a test that
+    /// scripts one exact reply is never overridden by a profile.
     queued: Vec<MockResponse>,
     default: Option<MockResponse>,
+    /// Per-model behaviour, keyed by the `model` field of the request.
+    profiles: HashMap<String, ModelProfile>,
+    /// How many calls each model has served, driving its jitter sequence.
+    calls: HashMap<String, u64>,
+}
+
+impl MockState {
+    /// Next response for `model` from its profile, plus the think-time to
+    /// sleep before serving it. Advances that model's call index.
+    fn from_profile(&mut self, model: &str) -> Option<(MockResponse, u64)> {
+        let profile = *self.profiles.get(model)?;
+        let index = self.calls.entry(model.to_string()).or_insert(0);
+        *index += 1;
+        let n = *index;
+        let seed = model_seed(model);
+        let think = jittered(profile.latency_ms.0, profile.latency_ms.1, seed ^ 0xF00D, n);
+
+        if profile.fail_every > 0 && n % profile.fail_every as u64 == 0 {
+            return Some((
+                MockResponse::error(StatusCode::INTERNAL_SERVER_ERROR, "mock upstream failure"),
+                think,
+            ));
+        }
+        let prompt = jittered(profile.prompt_tokens.0 as u64, profile.prompt_tokens.1 as u64, seed, n) as u32;
+        let completion =
+            jittered(profile.completion_tokens.0 as u64, profile.completion_tokens.1 as u64, seed ^ 0xBEEF, n) as u32;
+        Some((MockResponse::completion("mock response", prompt, completion), think))
+    }
 }
 
 /// A running mock provider. Dropping it leaves the server task to be reaped
@@ -145,6 +264,26 @@ impl MockLlm {
         self.state.lock().unwrap().default = Some(response);
     }
 
+    /// Give `model` a behaviour profile: token spread, think-time and failure
+    /// cadence. Applies to requests whose `model` field matches exactly, which
+    /// is the concrete model the router resolved, not the alias the caller
+    /// asked for.
+    pub fn set_profile(&self, model: &str, profile: ModelProfile) {
+        self.state.lock().unwrap().profiles.insert(model.to_string(), profile);
+    }
+
+    /// Every request the mock served for `model`, in order.
+    pub fn served_for(&self, model: &str) -> Vec<RecordedRequest> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.model() == Some(model))
+            .cloned()
+            .collect()
+    }
+
     /// Everything the mock has received so far.
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.state.lock().unwrap().requests.clone()
@@ -167,8 +306,38 @@ async fn chat_completions(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let response = {
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
+    // Pick the response under the lock, then release it: the profile's
+    // think-time is a real await and a std Mutex must not be held across one.
+    let (response, think_ms) = {
         let mut s = state.lock().unwrap();
+        if !s.queued.is_empty() {
+            (s.queued.remove(0), 0)
+        } else if let Some(scripted) = s.from_profile(&model) {
+            scripted
+        } else {
+            let fallback = s
+                .default
+                .clone()
+                .unwrap_or_else(|| MockResponse::completion("mock response", 10, 5));
+            (fallback, 0)
+        }
+    };
+
+    if think_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(think_ms)).await;
+    }
+
+    // Record after serving is decided, so the row carries what went back.
+    {
+        let mut s = state.lock().unwrap();
+        let usage = response.body.get("usage").map(|u| {
+            (
+                u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            )
+        });
         s.requests.push(RecordedRequest {
             path: "/v1/chat/completions".to_string(),
             authorization: headers
@@ -176,15 +345,10 @@ async fn chat_completions(
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
             body: body.clone(),
+            served_status: response.status.as_u16(),
+            served_usage: usage,
         });
-        if s.queued.is_empty() {
-            s.default
-                .clone()
-                .unwrap_or_else(|| MockResponse::completion("mock response", 10, 5))
-        } else {
-            s.queued.remove(0)
-        }
-    };
+    }
 
     // A streaming request gets a minimal but well-formed SSE body so the router's
     // streaming path can be exercised without pulling in a full SSE mock.
@@ -219,6 +383,8 @@ async fn list_models(State(state): State<Arc<Mutex<MockState>>>) -> impl IntoRes
         path: "/v1/models".to_string(),
         authorization: None,
         body: Value::Null,
+        served_status: 200,
+        served_usage: None,
     });
     Json(json!({
         "object": "list",

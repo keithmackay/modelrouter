@@ -31,6 +31,11 @@ pub struct FailureContext {
     pub attribution_correlation_id: Option<String>,
     pub attribution_tags: String,
     pub latency_ms: Option<i64>,
+    /// The experiment the request was bound to, when the header bound. A
+    /// header that failed to bind leaves both unset: the 400 it produced is
+    /// the record of that.
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
 }
 
 /// Build the capture context from the request as it arrived.
@@ -51,13 +56,34 @@ pub fn context_from_request(
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
-    let (provider, routed_model) = {
-        let (p, m) = state.router.resolve(&request_model);
-        (Some(p), Some(m))
-    };
     // Attribution is best-effort here: an unparseable attribution block is
     // itself a failure worth recording, and must not prevent the record.
     let attribution = crate::api::attribution::Attribution::extract(body, headers).ok();
+    // Likewise the experiment binding: re-derived from the header against the
+    // in-memory registry (no I/O), so a bound request's failure row carries
+    // its stamp. A header that does not bind is a 400 the handler records as
+    // an ordinary request-stage failure, unstamped.
+    let binding = state
+        .experiments
+        .bind(
+            headers,
+            body,
+            attribution.as_ref().and_then(|a| a.correlation_id.as_deref()),
+            user.id,
+            chrono::Utc::now().timestamp(),
+        )
+        .ok()
+        .flatten();
+    // A bound request goes where its variant pins the model, not where the
+    // alias would have sent it.
+    let effective_model = binding
+        .as_ref()
+        .and_then(|b| b.overlay.get(&request_model).cloned())
+        .unwrap_or_else(|| request_model.clone());
+    let (provider, routed_model) = {
+        let (p, m) = state.router.resolve(&effective_model);
+        (Some(p), Some(m))
+    };
 
     FailureContext {
         endpoint,
@@ -75,6 +101,8 @@ pub fn context_from_request(
             .map(|a| a.tags_json())
             .unwrap_or_else(|| "{}".to_string()),
         latency_ms: None,
+        experiment_id: binding.as_ref().map(|b| b.experiment_id),
+        experiment_variant: binding.map(|b| b.variant),
     }
 }
 
@@ -153,6 +181,8 @@ pub async fn record_failure(state: &AppState, ctx: FailureContext, err: &ApiErro
         project: ctx.project,
         attribution_correlation_id: ctx.attribution_correlation_id,
         attribution_tags: ctx.attribution_tags,
+        experiment_id: ctx.experiment_id,
+        experiment_variant: ctx.experiment_variant,
     };
 
     if let Err(e) = FailureRepository::create(&*state.db, record).await {

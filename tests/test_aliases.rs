@@ -47,6 +47,7 @@ async fn build_server() -> (TestServer, Arc<Settings>, Arc<RequestRouter>, Arc<d
 
     let state = AppState {
         settings: settings.clone(),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
         db: db.clone(),
         pool: None,
         router: router.clone(),
@@ -456,6 +457,7 @@ async fn alias_target_validated_against_available_catalog() {
 
     let state = AppState {
         settings: settings.clone(),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
         db: db.clone(),
         pool: None,
         router: router.clone(),

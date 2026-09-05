@@ -2,10 +2,11 @@
 
 use async_trait::async_trait;
 
-use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
+use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
-    AttributionBreakdownRow, AttributionFilter, AttributionTotals, CacheUsageSummary,
-    CostRepository,
+    ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
+    CacheUsageSummary, CostRepository, ExperimentRunRow, ExperimentRunKey,
+    ExperimentUnboundRow, ExperimentVariantModelRow, ExperimentVariantTotals,
 };
 use super::{PostgresDb, now_utc};
 
@@ -19,12 +20,14 @@ impl CostRepository for PostgresDb {
         let row = sqlx::query_as::<_, CostLedgerEntry>(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
-                                        attribution_correlation_id, attribution_tags)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                        attribution_correlation_id, attribution_tags,
+                                        experiment_id, experiment_variant, tokens_estimated)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
                          cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags"#,
+                         attribution_correlation_id, attribution_tags,
+                         experiment_id, experiment_variant, tokens_estimated"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -38,6 +41,9 @@ impl CostRepository for PostgresDb {
         .bind(&now)
         .bind(&entry.attribution_correlation_id)
         .bind(&entry.attribution_tags)
+        .bind(entry.experiment_id)
+        .bind(&entry.experiment_variant)
+        .bind(entry.tokens_estimated)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -50,12 +56,14 @@ impl CostRepository for PostgresDb {
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
-                                        attribution_correlation_id, attribution_tags)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12)
+                                        attribution_correlation_id, attribution_tags,
+                                        experiment_id, experiment_variant, tokens_estimated)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
                          cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags"#,
+                         attribution_correlation_id, attribution_tags,
+                         experiment_id, experiment_variant, tokens_estimated"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -69,6 +77,9 @@ impl CostRepository for PostgresDb {
         .bind(entry.cost_usd)
         .bind(&entry.attribution_correlation_id)
         .bind(&entry.attribution_tags)
+        .bind(entry.experiment_id)
+        .bind(&entry.experiment_variant)
+        .bind(entry.tokens_estimated)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -366,6 +377,28 @@ impl CostRepository for PostgresDb {
         Ok(rows.into_iter().map(|(m,)| m).collect())
     }
 
+    async fn distinct_providers_in_ledger(&self) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT provider FROM cost_ledger WHERE provider IS NOT NULL ORDER BY provider",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
+    async fn distinct_recent_correlation_ids(&self, limit: i64) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT attribution_correlation_id FROM cost_ledger \
+             WHERE attribution_correlation_id IS NOT NULL AND attribution_correlation_id <> '' \
+             GROUP BY attribution_correlation_id \
+             ORDER BY MAX(created_at) DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     async fn cost_rows_grouped(
         &self,
         filter_user_ids: Option<&[i64]>,
@@ -451,6 +484,21 @@ impl CostRepository for PostgresDb {
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn run_stamp(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<Option<RunStamp>> {
+        // Stamped rows sort first, then the earliest wins; a run whose rows are
+        // all unstamped therefore yields (NULL, NULL) rather than no row.
+        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT experiment_id, experiment_variant FROM cost_ledger \
+             WHERE user_id = $1 AND attribution_correlation_id = $2 \
+             ORDER BY (experiment_id IS NULL), created_at, id LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(correlation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(experiment_id, experiment_variant)| RunStamp { experiment_id, experiment_variant }))
     }
 
     async fn list_daily_spend(
@@ -554,20 +602,7 @@ impl CostRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<AttributionTotals> {
         let (predicate, binds) = attribution_predicate(filter);
-        let n = binds.len();
-        let sql = format!(
-            "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ${} AND created_at < ${}",
-            totals_select(),
-            predicate,
-            n + 1,
-            n + 2
-        );
-        let mut q = sqlx::query_as::<_, TotalsRow>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let row = q.bind(start).bind(end).fetch_one(&self.pool).await?;
-        Ok(totals_from_row(row))
+        self.totals_where(&predicate, binds, start, end).await
     }
 
     async fn attribution_by_model(
@@ -577,22 +612,7 @@ impl CostRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
         let (predicate, binds) = attribution_predicate(filter);
-        let n = binds.len();
-        let sql = format!(
-            "SELECT model, {} FROM cost_ledger \
-             WHERE {} AND created_at >= ${} AND created_at < ${} \
-             GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
-            totals_select(),
-            predicate,
-            n + 1,
-            n + 2
-        );
-        let mut q = sqlx::query_as::<_, BreakdownRow>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(breakdown_from_row).collect())
+        self.by_model_where(&predicate, binds, start, end).await
     }
 
     async fn attribution_by_day(
@@ -602,24 +622,7 @@ impl CostRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
         let (predicate, binds) = attribution_predicate(filter);
-        let n = binds.len();
-        // created_at is an ISO 8601 string column, so the first ten characters
-        // are the calendar day — no timestamp cast needed.
-        let sql = format!(
-            "SELECT substring(created_at from 1 for 10) AS day, {} FROM cost_ledger \
-             WHERE {} AND created_at >= ${} AND created_at < ${} \
-             GROUP BY day ORDER BY day ASC",
-            totals_select(),
-            predicate,
-            n + 1,
-            n + 2
-        );
-        let mut q = sqlx::query_as::<_, BreakdownRow>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(breakdown_from_row).collect())
+        self.by_day_where(&predicate, binds, start, end).await
     }
 
     async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
@@ -663,6 +666,288 @@ impl CostRepository for PostgresDb {
         };
         Ok(rows.into_iter().map(|(v,)| v).collect())
     }
+
+    // ── Comparison arms ──────────────────────────────────────────────────────
+
+    async fn arm_totals(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals> {
+        let (predicate, binds) = arm_predicate(filter);
+        self.totals_where(&predicate, binds, start, end).await
+    }
+
+    async fn arm_by_model(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = arm_predicate(filter);
+        self.by_model_where(&predicate, binds, start, end).await
+    }
+
+    async fn arm_by_day(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = arm_predicate(filter);
+        self.by_day_where(&predicate, binds, start, end).await
+    }
+
+    // ── Experiment results ───────────────────────────────────────────────────
+
+    async fn experiment_variant_totals(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantTotals>> {
+        let sql = format!(
+            "SELECT COALESCE(experiment_variant, ''), {} FROM cost_ledger \
+             WHERE experiment_id = $1 \
+             GROUP BY experiment_variant ORDER BY experiment_variant ASC",
+            EXPERIMENT_TOTALS_SELECT
+        );
+        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(variant, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows)| {
+                ExperimentVariantTotals {
+                    variant, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_variant_models(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentVariantModelRow>> {
+        let sql = format!(
+            "SELECT COALESCE(experiment_variant, ''), model, {} FROM cost_ledger \
+             WHERE experiment_id = $1 \
+             GROUP BY experiment_variant, model \
+             ORDER BY experiment_variant ASC, SUM(cost_usd) DESC, model ASC",
+            EXPERIMENT_TOTALS_SELECT
+        );
+        type Row = (String, String, i64, f64, f64, i64, i64, i64);
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(variant, model, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows)| {
+                ExperimentVariantModelRow {
+                    variant, model, requests, cost_usd, saved_usd, tokens_in, tokens_out, estimated_rows,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_runs(
+        &self,
+        experiment_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunRow>> {
+        // `$1` is the experiment id for both the subquery and the outer
+        // predicate; `$2`/`$3` are the page.
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, {}, \
+                    COUNT(DISTINCT experiment_variant), {}, \
+                    MIN(created_at), MAX(created_at) AS last_at \
+             FROM cost_ledger c \
+             WHERE {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY last_at DESC, user_id ASC, attribution_correlation_id ASC \
+             LIMIT $2 OFFSET $3",
+            RUN_VARIANT_SUBQUERY, EXPERIMENT_TOTALS_SELECT, RUN_ROWS_WHERE
+        );
+        type Row = (i64, String, String, i64, i64, f64, f64, i64, i64, i64, String, String);
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(experiment_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    user_id, correlation_id, variant, variant_count, requests, cost_usd, saved_usd,
+                    tokens_in, tokens_out, estimated_rows, first_at, last_at,
+                )| ExperimentRunRow {
+                    user_id, correlation_id, variant, variant_count, requests, cost_usd, saved_usd,
+                    tokens_in, tokens_out, estimated_rows, first_at, last_at,
+                },
+            )
+            .collect())
+    }
+
+    async fn experiment_run_keys(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunKey>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, {}, COUNT(DISTINCT experiment_variant), \
+                    COUNT(*), MIN(created_at), MAX(created_at) \
+             FROM cost_ledger c WHERE {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY user_id ASC, attribution_correlation_id ASC",
+            RUN_VARIANT_SUBQUERY, RUN_ROWS_WHERE
+        );
+        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, variant, n, requests, first_at, last_at)| {
+                ExperimentRunKey {
+                    user_id, correlation_id, variant, mixed: n > 1, requests, first_at, last_at,
+                }
+            })
+            .collect())
+    }
+
+    async fn experiment_unbound_requests(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentUnboundRow>> {
+        let rows = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT u.user_id, u.attribution_correlation_id, COUNT(*) FROM cost_ledger u \
+             WHERE u.experiment_id IS NULL AND u.attribution_correlation_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM cost_ledger b WHERE b.experiment_id = $1 \
+                           AND b.user_id = u.user_id \
+                           AND b.attribution_correlation_id = u.attribution_correlation_id) \
+             GROUP BY u.user_id, u.attribution_correlation_id \
+             ORDER BY u.user_id ASC, u.attribution_correlation_id ASC",
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, requests)| ExperimentUnboundRow {
+                user_id, correlation_id, requests,
+            })
+            .collect())
+    }
+}
+
+/// Aggregates over stamped rows; order matches [`ExperimentTotalsRow`] after
+/// the grouping columns. `SUM` over BIGINT yields NUMERIC in Postgres, so the
+/// token sums are cast back; `tokens_estimated` is BOOLEAN, hence the CASE.
+const EXPERIMENT_TOTALS_SELECT: &str = "COUNT(*), COALESCE(SUM(cost_usd), 0.0), \
+                                        COALESCE(SUM(saved_usd), 0.0), \
+                                        COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                                        COALESCE(SUM(tokens_out), 0)::BIGINT, \
+                                        COALESCE(SUM(CASE WHEN tokens_estimated THEN 1 ELSE 0 END), 0)::BIGINT";
+
+/// Rows that form runs: stamped with the experiment (`$1`) and carrying a
+/// correlation id. Aliased `c` so the variant subquery can correlate.
+const RUN_ROWS_WHERE: &str = "c.experiment_id = $1 AND c.attribution_correlation_id IS NOT NULL";
+
+/// The run's variant: its earliest stamped row by `created_at`, then id —
+/// the rule `run_stamp` applies. A correlated subquery keeps the SQLite and
+/// Postgres shapes identical; `$1` is the experiment id.
+const RUN_VARIANT_SUBQUERY: &str =
+    "(SELECT COALESCE(e.experiment_variant, '') FROM cost_ledger e \
+      WHERE e.experiment_id = $1 AND e.user_id = c.user_id \
+        AND e.attribution_correlation_id = c.attribution_correlation_id \
+      ORDER BY e.created_at ASC, e.id ASC LIMIT 1)";
+
+type ExperimentTotalsRow = (String, i64, f64, f64, i64, i64, i64);
+
+impl PostgresDb {
+    /// `SELECT totals FROM cost_ledger WHERE {predicate} AND window`. The
+    /// predicate uses `$1..$n`; `start`/`end` take `$n+1`/`$n+2`.
+    async fn totals_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttributionTotals> {
+        let n = binds.len();
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ${} AND created_at < ${}",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        let mut q = sqlx::query_as::<_, TotalsRow>(&sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let row = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(totals_from_row(row))
+    }
+
+    async fn by_model_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let n = binds.len();
+        let sql = format!(
+            "SELECT model, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        self.breakdown_query(&sql, binds, start, end).await
+    }
+
+    async fn by_day_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let n = binds.len();
+        // created_at is an ISO 8601 string column, so the first ten characters
+        // are the calendar day — no timestamp cast needed.
+        let sql = format!(
+            "SELECT substring(created_at from 1 for 10) AS day, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY day ORDER BY day ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        self.breakdown_query(&sql, binds, start, end).await
+    }
+
+    async fn breakdown_query(
+        &self,
+        sql: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let mut q = sqlx::query_as::<_, BreakdownRow>(sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let rows = q.bind(start).bind(end).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(breakdown_from_row).collect())
+    }
 }
 
 type TotalsRow = (f64, f64, i64, i64, i64, i64);
@@ -695,7 +980,7 @@ fn breakdown_from_row(row: BreakdownRow) -> AttributionBreakdownRow {
 
 /// SQL predicate plus its bound values, in placeholder order. Both the tag key
 /// and its value are bound, so nothing from the caller reaches the SQL text.
-fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
+pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
     match filter {
         AttributionFilter::CorrelationId(v) => (
             "attribution_correlation_id = $1".to_string(),
@@ -705,5 +990,27 @@ fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<String>) {
             "(attribution_tags::jsonb ->> $1) = $2".to_string(),
             vec![key.clone(), value.clone()],
         ),
+    }
+}
+
+/// SQL predicate plus its bound values for one experiment variant. Shared by
+/// the ledger, prompt and failure tables, which stamp the same two columns.
+///
+/// Binds are strings (sqlx declares them as TEXT), so the experiment id is
+/// cast back to BIGINT in SQL.
+pub(crate) fn variant_predicate(experiment_id: i64, variant: &str) -> (String, Vec<String>) {
+    (
+        "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
+        vec![experiment_id.to_string(), variant.to_string()],
+    )
+}
+
+/// SQL predicate plus its bound values for a comparison arm against the ledger.
+fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
+    match filter {
+        ArmFilter::Model(m) => ("model = $1".to_string(), vec![m.clone()]),
+        ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
+        ArmFilter::Attribution(f) => attribution_predicate(f),
+        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
     }
 }

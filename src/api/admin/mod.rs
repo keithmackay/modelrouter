@@ -9,6 +9,8 @@ pub mod dashboard;
 pub mod groups;
 pub mod budgets;
 pub mod cache;
+pub mod compare;
+pub mod experiments;
 pub mod reports;
 pub mod models;
 pub mod webhooks;

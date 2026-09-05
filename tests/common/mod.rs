@@ -1,15 +1,74 @@
 pub mod e2e;
 pub mod mock_llm;
 
+use modelrouter::api::app::DatabaseProvider;
+use modelrouter::api::auth::hash_token;
+use modelrouter::db::models::{CostLedgerEntry, NewApiKey, NewUser};
+use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+use modelrouter::db::repositories::costs::CostRepository;
+use modelrouter::db::repositories::users::UserRepository;
 use modelrouter::db::{migrations::run_migrations, sqlite::SqliteDb};
 use modelrouter::providers::adapter::{
     CompletionResult, NormalizedRequest, ProviderAdapter, SseStream,
 };
 
+// Each test crate compiles this module on its own, so an item one crate does
+// not use is dead code there; the allows keep the shared helpers warning-free.
+
 pub async fn in_memory_db() -> SqliteDb {
     let db = SqliteDb::connect(":memory:").await.unwrap();
     run_migrations(&db.pool).await.unwrap();
     db
+}
+
+/// A cutoff after every row, so `list_cost_entries_before(FOREVER)` is "all".
+#[allow(dead_code)]
+pub const FOREVER: &str = "2999-01-01T00:00:00Z";
+
+/// Create a user with one API key whose bearer token is `token`; returns the
+/// user id.
+#[allow(dead_code)]
+pub async fn create_user(db: &impl DatabaseProvider, name: &str, token: &str) -> i64 {
+    UserRepository::create(
+        db,
+        NewUser {
+            name: name.to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+    let user = UserRepository::find_by_name(db, name).await.unwrap().unwrap();
+    ApiKeyRepository::create_api_key(
+        db,
+        NewApiKey {
+            user_id: user.id,
+            key_hash: hash_token(token),
+            label: Some(name.to_string()),
+            expires_at: None,
+            project: None,
+            session_window_secs: None,
+        },
+    )
+    .await
+    .unwrap();
+    user.id
+}
+
+/// Cost logging is fire-and-forget, so poll until at least `want` ledger rows
+/// exist rather than sleeping for a guessed interval.
+#[allow(dead_code)]
+pub async fn wait_for_ledger_rows(db: &dyn DatabaseProvider, want: usize) -> Vec<CostLedgerEntry> {
+    for _ in 0..200 {
+        let rows = CostRepository::list_cost_entries_before(db, FOREVER)
+            .await
+            .unwrap();
+        if rows.len() >= want {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {want} cost-ledger rows");
 }
 
 pub struct MockAdapter {

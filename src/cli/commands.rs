@@ -66,6 +66,86 @@ pub enum Commands {
     Webhook(WebhookArgs),
     /// Inspect and control the response cache on a running router
     Cache(CacheArgs),
+    /// Manage controlled experiments (spec §7a)
+    Experiment(ExperimentArgs),
+}
+
+// ── Experiment subcommands ────────────────────────────────────────────────────
+
+/// Experiments are rows in the database, so these commands write it
+/// directly, the way `alias` and `webhook` do. A running server reloads its
+/// experiment registry every 60 seconds, so an experiment added or closed
+/// here is honoured within a minute without a restart.
+#[derive(Args)]
+pub struct ExperimentArgs {
+    #[command(subcommand)]
+    pub command: ExperimentCommands,
+}
+
+#[derive(Subcommand)]
+pub enum ExperimentCommands {
+    /// Create an experiment. A running server picks it up within 60 seconds.
+    Add(ExperimentAddArgs),
+    /// List experiments (active by default)
+    List {
+        /// Which experiments to show: active | closed | all
+        #[arg(long, default_value = "active")]
+        status: String,
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Close an experiment. A running server stops binding to it within 60 seconds.
+    Close {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Results for one experiment (the same document as
+    /// `GET /admin/api/experiments/:id/results`)
+    Results {
+        #[arg(long)]
+        id: i64,
+        /// Runs per page (1-1000, default 200)
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Runs to skip
+        #[arg(long)]
+        offset: Option<i64>,
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+}
+
+/// Flags of `experiment add`. Expiry and retention are required with no
+/// default, so an operator always states them (spec §7a).
+#[derive(Args, Debug)]
+pub struct ExperimentAddArgs {
+    /// Experiment name (unique, 1-128 characters)
+    #[arg(long)]
+    pub name: String,
+    /// One variant as `LABEL=KEY:TARGET[,KEY:TARGET...]`, where KEY is the
+    /// model name a caller requests and TARGET is an alias or
+    /// `provider/model` it is sent to instead. Repeat for each variant (at
+    /// least two). An empty overlay is `--variant control=`.
+    #[arg(long = "variant", required = true, value_name = "LABEL=KEY:TARGET[,...]")]
+    pub variants: Vec<String>,
+    /// When the experiment stops binding requests: an RFC3339 timestamp in
+    /// the future, or `never`
+    #[arg(long, required = true, value_name = "RFC3339|never")]
+    pub expires_at: String,
+    /// Days after close that retained content is kept (0 = forever, at most 3650)
+    #[arg(long, required = true, value_name = "DAYS")]
+    pub content_retention_days: i64,
+    /// Store full prompts and responses for bound requests regardless of
+    /// `[storage]`; requires a finite --expires-at
+    #[arg(long)]
+    pub retain_content: bool,
+    /// Mark the experiment's outcomes as input for later learning work
+    #[arg(long)]
+    pub feed_learning: bool,
+    /// Restrict binding to these users (by name); repeat for each. Omit to
+    /// admit every key.
+    #[arg(long = "allow-user", value_name = "NAME")]
+    pub allow_users: Vec<String>,
 }
 
 // ── Response cache subcommands ────────────────────────────────────────────────
@@ -448,6 +528,28 @@ pub enum ReportCommands {
         /// Break the attribution report down by `model` or `day`
         #[arg(long, default_value = "model")]
         by: AttributionBreakdown,
+        /// Time window: daily | weekly | monthly | alltime  [default: monthly]
+        #[arg(long, default_value = "monthly")]
+        window: String,
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Compare two experiment arms side by side (same query as
+    /// `GET /admin/api/compare` and the dashboard's Compare page)
+    Compare {
+        /// Partition traffic by `model`, `provider`, `tag` or `run`
+        /// (attribution correlation id)
+        #[arg(long)]
+        dimension: String,
+        /// Attribution tag key; required with `--dimension tag`
+        #[arg(long)]
+        key: Option<String>,
+        /// Arm A value (a model, provider, tag value or correlation id)
+        #[arg(long)]
+        a: String,
+        /// Arm B value
+        #[arg(long)]
+        b: String,
         /// Time window: daily | weekly | monthly | alltime  [default: monthly]
         #[arg(long, default_value = "monthly")]
         window: String,

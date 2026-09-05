@@ -31,6 +31,8 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Drop-in OpenAI compatibility** — any SDK that speaks `POST /v1/chat/completions` works without modification
 - **Multi-provider routing** — route to OpenAI, Anthropic, Google Gemini, or Ollama; switch providers by changing one config line
 - **Routing shortcuts** — use `:fastest` or `:cheapest` as the model name to route to your configured fastest or cheapest model without changing client code
+- **Runtime model aliases** — point an alias like `deep` at any `provider/model` from the admin UI or CLI, with no restart; DB aliases override config, and resolution is depth-capped so a cycle cannot hang a request
+- **Operator disable** — take a model or a whole provider out of rotation with a recorded reason; disabled targets return **403** naming the reason instead of reaching the provider, and stay disabled until explicitly re-enabled (unlike a circuit-breaker trip)
 - **Failure capture** — every request that does NOT return a result is persisted with the stage it died at (`resolve` / `policy` / `provider` / `request` / `internal`) and surfaced at `/admin/failures`; prompt rows only ever record successes, so without this the router had no answer for "what failed"
 - **Strict model resolution** — refuse to silently substitute `default_model` for a model nobody configured, instead of answering with a different model than the caller asked for
 - **Embedding failover with width verification** — `/v1/embeddings` walks the same fallback chains as completions, and a `dimensions` request is verified against what the provider returned, so failing over between models of different widths can never corrupt a vector store
@@ -38,6 +40,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Admin dashboard** — web UI at `/admin` with usage stats, failures, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
 - **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion; wire Datadog, Slack, or any HTTP endpoint; takes effect on next restart
 - **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
+- **Controlled experiments** — create an experiment with named variants, put `x-modelrouter-experiment: <id>[:<label>]` on each chat completion, report outcomes with `POST /v1/feedback`, and read per-variant and per-run cost, tokens, turns, latency, failures and outcomes back as JSON, from the CLI, or on `/admin/experiments`; bound requests are pinned to their variant's priced model with no downgrade, pool, cache or fallback
 - **Request cost attribution** — tag any metered call with your own correlation id and free-form tags (`attribution` in the request body, or `X-Attribution-*` headers); the router persists them on the prompt and cost-ledger rows and reports spend *and* cache savings per tag, so a consuming app can drop its own cost accounting. Attribution never affects routing or the cache key
 - **Session stickiness** — include `session_id` in any request to pin the session to the winning provider; automatically re-pins on model change; opt out per-request with `X-Session-Lb: true`
 - **Prompt logging control** — set `X-No-Log: true` on any request to skip prompt history and callback dispatch while preserving cost tracking for budget enforcement
@@ -1252,6 +1255,41 @@ GET /admin/api/usage/attribution/facets?key=engagement   # values for one key
 and on `/admin/reports`, where picking an attribution value swaps the panels
 for an attributed-usage view (spend, savings, cache-hit rate, per-model and
 per-day breakdowns).
+
+To compare two arms of an experiment — two tag values, two correlation ids,
+two models, two providers or two variants of a controlled experiment — use
+`GET /admin/api/compare`, `modelrouter report compare`, or the
+`/admin/compare` page. [docs/experiments.md](docs/experiments.md) walks a
+client application through labelling traffic, retrieving the comparison,
+and reading it.
+
+### Controlled experiments
+
+A router-managed A/B run. Create an experiment with named variants — each
+one an overlay from the model name a caller requests to the `provider/model`
+it is sent to instead — and put `x-modelrouter-experiment: <id>` (router
+assigns the variant by a stable hash of `session_id`) or `<id>:<label>` on
+each chat completion. Bound requests are pinned to their variant's model
+with no downgrade, pool, affinity, cache or fallback, and every row the
+router writes is stamped with the experiment and variant. The application
+reports how each run went with `POST /v1/feedback`, and reads back
+per-variant and per-run cost, tokens, turns, span, latency, failures and
+outcomes from `GET /admin/api/experiments/:id/results`, `modelrouter
+experiment results`, or the `/admin/experiments` page.
+
+```bash
+modelrouter experiment add --name checkout-haiku \
+  --variant 'control=fast:fast' --variant 'candidate=fast:anthropic/claude-haiku-4-5' \
+  --expires-at 2026-10-01T00:00:00Z --content-retention-days 30
+```
+
+Expiry and retention are required, never defaulted; every target must
+resolve to a priced, configured `provider/model` (no pools, no fall-through
+to the default model) or creation is refused; an unknown experiment or
+variant on a request is a `400`, never silent routing. An experiment can
+retain full prompt content for its own traffic under a superadmin-set
+window (`--retain-content`), purged after close. Part 1 of
+[docs/experiments.md](docs/experiments.md) is the end-to-end guide.
 
 Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
 
