@@ -3280,7 +3280,6 @@ mod experiment_cli_tests {
         assert!(experiment_list(&db, "all").await.unwrap().is_empty());
 
         // A runtime alias set through `alias set` resolves like a config one.
-        use crate::db::repositories::aliases::AliasRepository;
         db.upsert_alias(crate::db::models::NewModelAlias {
             alias: "runtime".to_string(),
             target: "fast".to_string(),
