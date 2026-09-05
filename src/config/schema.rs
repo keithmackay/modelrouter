@@ -213,6 +213,8 @@ pub struct Settings {
     pub oidc: OidcConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -458,6 +460,71 @@ impl Default for HealthConfig {
 fn default_deep_ttl() -> u64 { 60 }
 fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
 fn default_search_probe_engine() -> String { "tavily".to_string() }
+
+/// `[admin]` — admin account management.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub bootstrap: Option<AdminBootstrapConfig>,
+}
+
+/// `[admin.bootstrap]` — idempotent admin account creation at startup (issue #43).
+///
+/// When present, the account is created-if-absent by name at serve time.
+/// Second startup is a no-op: password and role are never overwritten. A
+/// malformed bcrypt hash or invalid role fails startup loudly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdminBootstrapConfig {
+    pub name: String,
+    pub role: String,
+    /// Bcrypt hash. NEVER plaintext.
+    pub password_hash: String,
+}
+
+impl AdminBootstrapConfig {
+    /// Validate role against the known vocabulary and bcrypt hash format.
+    ///
+    /// The role vocabulary is exactly {"superadmin", "viewer"}. An unknown role
+    /// would silently degrade to viewer in session extractors that gate on
+    /// `role != "superadmin"`, so this validation rejects startup loudly rather
+    /// than allowing misconfigured bootstrap accounts to believe they hold the
+    /// specified role when they do not.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const VALID_ROLES: &[&str] = &["superadmin", "viewer"];
+        if !VALID_ROLES.contains(&self.role.as_str()) {
+            anyhow::bail!(
+                "admin.bootstrap.role is '{}', which is not a recognized role. \
+                 Valid roles are: {}. Set the role explicitly in config.toml or \
+                 via MODELROUTER_ADMIN__BOOTSTRAP__ROLE. Refusing to start.",
+                self.role,
+                VALID_ROLES.join(", ")
+            );
+        }
+
+        // Validate bcrypt hash format: bcrypt hashes start with $2a$, $2b$, or $2y$
+        // and have a specific structure. We attempt verification with a dummy password
+        // to check if the hash is well-formed — any result (Ok/Err) proves it parses.
+        if !self.password_hash.starts_with("$2") {
+            anyhow::bail!(
+                "admin.bootstrap.password_hash does not look like a bcrypt hash. \
+                 Expected format: $2a$..., $2b$..., or $2y$... \
+                 Use `modelrouter admin hash-password` to generate a valid hash. \
+                 Refusing to start."
+            );
+        }
+
+        // Validate hash is parseable by attempting verification.
+        // Both Ok and Err are acceptable — we just need to ensure it doesn't panic.
+        let _ = bcrypt::verify("_validation_probe_", &self.password_hash)
+            .map_err(|_| anyhow::anyhow!(
+                "admin.bootstrap.password_hash is malformed (bcrypt verification failed). \
+                 Use `modelrouter admin hash-password` to generate a valid hash. \
+                 Refusing to start."
+            ))?;
+
+        Ok(())
+    }
+}
 
 /// `[storage]` — what the prompt log records (issue #4).
 ///

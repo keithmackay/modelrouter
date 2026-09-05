@@ -278,6 +278,39 @@ pub async fn run(cli: Cli) -> Result<()> {
                 settings.oidc.validate_role()?;
             }
 
+            // Bootstrap admin account from config if specified (issue #43).
+            // Idempotent: create-if-absent by name; second startup is a no-op.
+            // Invalid role or malformed hash fails startup loudly.
+            if let Some(ref bootstrap) = settings.admin.bootstrap {
+                bootstrap.validate()?;
+                use crate::db::repositories::admin_users::AdminUserRepository;
+                match AdminUserRepository::find_by_name(&*db, &bootstrap.name).await? {
+                    Some(existing) => {
+                        tracing::info!(
+                            name = %existing.name,
+                            role = %existing.role,
+                            "admin bootstrap: account already exists, skipping"
+                        );
+                    }
+                    None => {
+                        let admin = AdminUserRepository::create(
+                            &*db,
+                            crate::db::models::NewAdminUser {
+                                name: bootstrap.name.clone(),
+                                password_hash: bootstrap.password_hash.clone(),
+                                role: bootstrap.role.clone(),
+                            },
+                        )
+                        .await?;
+                        tracing::info!(
+                            name = %admin.name,
+                            role = %admin.role,
+                            "admin bootstrap: created account"
+                        );
+                    }
+                }
+            }
+
             // Effective [storage] policy (issue #4): the DB-stored GUI value
             // wins over config.toml; absence of a row means the file/default
             // applies. Held in an ArcSwap so an admin saving the form takes

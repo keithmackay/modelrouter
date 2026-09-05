@@ -634,6 +634,8 @@ pub enum AdminCommands {
     Disable {
         name: String,
     },
+    /// Generate a bcrypt password hash for [admin.bootstrap] config
+    HashPassword,
 }
 
 // ── Webhook subcommands ───────────────────────────────────────────────────────
