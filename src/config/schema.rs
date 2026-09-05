@@ -364,6 +364,18 @@ pub struct RoutingConfig {
     /// caller believed it was using Opus.
     #[serde(default)]
     pub strict_model_resolution: bool,
+    /// Search engine used when a `/v1/search` request omits `engine`.
+    ///
+    /// Unset means "infer from the configured search providers": if exactly one
+    /// is configured, use it. This exists because the previous behaviour was a
+    /// hardcoded `"tavily"` in `api/routes/search.rs`, which 502s on any host
+    /// that configures a different engine — a caller omitting `engine` got
+    /// `No search adapter configured for engine: tavily` even though a working
+    /// Vertex adapter was configured and reachable. Naming a provider in code
+    /// as the fallback for "caller said nothing" is the same class of mistake
+    /// `strict_model_resolution` exists to prevent for chat models.
+    #[serde(default)]
+    pub default_search_engine: Option<String>,
 }
 
 impl Default for RoutingConfig {
@@ -377,6 +389,7 @@ impl Default for RoutingConfig {
             load_balancer: HashMap::new(),
             shortcuts: RoutingShortcutsConfig::default(),
             strict_model_resolution: false,
+            default_search_engine: None,
         }
     }
 }

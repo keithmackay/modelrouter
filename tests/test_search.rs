@@ -39,6 +39,26 @@ async fn test_app_with_pricing_and_cache(
     pricing: Vec<PricingEntry>,
     cache: CacheConfig,
 ) -> (TestServer, Arc<dyn DatabaseProvider>) {
+    test_app_full(
+        pricing,
+        cache,
+        SearchRegistry::new_with_mock(common::MockSearchAdapter {
+            results: mock_results(),
+        }),
+        None,
+    )
+    .await
+}
+
+/// Full harness: lets a test choose which search engines the registry can serve
+/// and what `[routing] default_search_engine` says, which is what the
+/// engine-resolution tests below vary.
+async fn test_app_full(
+    pricing: Vec<PricingEntry>,
+    cache: CacheConfig,
+    search_registry: SearchRegistry,
+    default_search_engine: Option<&str>,
+) -> (TestServer, Arc<dyn DatabaseProvider>) {
     let db = common::in_memory_db().await;
     UserRepository::create(
         &db,
@@ -70,6 +90,7 @@ async fn test_app_with_pricing_and_cache(
 
     let mut settings = Settings::default();
     settings.pricing = pricing;
+    settings.routing.default_search_engine = default_search_engine.map(str::to_string);
     let settings = Arc::new(settings);
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
     let router = Arc::new(RequestRouter::new(settings.clone()));
@@ -86,9 +107,7 @@ async fn test_app_with_pricing_and_cache(
             embedding: vec![0.1_f32, 0.2, 0.3],
         },
     ));
-    let search_registry = Arc::new(SearchRegistry::new_with_mock(common::MockSearchAdapter {
-        results: mock_results(),
-    }));
+    let search_registry = Arc::new(search_registry);
 
     let state = AppState {
         settings: settings.clone(),
@@ -195,6 +214,117 @@ async fn search_unknown_engine_returns_400() {
         .json(&serde_json::json!({ "query": "rust", "engine": "bing" }))
         .await;
     assert_eq!(resp.status_code(), 400);
+}
+
+// ── Engine resolution when the request omits `engine` ────────────────────────
+//
+// These cover the regression that made a Vertex-only host answer every
+// engine-less `/v1/search` with `502 No search adapter configured for engine:
+// tavily`: the route used to hardcode `unwrap_or("tavily")` regardless of what
+// the operator had configured.
+
+fn mock_search_registry(engines: &[&str]) -> SearchRegistry {
+    SearchRegistry::new_with_mock_engines(
+        engines
+            .iter()
+            .map(|e| {
+                let adapter: Arc<dyn modelrouter::providers::search::SearchAdapter> =
+                    Arc::new(common::MockSearchAdapter {
+                        results: mock_results(),
+                    });
+                (*e, adapter)
+            })
+            .collect(),
+    )
+}
+
+async fn search_without_engine(
+    registry: SearchRegistry,
+    default_search_engine: Option<&str>,
+) -> axum_test::TestResponse {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        registry,
+        default_search_engine,
+    )
+    .await;
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust" }))
+        .await
+}
+
+/// The sole available engine serves the request even when it is not Tavily.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_omitted_engine_resolves_to_sole_configured_engine() {
+    let resp = search_without_engine(mock_search_registry(&["vertex"]), None).await;
+    assert_eq!(resp.status_code(), 200);
+}
+
+/// With more than one engine available and no configured default, refuse and
+/// name the options rather than silently substituting one of them.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_omitted_engine_with_multiple_engines_returns_400() {
+    let resp = search_without_engine(mock_search_registry(&["tavily", "vertex"]), None).await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("tavily"), "message was: {message}");
+    assert!(message.contains("vertex"), "message was: {message}");
+}
+
+/// `[routing] default_search_engine` resolves the ambiguity above.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_omitted_engine_uses_configured_default() {
+    let resp =
+        search_without_engine(mock_search_registry(&["tavily", "vertex"]), Some("vertex")).await;
+    assert_eq!(resp.status_code(), 200);
+}
+
+/// An explicit `engine` still wins over the configured default.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_explicit_engine_overrides_configured_default() {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        mock_search_registry(&["tavily", "vertex"]),
+        Some("vertex"),
+    )
+    .await;
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "bing" }))
+        .await;
+    // `bing` is unsupported: proof the request's own engine was used, not the
+    // default that would have answered 200.
+    assert_eq!(resp.status_code(), 400);
+}
+
+/// No engines at all is a configuration error the operator can act on, not a
+/// 502 naming an engine they never configured.
+#[tokio::test]
+async fn search_omitted_engine_with_no_engines_returns_400() {
+    let resp = search_without_engine(SearchRegistry::new(HashMap::new()), None).await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no search engine configured"),
+        "message was: {message}"
+    );
 }
 
 #[tokio::test]
