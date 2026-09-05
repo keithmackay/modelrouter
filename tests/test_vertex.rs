@@ -58,8 +58,15 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn unknown_prefix_errors() {
-        let err = parse_model_id("cohere/command-r").unwrap_err().to_string();
+    fn unrecognized_prefix_routes_to_maas_with_full_id() {
+        let (publisher, id) = parse_model_id("cohere/command-r").unwrap();
+        assert_eq!(publisher, Publisher::Maas);
+        assert_eq!(id, "cohere/command-r");
+    }
+
+    #[test]
+    fn bare_id_without_recognizable_prefix_errors() {
+        let err = parse_model_id("command-r").unwrap_err().to_string();
         assert!(err.contains("Unsupported Vertex publisher"), "got: {err}");
     }
 }
