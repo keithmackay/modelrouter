@@ -26,18 +26,18 @@
       hx-on::after-request="this.reset()"
       style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;flex-wrap:wrap;">
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Provider *</label>
-    <input type="text" name="provider" required placeholder="anthropic"
+    <label for="model-provider" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Provider *</label>
+    <input type="text" name="provider" id="model-provider" required placeholder="anthropic"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
   </div>
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Model Name *</label>
-    <input type="text" name="name" required placeholder="claude-opus-4-6"
+    <label for="model-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Model Name *</label>
+    <input type="text" name="name" id="model-name" required placeholder="claude-opus-4-6"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:240px;">
   </div>
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias</label>
-    <input type="text" name="alias" placeholder="opus"
+    <label for="model-alias" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias</label>
+    <input type="text" name="alias" id="model-alias" placeholder="opus"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
   </div>
   <button type="submit" class="btn btn-success">Add Model</button>
@@ -80,6 +80,7 @@
           hx-confirm="Delete this model?">Delete</button>
         {% if m.enabled %}
           <input type="text" name="reason" placeholder="reason" id="model-reason-{{ m.id }}"
+                 aria-label="Reason for disabling model {{ m.name }}"
                  style="padding:0.2rem 0.4rem;border:1px solid #ccc;border-radius:4px;width:150px">
           <button class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
             hx-post="/admin/models/{{ m.id }}/disable" hx-include="#model-reason-{{ m.id }}"
@@ -126,13 +127,13 @@
       hx-on::after-request="this.reset()"
       style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:0.5rem;flex-wrap:wrap;">
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias *</label>
-    <input type="text" name="alias" required placeholder="deep"
+    <label for="alias-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias *</label>
+    <input type="text" name="alias" id="alias-name" required placeholder="deep"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
   </div>
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
-    <input type="text" name="target" required placeholder="anthropic/claude-opus-4-6"
+    <label for="alias-target" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
+    <input type="text" name="target" id="alias-target" required placeholder="anthropic/claude-opus-4-6"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
   </div>
   <button type="submit" class="btn btn-success">Save Alias</button>
@@ -195,12 +196,12 @@ function editAlias(alias, target) {
     <form id="failover-form" style="background:#fff;border-radius:6px;padding:1rem;
           box-shadow:0 1px 3px rgba(0,0,0,0.1);">
       <div style="margin-bottom:0.75rem;">
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Primary Model *</label>
+        <label for="failover-primary" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Primary Model *</label>
         <input type="text" id="failover-primary" placeholder="opus or anthropic/claude-opus-4-6"
                style="width:100%;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
       </div>
       <div style="margin-bottom:0.75rem;">
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">
+        <label for="failover-fallbacks" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">
           Fallbacks (ordered, one per line or comma-separated)
         </label>
         <textarea id="failover-fallbacks" rows="4" placeholder="sonnet&#10;haiku"
