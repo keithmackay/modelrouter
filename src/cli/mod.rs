@@ -270,6 +270,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             // over it alone, so a weak value makes every session forgeable.
             settings.auth.validate_secret()?;
 
+            // Validate OIDC role against the known vocabulary {"superadmin", "viewer"}.
+            // An unknown role would silently degrade to viewer in session extractors,
+            // so this ensures operators set an explicit valid role if they want SSO
+            // admins to hold superadmin (issue #51).
+            if settings.oidc.enabled {
+                settings.oidc.validate_role()?;
+            }
+
             // Effective [storage] policy (issue #4): the DB-stored GUI value
             // wins over config.toml; absence of a row means the file/default
             // applies. Held in an ArcSwap so an admin saving the form takes

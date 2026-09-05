@@ -254,7 +254,7 @@ fn default_archive_after_days() -> u32 { 90 }
 fn default_archive_prefix() -> String { "modelrouter/cost-logs".to_string() }
 fn default_archive_region() -> String { "us-east-1".to_string() }
 
-fn default_oidc_role() -> String { "admin".to_string() }
+fn default_oidc_role() -> String { "viewer".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OidcConfig {
@@ -288,6 +288,30 @@ impl Default for OidcConfig {
             allowed_domains: vec![],
             auto_provision_role: default_oidc_role(),
         }
+    }
+}
+
+impl OidcConfig {
+    /// Validate the configured OIDC role against the known vocabulary.
+    ///
+    /// The role vocabulary is exactly {"superadmin", "viewer"}. An unknown role
+    /// would silently degrade to viewer in session extractors that gate on
+    /// `role != "superadmin"`, so this validation rejects startup loudly rather
+    /// than allowing misconfigured SSO admins to believe they hold the specified
+    /// role when they do not.
+    pub fn validate_role(&self) -> anyhow::Result<()> {
+        const VALID_ROLES: &[&str] = &["superadmin", "viewer"];
+        if !VALID_ROLES.contains(&self.auto_provision_role.as_str()) {
+            anyhow::bail!(
+                "oidc.auto_provision_role is '{}', which is not a recognized role. \
+                 Valid roles are: {}. Auto-provisioned admins with an unrecognized role \
+                 would silently degrade to viewer. Set the role explicitly in config.toml or \
+                 via MODELROUTER_OIDC__AUTO_PROVISION_ROLE. Refusing to start.",
+                self.auto_provision_role,
+                VALID_ROLES.join(", ")
+            );
+        }
+        Ok(())
     }
 }
 

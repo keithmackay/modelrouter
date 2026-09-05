@@ -112,6 +112,8 @@ impl axum::extract::FromRequestParts<AppState> for SuperDashboardSession {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let session = DashboardSession::from_request_parts(parts, state).await?;
+        // Explicit allow-list: only "superadmin" is permitted, anything else
+        // (including unrecognized roles) is denied rather than degraded (issue #51).
         if session.0.role != "superadmin" {
             return Err(DashboardError::Forbidden);
         }
