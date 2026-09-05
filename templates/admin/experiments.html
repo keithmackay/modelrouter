@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}Experiments — modelrouter Admin{% endblock %}
+{% block content %}
+<h1>Experiments</h1>
+<p style="color:#666;font-size:0.85rem;margin-top:-0.5rem;margin-bottom:1rem;">
+    Controlled experiments pin each variant to a priced provider/model at creation and never change
+    afterwards. Every experiment is listed here, closed ones included; the results panel below the
+    table is read from the ledger, the prompt log, the failure log and reported outcomes.
+</p>
+
+{% if session.role == "superadmin" %}
+<form hx-post="/admin/experiments" hx-target="#experiment-msg" hx-swap="innerHTML"
+      style="display:block;background:#fff;border-radius:6px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:1.5rem;">
+    <h2 style="font-size:1.1rem;margin-bottom:1rem;">Create experiment</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start;">
+        <div style="grid-column:1/-1;display:flex;gap:0.75rem;flex-wrap:wrap;align-items:flex-end;">
+            <div>
+                <label for="exp-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name *</label>
+                <input type="text" id="exp-name" name="name" required maxlength="128" placeholder="haiku-vs-mini"
+                       style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:240px;">
+            </div>
+            <div>
+                <label for="exp-expires" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Expires *</label>
+                <select id="exp-expires" name="expires_in" required
+                        style="padding:0.45rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+                    <option value="">Choose…</option>
+                    {% for o in expiry_options %}
+                    <option value="{{ o.value }}">{{ o.label }}</option>
+                    {% endfor %}
+                    <option value="never">Never</option>
+                </select>
+            </div>
+            <div>
+                <label for="exp-retention" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Content retention days *</label>
+                <input type="number" id="exp-retention" name="content_retention_days" required min="0" max="3650" step="1" placeholder="0 = forever"
+                       style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:140px;">
+            </div>
+            <label style="font-size:0.85rem;display:flex;align-items:center;gap:0.35rem;padding-bottom:0.5rem;">
+                <input type="checkbox" name="retain_content" value="on"> Retain content
+            </label>
+            <label style="font-size:0.85rem;display:flex;align-items:center;gap:0.35rem;padding-bottom:0.5rem;">
+                <input type="checkbox" name="feed_learning" value="on"> Feed learning
+            </label>
+        </div>
+        <div>
+            <label for="exp-variants" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Variants (JSON) *</label>
+            <textarea id="exp-variants" name="variants" required rows="6" spellcheck="false"
+                      placeholder='{"control": {"requested_name": "..."}, "candidate": {"requested_name": "..."}}'
+                      style="width:100%;box-sizing:border-box;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-family:monospace;font-size:0.8rem;"></textarea>
+            <div style="font-size:0.75rem;color:#777;margin-top:0.2rem;">
+                Label → overlay of requested model name → alias or <code>provider/model</code>; 2 to 16 variants.
+                Every target must resolve to a priced, configured model that is not a load balancer pool.
+            </div>
+        </div>
+        <div>
+            <label for="exp-users" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Allowed users</label>
+            <select id="exp-users" name="allowed_user_ids" multiple size="6"
+                    style="width:100%;box-sizing:border-box;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+                {% for u in users %}
+                <option value="{{ u.id }}">{{ u.name }}</option>
+                {% endfor %}
+            </select>
+            <div style="font-size:0.75rem;color:#777;margin-top:0.2rem;">None selected = every key may bind.</div>
+        </div>
+    </div>
+    <div style="margin-top:1rem;">
+        <button type="submit" class="btn btn-success">Create experiment</button>
+    </div>
+</form>
+{% else %}
+<p style="font-size:0.85rem;color:#777;margin-bottom:1rem;">Creating and closing experiments needs a superadmin session.</p>
+{% endif %}
+
+<div id="experiment-msg"></div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Variants</th>
+            <th>Expires</th>
+            <th>Retention</th>
+            <th>Users</th>
+            <th>Created</th>
+            <th>Closed</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody id="experiments-tbody">
+        {% block rows %}
+        {% for e in experiments %}
+        <tr id="experiment-row-{{ e.id }}">
+            <td><strong>{{ e.name }}</strong><div style="font-size:0.75rem;color:#999;">#{{ e.id }}</div></td>
+            <td>
+                {% if e.active %}
+                <span class="tag tag-enabled">{{ e.status }}</span>
+                {% else %}
+                <span class="tag tag-disabled">{{ e.status }}</span>
+                {% endif %}
+            </td>
+            <td title="{{ e.pins }}">
+                {% for l in e.labels %}<code>{{ l }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+            </td>
+            <td>{{ e.expires }}</td>
+            <td>
+                {% if e.retain_content %}
+                <span class="tag" style="background:#e8e4f5;color:#4a3b8c;" title="Prompt and response content is stored for this experiment and purged this long after close">retains content · {{ e.retention }}</span>
+                {% else %}
+                <span style="color:#999;">—</span>
+                {% endif %}
+                {% if e.feed_learning %}<span class="tag" style="background:#e3f2fd;color:#0d47a1;margin-left:0.25rem;">feeds learning</span>{% endif %}
+            </td>
+            <td>
+                {% if e.allowed_users %}
+                {% for u in e.allowed_users %}{{ u }}{% if not loop.last %}, {% endif %}{% endfor %}
+                {% else %}
+                <span style="color:#999;">every key</span>
+                {% endif %}
+            </td>
+            <td style="white-space:nowrap;">{{ e.created }}</td>
+            <td style="white-space:nowrap;">{% if e.closed %}{{ e.closed }}{% else %}<span style="color:#999;">—</span>{% endif %}</td>
+            <td style="white-space:nowrap;">
+                <button type="button" class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+                        hx-get="/admin/experiments/{{ e.id }}/panels?limit=50" hx-target="#panels" hx-swap="innerHTML">Results</button>
+                {% if e.active and session.role == "superadmin" %}
+                <button type="button" class="btn btn-danger" style="font-size:0.8rem;padding:0.25rem 0.5rem"
+                        hx-post="/admin/experiments/{{ e.id }}/close" hx-target="#experiment-msg" hx-swap="innerHTML"
+                        hx-confirm="Close experiment '{{ e.name }}'? New runs will no longer bind to it, and closing starts the retention clock{% if e.retain_content %}: stored content is {% if e.retention == "never" %}kept indefinitely{% else %}purged {{ e.retention }} after close{% endif %}{% endif %}.">Close</button>
+                {% endif %}
+            </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" style="color:#999;font-style:italic;">No experiments yet.</td></tr>
+        {% endfor %}
+        {% endblock %}
+    </tbody>
+</table>
+
+<div id="panels" style="margin-top:1.5rem;">
+    <p style="color:#999;font-size:0.85rem;">Choose <em>Results</em> on an experiment to load its results panel.</p>
+</div>
+{% endblock %}

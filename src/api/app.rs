@@ -291,6 +291,24 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/reports/panels", get(get_reports_panels))
         .route("/admin/compare", get(get_compare_page))
         .route("/admin/compare/panels", get(get_compare_panels))
+        // Experiments dashboard (spec §7a)
+        .route(
+            "/admin/experiments",
+            get(crate::api::admin::experiments::get_experiments_page)
+                .post(crate::api::admin::experiments::post_experiments_page),
+        )
+        .route(
+            "/admin/experiments/rows",
+            get(crate::api::admin::experiments::get_experiment_rows),
+        )
+        .route(
+            "/admin/experiments/:id/close",
+            post(crate::api::admin::experiments::post_close_experiment_page),
+        )
+        .route(
+            "/admin/experiments/:id/panels",
+            get(crate::api::admin::experiments::get_experiment_panels),
+        )
         .route("/admin/models", get(get_models).post(post_create_model))
         .route("/admin/models/:id/disable", post(post_disable_model))
         .route("/admin/models/:id/enable", post(post_enable_model))

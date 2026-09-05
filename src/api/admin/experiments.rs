@@ -26,15 +26,16 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
-    Json,
+    response::{Html, IntoResponse},
+    Form, Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::audit::audit;
+use super::dashboard::{DashboardError, DashboardSession, SuperDashboardSession};
 use crate::api::{
-    admin::auth::{AdminSession, SuperAdminSession},
+    admin::auth::{AdminClaims, AdminSession, SuperAdminSession},
     app::{AppState, DatabaseProvider},
     error::ApiError,
 };
@@ -352,30 +353,59 @@ pub(crate) fn is_unique_violation(err: &anyhow::Error) -> bool {
     )
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// ── Shared write path ─────────────────────────────────────────────────────────
 
-/// POST /admin/api/experiments
-pub async fn create_experiment_api(
-    State(state): State<AppState>,
-    session: SuperAdminSession,
-    Json(body): Json<Value>,
-) -> Result<impl IntoResponse, ApiError> {
+/// Why a write was refused: a message naming the offending field (a 400 on
+/// the API, an inline alert on the dashboard), or a database failure that
+/// has already been logged.
+#[derive(Debug)]
+pub enum WriteError {
+    Invalid(String),
+    Internal,
+}
+
+impl From<WriteError> for ApiError {
+    fn from(e: WriteError) -> Self {
+        match e {
+            WriteError::Invalid(msg) => ApiError::InvalidRequest(msg),
+            WriteError::Internal => ApiError::Internal,
+        }
+    }
+}
+
+impl From<WriteError> for DashboardError {
+    fn from(e: WriteError) -> Self {
+        match e {
+            WriteError::Invalid(msg) => DashboardError::BadRequest(msg),
+            WriteError::Internal => DashboardError::Internal,
+        }
+    }
+}
+
+/// Validate, gate, store, refresh and audit one experiment. Shared by the
+/// JSON endpoint and the dashboard form so both apply exactly the same rules;
+/// `actor` is whichever session performed the write.
+pub async fn create_experiment(
+    state: &AppState,
+    actor: &AdminClaims,
+    body: &Value,
+) -> Result<Experiment, WriteError> {
     let now = chrono::Utc::now();
-    let parsed = parse_create(&body, now).map_err(ApiError::InvalidRequest)?;
+    let parsed = parse_create(body, now).map_err(WriteError::Invalid)?;
 
     for id in &parsed.allowed_user_ids {
         let known = UserRepository::find_by_id(&*state.db, *id)
             .await
-            .map_err(|_| ApiError::Internal)?;
+            .map_err(|_| WriteError::Internal)?;
         if known.is_none() {
-            return Err(ApiError::InvalidRequest(format!(
+            return Err(WriteError::Invalid(format!(
                 "allowed_user_ids: no user with id {id}"
             )));
         }
     }
 
-    let variants = gate_variants(&GateSources::from_state(&state), &parsed.variants)
-        .map_err(ApiError::InvalidRequest)?;
+    let variants = gate_variants(&GateSources::from_state(state), &parsed.variants)
+        .map_err(WriteError::Invalid)?;
 
     let name = parsed.name;
     let row = ExperimentRepository::create(
@@ -394,18 +424,18 @@ pub async fn create_experiment_api(
     .map_err(|e| {
         // `experiments.name` is UNIQUE; the constraint is the duplicate check.
         if is_unique_violation(&e) {
-            return ApiError::InvalidRequest(format!("name '{name}' is already taken"));
+            return WriteError::Invalid(format!("name '{name}' is already taken"));
         }
         tracing::error!(error = %e, "failed to create experiment");
-        ApiError::Internal
+        WriteError::Internal
     })?;
 
-    refresh_registry(&state).await;
+    refresh_registry(state).await;
 
     audit(
         &state.db,
-        Some(session.0.sub),
-        &session.0.name,
+        Some(actor.sub),
+        &actor.name,
         "experiment.create",
         Some(format!("experiment:{}", row.id)),
         None,
@@ -413,6 +443,66 @@ pub async fn create_experiment_api(
     )
     .await;
 
+    Ok(row)
+}
+
+/// Close experiment `id`, refresh the registry and audit the transition.
+/// Shared by the JSON endpoint and the dashboard.
+pub async fn close_experiment(
+    state: &AppState,
+    actor: &AdminClaims,
+    id: i64,
+) -> Result<Experiment, WriteError> {
+    let before = ExperimentRepository::get(&*state.db, id)
+        .await
+        .map_err(|_| WriteError::Internal)?
+        .ok_or_else(|| WriteError::Invalid(format!("no experiment with id {id}")))?;
+    if before.closed_at.is_some() {
+        return Err(WriteError::Invalid(format!(
+            "experiment {id} is already closed"
+        )));
+    }
+
+    let closed_at = chrono::Utc::now().to_rfc3339();
+    let changed = ExperimentRepository::close(&*state.db, id, &closed_at)
+        .await
+        .map_err(|_| WriteError::Internal)?;
+    if !changed {
+        // Lost a race with the lifecycle tick or another operator.
+        return Err(WriteError::Invalid(format!(
+            "experiment {id} is already closed"
+        )));
+    }
+    let after = ExperimentRepository::get(&*state.db, id)
+        .await
+        .map_err(|_| WriteError::Internal)?
+        .ok_or(WriteError::Internal)?;
+
+    refresh_registry(state).await;
+
+    audit(
+        &state.db,
+        Some(actor.sub),
+        &actor.name,
+        "experiment.close",
+        Some(format!("experiment:{id}")),
+        Some(json!({ "status": before.status, "closed_at": before.closed_at }).to_string()),
+        Some(json!({ "status": after.status, "closed_at": after.closed_at }).to_string()),
+    )
+    .await;
+
+    Ok(after)
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+/// POST /admin/api/experiments
+pub async fn create_experiment_api(
+    State(state): State<AppState>,
+    session: SuperAdminSession,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let row = create_experiment(&state, &session.0, &body).await?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 
@@ -464,44 +554,7 @@ pub async fn close_experiment_api(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let id = parse_id(&id)?;
-    let before = ExperimentRepository::get(&*state.db, id)
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .ok_or_else(|| ApiError::InvalidRequest(format!("no experiment with id {id}")))?;
-    if before.closed_at.is_some() {
-        return Err(ApiError::InvalidRequest(format!(
-            "experiment {id} is already closed"
-        )));
-    }
-
-    let closed_at = chrono::Utc::now().to_rfc3339();
-    let changed = ExperimentRepository::close(&*state.db, id, &closed_at)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    if !changed {
-        // Lost a race with the lifecycle tick or another operator.
-        return Err(ApiError::InvalidRequest(format!(
-            "experiment {id} is already closed"
-        )));
-    }
-    let after = ExperimentRepository::get(&*state.db, id)
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .ok_or(ApiError::Internal)?;
-
-    refresh_registry(&state).await;
-
-    audit(
-        &state.db,
-        Some(session.0.sub),
-        &session.0.name,
-        "experiment.close",
-        Some(format!("experiment:{id}")),
-        Some(json!({ "status": before.status, "closed_at": before.closed_at }).to_string()),
-        Some(json!({ "status": after.status, "closed_at": after.closed_at }).to_string()),
-    )
-    .await;
-
+    let after = close_experiment(&state, &session.0, id).await?;
     Ok(Json(after))
 }
 
@@ -595,9 +648,8 @@ impl From<ResultsError> for ApiError {
     }
 }
 
-impl From<ResultsError> for super::dashboard::DashboardError {
+impl From<ResultsError> for DashboardError {
     fn from(e: ResultsError) -> Self {
-        use super::dashboard::DashboardError;
         match e {
             ResultsError::Invalid(msg) => DashboardError::BadRequest(msg),
             ResultsError::Db(err) => {
@@ -1226,6 +1278,626 @@ pub async fn get_experiment_results_api(
         .map_err(ApiError::InvalidRequest)?;
     let sources = ExperimentSources::from_state(&state);
     Ok(Json(build_results(&sources, id, page).await?))
+}
+
+// ── Dashboard (spec §7a, R17) ─────────────────────────────────────────────────
+//
+// `/admin/experiments` is the place to see every experiment, closed ones
+// included; the REST default of active-only is an API convenience. Writes go
+// through [`create_experiment`] and [`close_experiment`] so the form is held
+// to exactly the rules the API applies, and the form is turned into the same
+// JSON body first so a rejection names the same field.
+
+/// Runs per panel page. The JSON default of 200 is a long table for a
+/// screen; the panel has paging links. `RunPage::parse` still bounds it.
+const PANEL_RUN_LIMIT: &str = "50";
+
+/// Relative expiries the create form offers: `(form value, label, days)`.
+/// `never` and the empty placeholder are handled apart from this table.
+const EXPIRY_CHOICES: &[(&str, &str, i64)] = &[
+    ("1d", "1 day", 1),
+    ("7d", "7 days", 7),
+    ("30d", "30 days", 30),
+    ("90d", "90 days", 90),
+];
+
+fn expiry_text(expires_at: i64) -> String {
+    if expires_at == 0 {
+        return "never".to_string();
+    }
+    chrono::DateTime::from_timestamp(expires_at, 0)
+        .map(|t| super::templates::fmt_ts(&t.to_rfc3339()))
+        .unwrap_or_else(|| expires_at.to_string())
+}
+
+fn days_text(days: i64) -> String {
+    match days {
+        0 => "never".to_string(),
+        1 => "1 day".to_string(),
+        n => format!("{n} days"),
+    }
+}
+
+/// One list row, pre-rendered so the template only prints.
+#[derive(Debug, Serialize)]
+struct ExperimentRowView {
+    id: i64,
+    name: String,
+    status: &'static str,
+    active: bool,
+    /// Variant labels in declaration order.
+    labels: Vec<String>,
+    /// `label: key -> provider/model, ...` for the hover title.
+    pins: String,
+    expires: String,
+    created: String,
+    closed: Option<String>,
+    retain_content: bool,
+    /// The retention window, `never` when 0.
+    retention: String,
+    feed_learning: bool,
+    /// Names of the allowed users; empty means every key.
+    allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UserOption {
+    id: i64,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExpiryOption {
+    value: &'static str,
+    label: &'static str,
+}
+
+fn experiment_row_view(exp: &Experiment, names: &HashMap<i64, String>) -> ExperimentRowView {
+    let pins = exp
+        .variants
+        .iter()
+        .map(|(label, overlay)| {
+            let targets = overlay
+                .iter()
+                .map(|(k, t)| format!("{k} -> {}/{}", t.provider, t.model))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{label}: {targets}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    ExperimentRowView {
+        id: exp.id,
+        name: exp.name.clone(),
+        status: exp.status.as_str(),
+        active: exp.closed_at.is_none(),
+        labels: exp.variants.keys().cloned().collect(),
+        pins,
+        expires: expiry_text(exp.expires_at),
+        created: super::templates::fmt_ts(&exp.created_at),
+        closed: exp.closed_at.as_deref().map(super::templates::fmt_ts),
+        retain_content: exp.retain_content,
+        retention: days_text(exp.content_retention_days),
+        feed_learning: exp.feed_learning,
+        allowed_users: exp
+            .allowed_user_ids
+            .iter()
+            .map(|id| names.get(id).cloned().unwrap_or_else(|| format!("user:{id}")))
+            .collect(),
+    }
+}
+
+/// Everything the page and its rows fragment render from.
+async fn list_context(
+    state: &AppState,
+    session: &AdminClaims,
+) -> Result<minijinja::Value, DashboardError> {
+    let experiments = ExperimentRepository::list(&*state.db, ExperimentStatusFilter::All)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let names: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+    let rows: Vec<ExperimentRowView> = experiments
+        .iter()
+        .map(|e| experiment_row_view(e, &names))
+        .collect();
+    let mut user_options: Vec<UserOption> = users
+        .iter()
+        .map(|u| UserOption { id: u.id, name: u.name.clone() })
+        .collect();
+    user_options.sort_by(|a, b| a.name.cmp(&b.name));
+    let expiry_options: Vec<ExpiryOption> = EXPIRY_CHOICES
+        .iter()
+        .map(|(value, label, _)| ExpiryOption { value, label })
+        .collect();
+    Ok(minijinja::context! {
+        experiments => minijinja::Value::from_serialize(&rows),
+        users => minijinja::Value::from_serialize(&user_options),
+        expiry_options => minijinja::Value::from_serialize(&expiry_options),
+        session => minijinja::context! {
+            user_name => session.name.clone(),
+            role => session.role.clone(),
+        },
+    })
+}
+
+/// GET /admin/experiments
+pub async fn get_experiments_page(
+    State(state): State<AppState>,
+    session: DashboardSession,
+) -> Result<Html<String>, DashboardError> {
+    let ctx = list_context(&state, &session.0).await?;
+    super::dashboard::render("experiments.html", ctx)
+}
+
+/// Render only the `rows` block of the page: the list body, swapped into
+/// the table after a write so the row markup lives in one place.
+fn render_rows(ctx: minijinja::Value) -> Result<Html<String>, DashboardError> {
+    let template_error = |e: minijinja::Error| DashboardError::Template(e.to_string());
+    let tmpl = super::templates::env()
+        .get_template("experiments.html")
+        .map_err(template_error)?;
+    let mut captured = tmpl.render_captured(ctx).map_err(template_error)?;
+    let rows = captured
+        .with_state_mut(|s| s.render_block("rows"))
+        .map_err(template_error)?;
+    Ok(Html(rows))
+}
+
+/// GET /admin/experiments/rows — the list body, for the refresh after a write.
+pub async fn get_experiment_rows(
+    State(state): State<AppState>,
+    session: DashboardSession,
+) -> Result<Html<String>, DashboardError> {
+    let ctx = list_context(&state, &session.0).await?;
+    render_rows(ctx)
+}
+
+fn alert_danger(msg: &str) -> Html<String> {
+    Html(format!(
+        "<div class=\"alert alert-danger\">{}</div>",
+        super::models::he(msg)
+    ))
+}
+
+/// A success notice plus the trigger that reloads the list, the
+/// `aliases.rs` shape.
+fn alert_ok_and_refresh(msg: &str) -> Html<String> {
+    Html(format!(
+        "<div class=\"alert\" style=\"background:#d4edda;border:1px solid #c3e6cb;color:#155724\">\
+           ✓ {msg}\
+         </div>\
+         <div hx-get=\"/admin/experiments/rows\" hx-target=\"#experiments-tbody\" \
+              hx-swap=\"innerHTML\" hx-trigger=\"load\"></div>"
+    ))
+}
+
+fn form_bool(fields: &[(String, String)], name: &str) -> bool {
+    fields
+        .iter()
+        .any(|(k, v)| k == name && matches!(v.trim(), "on" | "true" | "1"))
+}
+
+/// Turn the submitted form into the JSON body the API takes, so
+/// [`parse_create`] validates both the same way. A blank field is left out
+/// of the body rather than defaulted, so the rejection names it; a value
+/// that cannot be an integer is passed through as text for the same reason.
+/// Only the encoding the form owns is checked here: the variants textarea
+/// must hold JSON and the expiry select must be one of its options.
+fn form_to_body(
+    fields: &[(String, String)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, String> {
+    let first = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v.trim());
+    let mut body = serde_json::Map::new();
+
+    if let Some(name) = first("name").filter(|v| !v.is_empty()) {
+        body.insert("name".into(), json!(name));
+    }
+
+    if let Some(raw) = first("variants").filter(|v| !v.is_empty()) {
+        let variants: Value = serde_json::from_str(raw)
+            .map_err(|e| format!("variants must be a JSON object of label -> overlay ({e})"))?;
+        body.insert("variants".into(), variants);
+    }
+
+    match first("expires_in") {
+        None | Some("") => {}
+        Some("never") => {
+            body.insert("expires_at".into(), json!(0));
+        }
+        Some(choice) => {
+            let (_, _, days) = EXPIRY_CHOICES
+                .iter()
+                .find(|(value, _, _)| *value == choice)
+                .ok_or_else(|| "expires_at must be one of the offered durations or never".to_string())?;
+            let at = now + chrono::Duration::days(*days);
+            body.insert("expires_at".into(), json!(at.to_rfc3339()));
+        }
+    }
+
+    if let Some(raw) = first("content_retention_days").filter(|v| !v.is_empty()) {
+        body.insert(
+            "content_retention_days".into(),
+            raw.parse::<i64>().map(|n| json!(n)).unwrap_or_else(|_| json!(raw)),
+        );
+    }
+
+    body.insert("retain_content".into(), json!(form_bool(fields, "retain_content")));
+    body.insert("feed_learning".into(), json!(form_bool(fields, "feed_learning")));
+
+    let allowed: Vec<Value> = fields
+        .iter()
+        .filter(|(k, v)| k == "allowed_user_ids" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().parse::<i64>().map(|n| json!(n)).unwrap_or_else(|_| json!(v.trim())))
+        .collect();
+    if !allowed.is_empty() {
+        body.insert("allowed_user_ids".into(), Value::Array(allowed));
+    }
+
+    Ok(Value::Object(body))
+}
+
+/// POST /admin/experiments — the create form.
+///
+/// The body is read as pairs rather than a struct so the multi-select's
+/// repeated `allowed_user_ids` keys survive and an absent field stays absent.
+pub async fn post_experiments_page(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Form(fields): Form<Vec<(String, String)>>,
+) -> Result<Html<String>, DashboardError> {
+    let body = match form_to_body(&fields, chrono::Utc::now()) {
+        Ok(body) => body,
+        Err(msg) => return Ok(alert_danger(&msg)),
+    };
+    match create_experiment(&state, &session.0, &body).await {
+        Ok(row) => Ok(alert_ok_and_refresh(&format!(
+            "Experiment <strong>{}</strong> created and live.",
+            super::models::he(&row.name)
+        ))),
+        Err(WriteError::Invalid(msg)) => Ok(alert_danger(&msg)),
+        Err(WriteError::Internal) => Err(DashboardError::Internal),
+    }
+}
+
+/// POST /admin/experiments/:id/close
+pub async fn post_close_experiment_page(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(id): Path<String>,
+) -> Result<Html<String>, DashboardError> {
+    let id = match parse_id(&id) {
+        Ok(id) => id,
+        Err(ApiError::InvalidRequest(msg)) => return Ok(alert_danger(&msg)),
+        Err(_) => return Err(DashboardError::Internal),
+    };
+    match close_experiment(&state, &session.0, id).await {
+        Ok(row) => Ok(alert_ok_and_refresh(&format!(
+            "Experiment <strong>{}</strong> closed; new runs no longer bind and the content \
+             retention clock has started.",
+            super::models::he(&row.name)
+        ))),
+        Err(WriteError::Invalid(msg)) => Ok(alert_danger(&msg)),
+        Err(WriteError::Internal) => Err(DashboardError::Internal),
+    }
+}
+
+// ── Results panel ─────────────────────────────────────────────────────────────
+
+fn fmt_ms(ms: f64) -> String {
+    format!("{ms:.0} ms")
+}
+
+fn fmt_secs(secs: f64) -> String {
+    if secs >= 60.0 {
+        format!("{:.1} min", secs / 60.0)
+    } else {
+        format!("{secs:.1} s")
+    }
+}
+
+fn fmt_opt(v: Option<f64>, decimals: usize) -> String {
+    v.map(|x| format!("{x:.decimals$}")).unwrap_or_else(|| "—".to_string())
+}
+
+fn fmt_pct(v: Option<f64>) -> String {
+    v.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "—".to_string())
+}
+
+/// Latency as one line: the summary with its sample count, or a note that
+/// nothing was measured.
+fn latency_line(latency: Option<&LatencySummary>, samples: i64) -> String {
+    match latency {
+        Some(l) if samples > 0 => {
+            let mut parts = vec![format!("mean {}", fmt_ms(l.mean_ms.unwrap_or(0.0)))];
+            if let Some(p) = l.p50_ms {
+                parts.push(format!("p50 {p} ms"));
+            }
+            if let Some(p) = l.p95_ms {
+                parts.push(format!("p95 {p} ms"));
+            }
+            format!(
+                "{} ({samples} sample{})",
+                parts.join(" · "),
+                if samples == 1 { "" } else { "s" }
+            )
+        }
+        _ => "no samples".to_string(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MetricLine {
+    label: &'static str,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VariantCardView {
+    label: String,
+    /// `key -> provider/model` for the card header.
+    targets: Vec<String>,
+    lines: Vec<MetricLine>,
+    unpriced: bool,
+    unpriced_models: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelRowView {
+    variant: String,
+    model: String,
+    requests: i64,
+    cost_usd: f64,
+    saved_usd: f64,
+    tokens_in: i64,
+    tokens_out: i64,
+    estimated_rows: i64,
+    unpriced: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RunRowView {
+    variant: String,
+    mixed: bool,
+    user: String,
+    correlation_id: String,
+    turns: i64,
+    requests: i64,
+    unbound_requests: i64,
+    cost_usd: f64,
+    span: String,
+    latency: String,
+    failures: i64,
+    outcome: String,
+    last_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PagingView {
+    total: i64,
+    from: i64,
+    to: i64,
+    prev: Option<String>,
+    next: Option<String>,
+}
+
+fn panel_url(id: i64, limit: i64, offset: i64) -> String {
+    format!("/admin/experiments/{id}/panels?limit={limit}&offset={offset}")
+}
+
+fn variant_card(exp: &Experiment, v: &VariantResults) -> VariantCardView {
+    let targets = exp
+        .variants
+        .get(&v.label)
+        .map(|overlay| {
+            overlay
+                .iter()
+                .map(|(k, t)| format!("{k} → {}/{}", t.provider, t.model))
+                .collect()
+        })
+        .unwrap_or_default();
+    let money = super::templates::fmt_money;
+    let lines = vec![
+        MetricLine { label: "Runs", value: v.runs.to_string() },
+        MetricLine { label: "Mixed runs", value: v.mixed_runs.to_string() },
+        MetricLine { label: "Requests", value: v.requests.to_string() },
+        MetricLine { label: "Unbound requests", value: v.unbound_requests.to_string() },
+        MetricLine { label: "Cost", value: money(v.cost_usd) },
+        MetricLine { label: "Saved", value: money(v.saved_usd) },
+        MetricLine {
+            label: "Tokens (in / out)",
+            value: format!("{} ({} / {})", v.tokens.total, v.tokens.prompt, v.tokens.completion),
+        },
+        MetricLine { label: "Estimated rows", value: v.estimated_rows.to_string() },
+        MetricLine { label: "Failures", value: v.failures.to_string() },
+        MetricLine {
+            label: "Latency",
+            value: latency_line(v.latency.as_ref(), v.latency_samples),
+        },
+        MetricLine {
+            label: "Per run",
+            value: v
+                .per_run
+                .map(|p| {
+                    format!(
+                        "{:.1} turns · {} · {:.0} tokens · {}",
+                        p.turns,
+                        money(p.cost_usd),
+                        p.tokens,
+                        fmt_secs(p.span_secs)
+                    )
+                })
+                .unwrap_or_else(|| "—".to_string()),
+        },
+        MetricLine {
+            label: "Outcomes",
+            value: if v.outcomes.reported == 0 {
+                "none reported".to_string()
+            } else {
+                format!(
+                    "{} reported · success {} · mean score {} · mean rating {}",
+                    v.outcomes.reported,
+                    fmt_pct(v.outcomes.success_rate),
+                    fmt_opt(v.outcomes.mean_score, 2),
+                    fmt_opt(v.outcomes.mean_rating, 1)
+                )
+            },
+        },
+    ];
+    VariantCardView {
+        label: v.label.clone(),
+        targets,
+        lines,
+        unpriced: v.unpriced,
+        unpriced_models: v.unpriced_models.clone(),
+    }
+}
+
+fn run_row(r: &RunResult, names: &HashMap<i64, String>) -> RunRowView {
+    RunRowView {
+        variant: r.variant.clone(),
+        mixed: r.mixed,
+        user: names
+            .get(&r.user_id)
+            .cloned()
+            .unwrap_or_else(|| format!("user:{}", r.user_id)),
+        correlation_id: r.correlation_id.clone(),
+        turns: r.turns,
+        requests: r.requests,
+        unbound_requests: r.unbound_requests,
+        cost_usd: r.cost_usd,
+        span: fmt_secs(r.span_secs),
+        latency: r
+            .latency
+            .map(|l| format!("{} ({})", fmt_ms(l.mean_ms), l.samples))
+            .unwrap_or_else(|| "—".to_string()),
+        failures: r.failures,
+        outcome: r
+            .outcome
+            .as_ref()
+            .map(|o| {
+                let mut s = o.outcome.clone();
+                if let Some(score) = o.score {
+                    s.push_str(&format!(" · score {score:.2}"));
+                }
+                if let Some(rating) = o.rating {
+                    s.push_str(&format!(" · rating {rating}"));
+                }
+                s
+            })
+            .unwrap_or_else(|| "—".to_string()),
+        last_at: super::templates::fmt_ts(&r.last_at),
+    }
+}
+
+/// GET /admin/experiments/:id/panels?limit=&offset= — the results panel.
+pub async fn get_experiment_panels(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    Path(id): Path<String>,
+    Query(q): Query<ResultsQuery>,
+) -> Result<Html<String>, DashboardError> {
+    let render_message = |message: String| {
+        super::dashboard::render(
+            "experiments_panels.html",
+            minijinja::context! { message => message },
+        )
+    };
+    let id = match parse_id(&id) {
+        Ok(id) => id,
+        Err(ApiError::InvalidRequest(msg)) => return render_message(msg),
+        Err(_) => return Err(DashboardError::Internal),
+    };
+    let limit = q
+        .limit
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(Some(PANEL_RUN_LIMIT));
+    let page = match RunPage::parse(limit, q.offset.as_deref()) {
+        Ok(page) => page,
+        Err(msg) => return render_message(msg),
+    };
+    let sources = ExperimentSources::from_state(&state);
+    let results = match build_results(&sources, id, page).await {
+        Ok(r) => r,
+        Err(ResultsError::Invalid(msg)) => return render_message(msg),
+        Err(e) => return Err(e.into()),
+    };
+    let users = UserRepository::list(&*state.db)
+        .await
+        .map_err(|_| DashboardError::Internal)?;
+    let names: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
+
+    let exp = &results.experiment;
+    let cards: Vec<VariantCardView> = results
+        .variants
+        .iter()
+        .map(|v| variant_card(exp, v))
+        .collect();
+    let models: Vec<ModelRowView> = results
+        .variants
+        .iter()
+        .flat_map(|v| {
+            v.models.iter().map(|m| ModelRowView {
+                variant: v.label.clone(),
+                model: m.model.clone(),
+                requests: m.requests,
+                cost_usd: m.cost_usd,
+                saved_usd: m.saved_usd,
+                tokens_in: m.tokens.prompt,
+                tokens_out: m.tokens.completion,
+                estimated_rows: m.estimated_rows,
+                unpriced: m.unpriced,
+            })
+        })
+        .collect();
+    let runs: Vec<RunRowView> = results.runs.items.iter().map(|r| run_row(r, &names)).collect();
+    let RunsPage { total, limit, offset, .. } = results.runs;
+    let paging = PagingView {
+        total,
+        from: if runs.is_empty() { 0 } else { offset + 1 },
+        to: offset + runs.len() as i64,
+        prev: (offset > 0).then(|| panel_url(id, limit, (offset - limit).max(0))),
+        next: (offset + limit < total).then(|| panel_url(id, limit, offset + limit)),
+    };
+    let totals = &results.totals;
+    let money = super::templates::fmt_money;
+
+    super::dashboard::render(
+        "experiments_panels.html",
+        minijinja::context! {
+            experiment => minijinja::context! {
+                id => exp.id,
+                name => exp.name.clone(),
+                status => exp.status.as_str(),
+                retain_content => exp.retain_content,
+                retention => days_text(exp.content_retention_days),
+                expires => expiry_text(exp.expires_at),
+            },
+            computed_at => super::templates::fmt_ts(&results.computed_at),
+            totals => minijinja::context! {
+                runs => totals.runs,
+                mixed_runs => totals.mixed_runs,
+                requests => totals.requests,
+                unbound_requests => totals.unbound_requests,
+                cost => money(totals.cost_usd),
+                saved => money(totals.saved_usd),
+                tokens => totals.tokens.total,
+                failures => totals.failures,
+                latency_samples => totals.latency_samples,
+                outcomes_reported => totals.outcomes.reported,
+                success_rate => fmt_pct(totals.outcomes.success_rate),
+            },
+            retained_content_bytes => results.retained_content_bytes,
+            cards => minijinja::Value::from_serialize(&cards),
+            models => minijinja::Value::from_serialize(&models),
+            runs => minijinja::Value::from_serialize(&runs),
+            paging => minijinja::Value::from_serialize(&paging),
+        },
+    )
 }
 
 #[cfg(test)]
