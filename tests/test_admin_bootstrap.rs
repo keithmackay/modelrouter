@@ -14,20 +14,14 @@ async fn bootstrap_creates_account_when_absent() {
         password_hash: bcrypt::hash("test-password", bcrypt::DEFAULT_COST).unwrap(),
     };
 
-    // Validate first
-    bootstrap.validate().unwrap();
+    // Apply bootstrap
+    bootstrap.apply(&db).await.unwrap();
 
-    // Apply bootstrap (mimics serve startup logic)
-    let admin = AdminUserRepository::create(
-        &db,
-        modelrouter::db::models::NewAdminUser {
-            name: bootstrap.name.clone(),
-            password_hash: bootstrap.password_hash.clone(),
-            role: bootstrap.role.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    // Verify account was created
+    let admin = AdminUserRepository::find_by_name(&db, &bootstrap.name)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(admin.name, "bootstrapped-admin");
     assert_eq!(admin.role, "superadmin");
@@ -50,19 +44,8 @@ async fn bootstrap_second_run_is_noop() {
         password_hash: original_hash.clone(),
     };
 
-    bootstrap.validate().unwrap();
-
     // First bootstrap
-    AdminUserRepository::create(
-        &db,
-        modelrouter::db::models::NewAdminUser {
-            name: bootstrap.name.clone(),
-            password_hash: bootstrap.password_hash.clone(),
-            role: bootstrap.role.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    bootstrap.apply(&db).await.unwrap();
 
     // Simulate second startup with different password hash
     let new_hash = bcrypt::hash("new-password", bcrypt::DEFAULT_COST).unwrap();
@@ -72,13 +55,14 @@ async fn bootstrap_second_run_is_noop() {
         password_hash: new_hash,
     };
 
-    // Check if account exists
+    // Second bootstrap should be a no-op
+    second_bootstrap.apply(&db).await.unwrap();
+
+    // Check that original values are preserved
     let existing = AdminUserRepository::find_by_name(&db, &second_bootstrap.name)
         .await
+        .unwrap()
         .unwrap();
-    assert!(existing.is_some());
-
-    let existing = existing.unwrap();
     // Password and role should NOT have changed
     assert_eq!(existing.password_hash, original_hash);
     assert_eq!(existing.role, "superadmin");

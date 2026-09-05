@@ -72,6 +72,8 @@ base64 = "0.22"
 prometheus = { version = "0.13", optional = true }
 
 # ── AWS Bedrock (--features bedrock) ───────────────────────────────────
+# Note: rustls-webpki 0.101.7 remains reachable via aws-smithy-http-client's
+# rustls 0.21 pin until AWS SDK moves to rustls ≥0.22 (advisory GHSA-82j2-j2ch-gfr8 residual).
 aws-sdk-bedrockruntime = { version = "1", optional = true }
 aws-config             = { version = "1", optional = true }
 

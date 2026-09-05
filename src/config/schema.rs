@@ -533,6 +533,43 @@ impl AdminBootstrapConfig {
 
         Ok(())
     }
+
+    /// Apply the bootstrap admin account (issue #43).
+    /// Idempotent: create-if-absent by name; second startup is a no-op.
+    /// Invalid role or malformed hash fails loudly.
+    pub async fn apply(
+        &self,
+        db: &dyn crate::api::app::DatabaseProvider,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        use crate::db::repositories::admin_users::AdminUserRepository;
+        match AdminUserRepository::find_by_name(db, &self.name).await? {
+            Some(existing) => {
+                tracing::info!(
+                    name = %existing.name,
+                    role = %existing.role,
+                    "admin bootstrap: account already exists, skipping"
+                );
+            }
+            None => {
+                let admin = AdminUserRepository::create(
+                    db,
+                    crate::db::models::NewAdminUser {
+                        name: self.name.clone(),
+                        password_hash: self.password_hash.clone(),
+                        role: self.role.clone(),
+                    },
+                )
+                .await?;
+                tracing::info!(
+                    name = %admin.name,
+                    role = %admin.role,
+                    "admin bootstrap: created account"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[storage]` — what the prompt log records (issue #4).
