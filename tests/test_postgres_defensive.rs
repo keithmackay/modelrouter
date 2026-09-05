@@ -2,16 +2,17 @@
 //!
 //! These tests verify that malformed attribution_tags rows (e.g., JSON arrays
 //! instead of objects) don't crash queries that expect objects. They require a
-//! live Postgres instance and may be `#[ignore]`d in CI if no DB is available.
+//! live Postgres instance via MODELROUTER_TEST_POSTGRES_URL.
 
 #![cfg(feature = "postgres")]
 
 use modelrouter::db::repositories::costs::CostRepository;
 
 /// Helper to insert a cost row with a given attribution_tags value directly.
+/// Uses ON CONFLICT because users.name has a UNIQUE constraint (migrations/014).
 async fn insert_row_with_tags(pool: &sqlx::PgPool, tags: &str) {
     let now = chrono::Utc::now().to_rfc3339();
-    // Insert a minimal user if not exists
+    // Insert a minimal user if not exists. users.name is UNIQUE per migration 014.
     sqlx::query(
         "INSERT INTO users (name, enabled, created_at, metadata) \
          VALUES ('test-user', true, $1, '{}') ON CONFLICT (name) DO NOTHING",
@@ -43,9 +44,9 @@ async fn insert_row_with_tags(pool: &sqlx::PgPool, tags: &str) {
 async fn distinct_attribution_tag_keys_tolerates_array_rows() {
     use modelrouter::db::postgres::PostgresDb;
 
-    // Connect to a test database. Adjust this URL for your CI/local setup.
-    let database_url =
-        std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/modelrouter_test".to_string());
+    // Requires MODELROUTER_TEST_POSTGRES_URL to be set.
+    let database_url = std::env::var("MODELROUTER_TEST_POSTGRES_URL")
+        .expect("MODELROUTER_TEST_POSTGRES_URL must be set to run postgres tests");
     let db = PostgresDb::connect(&database_url).await.unwrap();
 
     // Clean up any existing test data
