@@ -675,7 +675,7 @@ struct MetricRow {
     delta: String,
 }
 
-fn fmt_opt<F: Fn(f64) -> String>(v: Option<f64>, f: F) -> String {
+pub(crate) fn fmt_opt<F: Fn(f64) -> String>(v: Option<f64>, f: F) -> String {
     v.map(f).unwrap_or_else(|| "—".to_string())
 }
 
@@ -703,7 +703,7 @@ fn fmt_count(v: f64) -> String {
     format!("{}", v.round() as i64)
 }
 
-fn fmt_ms(v: f64) -> String {
+pub(crate) fn fmt_ms(v: f64) -> String {
     format!("{:.0} ms", v)
 }
 

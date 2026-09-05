@@ -783,19 +783,6 @@ impl CostRepository for SqliteDb {
             .collect())
     }
 
-    async fn experiment_run_count(&self, experiment_id: i64) -> anyhow::Result<i64> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM cost_ledger c WHERE {} \
-             GROUP BY user_id, attribution_correlation_id)",
-            RUN_ROWS_WHERE
-        );
-        let (count,): (i64,) = sqlx::query_as(&sql)
-            .bind(experiment_id)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count)
-    }
-
     async fn experiment_run_keys(
         &self,
         experiment_id: i64,
@@ -983,19 +970,25 @@ pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<
     }
 }
 
-/// SQL predicate plus its bound values for a comparison arm against the ledger.
+/// SQL predicate plus its bound values for one experiment variant. Shared by
+/// the ledger, prompt and failure tables, which stamp the same two columns.
 ///
 /// Binds are strings; the experiment id is cast back to an integer in SQL so
 /// the comparison never relies on column affinity.
+pub(crate) fn variant_predicate(experiment_id: i64, variant: &str) -> (String, Vec<String>) {
+    (
+        "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
+        vec![experiment_id.to_string(), variant.to_string()],
+    )
+}
+
+/// SQL predicate plus its bound values for a comparison arm against the ledger.
 fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
     match filter {
         ArmFilter::Model(m) => ("model = ?".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => (
-            "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
-            vec![experiment_id.to_string(), variant.clone()],
-        ),
+        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
     }
 }
 
@@ -1489,8 +1482,8 @@ mod tests {
     #[tokio::test]
     async fn experiment_runs_take_the_earliest_variant_and_flag_mixed() {
         let db = experiment_db().await;
-        assert_eq!(db.experiment_run_count(7).await.unwrap(), 3);
-        assert_eq!(db.experiment_run_count(9).await.unwrap(), 0);
+        assert_eq!(db.experiment_run_keys(7).await.unwrap().len(), 3);
+        assert!(db.experiment_run_keys(9).await.unwrap().is_empty());
 
         let runs = db.experiment_runs(7, 10, 0).await.unwrap();
         let order: Vec<(i64, &str)> = runs.iter().map(|r| (r.user_id, r.correlation_id.as_str())).collect();

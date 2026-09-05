@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewRequestFailure, RequestFailure};
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::failures::{ExperimentRunFailures, FailureRepository};
-use super::costs::attribution_predicate;
+use super::costs::{attribution_predicate, variant_predicate};
 use super::{SqliteDb, now_utc};
 
 /// Columns selected when reading a failure row back.
@@ -146,10 +146,7 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ),
         ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => (
-            "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
-            vec![experiment_id.to_string(), variant.clone()],
-        ),
+        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
     }
 }
 

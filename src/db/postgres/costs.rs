@@ -788,19 +788,6 @@ impl CostRepository for PostgresDb {
             .collect())
     }
 
-    async fn experiment_run_count(&self, experiment_id: i64) -> anyhow::Result<i64> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM cost_ledger c WHERE {} \
-             GROUP BY user_id, attribution_correlation_id) runs",
-            RUN_ROWS_WHERE
-        );
-        let (count,): (i64,) = sqlx::query_as(&sql)
-            .bind(experiment_id)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count)
-    }
-
     async fn experiment_run_keys(
         &self,
         experiment_id: i64,
@@ -1003,18 +990,24 @@ pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<
     }
 }
 
-/// SQL predicate plus its bound values for a comparison arm against the ledger.
+/// SQL predicate plus its bound values for one experiment variant. Shared by
+/// the ledger, prompt and failure tables, which stamp the same two columns.
 ///
 /// Binds are strings (sqlx declares them as TEXT), so the experiment id is
 /// cast back to BIGINT in SQL.
+pub(crate) fn variant_predicate(experiment_id: i64, variant: &str) -> (String, Vec<String>) {
+    (
+        "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
+        vec![experiment_id.to_string(), variant.to_string()],
+    )
+}
+
+/// SQL predicate plus its bound values for a comparison arm against the ledger.
 fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
     match filter {
         ArmFilter::Model(m) => ("model = $1".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => (
-            "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
-            vec![experiment_id.to_string(), variant.clone()],
-        ),
+        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
     }
 }

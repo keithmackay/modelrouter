@@ -4,7 +4,7 @@ use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{ExperimentRunLatency, LatencySummary, PromptRepository};
-use super::costs::attribution_predicate;
+use super::costs::{attribution_predicate, variant_predicate};
 use super::{SqliteDb, now_utc};
 
 /// Rows that carry a real latency measurement. Cache hits are logged with
@@ -296,10 +296,7 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ArmFilter::Model(m) => ("routed_model = ?".to_string(), vec![m.clone()]),
         ArmFilter::Provider(p) => ("provider = ?".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => (
-            "experiment_id = CAST(? AS INTEGER) AND experiment_variant = ?".to_string(),
-            vec![experiment_id.to_string(), variant.clone()],
-        ),
+        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
     }
 }
 

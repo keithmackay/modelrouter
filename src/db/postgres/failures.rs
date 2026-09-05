@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewRequestFailure, RequestFailure};
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::failures::{ExperimentRunFailures, FailureRepository};
-use super::costs::attribution_predicate;
+use super::costs::{attribution_predicate, variant_predicate};
 use super::{PostgresDb, now_utc};
 
 const FAILURE_COLUMNS: &str = "id, user_id, api_key_id, endpoint, request_model, routed_model, \
@@ -145,9 +145,6 @@ fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
         ),
         ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
         ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => (
-            "experiment_id = CAST($1 AS BIGINT) AND experiment_variant = $2".to_string(),
-            vec![experiment_id.to_string(), variant.clone()],
-        ),
+        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
     }
 }

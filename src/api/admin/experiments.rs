@@ -31,8 +31,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use futures::future::try_join_all;
 
 use super::audit::audit;
+use super::compare::{fmt_ms, fmt_opt};
 use super::dashboard::{DashboardError, DashboardSession, SuperDashboardSession};
 use crate::api::{
     admin::auth::{AdminClaims, AdminSession, SuperAdminSession},
@@ -1005,20 +1007,20 @@ pub async fn build_results(
         .await?
         .ok_or_else(|| ResultsError::Invalid(format!("no experiment with id {id}")))?;
 
-    let (variant_totals, variant_models, run_keys, ledger_total, page_rows, unbound) =
+    // Eight independent reads; the ledger pool has ten connections and none
+    // is held across another await.
+    let (variant_totals, variant_models, run_keys, page_rows, unbound, failures, outcomes, run_latency) =
         tokio::try_join!(
             CostRepository::experiment_variant_totals(db, id),
             CostRepository::experiment_variant_models(db, id),
             CostRepository::experiment_run_keys(db, id),
-            CostRepository::experiment_run_count(db, id),
             CostRepository::experiment_runs(db, id, page.limit, page.offset),
             CostRepository::experiment_unbound_requests(db, id),
+            FailureRepository::experiment_run_failures(db, id),
+            OutcomeRepository::for_experiment(db, id),
+            PromptRepository::experiment_run_latency(&*sources.prompt_db, id),
         )?;
-    let (failures, outcomes, run_latency) = tokio::try_join!(
-        FailureRepository::experiment_run_failures(db, id),
-        OutcomeRepository::for_experiment(db, id),
-        PromptRepository::experiment_run_latency(&*sources.prompt_db, id),
-    )?;
+    let ledger_total = run_keys.len() as i64;
     let retained_content_bytes = if experiment.retain_content {
         Some(PromptRepository::experiment_content_bytes(&*sources.prompt_db, id).await?)
     } else {
@@ -1155,16 +1157,15 @@ pub async fn build_results(
             .unwrap_or_default();
         slot(&mut variants, &label).outcomes.add(o);
     }
-    for label in variants.keys().cloned().collect::<Vec<_>>() {
-        let filter = ArmFilter::Variant { experiment_id: id, variant: label.clone() };
-        let summary = PromptRepository::latency_summary(
-            &*sources.prompt_db,
-            &filter,
-            ALL_TIME_START,
-            ALL_TIME_END,
-        )
-        .await?;
-        let v = slot(&mut variants, &label);
+    let latency_filters: Vec<ArmFilter> = variants
+        .keys()
+        .map(|label| ArmFilter::Variant { experiment_id: id, variant: label.clone() })
+        .collect();
+    let summaries = try_join_all(latency_filters.iter().map(|filter| {
+        PromptRepository::latency_summary(&*sources.prompt_db, filter, ALL_TIME_START, ALL_TIME_END)
+    }))
+    .await?;
+    for (v, summary) in variants.values_mut().zip(summaries) {
         v.latency_samples = summary.samples;
         v.latency = (summary.samples > 0).then_some(summary);
         v.finish();
@@ -1392,12 +1393,11 @@ async fn list_context(
     state: &AppState,
     session: &AdminClaims,
 ) -> Result<minijinja::Value, DashboardError> {
-    let experiments = ExperimentRepository::list(&*state.db, ExperimentStatusFilter::All)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let users = UserRepository::list(&*state.db)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
+    let (experiments, users) = tokio::try_join!(
+        ExperimentRepository::list(&*state.db, ExperimentStatusFilter::All),
+        UserRepository::list(&*state.db),
+    )
+    .map_err(|_| DashboardError::Internal)?;
     let names: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
     let rows: Vec<ExperimentRowView> = experiments
         .iter()
@@ -1587,10 +1587,6 @@ pub async fn post_close_experiment_page(
 
 // ── Results panel ─────────────────────────────────────────────────────────────
 
-fn fmt_ms(ms: f64) -> String {
-    format!("{ms:.0} ms")
-}
-
 fn fmt_secs(secs: f64) -> String {
     if secs >= 60.0 {
         format!("{:.1} min", secs / 60.0)
@@ -1599,12 +1595,8 @@ fn fmt_secs(secs: f64) -> String {
     }
 }
 
-fn fmt_opt(v: Option<f64>, decimals: usize) -> String {
-    v.map(|x| format!("{x:.decimals$}")).unwrap_or_else(|| "—".to_string())
-}
-
 fn fmt_pct(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "—".to_string())
+    fmt_opt(v, |x| format!("{:.0}%", x * 100.0))
 }
 
 /// Latency as one line: the summary with its sample count, or a note that
@@ -1741,8 +1733,8 @@ fn variant_card(exp: &Experiment, v: &VariantResults) -> VariantCardView {
                     "{} reported · success {} · mean score {} · mean rating {}",
                     v.outcomes.reported,
                     fmt_pct(v.outcomes.success_rate),
-                    fmt_opt(v.outcomes.mean_score, 2),
-                    fmt_opt(v.outcomes.mean_rating, 1)
+                    fmt_opt(v.outcomes.mean_score, |x| format!("{x:.2}")),
+                    fmt_opt(v.outcomes.mean_rating, |x| format!("{x:.1}"))
                 )
             },
         },
@@ -1821,14 +1813,14 @@ pub async fn get_experiment_panels(
         Err(msg) => return render_message(msg),
     };
     let sources = ExperimentSources::from_state(&state);
-    let results = match build_results(&sources, id, page).await {
+    let (results, users) =
+        tokio::join!(build_results(&sources, id, page), UserRepository::list(&*state.db));
+    let results = match results {
         Ok(r) => r,
         Err(ResultsError::Invalid(msg)) => return render_message(msg),
         Err(e) => return Err(e.into()),
     };
-    let users = UserRepository::list(&*state.db)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
+    let users = users.map_err(|_| DashboardError::Internal)?;
     let names: HashMap<i64, String> = users.iter().map(|u| (u.id, u.name.clone())).collect();
 
     let exp = &results.experiment;

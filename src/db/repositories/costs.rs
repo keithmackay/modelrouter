@@ -404,9 +404,6 @@ pub trait CostRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<ExperimentRunRow>>;
-    /// Number of runs — distinct `(user_id, correlation_id)` — stamped with
-    /// the experiment.
-    async fn experiment_run_count(&self, experiment_id: i64) -> anyhow::Result<i64>;
     /// Key, variant, mixed flag, request count and span of every run,
     /// unpaginated, sorted by user and correlation id.
     async fn experiment_run_keys(
