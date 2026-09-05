@@ -341,7 +341,6 @@ async fn runtime_alias_overrides_model_row_alias() {
     let (hk, hv) = bearer(&jwt(&settings, "superadmin"));
 
     use modelrouter::db::models::NewModel;
-    use modelrouter::db::repositories::models::ModelRepository;
     db.create_model(NewModel {
         provider: "openai".to_string(),
         name: "gpt-5-mini".to_string(),
@@ -396,4 +395,138 @@ async fn v1_models_lists_config_and_db_aliases() {
     let quick = find("quick").expect("db alias listed");
     assert_eq!(quick["alias_for"], "openai/gpt-4o-mini");
     assert_eq!(quick["owned_by"], "openai");
+}
+
+/// Issue #35: catalog validation when the catalog is available.
+#[tokio::test]
+async fn alias_target_validated_against_available_catalog() {
+    use axum::routing::get;
+
+    // Set up a mock catalog server
+    let catalog_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            axum::Json(json!({
+                "data": [
+                    {"id": "gpt-4o"},
+                    {"id": "gpt-4o-mini"}
+                ]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catalog_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, catalog_router).await.unwrap();
+    });
+    let catalog_base = format!("http://{}", catalog_addr);
+
+    // Give the server a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Build server with the catalog provider configured
+    let db = common::in_memory_db().await;
+    {
+        use modelrouter::db::models::NewAdminUser;
+        use modelrouter::db::repositories::admin_users::AdminUserRepository;
+        AdminUserRepository::create(
+            &db,
+            NewAdminUser {
+                name: "superadmin-user".to_string(),
+                password_hash: "x".to_string(),
+                role: "superadmin".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut base = Settings::default();
+    base.providers.insert(
+        "openai".to_string(),
+        modelrouter::config::schema::ProviderConfig {
+            api_base: Some(catalog_base),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    );
+    let settings = Arc::new(base);
+    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    let router = Arc::new(RequestRouter::new(settings.clone()));
+
+    let state = AppState {
+        settings: settings.clone(),
+        db: db.clone(),
+        pool: None,
+        router: router.clone(),
+        cost_calc: Arc::new(CostCalculator::new()),
+        provider_registry: Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
+            response: "ok".to_string(),
+        })),
+        policy: Arc::new(PolicyEngine::new(db.clone())),
+        fallback: Arc::new(FallbackChain::new(HashMap::new())),
+        complexity_router: Arc::new(ComplexityRouter::new(None)),
+        response_cache: Arc::new(ResponseCache::new(&CacheConfig::default())),
+        embedding_registry: Arc::new(
+            modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
+                common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
+            ),
+        ),
+        search_registry: Arc::new(modelrouter::providers::search_registry::SearchRegistry::new(
+            HashMap::new(),
+        )),
+        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+            HashMap::new(),
+        )),
+        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
+        ip_rate_limiter: Arc::new(modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0)),
+        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(0, 0)),
+        session_affinity: Arc::new(modelrouter::router::session_affinity::SessionAffinityMap::new(1800)),
+        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
+        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        prompt_db: db.clone(),
+        app_metrics: None,
+        callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+    };
+
+    let server = TestServer::new(build_router(state)).unwrap();
+    let (hk, hv) = bearer(&jwt(&settings, "superadmin"));
+
+    // Model present in catalog → success (full provider/name format)
+    server
+        .put("/admin/api/aliases/fast")
+        .add_header(hk.clone(), hv.clone())
+        .json(&json!({ "target": "openai/gpt-4o" }))
+        .await
+        .assert_status_ok();
+
+    // Model absent from catalog → 400 with message naming the model
+    let res = server
+        .put("/admin/api/aliases/slow")
+        .add_header(hk.clone(), hv.clone())
+        .json(&json!({ "target": "missing-model" }))
+        .await;
+    res.assert_status_bad_request();
+    let text = res.text();
+    assert!(text.contains("missing-model"), "expected model name in error; got: {text}");
+    assert!(text.contains("not found"), "expected 'not found' in error; got: {text}");
+}
+
+/// Issue #35: graceful degradation when catalog is unavailable.
+#[tokio::test]
+async fn alias_write_degrades_when_catalog_unavailable() {
+    // Build server with no catalog provider configured (catalog will be empty/unavailable)
+    let (server, settings, _router, _db) = build_server().await;
+    let (hk, hv) = bearer(&jwt(&settings, "superadmin"));
+
+    // Should succeed even though we can't validate against the catalog
+    server
+        .put("/admin/api/aliases/deep")
+        .add_header(hk, hv)
+        .json(&json!({ "target": "anthropic/claude-opus-4-6" }))
+        .await
+        .assert_status_ok();
 }

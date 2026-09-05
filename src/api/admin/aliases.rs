@@ -119,6 +119,41 @@ fn would_cycle(map: &HashMap<String, String>, alias: &str, target: &str) -> bool
     true
 }
 
+/// Fetch the catalog and extract all available model IDs (provider/name format).
+/// Returns None if the catalog is unavailable (fetch error), or Some(set) when available.
+async fn fetch_available_model_ids(state: &AppState) -> Option<std::collections::HashSet<String>> {
+    let catalog_result = crate::providers::catalog_registry::aggregate_catalogs(
+        &state.live_settings.load().providers,
+    )
+    .await;
+
+    let providers = match catalog_result.as_object() {
+        Some(obj) => obj,
+        None => return None,
+    };
+
+    let mut model_ids = std::collections::HashSet::new();
+    for (_provider_name, provider_data) in providers.iter() {
+        if let Some(models) = provider_data.get("models").and_then(|m| m.as_array()) {
+            for model in models {
+                // CatalogModel has 'provider' and 'name' fields
+                if let (Some(provider), Some(name)) = (
+                    model.get("provider").and_then(|p| p.as_str()),
+                    model.get("name").and_then(|n| n.as_str()),
+                ) {
+                    model_ids.insert(format!("{}/{}", provider, name));
+                }
+            }
+        }
+    }
+
+    if model_ids.is_empty() {
+        None
+    } else {
+        Some(model_ids)
+    }
+}
+
 /// Shared validation for an alias write. Returns the trimmed (alias, target).
 async fn validate_alias(
     state: &AppState,
@@ -148,6 +183,27 @@ async fn validate_alias(
             "alias '{alias}' -> '{target}' would create an alias cycle"
         ));
     }
+
+    // Validate target against the catalog when available (issue #35).
+    match fetch_available_model_ids(state).await {
+        Some(available) => {
+            if !available.contains(&target) {
+                return Err(format!(
+                    "model '{}' not found in provider catalogs — validation can be bypassed when catalog is unavailable",
+                    target
+                ));
+            }
+        }
+        None => {
+            // Catalog unavailable — degrade gracefully, accept the write with a warning.
+            tracing::warn!(
+                alias = %alias,
+                target = %target,
+                "alias write accepted without catalog validation — provider catalog unavailable"
+            );
+        }
+    }
+
     Ok((alias, target))
 }
 

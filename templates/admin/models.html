@@ -134,7 +134,12 @@
   <div>
     <label for="alias-target" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
     <input type="text" name="target" id="alias-target" required placeholder="anthropic/claude-opus-4-6"
+           list="available-models-list"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
+    <datalist id="available-models-list"></datalist>
+    <div id="catalog-warning" style="display:none;color:#856404;background:#fff3cd;border:1px solid #ffeeba;border-radius:4px;padding:0.5rem;margin-top:0.5rem;font-size:0.85rem;">
+      ⚠ Model catalog unavailable — you can still enter a target manually, but it won't be validated against available models.
+    </div>
   </div>
   <button type="submit" class="btn btn-success">Save Alias</button>
 </form>
@@ -182,6 +187,54 @@ function editAlias(alias, target) {
   form.querySelector('input[name="target"]').value = target;
   form.querySelector('input[name="alias"]').focus();
 }
+
+// Populate the datalist from the catalog API.
+(function() {
+  fetch('/admin/api/models/available')
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(data) {
+      var datalist = document.getElementById('available-models-list');
+      var warning = document.getElementById('catalog-warning');
+      var models = [];
+
+      if (!data.providers) {
+        warning.style.display = 'block';
+        return;
+      }
+
+      // Extract all models from all providers
+      Object.keys(data.providers).forEach(function(providerName) {
+        var provider = data.providers[providerName];
+        if (provider.supported && provider.models && Array.isArray(provider.models)) {
+          provider.models.forEach(function(m) {
+            // CatalogModel has 'provider' and 'name' fields
+            if (m.provider && m.name) {
+              models.push(m.provider + '/' + m.name);
+            }
+          });
+        }
+      });
+
+      if (models.length === 0) {
+        warning.style.display = 'block';
+        return;
+      }
+
+      // Populate datalist
+      models.forEach(function(modelId) {
+        var option = document.createElement('option');
+        option.value = modelId;
+        datalist.appendChild(option);
+      });
+    })
+    .catch(function(err) {
+      console.warn('Failed to load model catalog:', err);
+      document.getElementById('catalog-warning').style.display = 'block';
+    });
+})();
 </script>
 
 <h2 style="margin-bottom:1rem;">Failover Chains</h2>
