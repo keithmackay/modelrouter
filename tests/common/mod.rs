@@ -108,3 +108,25 @@ impl modelrouter::providers::search::SearchAdapter for NamedMockSearchAdapter {
         })
     }
 }
+
+/// Mock search adapter that tracks whether it was called.
+/// Used to verify an engine in a fallback chain was NOT consulted.
+pub struct CallTrackingSearchAdapter {
+    pub results: Vec<modelrouter::providers::search::SearchResultItem>,
+    pub engine_name: String,
+    pub was_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for CallTrackingSearchAdapter {
+    async fn search(
+        &self,
+        _req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        self.was_called.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(modelrouter::providers::search::SearchResponse {
+            results: self.results.clone(),
+            engine: self.engine_name.clone(),
+        })
+    }
+}

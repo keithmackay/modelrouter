@@ -803,3 +803,61 @@ async fn caller_error_does_not_trigger_failover() {
     // engine, so fallback does not happen.
     assert_eq!(resp.status_code(), 400);
 }
+
+#[tokio::test]
+async fn provider_client_error_surfaces_immediately_no_failover() {
+    // Primary engine returns a client error (400 Bad Request from the provider,
+    // not the modelrouter validation layer). Fallback chain is configured, but
+    // the 4xx error surfaces immediately without trying the next engine.
+    let fallback_was_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                // This error string matches the "returned 400" pattern that
+                // RetryableError::classify uses to identify client errors.
+                error_message: "Tavily returned 400 Bad Request: invalid query parameter 'foo'"
+                    .to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::CallTrackingSearchAdapter {
+                results: mock_results(),
+                engine_name: "vertex".to_string(),
+                was_called: fallback_was_called.clone(),
+            }),
+        ),
+    ]);
+
+    let mut chains = HashMap::new();
+    chains.insert("tavily".to_string(), vec!["vertex".to_string()]);
+
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "tavily" }))
+        .await;
+
+    // The 400 from the provider surfaces as a 502 (ProviderError), but the key
+    // is that it does NOT fail over to vertex.
+    assert_eq!(resp.status_code(), 502);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("400 Bad Request"),
+        "error must surface the provider's 400: {message}"
+    );
+
+    // The fallback engine must NOT have been called.
+    assert!(
+        !fallback_was_called.load(std::sync::atomic::Ordering::SeqCst),
+        "vertex fallback engine must not be called when the primary returns a client error"
+    );
+}

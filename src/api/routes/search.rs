@@ -236,7 +236,7 @@ async fn search_inner(
     let mut result = None;
     let mut latency_ms = 0_i64;
 
-    for candidate in &engines_to_try {
+    for (idx, candidate) in engines_to_try.iter().enumerate() {
         if !crate::providers::search_registry::is_supported_engine(candidate) {
             tracing::debug!(
                 engine = candidate,
@@ -266,10 +266,31 @@ async fn search_inner(
                 break;
             }
             Err(e) => {
+                // Classify the error: client errors (4xx except 429) surface
+                // immediately without failover; provider errors (5xx, 429,
+                // timeouts, connection failures) walk the chain.
+                use crate::router::retry::RetryableError;
+                let err_str = e.to_string();
+                let classified = RetryableError::classify(&err_str);
+
+                if matches!(classified, RetryableError::ClientError(_)) {
+                    // Client error (provider 400/404/422 etc) — the caller sent
+                    // a bad query/params. Surface immediately, do not fail over.
+                    tracing::debug!(
+                        engine = candidate,
+                        error = %e,
+                        "client error from search engine, not failing over"
+                    );
+                    return Err(ApiError::ProviderError(e));
+                }
+
+                // Provider error — try the next engine in the chain.
+                let remaining: Vec<_> = engines_to_try[idx + 1..].to_vec();
                 last_error = Some(e);
                 tracing::warn!(
                     engine = candidate,
                     error = %last_error.as_ref().unwrap(),
+                    remaining = ?remaining,
                     "search engine failed, trying next in chain"
                 );
             }
@@ -277,10 +298,16 @@ async fn search_inner(
     }
 
     let result = result.ok_or_else(|| {
+        let tried: Vec<_> = engines_to_try.iter().map(|s| s.as_str()).collect();
         ApiError::ProviderError(
-            last_error.unwrap_or_else(|| {
-                anyhow::anyhow!("all engines in the fallback chain are unconfigured or unsupported")
-            }),
+            last_error
+                .map(|e| anyhow::anyhow!("all engines exhausted (tried: {}): {}", tried.join(", "), e))
+                .unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "all engines in the fallback chain are unconfigured or unsupported (tried: {})",
+                        tried.join(", ")
+                    )
+                }),
         )
     })?;
 
