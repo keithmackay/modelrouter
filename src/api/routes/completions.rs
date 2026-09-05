@@ -153,6 +153,25 @@ async fn chat_completions_inner(
         }
     };
 
+    // Validate that `tools` and `tool_choice` are not present (issue #41).
+    // Treat null and "none" as absent (both mean: do not use tools).
+    // Check BEFORE session limiter and guardrails so a doomed request doesn't
+    // consume budget or make external calls.
+    if let Some(tools) = body["tools"].as_array() {
+        if !tools.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "`tools` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+            ));
+        }
+    }
+    if let Some(tc) = body.get("tool_choice") {
+        if !tc.is_null() && tc.as_str() != Some("none") {
+            return Err(ApiError::InvalidRequest(
+                "`tool_choice` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+            ));
+        }
+    }
+
     // Session rate limit check
     if let Some(session_id) = body["session_id"].as_str() {
         let estimated_tokens = body["messages"]
@@ -183,20 +202,6 @@ async fn chat_completions_inner(
         crate::guardrails::GuardrailDecision::Replace { .. } => {
             // Replace on request is not supported; treat as Allow
         }
-    }
-
-    // Validate that `tools` and `tool_choice` are not present (issue #41)
-    if let Some(tools) = body["tools"].as_array() {
-        if !tools.is_empty() {
-            return Err(ApiError::InvalidRequest(
-                "`tools` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
-            ));
-        }
-    }
-    if body.get("tool_choice").is_some() {
-        return Err(ApiError::InvalidRequest(
-            "`tool_choice` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
-        ));
     }
 
     // Inject per-key metadata for pipeline hooks before running them
