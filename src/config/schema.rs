@@ -2,6 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Admin role vocabulary. The complete set of recognized roles for admin users.
+///
+/// Session extractors gate on `role != "superadmin"`, so an unknown role would
+/// silently degrade to viewer. Both OIDC auto-provisioning and bootstrap config
+/// validation check against this list to ensure operators set explicit valid roles.
+pub const ADMIN_ROLE_VOCABULARY: &[&str] = &["superadmin", "viewer"];
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PricingEntry {
     pub model: String,
@@ -296,21 +303,18 @@ impl Default for OidcConfig {
 impl OidcConfig {
     /// Validate the configured OIDC role against the known vocabulary.
     ///
-    /// The role vocabulary is exactly {"superadmin", "viewer"}. An unknown role
-    /// would silently degrade to viewer in session extractors that gate on
-    /// `role != "superadmin"`, so this validation rejects startup loudly rather
-    /// than allowing misconfigured SSO admins to believe they hold the specified
-    /// role when they do not.
+    /// An unknown role would silently degrade to viewer in session extractors
+    /// that gate on `role != "superadmin"`, so this validation rejects startup
+    /// loudly rather than allowing misconfigured SSO admins to believe they hold
+    /// the specified role when they do not.
     pub fn validate_role(&self) -> anyhow::Result<()> {
-        const VALID_ROLES: &[&str] = &["superadmin", "viewer"];
-        if !VALID_ROLES.contains(&self.auto_provision_role.as_str()) {
+        if !ADMIN_ROLE_VOCABULARY.contains(&self.auto_provision_role.as_str()) {
             anyhow::bail!(
                 "oidc.auto_provision_role is '{}', which is not a recognized role. \
-                 Valid roles are: {}. Auto-provisioned admins with an unrecognized role \
-                 would silently degrade to viewer. Set the role explicitly in config.toml or \
+                 Valid roles are: {}. Set the role explicitly in config.toml or \
                  via MODELROUTER_OIDC__AUTO_PROVISION_ROLE. Refusing to start.",
                 self.auto_provision_role,
-                VALID_ROLES.join(", ")
+                ADMIN_ROLE_VOCABULARY.join(", ")
             );
         }
         Ok(())
@@ -484,20 +488,18 @@ pub struct AdminBootstrapConfig {
 impl AdminBootstrapConfig {
     /// Validate role against the known vocabulary and bcrypt hash format.
     ///
-    /// The role vocabulary is exactly {"superadmin", "viewer"}. An unknown role
-    /// would silently degrade to viewer in session extractors that gate on
-    /// `role != "superadmin"`, so this validation rejects startup loudly rather
-    /// than allowing misconfigured bootstrap accounts to believe they hold the
-    /// specified role when they do not.
+    /// An unknown role would silently degrade to viewer in session extractors
+    /// that gate on `role != "superadmin"`, so this validation rejects startup
+    /// loudly rather than allowing misconfigured bootstrap accounts to believe
+    /// they hold the specified role when they do not.
     pub fn validate(&self) -> anyhow::Result<()> {
-        const VALID_ROLES: &[&str] = &["superadmin", "viewer"];
-        if !VALID_ROLES.contains(&self.role.as_str()) {
+        if !ADMIN_ROLE_VOCABULARY.contains(&self.role.as_str()) {
             anyhow::bail!(
                 "admin.bootstrap.role is '{}', which is not a recognized role. \
                  Valid roles are: {}. Set the role explicitly in config.toml or \
                  via MODELROUTER_ADMIN__BOOTSTRAP__ROLE. Refusing to start.",
                 self.role,
-                VALID_ROLES.join(", ")
+                ADMIN_ROLE_VOCABULARY.join(", ")
             );
         }
 
