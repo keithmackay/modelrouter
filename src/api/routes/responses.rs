@@ -80,6 +80,23 @@ async fn responses_inner(
     // Operator disable gate (issue #5) — 403 naming the reason, never a provider call.
     state.router.check_available(&provider_name, &canonical_model)?;
 
+    // Validate that `tools` and `tool_choice` are not present (issue #41).
+    // Treat null and "none" as absent (both mean: do not use tools).
+    if let Some(tools) = body["tools"].as_array() {
+        if !tools.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "`tools` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+            ));
+        }
+    }
+    if let Some(tc) = body.get("tool_choice") {
+        if !tc.is_null() && tc.as_str() != Some("none") {
+            return Err(ApiError::InvalidRequest(
+                "`tool_choice` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+            ));
+        }
+    }
+
     // Translate body: if messages absent and input is a string, synthesize messages
     let mut body = body;
     let has_messages = body["messages"].is_array();

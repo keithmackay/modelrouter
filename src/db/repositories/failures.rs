@@ -15,4 +15,10 @@ pub trait FailureRepository: Send + Sync {
     /// Failure counts grouped by stage, newest window first — the shape an
     /// operator actually wants ("what is failing, and where").
     async fn count_by_stage(&self) -> anyhow::Result<Vec<(String, i64)>>;
+    /// Retrieve a single failure by its primary key, for detail-drill surfaces
+    /// a downstream caller may build.
+    async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<RequestFailure>>;
+    /// List all failures matching a given correlation id, enabling drill-down
+    /// from a downstream caller's trace.
+    async fn find_by_correlation_id(&self, correlation_id: &str) -> anyhow::Result<Vec<RequestFailure>>;
 }

@@ -85,6 +85,8 @@ impl axum::extract::FromRequestParts<crate::api::app::AppState> for SuperAdminSe
     ) -> Result<Self, Self::Rejection> {
         use crate::api::error::ApiError;
         let session = AdminSession::from_request_parts(parts, state).await?;
+        // Explicit allow-list: only "superadmin" is permitted, anything else
+        // (including unrecognized roles) is denied rather than degraded (issue #51).
         if session.0.role != "superadmin" {
             return Err(ApiError::Forbidden);
         }

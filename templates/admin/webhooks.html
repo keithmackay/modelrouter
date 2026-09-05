@@ -12,29 +12,29 @@
   <h2 style="font-size:1.1rem;margin-bottom:1rem;">Add Webhook</h2>
   <div style="display:flex;gap:0.75rem;align-items:flex-end;flex-wrap:wrap;">
     <div>
-      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name *</label>
-      <input type="text" name="name" required placeholder="my-webhook"
+      <label for="webhook-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name *</label>
+      <input type="text" name="name" id="webhook-name" required placeholder="my-webhook"
              style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:160px;">
     </div>
     <div>
-      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">URL *</label>
-      <input type="url" name="url" required placeholder="https://example.com/hook"
+      <label for="webhook-url" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">URL *</label>
+      <input type="url" name="url" id="webhook-url" required placeholder="https://example.com/hook"
              style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
     </div>
     <div>
-      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Events</label>
-      <input type="text" name="events" placeholder="completion"
+      <label for="webhook-events" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Events</label>
+      <input type="text" name="events" id="webhook-events" placeholder="completion"
              style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:140px;">
       <div style="font-size:0.75rem;color:#777;margin-top:0.2rem;">comma-separated or * for all</div>
     </div>
     <div>
-      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Secret Header Name</label>
-      <input type="text" name="secret_header_name" placeholder="X-Webhook-Secret"
+      <label for="webhook-secret-header-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Secret Header Name</label>
+      <input type="text" name="secret_header_name" id="webhook-secret-header-name" placeholder="X-Webhook-Secret"
              style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:180px;">
     </div>
     <div>
-      <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Secret Header Value</label>
-      <input type="password" name="secret_header_value" placeholder=""
+      <label for="webhook-secret-header-value" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Secret Header Value</label>
+      <input type="password" name="secret_header_value" id="webhook-secret-header-value" placeholder=""
              style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:180px;">
     </div>
     <button type="submit" class="btn btn-success">Add Webhook</button>

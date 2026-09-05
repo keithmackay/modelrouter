@@ -33,6 +33,7 @@ modelrouter webhook add --name <name> --url <url> [--events completion] [--secre
 modelrouter webhook delete --id <id>
 modelrouter webhook enable --id <id>
 modelrouter webhook disable --id <id>
+modelrouter admin hash-password
 modelrouter install-service  (macOS/Linux)
 ```
 

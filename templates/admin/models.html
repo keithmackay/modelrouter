@@ -26,18 +26,18 @@
       hx-on::after-request="this.reset()"
       style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;flex-wrap:wrap;">
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Provider *</label>
-    <input type="text" name="provider" required placeholder="anthropic"
+    <label for="model-provider" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Provider *</label>
+    <input type="text" name="provider" id="model-provider" required placeholder="anthropic"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
   </div>
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Model Name *</label>
-    <input type="text" name="name" required placeholder="claude-opus-4-6"
+    <label for="model-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Model Name *</label>
+    <input type="text" name="name" id="model-name" required placeholder="claude-opus-4-6"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:240px;">
   </div>
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias</label>
-    <input type="text" name="alias" placeholder="opus"
+    <label for="model-alias" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias</label>
+    <input type="text" name="alias" id="model-alias" placeholder="opus"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
   </div>
   <button type="submit" class="btn btn-success">Add Model</button>
@@ -80,6 +80,7 @@
           hx-confirm="Delete this model?">Delete</button>
         {% if m.enabled %}
           <input type="text" name="reason" placeholder="reason" id="model-reason-{{ m.id }}"
+                 aria-label="Reason for disabling model {{ m.name }}"
                  style="padding:0.2rem 0.4rem;border:1px solid #ccc;border-radius:4px;width:150px">
           <button class="btn btn-secondary" style="font-size:0.8rem;padding:0.25rem 0.5rem"
             hx-post="/admin/models/{{ m.id }}/disable" hx-include="#model-reason-{{ m.id }}"
@@ -126,14 +127,19 @@
       hx-on::after-request="this.reset()"
       style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:0.5rem;flex-wrap:wrap;">
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias *</label>
-    <input type="text" name="alias" required placeholder="deep"
+    <label for="alias-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Alias *</label>
+    <input type="text" name="alias" id="alias-name" required placeholder="deep"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
   </div>
   <div>
-    <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
-    <input type="text" name="target" required placeholder="anthropic/claude-opus-4-6"
+    <label for="alias-target" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Target *</label>
+    <input type="text" name="target" id="alias-target" required placeholder="anthropic/claude-opus-4-6"
+           list="available-models-list"
            style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:280px;">
+    <datalist id="available-models-list"></datalist>
+    <div id="catalog-warning" style="display:none;color:#856404;background:#fff3cd;border:1px solid #ffeeba;border-radius:4px;padding:0.5rem;margin-top:0.5rem;font-size:0.85rem;">
+      ⚠ Model catalog unavailable — you can still enter a target manually, but it won't be validated against available models.
+    </div>
   </div>
   <button type="submit" class="btn btn-success">Save Alias</button>
 </form>
@@ -181,6 +187,54 @@ function editAlias(alias, target) {
   form.querySelector('input[name="target"]').value = target;
   form.querySelector('input[name="alias"]').focus();
 }
+
+// Populate the datalist from the catalog API.
+(function() {
+  fetch('/admin/api/models/available')
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(data) {
+      var datalist = document.getElementById('available-models-list');
+      var warning = document.getElementById('catalog-warning');
+      var models = [];
+
+      if (!data.providers) {
+        warning.style.display = 'block';
+        return;
+      }
+
+      // Extract all models from all providers
+      Object.keys(data.providers).forEach(function(providerName) {
+        var provider = data.providers[providerName];
+        if (provider.supported && provider.models && Array.isArray(provider.models)) {
+          provider.models.forEach(function(m) {
+            // CatalogModel has 'provider' and 'name' fields
+            if (m.provider && m.name) {
+              models.push(m.provider + '/' + m.name);
+            }
+          });
+        }
+      });
+
+      if (models.length === 0) {
+        warning.style.display = 'block';
+        return;
+      }
+
+      // Populate datalist
+      models.forEach(function(modelId) {
+        var option = document.createElement('option');
+        option.value = modelId;
+        datalist.appendChild(option);
+      });
+    })
+    .catch(function(err) {
+      console.warn('Failed to load model catalog:', err);
+      document.getElementById('catalog-warning').style.display = 'block';
+    });
+})();
 </script>
 
 <h2 style="margin-bottom:1rem;">Failover Chains</h2>
@@ -195,12 +249,12 @@ function editAlias(alias, target) {
     <form id="failover-form" style="background:#fff;border-radius:6px;padding:1rem;
           box-shadow:0 1px 3px rgba(0,0,0,0.1);">
       <div style="margin-bottom:0.75rem;">
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Primary Model *</label>
+        <label for="failover-primary" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Primary Model *</label>
         <input type="text" id="failover-primary" placeholder="opus or anthropic/claude-opus-4-6"
                style="width:100%;padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
       </div>
       <div style="margin-bottom:0.75rem;">
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">
+        <label for="failover-fallbacks" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">
           Fallbacks (ordered, one per line or comma-separated)
         </label>
         <textarea id="failover-fallbacks" rows="4" placeholder="sonnet&#10;haiku"

@@ -118,3 +118,80 @@ async fn authenticated_responses_with_input_returns_200() {
     let body: serde_json::Value = resp.json();
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
 }
+
+#[tokio::test]
+async fn responses_tools_field_with_non_empty_array_returns_400() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/responses")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "tools": [{"type": "function", "function": {"name": "test"}}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("tools"), "Error message should mention 'tools' field, got: {}", message);
+}
+
+#[tokio::test]
+async fn responses_tool_choice_field_returns_400() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/responses")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "tool_choice": "auto"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("tool_choice"), "Error message should mention 'tool_choice' field, got: {}", message);
+}
+
+#[tokio::test]
+async fn responses_empty_tools_array_returns_200() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/responses")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "tools": []
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+}
+
+#[tokio::test]
+async fn responses_request_without_tools_returns_200() {
+    let server = test_app().await;
+    let resp = server
+        .post("/v1/responses")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+}

@@ -140,10 +140,12 @@ async fn search_inner(
 
     // Policy check — engines are gated as pseudo-models "search/{engine}" so
     // allow-lists and budgets apply the same way they do to chat/embedding models.
-    let pseudo_model = format!("search/{}", engine);
+    // NOTE: Policy is checked against the REQUESTED engine; cost is resolved after
+    // failover from the SERVING engine (issue #42).
+    let requested_pseudo_model = format!("search/{}", engine);
     let policy_result = state
         .policy
-        .check(&user, &pseudo_model)
+        .check(&user, &requested_pseudo_model)
         .await
         .map_err(|_| ApiError::Internal)?;
     match policy_result {
@@ -153,21 +155,10 @@ async fn search_inner(
         }
     }
 
-    // Pricing follows the images.rs precedent: `input_per_million` is reused as
-    // a flat per-unit dollar rate (here: dollars per query), not a
-    // per-million-token rate. See config.example.toml for the documented unit.
-    let cost = state
-        .settings
-        .pricing
-        .iter()
-        .find(|p| p.model == pseudo_model)
-        .map(|p| p.input_per_million)
-        .unwrap_or(DEFAULT_COST_PER_QUERY);
-
     // ── Response cache ───────────────────────────────────────────────────────
     // Search queries are deterministic enough to cache by default; the key is
     // engine + query + options, and the TTL is shorter than for completions.
-    let cache_key = if state.policy.cache_enabled(&user, &pseudo_model)
+    let cache_key = if state.policy.cache_enabled(&user, &requested_pseudo_model)
         && state.response_cache.search_eligible()
     {
         Some(crate::router::cache::search_cache_key(
@@ -180,14 +171,27 @@ async fn search_inner(
     };
 
     if let Some(ref key) = cache_key {
-        if let Some(payload) = state.response_cache.get_search(key, &pseudo_model).await {
-            tracing::info!(engine = engine.as_str(), "search cache hit");
+        if let Some(payload) = state.response_cache.get_search(key, &requested_pseudo_model).await {
+            // Cache hit: the cached payload already names the serving engine.
+            let cached_engine = payload["engine"].as_str().unwrap_or(&engine);
+            let cached_pseudo_model = format!("search/{}", cached_engine);
+            tracing::info!(engine = cached_engine, "search cache hit");
             let results_returned = payload["results"].as_array().map(|r| r.len()).unwrap_or(0) as i64;
+
+            // Recompute cost from the serving engine's pricing
+            let cost = state
+                .settings
+                .pricing
+                .iter()
+                .find(|p| p.model == cached_pseudo_model)
+                .map(|p| p.input_per_million)
+                .unwrap_or(DEFAULT_COST_PER_QUERY);
+
             record_search_cache_hit(
                 &state,
                 &user,
-                &pseudo_model,
-                &engine,
+                &cached_pseudo_model,
+                cached_engine,
                 results_returned,
                 cost,
                 &attribution,
@@ -208,36 +212,138 @@ async fn search_inner(
         }
     }
 
-    let adapter = state
-        .search_registry
-        .get(&engine)
-        .map_err(ApiError::ProviderError)?;
-
+    // ── Fallback chain walk ──────────────────────────────────────────────────
+    // Try the primary engine, then walk the chain on provider errors (adapter/
+    // provider failures: timeouts, 5xx, rate-limit, connection issues). Do NOT
+    // fail over on caller errors (invalid query → 400). Skip chain entries that
+    // are unsupported/unconfigured. Return the last error if the chain exhausts.
     let req = SearchRequest {
         query: query.clone(),
         max_results,
     };
 
-    let start = Instant::now();
-    let result = adapter
-        .search(&req)
-        .await
-        .map_err(ApiError::ProviderError)?;
-    let latency_ms = start.elapsed().as_millis() as i64;
+    let chain = state
+        .settings
+        .routing
+        .search_fallback_chains
+        .get(&engine)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let mut engines_to_try = vec![engine.clone()];
+    engines_to_try.extend_from_slice(chain);
+
+    // Dedupe while preserving order (cheap adjacent item #11).
+    let mut seen = std::collections::HashSet::new();
+    engines_to_try.retain(|e| seen.insert(e.clone()));
+
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut serving_engine = String::new();
+    let mut result = None;
+    let mut latency_ms = 0_i64;
+
+    for (idx, candidate) in engines_to_try.iter().enumerate() {
+        if !crate::providers::search_registry::is_supported_engine(candidate) {
+            tracing::debug!(
+                engine = candidate,
+                "skipping unsupported engine in fallback chain"
+            );
+            continue;
+        }
+
+        let adapter = match state.search_registry.get(candidate) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(
+                    engine = candidate,
+                    error = %e,
+                    "skipping unconfigured engine in fallback chain"
+                );
+                continue;
+            }
+        };
+
+        let start = Instant::now();
+        match adapter.search(&req).await {
+            Ok(res) => {
+                latency_ms = start.elapsed().as_millis() as i64;
+                serving_engine = candidate.clone();
+                result = Some(res);
+                break;
+            }
+            Err(e) => {
+                // Classify the error: client errors (4xx except 429) surface
+                // immediately without failover; provider errors (5xx, 429,
+                // timeouts, connection failures) walk the chain.
+                use crate::router::retry::RetryableError;
+                let err_str = e.to_string();
+                let classified = RetryableError::classify(&err_str);
+
+                if matches!(classified, RetryableError::ClientError(_)) {
+                    // Client error (provider 400/404/422 etc) — the caller sent
+                    // a bad query/params. Surface immediately, do not fail over.
+                    tracing::debug!(
+                        engine = candidate,
+                        error = %e,
+                        "client error from search engine, not failing over"
+                    );
+                    return Err(ApiError::ProviderError(e));
+                }
+
+                // Provider error — try the next engine in the chain.
+                let remaining: Vec<_> = engines_to_try[idx + 1..].to_vec();
+                last_error = Some(e);
+                tracing::warn!(
+                    engine = candidate,
+                    error = %last_error.as_ref().unwrap(),
+                    remaining = ?remaining,
+                    "search engine failed, trying next in chain"
+                );
+            }
+        }
+    }
+
+    let result = result.ok_or_else(|| {
+        let tried: Vec<_> = engines_to_try.iter().map(|s| s.as_str()).collect();
+        ApiError::ProviderError(
+            last_error
+                .map(|e| anyhow::anyhow!("all engines exhausted (tried: {}): {}", tried.join(", "), e))
+                .unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "all engines in the fallback chain are unconfigured or unsupported (tried: {})",
+                        tried.join(", ")
+                    )
+                }),
+        )
+    })?;
 
     let results_returned = result.results.len() as i64;
+
+    // Recompute cost and pseudo-model from the SERVING engine (issue #42).
+    // Pricing follows the images.rs precedent: `input_per_million` is reused as
+    // a flat per-unit dollar rate (here: dollars per query), not a
+    // per-million-token rate. See config.example.toml for the documented unit.
+    let serving_pseudo_model = format!("search/{}", serving_engine);
+    let cost = state
+        .settings
+        .pricing
+        .iter()
+        .find(|p| p.model == serving_pseudo_model)
+        .map(|p| p.input_per_million)
+        .unwrap_or(DEFAULT_COST_PER_QUERY);
 
     let span = tracing::Span::current();
     span.record("cost.usd", cost);
     span.record("results.count", results_returned);
 
+    // Metrics and cost tracking use the serving_engine, not the requested engine.
     #[cfg(feature = "otel")]
     {
-        crate::telemetry::metrics::record_request(&pseudo_model, &engine, "ok");
-        crate::telemetry::metrics::record_cost(&pseudo_model, &engine, user.id, cost);
+        crate::telemetry::metrics::record_request(&serving_pseudo_model, &serving_engine, "ok");
+        crate::telemetry::metrics::record_cost(&serving_pseudo_model, &serving_engine, user.id, cost);
         crate::telemetry::metrics::record_duration(
-            &pseudo_model,
-            &engine,
+            &serving_pseudo_model,
+            &serving_engine,
             false,
             latency_ms as f64,
         );
@@ -245,14 +351,14 @@ async fn search_inner(
 
     #[cfg(feature = "prometheus")]
     if let Some(ref metrics) = state.app_metrics {
-        metrics.record_request(&pseudo_model, &engine, "ok");
-        metrics.record_cost(&pseudo_model, &engine, cost);
+        metrics.record_request(&serving_pseudo_model, &serving_engine, "ok");
+        metrics.record_cost(&serving_pseudo_model, &serving_engine, cost);
     }
 
     // Fire-and-forget cost recording
     let state_clone = state.clone();
-    let engine_clone = engine.clone();
-    let pseudo_model_clone = pseudo_model.clone();
+    let engine_clone = serving_engine.clone();
+    let serving_pseudo_model_clone = serving_pseudo_model.clone();
     let user_id = user.id;
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
@@ -263,8 +369,8 @@ async fn search_inner(
         let prompt = NewPrompt {
             user_id,
             session_id: None,
-            request_model: pseudo_model_clone.clone(),
-            routed_model: pseudo_model_clone.clone(),
+            request_model: serving_pseudo_model_clone.clone(),
+            routed_model: serving_pseudo_model_clone.clone(),
             provider: engine_clone.clone(),
             messages: "[]".to_string(), // search has no chat messages
             response: None,
@@ -295,7 +401,7 @@ async fn search_inner(
                 let ledger = NewCostLedgerEntry {
                     user_id,
                     prompt_id: stored.as_ref().map(|s| s.id),
-                    model: pseudo_model_clone,
+                    model: serving_pseudo_model_clone,
                     provider: engine_clone,
                     project: user_project.clone(),
                     tokens_in: results_returned,
@@ -312,7 +418,7 @@ async fn search_inner(
     });
 
     let payload = serde_json::json!({
-        "engine": result.engine,
+        "engine": serving_engine,
         "results": result.results,
         "usage": {
             "results": results_returned,
@@ -323,7 +429,7 @@ async fn search_inner(
     if let Some(key) = cache_key {
         state
             .response_cache
-            .put_search(&key, &pseudo_model, payload.clone(), cost)
+            .put_search(&key, &serving_pseudo_model, payload.clone(), cost)
             .await;
     }
 

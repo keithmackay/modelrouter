@@ -5,12 +5,12 @@
 
 <form hx-post="/admin/users" hx-target="#users-tbody" hx-swap="afterbegin" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1.5rem;">
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name *</label>
-        <input type="text" name="name" required placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+        <label for="user-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Name *</label>
+        <input type="text" name="name" id="user-name" required placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
     </div>
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Email</label>
-        <input type="email" name="email" disabled placeholder="Coming soon" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;opacity:0.6;">
+        <label for="user-email" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Email</label>
+        <input type="email" name="email" id="user-email" disabled placeholder="Coming soon" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;opacity:0.6;">
     </div>
     <button type="submit" class="btn btn-success">Create User</button>
 </form>

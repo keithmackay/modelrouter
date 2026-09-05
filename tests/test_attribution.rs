@@ -727,3 +727,54 @@ async fn reports_page_filters_by_attribution() {
     assert_eq!(resp.status_code(), 200);
     assert!(resp.text().contains("Spend by User"));
 }
+
+// ── Issue #50: health probe must write {} not [] ─────────────────────────────
+
+#[tokio::test]
+async fn health_probe_writes_empty_object_not_array() {
+    use modelrouter::db::models::NewCostLedgerEntry;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let db = common::in_memory_db().await;
+
+    // Create the health-probe user.
+    UserRepository::create(
+        &db,
+        modelrouter::db::models::NewUser {
+            name: "health-probe".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+    let user = UserRepository::find_by_name(&db, "health-probe")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Simulate what the health probe does: write a cost row with empty attribution.
+    let entry = NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: "mock-model".to_string(),
+        provider: "mock".to_string(),
+        project: Some("health-probe".to_string()),
+        tokens_in: 10,
+        tokens_out: 20,
+        cost_usd: 0.001,
+        api_key_id: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+    };
+    CostRepository::create(&db, entry).await.unwrap();
+
+    // Verify the row has "{}" not "[]".
+    let ledger = CostRepository::list_cost_entries_before(&db, FOREVER)
+        .await
+        .unwrap();
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(
+        ledger[0].attribution_tags, "{}",
+        "health probe must write '{{}}', not '[]' (issue #50)"
+    );
+}

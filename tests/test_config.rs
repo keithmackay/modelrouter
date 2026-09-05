@@ -78,3 +78,70 @@ fn cache_is_disabled_by_default() {
     assert_eq!(s.cache.backend, "memory");
     assert_eq!(s.cache.completions.max_temperature, 0.0);
 }
+
+// ── OIDC role validation (issue #51) ─────────────────────────────────────────
+
+#[test]
+#[serial]
+fn oidc_default_role_is_viewer() {
+    let s = modelrouter::config::load(Some("/nonexistent/path.toml".into())).unwrap();
+    assert_eq!(s.oidc.auto_provision_role, "viewer");
+}
+
+#[test]
+#[serial]
+fn oidc_role_validation_accepts_superadmin() {
+    use modelrouter::config::schema::OidcConfig;
+    let cfg = OidcConfig {
+        enabled: true,
+        auto_provision_role: "superadmin".to_string(),
+        ..Default::default()
+    };
+    assert!(cfg.validate_role().is_ok());
+}
+
+#[test]
+#[serial]
+fn oidc_role_validation_accepts_viewer() {
+    use modelrouter::config::schema::OidcConfig;
+    let cfg = OidcConfig {
+        enabled: true,
+        auto_provision_role: "viewer".to_string(),
+        ..Default::default()
+    };
+    assert!(cfg.validate_role().is_ok());
+}
+
+#[test]
+#[serial]
+fn oidc_role_validation_rejects_admin() {
+    use modelrouter::config::schema::OidcConfig;
+    let cfg = OidcConfig {
+        enabled: true,
+        auto_provision_role: "admin".to_string(),
+        ..Default::default()
+    };
+    let result = cfg.validate_role();
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("admin"));
+    assert!(err.contains("superadmin"));
+    assert!(err.contains("viewer"));
+}
+
+#[test]
+#[serial]
+fn oidc_role_validation_rejects_unknown() {
+    use modelrouter::config::schema::OidcConfig;
+    let cfg = OidcConfig {
+        enabled: true,
+        auto_provision_role: "god".to_string(),
+        ..Default::default()
+    };
+    let result = cfg.validate_role();
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("god"));
+    assert!(err.contains("superadmin"));
+    assert!(err.contains("viewer"));
+}

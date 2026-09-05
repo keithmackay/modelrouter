@@ -126,7 +126,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
         get_overview, get_users, post_create_user, post_disable_user, post_enable_user,
-        get_prompts as dash_get_prompts, get_prompt_detail, get_failures, post_storage_settings,
+        get_prompts as dash_get_prompts, get_prompt_detail, get_failures, get_failure_detail, post_storage_settings,
         get_cost, get_hooks,
         get_audit as dash_get_audit,
         get_admins, post_create_admin, post_delete_admin,
@@ -235,6 +235,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/prompts", get(dash_get_prompts))
         .route("/admin/storage-settings", axum::routing::post(post_storage_settings))
         .route("/admin/failures", get(get_failures))
+        .route("/admin/failures/:id", get(get_failure_detail))
         .route("/admin/prompts/:id", get(get_prompt_detail))
         .route("/admin/cost", get(get_cost))
         // Response cache dashboard

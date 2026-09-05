@@ -185,6 +185,26 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
 
             println!("Disabled admin '{}'.", admin.name);
         }
+
+        AdminCommands::HashPassword => {
+            let password = rpassword::prompt_password("Password: ")?;
+            let confirm = rpassword::prompt_password("Confirm password: ")?;
+            if password != confirm {
+                anyhow::bail!("passwords do not match");
+            }
+
+            let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
+                .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
+
+            println!("{}", password_hash);
+            println!();
+            println!("Paste this hash into config.toml:");
+            println!();
+            println!("[admin.bootstrap]");
+            println!("name = \"admin\"");
+            println!("role = \"superadmin\"");
+            println!("password_hash = \"{}\"", password_hash);
+        }
     }
     Ok(())
 }

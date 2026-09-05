@@ -283,7 +283,7 @@ fn record_probe_usage(
     tokens_out: i64,
     cost_usd: f64,
 ) {
-    use crate::db::models::{NewCostLedgerEntry, NewUser};
+    use crate::db::models::{empty_json_object, NewCostLedgerEntry, NewUser};
     use crate::db::repositories::{costs::CostRepository, users::UserRepository};
 
     const PROBE_USER: &str = "health-probe";
@@ -321,7 +321,7 @@ fn record_probe_usage(
             cost_usd,
             api_key_id: None,
             attribution_correlation_id: None,
-            attribution_tags: "[]".to_string(),
+            attribution_tags: empty_json_object(),
         };
         if let Err(e) = CostRepository::create(&*state.db, entry).await {
             tracing::error!(error = %e, "failed to record health-probe usage");

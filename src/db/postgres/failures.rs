@@ -71,4 +71,26 @@ impl FailureRepository for PostgresDb {
         .await?;
         Ok(rows)
     }
+
+    async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<RequestFailure>> {
+        let row = sqlx::query_as::<_, RequestFailure>(&format!(
+            "SELECT {} FROM request_failures WHERE id = $1",
+            FAILURE_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn find_by_correlation_id(&self, correlation_id: &str) -> anyhow::Result<Vec<RequestFailure>> {
+        let rows = sqlx::query_as::<_, RequestFailure>(&format!(
+            "SELECT {} FROM request_failures WHERE attribution_correlation_id = $1 ORDER BY created_at DESC",
+            FAILURE_COLUMNS
+        ))
+        .bind(correlation_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }

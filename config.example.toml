@@ -35,9 +35,17 @@ default_model = "gpt-4o"
 "smart"   = "anthropic/claude-opus-4-5"
 "local"   = "ollama/llama3"
 
-# Fallback chains: if a provider fails, try the next one.
+# Fallback chains: if a chat/completion model provider fails, try the next one.
+# Provider errors (5xx, 429, timeouts, connection failures) walk the chain.
+# Client errors (400, 404, etc) surface immediately without failover.
 [routing.fallback_chains]
 "openai/gpt-4o" = ["anthropic/claude-opus-4-5", "ollama/llama3"]
+
+# Search fallback chains: same provider-error semantics as fallback_chains.
+# The serving engine is recorded in the cost ledger (and in cache hits), so
+# cost attribution reflects the engine that actually served the request.
+[routing.search_fallback_chains]
+"tavily" = ["vertex"]
 
 # ---------------------------------------------------------------------------
 # Providers
@@ -98,6 +106,17 @@ jwt_secret            = "change-me-jwt-secret"
 jwt_expiry_mins       = 60
 # Grace period during key rotation where both old and new keys are accepted.
 rotation_overlap_mins = 15
+
+# ---------------------------------------------------------------------------
+# Admin Bootstrap
+# ---------------------------------------------------------------------------
+# Automatically create an admin account at startup if it does not exist.
+# Idempotent: second startup is a no-op (password and role are never rotated).
+# Generate the password_hash with: modelrouter admin hash-password
+# [admin.bootstrap]
+# name = "bootstrap-admin"
+# role = "superadmin"        # Valid roles: superadmin, admin, viewer
+# password_hash = "$2b$12$..."  # NEVER use plaintext
 
 # ---------------------------------------------------------------------------
 # Hooks — lifecycle

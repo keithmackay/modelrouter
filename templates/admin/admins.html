@@ -42,16 +42,16 @@
 <h2 style="margin-top: 2rem; margin-bottom: 1rem; font-size: 1.1rem;">Create New Admin</h2>
 <form hx-post="/admin/admins" hx-target="#admins-form-result" hx-swap="innerHTML" style="display:flex; gap:1rem; flex-wrap:wrap; align-items:flex-end;">
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Username</label>
-        <input type="text" name="name" required style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="admin-username" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Username</label>
+        <input type="text" name="name" id="admin-username" required style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Password</label>
-        <input type="password" name="password" required style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="admin-password" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Password</label>
+        <input type="password" name="password" id="admin-password" required style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Role</label>
-        <select name="role" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="admin-role" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Role</label>
+        <select name="role" id="admin-role" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="viewer">Viewer</option>
             <option value="superadmin">Superadmin</option>
         </select>

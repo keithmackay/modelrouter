@@ -11,7 +11,7 @@ async fn test_find_by_oidc_subject() {
         name: "Alice OIDC".to_string(),
         email: "alice@example.com".to_string(),
         oidc_subject: "google|12345".to_string(),
-        role: "admin".to_string(),
+        role: "viewer".to_string(),
     }).await.unwrap();
     assert_eq!(created.password_hash, "");
 
@@ -31,7 +31,7 @@ mod oidc_config_tests {
     fn test_oidc_config_defaults() {
         let settings: Settings = toml::from_str("").unwrap();
         assert!(!settings.oidc.enabled);
-        assert_eq!(settings.oidc.auto_provision_role, "admin");
+        assert_eq!(settings.oidc.auto_provision_role, "viewer");
         assert!(settings.oidc.allowed_emails.is_empty());
         assert!(settings.oidc.allowed_domains.is_empty());
     }
@@ -103,7 +103,7 @@ mod oidc_integration_tests {
             name: "Alice OIDC".to_string(),
             email: "alice@example.com".to_string(),
             oidc_subject: "google|12345".to_string(),
-            role: "admin".to_string(),
+            role: "viewer".to_string(),
         }).await.unwrap();
 
         assert_eq!(created.oidc_subject.as_deref(), Some("google|12345"));
@@ -126,7 +126,7 @@ mod oidc_integration_tests {
             name: "Alice".to_string(),
             email: "alice@example.com".to_string(),
             oidc_subject: "provider|abc".to_string(),
-            role: "admin".to_string(),
+            role: "viewer".to_string(),
         }).await.unwrap();
 
         // Second insert with same oidc_subject must fail
@@ -134,7 +134,7 @@ mod oidc_integration_tests {
             name: "Alice Dup".to_string(),
             email: "alice2@example.com".to_string(),
             oidc_subject: "provider|abc".to_string(),
-            role: "admin".to_string(),
+            role: "viewer".to_string(),
         }).await;
         assert!(result.is_err());
     }
@@ -145,10 +145,54 @@ mod oidc_integration_tests {
         let created = db.create(NewAdminUser {
             name: "bob".to_string(),
             password_hash: "hash".to_string(),
-            role: "admin".to_string(),
+            role: "viewer".to_string(),
         }).await.unwrap();
 
         assert!(created.oidc_subject.is_none());
         assert!(created.email.is_none());
+    }
+
+    /// Test that OIDC-provisioned admins with `role: "superadmin"` can hold superadmin
+    /// (verifies issue #51 fix: the default is now "viewer", but an explicit config
+    /// of "superadmin" should work).
+    #[tokio::test]
+    async fn test_oidc_superadmin_role_yields_superadmin_session() {
+        let db = crate::common::in_memory_db().await;
+
+        // Auto-provision with role "superadmin" (operator explicitly configured it)
+        let admin = db.create_from_oidc(NewAdminUserFromOidc {
+            name: "Super Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            oidc_subject: "oidc|superadmin-test".to_string(),
+            role: "superadmin".to_string(),
+        }).await.unwrap();
+
+        assert_eq!(admin.role, "superadmin");
+        assert!(admin.enabled);
+
+        // Confirm the DB record is truly "superadmin", not degraded
+        let found = db.find_by_oidc_subject("oidc|superadmin-test").await.unwrap().unwrap();
+        assert_eq!(found.role, "superadmin");
+    }
+
+    /// Test that OIDC-provisioned admins with `role: "viewer"` hold viewer role
+    /// (the new fail-safe default).
+    #[tokio::test]
+    async fn test_oidc_viewer_role_yields_viewer_session() {
+        let db = crate::common::in_memory_db().await;
+
+        // Auto-provision with role "viewer" (the new default)
+        let admin = db.create_from_oidc(NewAdminUserFromOidc {
+            name: "Viewer Bob".to_string(),
+            email: "bob@example.com".to_string(),
+            oidc_subject: "oidc|viewer-test".to_string(),
+            role: "viewer".to_string(),
+        }).await.unwrap();
+
+        assert_eq!(admin.role, "viewer");
+        assert!(admin.enabled);
+
+        let found = db.find_by_oidc_subject("oidc|viewer-test").await.unwrap().unwrap();
+        assert_eq!(found.role, "viewer");
     }
 }

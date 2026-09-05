@@ -143,20 +143,20 @@
             <input type="checkbox" name="search_enabled" {% if policy.search.enabled %}checked{% endif %}> Search
         </label>
         <div>
-            <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Max temperature</label>
-            <input type="number" step="0.05" min="0" max="2" name="completions_max_temperature"
+            <label for="completions-max-temperature" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Max temperature</label>
+            <input type="number" step="0.05" min="0" max="2" name="completions_max_temperature" id="completions-max-temperature"
                    value="{{ policy.completions.max_temperature }}"
                    style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;width:110px;">
         </div>
         <div>
-            <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Completion TTL (s)</label>
-            <input type="number" min="1" name="completions_ttl_seconds"
+            <label for="completions-ttl-seconds" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Completion TTL (s)</label>
+            <input type="number" min="1" name="completions_ttl_seconds" id="completions-ttl-seconds"
                    value="{{ policy.completions.ttl_seconds or policy.default_ttl_seconds }}"
                    style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;width:130px;">
         </div>
         <div>
-            <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Search TTL (s)</label>
-            <input type="number" min="1" name="search_ttl_seconds"
+            <label for="search-ttl-seconds" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Search TTL (s)</label>
+            <input type="number" min="1" name="search_ttl_seconds" id="search-ttl-seconds"
                    value="{{ policy.search.ttl_seconds }}"
                    style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;width:130px;">
         </div>
@@ -168,21 +168,21 @@
 <div class="stat-card">
     <form method="POST" action="/admin/cache/purge" style="display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-end;">
         <div>
-            <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Scope</label>
-            <select name="scope" style="padding:0.5rem;border:1px solid #ccc;border-radius:4px;">
+            <label for="purge-scope" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Scope</label>
+            <select name="scope" id="purge-scope" style="padding:0.5rem;border:1px solid #ccc;border-radius:4px;">
                 <option value="all">Everything</option>
                 <option value="model">One model</option>
                 <option value="key">One key</option>
             </select>
         </div>
         <div>
-            <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Model (scope = model)</label>
-            <input type="text" name="model" placeholder="gpt-4o-mini"
+            <label for="purge-model" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Model (scope = model)</label>
+            <input type="text" name="model" id="purge-model" placeholder="gpt-4o-mini"
                    style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;">
         </div>
         <div>
-            <label style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Key (scope = key)</label>
-            <input type="text" name="key" placeholder="completion:…"
+            <label for="purge-key" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Key (scope = key)</label>
+            <input type="text" name="key" id="purge-key" placeholder="completion:…"
                    style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;width:260px;">
         </div>
         <button class="btn btn-danger" type="submit">Purge</button>

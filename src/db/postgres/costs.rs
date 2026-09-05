@@ -625,7 +625,10 @@ impl CostRepository for PostgresDb {
     async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT jsonb_object_keys(attribution_tags::jsonb) AS k \
-             FROM cost_ledger WHERE attribution_tags <> '{}' ORDER BY k ASC",
+             FROM cost_ledger \
+             WHERE attribution_tags <> '{}' \
+               AND jsonb_typeof(attribution_tags::jsonb) = 'object' \
+             ORDER BY k ASC",
         )
         .fetch_all(&self.pool)
         .await?;

@@ -670,19 +670,18 @@ pub struct AvailableModelsQuery {
     pub refresh: bool,
 }
 
-/// GET /admin/api/models/available — what each configured provider's catalog
-/// actually offers, per-provider degraded, TTL-cached.
-pub async fn get_available_models(
-    State(state): State<AppState>,
-    _session: AdminSession,
-    axum::extract::Query(q): axum::extract::Query<AvailableModelsQuery>,
-) -> Result<axum::Json<serde_json::Value>, ApiError> {
+/// Shared catalog cache used by both the models API and alias validation.
+/// Returns the aggregated catalog, using the cache unless `refresh` is true.
+pub(crate) async fn cached_catalog(
+    state: &AppState,
+    refresh: bool,
+) -> serde_json::Value {
     let cache = CATALOG_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
     let mut guard = cache.lock().await;
-    if !q.refresh {
+    if !refresh {
         if let Some((at, value)) = guard.as_ref() {
             if at.elapsed() < CATALOG_TTL {
-                return Ok(axum::Json(value.clone()));
+                return value.clone();
             }
         }
     }
@@ -695,5 +694,16 @@ pub async fn get_available_models(
         "ttl_seconds": CATALOG_TTL.as_secs(),
     });
     *guard = Some((std::time::Instant::now(), value.clone()));
+    value
+}
+
+/// GET /admin/api/models/available — what each configured provider's catalog
+/// actually offers, per-provider degraded, TTL-cached.
+pub async fn get_available_models(
+    State(state): State<AppState>,
+    _session: AdminSession,
+    axum::extract::Query(q): axum::extract::Query<AvailableModelsQuery>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let value = cached_catalog(&state, q.refresh).await;
     Ok(axum::Json(value))
 }

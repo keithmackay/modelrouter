@@ -12,24 +12,24 @@
 
 <form hx-post="/admin/keys" hx-target="#key-form-message" hx-swap="innerHTML" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;">
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">User *</label>
-        <input type="text" name="user_name" required list="user-list" placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+        <label for="key-user-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">User *</label>
+        <input type="text" name="user_name" id="key-user-name" required list="user-list" placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
     </div>
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Project</label>
-        <input type="text" name="project" list="project-list" placeholder="my-project" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+        <label for="key-project" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Project</label>
+        <input type="text" name="project" id="key-project" list="project-list" placeholder="my-project" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
     </div>
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Label</label>
-        <input type="text" name="label" placeholder="laptop" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+        <label for="key-label" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Label</label>
+        <input type="text" name="label" id="key-label" placeholder="laptop" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
     </div>
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Email</label>
-        <input type="email" name="email" placeholder="user@example.com" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
+        <label for="key-email" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Email</label>
+        <input type="email" name="email" id="key-email" placeholder="user@example.com" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
     </div>
     <div>
-        <label style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Session Window (secs)</label>
-        <input type="number" name="session_window_secs" placeholder="28800" min="60" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:8rem;" title="Synthetic session ID window for opaque clients (e.g. Claude Code). Default: 28800 = 8 hrs.">
+        <label for="session-window-secs" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Session Window (secs)</label>
+        <input type="number" name="session_window_secs" id="session-window-secs" placeholder="28800" min="60" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:8rem;" title="Synthetic session ID window for opaque clients (e.g. Claude Code). Default: 28800 = 8 hrs.">
     </div>
     <button type="submit" class="btn btn-success">Create Key</button>
 </form>

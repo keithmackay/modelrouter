@@ -2,6 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Admin role vocabulary. The complete set of recognized roles for admin users.
+///
+/// Session extractors gate on `role != "superadmin"`, so an unknown role would
+/// silently degrade to viewer. Both OIDC auto-provisioning and bootstrap config
+/// validation check against this list to ensure operators set explicit valid roles.
+pub const ADMIN_ROLE_VOCABULARY: &[&str] = &["superadmin", "viewer"];
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PricingEntry {
     pub model: String,
@@ -213,6 +220,8 @@ pub struct Settings {
     pub oidc: OidcConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -254,7 +263,7 @@ fn default_archive_after_days() -> u32 { 90 }
 fn default_archive_prefix() -> String { "modelrouter/cost-logs".to_string() }
 fn default_archive_region() -> String { "us-east-1".to_string() }
 
-fn default_oidc_role() -> String { "admin".to_string() }
+fn default_oidc_role() -> String { "viewer".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OidcConfig {
@@ -288,6 +297,27 @@ impl Default for OidcConfig {
             allowed_domains: vec![],
             auto_provision_role: default_oidc_role(),
         }
+    }
+}
+
+impl OidcConfig {
+    /// Validate the configured OIDC role against the known vocabulary.
+    ///
+    /// An unknown role would silently degrade to viewer in session extractors
+    /// that gate on `role != "superadmin"`, so this validation rejects startup
+    /// loudly rather than allowing misconfigured SSO admins to believe they hold
+    /// the specified role when they do not.
+    pub fn validate_role(&self) -> anyhow::Result<()> {
+        if !ADMIN_ROLE_VOCABULARY.contains(&self.auto_provision_role.as_str()) {
+            anyhow::bail!(
+                "oidc.auto_provision_role is '{}', which is not a recognized role. \
+                 Valid roles are: {}. Set the role explicitly in config.toml or \
+                 via MODELROUTER_OIDC__AUTO_PROVISION_ROLE. Refusing to start.",
+                self.auto_provision_role,
+                ADMIN_ROLE_VOCABULARY.join(", ")
+            );
+        }
+        Ok(())
     }
 }
 
@@ -376,6 +406,12 @@ pub struct RoutingConfig {
     /// `strict_model_resolution` exists to prevent for chat models.
     #[serde(default)]
     pub default_search_engine: Option<String>,
+    /// Fallback chains for search engines (engine → ordered list of fallback engines).
+    /// Shape-consistent with `fallback_chains` for LLM routing. When a search request
+    /// fails due to provider error (timeout, 5xx, rate-limit), the chain is walked.
+    /// Caller errors (invalid query → 400) never trigger failover.
+    #[serde(default)]
+    pub search_fallback_chains: HashMap<String, Vec<String>>,
 }
 
 impl Default for RoutingConfig {
@@ -390,6 +426,7 @@ impl Default for RoutingConfig {
             shortcuts: RoutingShortcutsConfig::default(),
             strict_model_resolution: false,
             default_search_engine: None,
+            search_fallback_chains: HashMap::new(),
         }
     }
 }
@@ -434,6 +471,106 @@ impl Default for HealthConfig {
 fn default_deep_ttl() -> u64 { 60 }
 fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
 fn default_search_probe_engine() -> String { "tavily".to_string() }
+
+/// `[admin]` — admin account management.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub bootstrap: Option<AdminBootstrapConfig>,
+}
+
+/// `[admin.bootstrap]` — idempotent admin account creation at startup (issue #43).
+///
+/// When present, the account is created-if-absent by name at serve time.
+/// Second startup is a no-op: password and role are never overwritten. A
+/// malformed bcrypt hash or invalid role fails startup loudly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdminBootstrapConfig {
+    pub name: String,
+    pub role: String,
+    /// Bcrypt hash. NEVER plaintext.
+    pub password_hash: String,
+}
+
+impl AdminBootstrapConfig {
+    /// Validate role against the known vocabulary and bcrypt hash format.
+    ///
+    /// An unknown role would silently degrade to viewer in session extractors
+    /// that gate on `role != "superadmin"`, so this validation rejects startup
+    /// loudly rather than allowing misconfigured bootstrap accounts to believe
+    /// they hold the specified role when they do not.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !ADMIN_ROLE_VOCABULARY.contains(&self.role.as_str()) {
+            anyhow::bail!(
+                "admin.bootstrap.role is '{}', which is not a recognized role. \
+                 Valid roles are: {}. Set the role explicitly in config.toml or \
+                 via MODELROUTER_ADMIN__BOOTSTRAP__ROLE. Refusing to start.",
+                self.role,
+                ADMIN_ROLE_VOCABULARY.join(", ")
+            );
+        }
+
+        // Validate bcrypt hash format: bcrypt hashes start with $2a$, $2b$, or $2y$
+        // and have a specific structure. We attempt verification with a dummy password
+        // to check if the hash is well-formed — any result (Ok/Err) proves it parses.
+        if !self.password_hash.starts_with("$2") {
+            anyhow::bail!(
+                "admin.bootstrap.password_hash does not look like a bcrypt hash. \
+                 Expected format: $2a$..., $2b$..., or $2y$... \
+                 Use `modelrouter admin hash-password` to generate a valid hash. \
+                 Refusing to start."
+            );
+        }
+
+        // Validate hash is parseable by attempting verification.
+        // Both Ok and Err are acceptable — we just need to ensure it doesn't panic.
+        let _ = bcrypt::verify("_validation_probe_", &self.password_hash)
+            .map_err(|_| anyhow::anyhow!(
+                "admin.bootstrap.password_hash is malformed (bcrypt verification failed). \
+                 Use `modelrouter admin hash-password` to generate a valid hash. \
+                 Refusing to start."
+            ))?;
+
+        Ok(())
+    }
+
+    /// Apply the bootstrap admin account (issue #43).
+    /// Idempotent: create-if-absent by name; second startup is a no-op.
+    /// Invalid role or malformed hash fails loudly.
+    pub async fn apply(
+        &self,
+        db: &dyn crate::api::app::DatabaseProvider,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        use crate::db::repositories::admin_users::AdminUserRepository;
+        match AdminUserRepository::find_by_name(db, &self.name).await? {
+            Some(existing) => {
+                tracing::info!(
+                    name = %existing.name,
+                    role = %existing.role,
+                    "admin bootstrap: account already exists, skipping"
+                );
+            }
+            None => {
+                let admin = AdminUserRepository::create(
+                    db,
+                    crate::db::models::NewAdminUser {
+                        name: self.name.clone(),
+                        password_hash: self.password_hash.clone(),
+                        role: self.role.clone(),
+                    },
+                )
+                .await?;
+                tracing::info!(
+                    name = %admin.name,
+                    role = %admin.role,
+                    "admin bootstrap: created account"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 /// `[storage]` — what the prompt log records (issue #4).
 ///
