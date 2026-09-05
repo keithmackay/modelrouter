@@ -1036,6 +1036,12 @@ pub struct PageQuery {
     pub page: Option<u32>,
 }
 
+#[derive(Deserialize)]
+pub struct FailuresQuery {
+    pub page: Option<u32>,
+    pub correlation_id: Option<String>,
+}
+
 pub async fn get_prompts(
     State(state): State<AppState>,
     _session: DashboardSession,
@@ -1144,7 +1150,7 @@ pub async fn post_storage_settings(
 pub async fn get_failures(
     State(state): State<AppState>,
     _session: DashboardSession,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<FailuresQuery>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::failures::FailureRepository;
 
@@ -1152,10 +1158,18 @@ pub async fn get_failures(
     let per_page: i64 = 50;
     let offset = (page - 1) * per_page;
 
-    let failures = FailureRepository::list(&*state.db, per_page, offset)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let has_next = failures.len() as i64 == per_page;
+    // If a correlation_id is provided, filter to just those failures;
+    // otherwise list the latest batch.
+    let failures = if let Some(ref cid) = q.correlation_id {
+        FailureRepository::find_by_correlation_id(&*state.db, cid)
+            .await
+            .map_err(|_| DashboardError::Internal)?
+    } else {
+        FailureRepository::list(&*state.db, per_page, offset)
+            .await
+            .map_err(|_| DashboardError::Internal)?
+    };
+    let has_next = failures.len() as i64 == per_page && q.correlation_id.is_none();
 
     // Stage counts lead the page: "what is failing, and where" is the question an
     // operator actually arrives with, and it is answerable at a glance.
@@ -1181,6 +1195,7 @@ pub async fn get_failures(
                 error_message => f.error_message,
                 latency_ms => f.latency_ms,
                 project => f.project.unwrap_or_else(|| "-".to_string()),
+                attribution_correlation_id => f.attribution_correlation_id.unwrap_or_else(|| "-".to_string()),
                 created_at => f.created_at,
             }
         })
@@ -1193,6 +1208,7 @@ pub async fn get_failures(
             by_stage => stage_items,
             page => page,
             has_next => has_next,
+            correlation_id => q.correlation_id,
         },
     )
 }
@@ -1223,6 +1239,48 @@ pub async fn get_prompt_detail(
             Ok(Html(html))
         }
         None => Ok(Html(format!("<div>Prompt {} not found.</div>", id))),
+    }
+}
+
+pub async fn get_failure_detail(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::failures::FailureRepository;
+
+    match FailureRepository::find_by_id(&*state.db, id)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+    {
+        Some(f) => {
+            let html = format!(
+                r#"<div style="padding:0.75rem; background:#f9f9f9; border:1px solid #eee; border-radius:4px; margin-top:0.5rem;">
+                    <strong>Endpoint:</strong> {}<br>
+                    <strong>Requested Model:</strong> {}<br>
+                    <strong>Routed Model:</strong> {}<br>
+                    <strong>Provider:</strong> {}<br>
+                    <strong>Stage:</strong> {}<br>
+                    <strong>Status Code:</strong> {}<br>
+                    <strong>Attempts:</strong> {}<br>
+                    <strong>Latency:</strong> {} ms<br>
+                    <strong>Correlation ID:</strong> {}<br>
+                    <strong>Error Message:</strong><pre style="white-space:pre-wrap; font-size:0.8rem; margin-top:0.5rem;">{}</pre>
+                </div>"#,
+                html_escape(&f.endpoint),
+                html_escape(&f.request_model),
+                html_escape(&f.routed_model.unwrap_or_else(|| "-".to_string())),
+                html_escape(&f.provider.unwrap_or_else(|| "-".to_string())),
+                html_escape(&f.stage),
+                f.status_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                f.attempts,
+                f.latency_ms.map(|l| l.to_string()).unwrap_or_else(|| "-".to_string()),
+                html_escape(&f.attribution_correlation_id.unwrap_or_else(|| "-".to_string())),
+                html_escape(&f.error_message),
+            );
+            Ok(Html(html))
+        }
+        None => Ok(Html(format!("<div>Failure {} not found.</div>", id))),
     }
 }
 

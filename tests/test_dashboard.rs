@@ -329,3 +329,216 @@ async fn failures_page_lists_captured_failures_by_stage() {
         "the stage must be shown so the operator knows it is a config fault"
     );
 }
+
+#[tokio::test]
+async fn failure_detail_route_returns_200_for_existing() {
+    use modelrouter::db::models::{FailureStage, NewRequestFailure};
+    use modelrouter::db::repositories::failures::FailureRepository;
+
+    let raw_db = common::in_memory_db().await;
+    let created = FailureRepository::create(
+        &raw_db,
+        NewRequestFailure {
+            user_id: None,
+            api_key_id: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            request_model: "anthropic/claude-sonnet-4".to_string(),
+            routed_model: Some("claude-sonnet-4".to_string()),
+            provider: Some("anthropic".to_string()),
+            stage: FailureStage::Provider,
+            status_code: Some(429),
+            error_message: "rate_limit_error: Rate limit exceeded".to_string(),
+            attempts: 2,
+            latency_ms: Some(123),
+            project: None,
+            attribution_correlation_id: Some("test-correlation-123".to_string()),
+            attribution_tags: "{}".to_string(),
+        },
+    )
+    .await
+    .expect("failure should persist");
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get(&format!("/admin/failures/{}", created.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "failure detail should render for an existing failure");
+    let body = resp.text();
+    assert!(
+        body.contains("claude-sonnet-4"),
+        "detail must show routed model"
+    );
+    assert!(
+        body.contains("rate_limit_error"),
+        "detail must show error message"
+    );
+    assert!(
+        body.contains("test-correlation-123"),
+        "detail must show correlation id"
+    );
+    assert!(
+        body.contains("429"),
+        "detail must show status code"
+    );
+}
+
+#[tokio::test]
+async fn failure_detail_route_returns_404_for_missing() {
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/failures/99999")
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "route returns 200 even when not found");
+    let body = resp.text();
+    assert!(
+        body.contains("not found"),
+        "body should indicate failure not found"
+    );
+}
+
+#[tokio::test]
+async fn failures_list_filters_by_correlation_id() {
+    use modelrouter::db::models::{FailureStage, NewRequestFailure};
+    use modelrouter::db::repositories::failures::FailureRepository;
+
+    let raw_db = common::in_memory_db().await;
+
+    // Create failure with correlation id "match-this"
+    FailureRepository::create(
+        &raw_db,
+        NewRequestFailure {
+            user_id: None,
+            api_key_id: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            request_model: "model-a".to_string(),
+            routed_model: None,
+            provider: None,
+            stage: FailureStage::Resolve,
+            status_code: None,
+            error_message: "First failure".to_string(),
+            attempts: 1,
+            latency_ms: None,
+            project: None,
+            attribution_correlation_id: Some("match-this".to_string()),
+            attribution_tags: "{}".to_string(),
+        },
+    )
+    .await
+    .expect("first failure should persist");
+
+    // Create failure with different correlation id
+    FailureRepository::create(
+        &raw_db,
+        NewRequestFailure {
+            user_id: None,
+            api_key_id: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            request_model: "model-b".to_string(),
+            routed_model: None,
+            provider: None,
+            stage: FailureStage::Provider,
+            status_code: None,
+            error_message: "Second failure".to_string(),
+            attempts: 1,
+            latency_ms: None,
+            project: None,
+            attribution_correlation_id: Some("different-id".to_string()),
+            attribution_tags: "{}".to_string(),
+        },
+    )
+    .await
+    .expect("second failure should persist");
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/failures")
+        .add_query_param("correlation_id", "match-this")
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "filtered failures page should render");
+    let body = resp.text();
+    assert!(
+        body.contains("First failure"),
+        "response must include the matching failure"
+    );
+    assert!(
+        !body.contains("Second failure"),
+        "response must NOT include non-matching failure"
+    );
+}
+
+#[tokio::test]
+async fn failures_list_shows_correlation_id_column() {
+    use modelrouter::db::models::{FailureStage, NewRequestFailure};
+    use modelrouter::db::repositories::failures::FailureRepository;
+
+    let raw_db = common::in_memory_db().await;
+    FailureRepository::create(
+        &raw_db,
+        NewRequestFailure {
+            user_id: None,
+            api_key_id: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            request_model: "test-model".to_string(),
+            routed_model: None,
+            provider: None,
+            stage: FailureStage::Resolve,
+            status_code: None,
+            error_message: "Test error".to_string(),
+            attempts: 1,
+            latency_ms: None,
+            project: None,
+            attribution_correlation_id: Some("visible-correlation-id".to_string()),
+            attribution_tags: "{}".to_string(),
+        },
+    )
+    .await
+    .expect("failure should persist");
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/failures")
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "failures list should render");
+    let body = resp.text();
+    assert!(
+        body.contains("visible-correlation-id"),
+        "correlation id must appear in the list"
+    );
+    assert!(
+        body.contains("Correlation ID"),
+        "table header for correlation id must be present"
+    );
+}

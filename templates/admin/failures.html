@@ -10,6 +10,15 @@
     budget, rate limit or guardrail; <code>request</code> is a malformed call.
 </p>
 
+<form method="get" action="/admin/failures" style="margin:1rem 0;">
+    <label for="correlation_id" style="font-size:0.9rem; margin-right:0.5rem;">Filter by Correlation ID:</label>
+    <input type="text" id="correlation_id" name="correlation_id" value="{{ correlation_id }}" style="padding:0.3rem; border:1px solid #ccc; border-radius:3px; width:20rem;">
+    <button type="submit" style="padding:0.3rem 0.75rem; margin-left:0.5rem;">Filter</button>
+    {% if correlation_id %}
+    <a href="/admin/failures" style="margin-left:0.5rem; font-size:0.9rem;">Clear</a>
+    {% endif %}
+</form>
+
 <div style="display:flex; gap:1rem; margin:1rem 0; flex-wrap:wrap;">
     {% for s in by_stage %}
     <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:0.75rem 1.25rem; min-width:8rem;">
@@ -32,6 +41,7 @@
             <th>Routed</th>
             <th>Provider</th>
             <th>Status</th>
+            <th>Correlation ID</th>
             <th>Error</th>
             <th>Created</th>
         </tr>
@@ -39,13 +49,14 @@
     <tbody>
         {% for f in failures %}
         <tr>
-            <td>{{ f.id }}</td>
+            <td><a href="/admin/failures/{{ f.id }}" style="color:#0066cc;">{{ f.id }}</a></td>
             <td><span style="font-size:0.75rem; padding:0.15rem 0.5rem; border-radius:3px; background:{% if f.stage == 'resolve' %}#fde2e2{% elif f.stage == 'provider' %}#fdf0d5{% elif f.stage == 'policy' %}#e2e8fd{% else %}#eee{% endif %};">{{ f.stage }}</span></td>
             <td>{{ f.endpoint }}</td>
             <td>{{ f.request_model }}</td>
             <td>{{ f.routed_model }}</td>
             <td>{{ f.provider }}</td>
             <td>{{ f.status_code }}</td>
+            <td style="font-size:0.75rem; font-family:monospace;">{{ f.attribution_correlation_id }}</td>
             <td style="max-width:32rem; font-size:0.8rem; word-break:break-word;">{{ f.error_message }}</td>
             <td>{{ f.created_at | fmt_ts }}</td>
         </tr>
