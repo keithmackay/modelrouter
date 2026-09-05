@@ -77,6 +77,14 @@ impl From<crate::router::availability::Unavailable> for ApiError {
     }
 }
 
+/// A request that named an experiment it cannot bind to. Always the caller's
+/// fault (bad header, unknown id, not on the allow list), hence 400.
+impl From<crate::router::experiments::BindError> for ApiError {
+    fn from(e: crate::router::experiments::BindError) -> Self {
+        ApiError::InvalidRequest(e.to_string())
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         ApiError::ProviderError(e)

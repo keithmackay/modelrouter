@@ -7,6 +7,9 @@ commit; `git log v0.1.0..` has the detail.
 
 ### Week of 2026-08-31
 
+**Features**
+- Controlled experiments (design spec §7a/§7c). Create an experiment with 2–16 named variants, each an overlay from a requested model name to a pinned, priced `provider/model`; expiry and content retention are required with no default, and creation is refused for any target that is a pool, would fall through to the default model, names an unconfigured provider or has no pricing entry. `x-modelrouter-experiment: <id>[:<label>]` on `/v1/chat/completions` binds the request to a variant — explicit, or assigned by a stable hash of `session_id` — with no downgrade, pool, affinity, cache or fallback; an unknown experiment or variant, a missing correlation id, or the header on any other endpoint is a 400. `POST /v1/feedback` records a run's outcome (`success`/`failure`, score, rating, note) by correlation id under the caller's key. `GET /admin/api/experiments/:id/results` returns per-variant and per-run cost, tokens, turns, span, latency, failures and outcomes in one paged document, also rendered by `modelrouter experiment results` and the `/admin/experiments` page; `/admin/compare` gains a `variant` dimension. Management via `/admin/api/experiments`, the dashboard and `modelrouter experiment add|list|close`; expired experiments auto-close within 60 s; a superadmin can have an experiment retain full prompt content for its own traffic, redacted in place `content_retention_days` after close. `docs/experiments.md` Part 1 is the client guide.
+
 **Security**
 - `init` generates a real JWT secret instead of writing the published placeholder, so a fresh install can start again.
 - `serve` refuses to start on an empty or placeholder `auth.jwt_secret`.

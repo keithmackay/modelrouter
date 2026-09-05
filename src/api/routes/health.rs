@@ -322,6 +322,9 @@ fn record_probe_usage(
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "[]".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         };
         if let Err(e) = CostRepository::create(&*state.db, entry).await {
             tracing::error!(error = %e, "failed to record health-probe usage");

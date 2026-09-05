@@ -73,6 +73,7 @@ async fn build_test_server_with_db(
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     TestServer::new(build_router(state)).unwrap()
@@ -180,6 +181,7 @@ async fn login_success_sets_cookie() {
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -250,6 +252,7 @@ async fn superadmin_only_admins_page() {
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
@@ -295,6 +298,8 @@ async fn failures_page_lists_captured_failures_by_stage() {
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -373,6 +378,9 @@ async fn seed_compare_ledger(
                 api_key_id: None,
                 attribution_correlation_id: Some(format!("run-{model}")),
                 attribution_tags: tags.to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             },
         )
         .await
@@ -633,4 +641,447 @@ async fn compare_escapes_tag_values_and_chart_json_round_trips() {
     let bars: serde_json::Value =
         serde_json::from_str(&html_unescape(&charts["compare-bars-chart"])).unwrap();
     assert_eq!(bars["a"]["label"], hostile, "chart JSON must round-trip the original value");
+}
+
+// ── Experiments page ──────────────────────────────────────────────────────────
+
+/// A superadmin session whose actor exists in `admin_users`, so the audit
+/// rows the page writes have someone to reference.
+async fn superadmin_jwt(db: &modelrouter::db::sqlite::SqliteDb, settings: &Settings) -> String {
+    use modelrouter::db::models::NewAdminUser;
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+
+    let admin = AdminUserRepository::create(
+        db,
+        NewAdminUser {
+            name: "super-user".to_string(),
+            password_hash: "x".to_string(),
+            role: "superadmin".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+    let claims = AdminClaims {
+        sub: admin.id,
+        name: admin.name,
+        role: "superadmin".to_string(),
+        exp,
+    };
+    issue_jwt(&claims, &settings.auth.jwt_secret).unwrap()
+}
+
+/// Create an experiment through the REST API, the way an operator without the
+/// dashboard would, and return its id.
+async fn create_experiment_via_api(
+    server: &TestServer,
+    token: &str,
+    body: &serde_json::Value,
+) -> i64 {
+    let res = server
+        .post("/admin/api/experiments")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        )
+        .json(body)
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    res.json::<serde_json::Value>()["id"].as_i64().unwrap()
+}
+
+/// Two priced, configured targets that need no alias.
+fn experiment_body(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "variants": {
+            "control": { "fast": "openai/gpt-4o-mini" },
+            "candidate": { "fast": "anthropic/claude-haiku-4-5" }
+        },
+        "expires_at": 0,
+        "content_retention_days": 0,
+        "retain_content": false
+    })
+}
+
+/// One stamped ledger row of `run` under `variant`, for the results panel.
+async fn seed_experiment_ledger(
+    db: &modelrouter::db::sqlite::SqliteDb,
+    experiment: i64,
+    run: &str,
+    variant: &str,
+) {
+    use modelrouter::db::models::{NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    if UserRepository::find_by_name(db, "exp-user").await.unwrap().is_none() {
+        UserRepository::create(db, NewUser { name: "exp-user".to_string(), email: None })
+            .await
+            .unwrap();
+    }
+    let user = UserRepository::find_by_name(db, "exp-user").await.unwrap().unwrap();
+    CostRepository::create(
+        db,
+        NewCostLedgerEntry {
+            user_id: user.id,
+            prompt_id: None,
+            model: "openai/gpt-4o-mini".to_string(),
+            provider: "openai".to_string(),
+            project: None,
+            tokens_in: 100,
+            tokens_out: 50,
+            cost_usd: 0.01,
+            api_key_id: None,
+            attribution_correlation_id: Some(run.to_string()),
+            attribution_tags: "{}".to_string(),
+            experiment_id: Some(experiment),
+            experiment_variant: Some(variant.to_string()),
+            tokens_estimated: false,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn experiments_page_lists_a_created_experiment_with_its_status() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+    create_experiment_via_api(&server, &admin, &experiment_body("haiku-vs-mini")).await;
+
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    assert_eq!(page.status_code(), 200, "{}", page.text());
+    let body = page.text();
+    assert!(body.contains("href=\"/admin/experiments\""), "nav link missing: {body}");
+    assert!(body.contains("haiku-vs-mini"), "created experiment missing: {body}");
+    assert!(body.contains("tag-enabled\">active<"), "status column missing: {body}");
+    assert!(body.contains("<code>control</code>") && body.contains("<code>candidate</code>"));
+    assert!(body.contains("<td>never</td>"), "an expiry of 0 must render as never: {body}");
+    assert!(!body.contains("No experiments yet."));
+}
+
+#[tokio::test]
+async fn experiments_panels_render_variant_cards_and_run_rows() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+    let id = create_experiment_via_api(&server, &admin, &experiment_body("panels")).await;
+    seed_experiment_ledger(&raw_db, id, "run-a", "control").await;
+    seed_experiment_ledger(&raw_db, id, "run-a", "control").await;
+    seed_experiment_ledger(&raw_db, id, "run-b", "candidate").await;
+
+    let panels = server
+        .get(&format!("/admin/experiments/{id}/panels"))
+        .add_query_param("limit", "50")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    assert_eq!(panels.status_code(), 200, "{}", panels.text());
+    let body = panels.text();
+    assert_eq!(body.matches("variant-card").count(), 2, "one card per variant: {body}");
+    assert!(body.contains("<code>control</code>") && body.contains("<code>candidate</code>"));
+    assert_eq!(body.matches("class=\"run-row\"").count(), 2, "one row per run: {body}");
+    assert!(body.contains("<code>run-a</code>") && body.contains("<code>run-b</code>"));
+    assert!(body.contains("exp-user"), "runs must name the user: {body}");
+    assert!(body.contains("no samples"), "no prompt rows means no latency samples: {body}");
+    assert!(body.contains("computed "), "the panel header must show computed_at: {body}");
+    assert!(body.contains("1–2 of 2"), "paging must show the total: {body}");
+    assert!(body.contains("gpt-4o-mini"), "the per-model table must list the model: {body}");
+
+    // Paging: one run per page, and the second page links back.
+    let second = server
+        .get(&format!("/admin/experiments/{id}/panels"))
+        .add_query_param("limit", "1")
+        .add_query_param("offset", "1")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    let body = second.text();
+    assert_eq!(body.matches("class=\"run-row\"").count(), 1, "{body}");
+    assert!(body.contains("2–2 of 2"), "{body}");
+    let plain = html_unescape(&body);
+    assert!(plain.contains(&format!("/admin/experiments/{id}/panels?limit=1&offset=0")), "{plain}");
+
+    // Out-of-range paging is refused inline, in the panel, naming the field.
+    let bad = server
+        .get(&format!("/admin/experiments/{id}/panels"))
+        .add_query_param("limit", "0")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    assert_eq!(bad.status_code(), 200);
+    assert!(bad.text().contains("limit must be"), "{}", bad.text());
+}
+
+#[tokio::test]
+async fn experiments_page_badges_a_retaining_experiment_with_its_window() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+    let mut body = experiment_body("retaining");
+    body["expires_at"] = serde_json::json!("2999-01-01T00:00:00Z");
+    body["retain_content"] = serde_json::json!(true);
+    body["content_retention_days"] = serde_json::json!(30);
+    create_experiment_via_api(&server, &admin, &body).await;
+
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    let html = page.text();
+    assert!(html.contains("retains content · 30 days"), "badge with window missing: {html}");
+    assert!(html.contains("2999-01-01 00:00:00"), "a dated expiry must be rendered: {html}");
+}
+
+#[tokio::test]
+async fn experiments_form_without_an_expiry_is_rejected_inline_and_the_list_is_unchanged() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let variants = experiment_body("x")["variants"].to_string();
+    let res = server
+        .post("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .form(&[
+            ("name", "no-expiry"),
+            ("variants", variants.as_str()),
+            ("expires_in", ""),
+            ("content_retention_days", "0"),
+        ])
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let body = res.text();
+    assert!(body.contains("alert-danger"), "rejection must be an inline alert: {body}");
+    assert!(body.contains("expires_at"), "the rejection must name the field: {body}");
+    assert!(!body.contains("hx-get=\"/admin/experiments/rows\""), "no refresh on rejection");
+
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+    let html = page.text();
+    assert!(html.contains("No experiments yet."), "the list must be unchanged: {html}");
+    assert!(!html.contains("no-expiry"));
+}
+
+#[tokio::test]
+async fn experiments_page_on_an_empty_deployment_renders_the_empty_state_row() {
+    let settings = Arc::new(Settings::default());
+    let db = Arc::new(common::in_memory_db().await);
+    let viewer = viewer_jwt(&settings);
+    let superadmin = superadmin_jwt(&db, &settings).await;
+    let server = build_test_server_with_db(db, settings).await;
+
+    // A viewer sees the empty list and no create form.
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    assert_eq!(page.status_code(), 200, "{}", page.text());
+    let html = page.text();
+    assert!(html.contains("No experiments yet."), "{html}");
+    assert!(!html.contains("name=\"expires_in\""), "{html}");
+
+    // A superadmin gets the form; the expiry select has no preselected value,
+    // the placeholder comes first, and retention days is required.
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&superadmin).0, session_cookie(&superadmin).1)
+        .await;
+    assert_eq!(page.status_code(), 200, "{}", page.text());
+    let html = page.text();
+    assert!(html.contains("No experiments yet."), "{html}");
+    assert!(html.contains("name=\"expires_in\" required"), "{html}");
+    assert!(html.contains("<option value=\"\">Choose…</option>"), "{html}");
+    assert!(html.contains("name=\"content_retention_days\" required"), "{html}");
+}
+
+#[tokio::test]
+async fn experiments_close_button_carries_a_confirm_naming_the_experiment() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+    create_experiment_via_api(&server, &admin, &experiment_body("closable")).await;
+
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+    let html = page.text();
+    let confirm = html
+        .split("hx-confirm=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the Close button must carry hx-confirm");
+    assert!(confirm.contains("closable"), "confirm must name the experiment: {confirm}");
+    assert!(confirm.contains("retention clock"), "confirm must mention the retention clock: {confirm}");
+    assert!(html.contains("hx-post=\"/admin/experiments/1/close\""), "{html}");
+
+    // A viewer sees the row but not the Close button.
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    let html = page.text();
+    assert!(html.contains("closable"));
+    assert!(!html.contains("hx-confirm"), "viewers cannot close: {html}");
+}
+
+#[tokio::test]
+async fn a_viewer_session_cannot_create_an_experiment_from_the_page() {
+    let settings = Arc::new(Settings::default());
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(common::in_memory_db().await), settings).await;
+
+    let variants = experiment_body("x")["variants"].to_string();
+    let res = server
+        .post("/admin/experiments")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .form(&[
+            ("name", "viewer-made"),
+            ("variants", variants.as_str()),
+            ("expires_in", "never"),
+            ("content_retention_days", "0"),
+        ])
+        .await;
+    assert_eq!(res.status_code(), 403);
+
+    let close = server
+        .post("/admin/experiments/1/close")
+        .add_header(session_cookie(&viewer).0, session_cookie(&viewer).1)
+        .await;
+    assert_eq!(close.status_code(), 403);
+}
+
+#[tokio::test]
+async fn experiments_form_creates_and_closes_through_the_page() {
+    use modelrouter::db::models::NewUser;
+    use modelrouter::db::repositories::audit::AuditRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let alice = UserRepository::create(&*raw_db, NewUser { name: "alice".to_string(), email: None })
+        .await
+        .unwrap();
+    let bob = UserRepository::create(&*raw_db, NewUser { name: "bob".to_string(), email: None })
+        .await
+        .unwrap();
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let variants = experiment_body("x")["variants"].to_string();
+    let alice_id = alice.id.to_string();
+    let bob_id = bob.id.to_string();
+    let res = server
+        .post("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .form(&[
+            ("name", "from-the-form"),
+            ("variants", variants.as_str()),
+            ("expires_in", "7d"),
+            ("content_retention_days", "14"),
+            ("retain_content", "on"),
+            ("allowed_user_ids", alice_id.as_str()),
+            ("allowed_user_ids", bob_id.as_str()),
+        ])
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let body = res.text();
+    assert!(body.contains("from-the-form") && !body.contains("alert-danger"), "{body}");
+    assert!(body.contains("hx-get=\"/admin/experiments/rows\""), "success must refresh the list: {body}");
+
+    // The rows fragment the refresh loads shows the new row with its badge and users.
+    let rows = server
+        .get("/admin/experiments/rows")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+    assert_eq!(rows.status_code(), 200);
+    let html = rows.text();
+    assert!(html.starts_with("\n") || html.starts_with("<tr") || html.trim_start().starts_with("<tr"), "{html}");
+    assert!(!html.contains("<html"), "the fragment must not be the whole page: {html}");
+    assert!(html.contains("from-the-form"), "{html}");
+    assert!(html.contains("retains content · 14 days"), "{html}");
+    assert!(html.contains("alice, bob"), "{html}");
+
+    // A relative expiry became a dated one, seven days out.
+    let stored = server
+        .get("/admin/api/experiments/1")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {admin}")).unwrap(),
+        )
+        .await
+        .json::<serde_json::Value>();
+    let expires_at = stored["expires_at"].as_i64().unwrap();
+    let seven_days = (chrono::Utc::now() + chrono::Duration::days(7)).timestamp();
+    assert!((expires_at - seven_days).abs() < 60, "expires_at {expires_at} vs {seven_days}");
+    assert_eq!(stored["allowed_user_ids"], serde_json::json!([alice.id, bob.id]));
+
+    // A duplicate name is refused inline, naming the field.
+    let dup = server
+        .post("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .form(&[
+            ("name", "from-the-form"),
+            ("variants", variants.as_str()),
+            ("expires_in", "never"),
+            ("content_retention_days", "0"),
+        ])
+        .await;
+    assert!(dup.text().contains("alert-danger") && dup.text().contains("name"), "{}", dup.text());
+
+    // Malformed variants JSON is refused before validation, naming the field.
+    let bad_json = server
+        .post("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .form(&[
+            ("name", "bad-json"),
+            ("variants", "{not json"),
+            ("expires_in", "never"),
+            ("content_retention_days", "0"),
+        ])
+        .await;
+    assert!(bad_json.text().contains("alert-danger") && bad_json.text().contains("variants"), "{}", bad_json.text());
+
+    // Close through the page: success notice plus refresh, then the row is closed.
+    let closed = server
+        .post("/admin/experiments/1/close")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+    assert_eq!(closed.status_code(), 200, "{}", closed.text());
+    let body = closed.text();
+    assert!(body.contains("closed") && body.contains("hx-get=\"/admin/experiments/rows\""), "{body}");
+    let again = server
+        .post("/admin/experiments/1/close")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+    assert!(again.text().contains("alert-danger") && again.text().contains("already closed"), "{}", again.text());
+
+    let page = server
+        .get("/admin/experiments")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+    let html = page.text();
+    assert!(html.contains("tag-disabled\">closed<"), "{html}");
+    assert!(!html.contains("hx-confirm"), "a closed experiment has no Close button: {html}");
+
+    // Both writes were audited under the session's actor.
+    let entries = AuditRepository::list(&*raw_db, 10, 0).await.unwrap();
+    let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+    assert!(actions.contains(&"experiment.create"), "{actions:?}");
+    assert!(actions.contains(&"experiment.close"), "{actions:?}");
+    assert!(entries.iter().all(|e| e.actor_name == "super-user"), "{entries:?}");
 }

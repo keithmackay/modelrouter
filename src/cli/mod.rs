@@ -293,31 +293,30 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tracing::info!(path, "prompt log using dedicated database");
             }
 
-            // Prompt-log retention: purge on an hourly check against the LIVE
-            // policy, so a retention set in the GUI applies within the hour.
+            // Prompt-log retention: an hourly tick against the LIVE policy, so
+            // a retention set in the GUI applies within the hour.
             // retention_days == 0 (the default) means keep forever — deletion
-            // is strictly opt-in. Failures are logged, never fatal.
+            // is strictly opt-in. The rows of a retaining experiment are
+            // exempt while its content window is open, and once it has
+            // elapsed they are redacted in place (spec §7c); that half runs
+            // on every tick whatever the global retention says. The
+            // experiment list is read from the main database, the prompt rows
+            // live in the prompt store. Failures are logged, never fatal.
             {
-                let purge_db = prompt_db.clone();
-                let purge_storage = storage_live.clone();
+                let tick_db = db.clone();
+                let tick_prompt_db = prompt_db.clone();
+                let tick_storage = storage_live.clone();
                 tokio::spawn(async move {
                     loop {
-                        let retention_days = purge_storage.load().prompt_retention_days;
-                        if retention_days > 0 {
-                            let cutoff = (chrono::Utc::now()
-                                - chrono::Duration::days(retention_days as i64))
-                            .to_rfc3339();
-                            use crate::db::repositories::prompts::PromptRepository;
-                            match PromptRepository::purge_older_than(&*purge_db, &cutoff).await {
-                                Ok(n) if n > 0 => {
-                                    tracing::info!(deleted = n, retention_days, "prompt-log retention purge")
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "prompt-log retention purge failed")
-                                }
-                            }
-                        }
+                        let retention_days = tick_storage.load().prompt_retention_days;
+                        crate::db::retention::run_retention_tick(
+                            &*tick_db,
+                            &*tick_db,
+                            &*tick_prompt_db,
+                            retention_days,
+                            chrono::Utc::now(),
+                        )
+                        .await;
                         tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
                     }
                 });
@@ -370,6 +369,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                 use crate::db::repositories::webhook_callbacks::WebhookCallbackRepository;
                 db.list_enabled_webhooks().await.unwrap_or_default()
             };
+
+            // Experiment registry (spec §7a): load once before serving so the
+            // first request can bind; the tick below keeps it fresh.
+            let experiments = Arc::new(crate::router::experiments::ExperimentRegistry::default());
+            match experiments.load_from(&*db).await {
+                Ok(()) if !experiments.is_empty() => {
+                    tracing::info!(count = experiments.len(), "loaded experiments")
+                }
+                Ok(()) => {}
+                Err(e) => tracing::warn!(error = %e, "experiment registry load failed"),
+            }
 
             let state = crate::api::app::AppState {
                 settings: settings.clone(),
@@ -441,6 +451,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 },
                 app_metrics,
                 oidc_state,
+                experiments,
             };
             // Seed DB model aliases and failover chains into live router/fallback
             {
@@ -470,6 +481,45 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     state.fallback.update_db_chains(db_chains);
                 }
+            }
+
+            // Experiment lifecycle tick (spec §7a): every minute close the
+            // experiments whose `expires_at` has passed, audit each close as
+            // actor `system`, then reload the registry so admin writes made
+            // from another process are picked up too. Binding already refuses
+            // an expired experiment per request, so this is bookkeeping, not
+            // enforcement. Failures are logged, never fatal.
+            {
+                let tick_db = state.db.clone();
+                let tick_registry = state.experiments.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        let now = chrono::Utc::now();
+                        match tick_db.close_expired(now.timestamp(), &now.to_rfc3339()).await {
+                            Ok(ids) => {
+                                for id in ids {
+                                    tracing::info!(experiment_id = id, "experiment auto-closed on expiry");
+                                    crate::api::admin::audit::audit(
+                                        &tick_db,
+                                        None,
+                                        "system",
+                                        "experiment.close",
+                                        Some(id.to_string()),
+                                        None,
+                                        Some(serde_json::json!({"status": "closed", "reason": "expired"}).to_string()),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "experiment auto-close failed"),
+                        }
+                        if let Err(e) = tick_registry.load_from(&*tick_db).await {
+                            tracing::warn!(error = %e, "experiment registry reload failed");
+                        }
+                    }
+                });
             }
 
             // Background sweeper for session affinity TTL eviction
@@ -1726,6 +1776,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Experiment(experiment_args) => {
+            let settings = crate::config::load(cli.config)?;
+            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
+            crate::db::migrations::run_migrations(&db.pool).await?;
+            let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+            run_experiment_command(&db, &settings, experiment_args.command).await?;
+        }
     }
     Ok(())
 }
@@ -1891,6 +1948,16 @@ fn write_comparison(
     ];
     if table {
         writeln!(out, "Compare by {}: A = {}  B = {}  (window: {})", c.dimension, a.label, b.label, c.window)?;
+        if let Some(exp) = &c.experiment {
+            writeln!(
+                out,
+                "Experiment: {} (#{}, {}{})",
+                exp.name,
+                exp.id,
+                exp.status.as_str(),
+                if exp.retain_content { ", retains content" } else { "" }
+            )?;
+        }
     }
     write_rows(
         &rows,
@@ -1913,6 +1980,9 @@ fn write_comparison(
         writeln!(out, "{}", c.ttft_note)?;
         for caveat in c.caveats {
             writeln!(out, "Note: {}", caveat)?;
+        }
+        if let Some(exp) = &c.experiment {
+            writeln!(out, "Note: {}", exp.stored_content_note)?;
         }
     }
     Ok(())
@@ -2066,6 +2136,9 @@ mod attribution_cli_tests {
                 api_key_id: None,
                 attribution_correlation_id: Some("run-7".to_string()),
                 attribution_tags: r#"{"engagement":"eng-1"}"#.to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             },
         )
         .await
@@ -2119,6 +2192,9 @@ mod tests {
                 user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
                 project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2126,6 +2202,8 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
             }).await.unwrap();
         }
         let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
@@ -2194,6 +2272,9 @@ mod tests {
                 user_id: 1, prompt_id: None, model: model.into(), provider: "p".into(),
                 project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2201,6 +2282,8 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(100), tags: "[]".into(), project: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
             }).await.unwrap();
         }
         let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
@@ -2218,6 +2301,133 @@ mod tests {
         assert!(!text.contains("+0.0%"), "{}", text);
     }
 
+    /// An experiment with two variants and stamped ledger rows on each arm.
+    async fn seeded_variant_sources() -> (CompareSources, i64) {
+        use crate::db::repositories::experiments::ExperimentRepository;
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        crate::db::repositories::users::UserRepository::create(
+            &db,
+            crate::db::models::NewUser { name: "u".into(), email: None },
+        )
+        .await
+        .unwrap();
+        let mut variants: crate::db::models::ExperimentVariants = Default::default();
+        variants.insert("control".into(), Default::default());
+        variants.insert("candidate".into(), Default::default());
+        let exp = ExperimentRepository::create(&db, crate::db::models::NewExperiment {
+            name: "exp".into(),
+            variants,
+            allowed_user_ids: vec![],
+            feed_learning: false,
+            expires_at: 4_102_444_800,
+            retain_content: true,
+            content_retention_days: 0,
+        })
+        .await
+        .unwrap();
+        for (variant, latency) in [("control", 100), ("control", 300), ("candidate", 50)] {
+            CostRepository::create(&db, NewCostLedgerEntry {
+                user_id: 1, prompt_id: None, model: "m".into(), provider: "p".into(),
+                project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: Some(exp.id),
+                experiment_variant: Some(variant.into()),
+                tokens_estimated: false,
+            }).await.unwrap();
+            PromptRepository::create(&db, NewPrompt {
+                user_id: 1, session_id: None, request_model: "m".into(), routed_model: "m".into(),
+                provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
+                prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+                cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
+                attribution_correlation_id: None, attribution_tags: "{}".into(),
+                experiment_id: Some(exp.id),
+                experiment_variant: Some(variant.into()),
+            }).await.unwrap();
+        }
+        let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
+        let sources = CompareSources {
+            prompt_db: db.clone(),
+            db,
+            cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&[])),
+        };
+        (sources, exp.id)
+    }
+
+    fn variant_query(experiment: i64) -> CompareQuery {
+        CompareQuery {
+            dimension: "variant".into(),
+            key: experiment.to_string(),
+            a: "control".into(),
+            b: "candidate".into(),
+            window: "all".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_variant_json_carries_the_arms_and_the_experiment() {
+        let (sources, exp) = seeded_variant_sources().await;
+        let comparison = build_comparison(&sources, &variant_query(exp)).await.unwrap();
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Json, &mut out).unwrap();
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed["dimension"], "variant");
+        assert_eq!(printed["key"], exp.to_string());
+        assert_eq!(printed["a"]["label"], format!("experiment={exp}:control"));
+        assert_eq!(printed["a"]["requests"], 2);
+        assert_eq!(printed["a"]["latency"]["p95_ms"], 300);
+        assert_eq!(printed["b"]["label"], format!("experiment={exp}:candidate"));
+        assert_eq!(printed["b"]["requests"], 1);
+        assert_eq!(printed["experiment"]["name"], "exp");
+        assert_eq!(printed["experiment"]["retain_content"], true);
+        assert!(printed["caveats"][0].as_str().unwrap().contains("/admin/experiments"));
+    }
+
+    #[tokio::test]
+    async fn compare_variant_csv_and_table_carry_the_arms() {
+        let (sources, exp) = seeded_variant_sources().await;
+        let comparison = build_comparison(&sources, &variant_query(exp)).await.unwrap();
+
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Csv, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        let requests = csv.lines().find(|l| l.starts_with("Requests")).unwrap();
+        assert_eq!(requests, "Requests,2,1,-1,-50.0%", "{csv}");
+        assert!(csv.lines().any(|l| l.starts_with("p95 latency (ms),300,50,")), "{csv}");
+        assert!(!csv.contains("Note:"), "csv must be rows only: {csv}");
+
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(&format!("Compare by variant: A = experiment={exp}:control  B = experiment={exp}:candidate")), "{text}");
+        assert!(text.contains(&format!("Experiment: exp (#{exp}, active, retains content)")), "{text}");
+        assert!(text.contains("never purged"), "{text}");
+        assert!(text.contains("/admin/experiments"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn compare_variant_rejects_an_undeclared_label_and_an_unknown_experiment() {
+        let (sources, exp) = seeded_variant_sources().await;
+        let mut q = variant_query(exp);
+        q.b = "nope".into();
+        let err = build_comparison(&sources, &q).await.unwrap_err().to_string();
+        assert!(err.starts_with("b: ") && err.contains("nope"), "{err}");
+        let q = variant_query(exp + 1);
+        let err = build_comparison(&sources, &q).await.unwrap_err().to_string();
+        assert!(err.contains(&(exp + 1).to_string()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn compare_variant_with_a_bad_key_fails_before_opening_the_prompt_database() {
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        let settings = crate::config::schema::Settings::default();
+        let mut q = variant_query(1);
+        q.key = "one".into();
+        let err = report_compare(db, &settings, &q, OutputFormat::Table).await.unwrap_err();
+        assert!(err.to_string().starts_with("key must be an experiment id"), "{}", err);
+    }
+
     #[tokio::test]
     async fn compare_invalid_dimension_fails_with_the_validation_message() {
         let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
@@ -2233,5 +2443,977 @@ mod tests {
     fn config_dir_permission_mode() {
         // 0o700 = rwx for owner only
         assert_eq!(0o700u32, 0b111_000_000);
+    }
+}
+
+// ── Experiments (spec §7a) ────────────────────────────────────────────────────
+//
+// `experiment add|list|close|results`: direct database writes like `alias`
+// and `webhook`, each audited as actor `cli`. Creation runs the same body
+// validation and the same pricing gate as `POST /admin/api/experiments`,
+// with the gate's inputs built from settings — the alias-aware router, the
+// pool map and the price table — so no provider adapter is constructed and
+// no credential is needed. A running server reloads its registry every 60
+// seconds, so a write made here is honoured within a minute.
+
+/// Dispatch one `experiment` subcommand against an open database.
+async fn run_experiment_command(
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+    settings: &crate::config::schema::Settings,
+    command: commands::ExperimentCommands,
+) -> anyhow::Result<()> {
+    use commands::ExperimentCommands;
+    match command {
+        ExperimentCommands::Add(args) => {
+            let row = experiment_add(db, settings, &args).await?;
+            println!(
+                "Created experiment id={} name={} (expires {}, retain content {})",
+                row.id,
+                row.name,
+                render_expires_at(row.expires_at),
+                render_retention(&row),
+            );
+            for (label, overlay) in &row.variants {
+                let targets: Vec<String> = overlay
+                    .iter()
+                    .map(|(key, t)| format!("{key} -> {}/{}", t.provider, t.model))
+                    .collect();
+                if targets.is_empty() {
+                    println!("  {label}: (no overlay)");
+                } else {
+                    println!("  {label}: {}", targets.join(", "));
+                }
+            }
+            println!("A running server picks up this experiment within 60 seconds.");
+        }
+        ExperimentCommands::List { status, format } => {
+            let rows = experiment_list(db, &status).await?;
+            print_rows(&rows, EXPERIMENT_LIST_HEADERS, experiment_list_row, format);
+        }
+        ExperimentCommands::Close { id } => {
+            let row = experiment_close(db, id).await?;
+            println!(
+                "Closed experiment id={} name={} at {}",
+                row.id,
+                row.name,
+                row.closed_at.as_deref().unwrap_or("-"),
+            );
+            println!("A running server stops binding to it within 60 seconds.");
+        }
+        ExperimentCommands::Results { id, limit, offset, format } => {
+            use crate::api::admin::experiments::RunPage;
+            // The page bounds and their messages are the endpoint's.
+            let (limit, offset) = (limit.map(|n| n.to_string()), offset.map(|n| n.to_string()));
+            let page = RunPage::parse(limit.as_deref(), offset.as_deref())
+                .map_err(anyhow::Error::msg)?;
+            let results = experiment_results(db, settings, id, page).await?;
+            // Like `print_rows`: a closed pipe (`| head`) is not an error.
+            match write_experiment_results(&results, format, &mut std::io::stdout()) {
+                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.into()),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse the repeated `--variant LABEL=KEY:TARGET[,KEY:TARGET...]` flags into
+/// the `variants` object of the API body. Only the flag grammar is checked
+/// here; labels, bounds and targets are validated by the shared
+/// `parse_create` and gate, so the CLI refuses what the API refuses, in the
+/// same words.
+fn parse_variant_flags(flags: &[String]) -> anyhow::Result<serde_json::Value> {
+    let mut variants = serde_json::Map::new();
+    for flag in flags {
+        let (label, overlay) = flag.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--variant must be LABEL=KEY:TARGET[,KEY:TARGET...], got '{flag}'")
+        })?;
+        let label = label.trim();
+        let mut entries = serde_json::Map::new();
+        for entry in overlay.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (key, target) = entry.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("--variant {label}: entry '{entry}' must be KEY:TARGET")
+            })?;
+            let (key, target) = (key.trim(), target.trim());
+            if entries.insert(key.to_string(), serde_json::json!(target)).is_some() {
+                anyhow::bail!("--variant {label}: key '{key}' appears more than once");
+            }
+        }
+        if variants
+            .insert(label.to_string(), serde_json::Value::Object(entries))
+            .is_some()
+        {
+            // A JSON object cannot say this; the API's wording for the case.
+            anyhow::bail!("variants: label '{label}' appears more than once");
+        }
+    }
+    Ok(serde_json::Value::Object(variants))
+}
+
+/// The body `POST /admin/api/experiments` would receive for these flags.
+/// `never` is the CLI spelling of the API's `0`; anything else is passed
+/// through as a string for `parse_create` to validate.
+fn experiment_create_body(
+    args: &commands::ExperimentAddArgs,
+    variants: serde_json::Value,
+    allowed_user_ids: Vec<i64>,
+) -> serde_json::Value {
+    let expires_at = args.expires_at.trim();
+    let expires_at = if expires_at.eq_ignore_ascii_case("never") {
+        serde_json::json!(0)
+    } else {
+        serde_json::json!(expires_at)
+    };
+    serde_json::json!({
+        "name": args.name,
+        "variants": variants,
+        "expires_at": expires_at,
+        "content_retention_days": args.content_retention_days,
+        "retain_content": args.retain_content,
+        "feed_learning": args.feed_learning,
+        "allowed_user_ids": allowed_user_ids,
+    })
+}
+
+/// `experiment add`: validate, gate, store and audit, returning the row.
+async fn experiment_add(
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+    settings: &crate::config::schema::Settings,
+    args: &commands::ExperimentAddArgs,
+) -> anyhow::Result<crate::db::models::Experiment> {
+    use crate::api::admin::experiments::{
+        audit_row, gate_variants, is_unique_violation, parse_create, GateSources,
+    };
+    use crate::db::repositories::experiments::ExperimentRepository;
+    use crate::db::repositories::users::UserRepository;
+
+    let variants = parse_variant_flags(&args.variants)?;
+    let mut allowed_user_ids: Vec<i64> = Vec::new();
+    for name in &args.allow_users {
+        let user = UserRepository::find_by_name(&**db, name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("--allow-user: no user named '{name}'"))?;
+        if !allowed_user_ids.contains(&user.id) {
+            allowed_user_ids.push(user.id);
+        }
+    }
+    let body = experiment_create_body(args, variants, allowed_user_ids);
+    let parsed = parse_create(&body, chrono::Utc::now()).map_err(anyhow::Error::msg)?;
+
+    // The creation gate from settings alone: config and DB aliases resolve
+    // through the same router the server uses, pools come from
+    // `[routing.load_balancer]`, prices from `[[pricing]]` over the built-in
+    // table, and a provider counts as configured when `[providers.<name>]`
+    // exists. No adapter is built, so no credential is read.
+    let router = crate::router::engine::RequestRouter::new(Arc::new(settings.clone()));
+    router.update_db_aliases(crate::api::admin::aliases::build_db_alias_map(db).await);
+    let load_balancer =
+        crate::router::load_balancer::LoadBalancer::new(settings.routing.load_balancer.clone());
+    let cost_calc = crate::router::cost::CostCalculator::new_with_config(&settings.pricing);
+    let gate = GateSources {
+        router: &router,
+        load_balancer: &load_balancer,
+        has_provider: Box::new(|name| settings.providers.contains_key(name)),
+        cost_calc: &cost_calc,
+    };
+    let variants = gate_variants(&gate, &parsed.variants).map_err(anyhow::Error::msg)?;
+
+    let name = parsed.name;
+    let row = ExperimentRepository::create(
+        &**db,
+        crate::db::models::NewExperiment {
+            name: name.clone(),
+            variants,
+            allowed_user_ids: parsed.allowed_user_ids,
+            feed_learning: parsed.feed_learning,
+            expires_at: parsed.expires_at,
+            retain_content: parsed.retain_content,
+            content_retention_days: parsed.content_retention_days,
+        },
+    )
+    .await
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!("name '{name}' is already taken")
+        } else {
+            e
+        }
+    })?;
+
+    admin::audit_change(
+        &**db,
+        "experiment.create",
+        &format!("experiment:{}", row.id),
+        None,
+        audit_row(&row),
+    )
+    .await;
+    Ok(row)
+}
+
+/// `experiment list --status`: the same filter words as the endpoint.
+async fn experiment_list(
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+    status: &str,
+) -> anyhow::Result<Vec<crate::db::models::Experiment>> {
+    use crate::db::repositories::experiments::{ExperimentRepository, ExperimentStatusFilter};
+    let filter = match status.trim() {
+        "" | "active" => ExperimentStatusFilter::Active,
+        "closed" => ExperimentStatusFilter::Closed,
+        "all" => ExperimentStatusFilter::All,
+        other => anyhow::bail!("status must be active, closed or all, got '{other}'"),
+    };
+    ExperimentRepository::list(&**db, filter).await
+}
+
+/// `experiment close --id`: the endpoint's semantics — a missing id and a
+/// second close are errors — audited with the closed row.
+async fn experiment_close(
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+    id: i64,
+) -> anyhow::Result<crate::db::models::Experiment> {
+    use crate::api::admin::experiments::audit_row;
+    use crate::db::repositories::experiments::ExperimentRepository;
+
+    let before = ExperimentRepository::get(&**db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no experiment with id {id}"))?;
+    if before.closed_at.is_some() {
+        anyhow::bail!("experiment {id} is already closed");
+    }
+    let closed_at = chrono::Utc::now().to_rfc3339();
+    if !ExperimentRepository::close(&**db, id, &closed_at).await? {
+        // Lost a race with the lifecycle tick or another operator.
+        anyhow::bail!("experiment {id} is already closed");
+    }
+    let after = ExperimentRepository::get(&**db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no experiment with id {id}"))?;
+
+    admin::audit_change(
+        &**db,
+        "experiment.close",
+        &format!("experiment:{id}"),
+        Some(serde_json::json!({ "status": before.status, "closed_at": before.closed_at })),
+        audit_row(&after),
+    )
+    .await;
+    Ok(after)
+}
+
+/// `experiment results --id`: the endpoint's document, built from the CLI's
+/// own sources — the main database, the dedicated prompt database when one
+/// is configured, and the configured pricing. Never constructs an `AppState`.
+async fn experiment_results(
+    db: &Arc<dyn crate::api::app::DatabaseProvider>,
+    settings: &crate::config::schema::Settings,
+    id: i64,
+    page: crate::api::admin::experiments::RunPage,
+) -> anyhow::Result<crate::api::admin::experiments::ExperimentResults> {
+    use crate::api::admin::experiments::{build_results, ExperimentSources};
+    let prompt_db = open_prompt_db(settings, db).await?;
+    let sources = ExperimentSources {
+        db: db.clone(),
+        prompt_db,
+        cost_calc: Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing)),
+    };
+    Ok(build_results(&sources, id, page).await?)
+}
+
+/// `expires_at` as an operator reads it: `never` for 0, else RFC3339.
+fn render_expires_at(expires_at: i64) -> String {
+    if expires_at == 0 {
+        return "never".to_string();
+    }
+    chrono::DateTime::from_timestamp(expires_at, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| expires_at.to_string())
+}
+
+/// Whether content is retained and for how long after close.
+fn render_retention(e: &crate::db::models::Experiment) -> String {
+    match (e.retain_content, e.content_retention_days) {
+        (false, _) => "no".to_string(),
+        (true, 0) => "yes (never)".to_string(),
+        (true, days) => format!("yes ({days}d)"),
+    }
+}
+
+const EXPERIMENT_LIST_HEADERS: &[&str] = &[
+    "ID", "Name", "Status", "Variants", "Expires", "Retain (Window)", "Created", "Closed",
+];
+
+fn experiment_list_row(e: &crate::db::models::Experiment) -> Vec<String> {
+    vec![
+        e.id.to_string(),
+        e.name.clone(),
+        e.status.as_str().to_string(),
+        e.variants.keys().cloned().collect::<Vec<_>>().join(","),
+        render_expires_at(e.expires_at),
+        render_retention(e),
+        e.created_at.clone(),
+        e.closed_at.clone().unwrap_or_else(|| "-".to_string()),
+    ]
+}
+
+/// Render a results document: the full JSON (identical to the endpoint's),
+/// or the per-variant summary and the page of runs as two tables (with a
+/// heading and notes) or two CSV blocks separated by a blank line.
+fn write_experiment_results(
+    r: &crate::api::admin::experiments::ExperimentResults,
+    format: OutputFormat,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    use crate::report::formatter::write_rows;
+
+    if matches!(format, OutputFormat::Json) {
+        return writeln!(out, "{}", serde_json::to_string_pretty(r)?);
+    }
+    let table = matches!(format, OutputFormat::Table);
+
+    let dash = || "-".to_string();
+    let usd = |v: f64| format!("{:.4}", v);
+    let one = |v: f64| format!("{:.1}", v);
+    let pct = |v: Option<f64>| v.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_else(dash);
+    let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
+
+    let e = &r.experiment;
+    if table {
+        writeln!(
+            out,
+            "Experiment {} '{}' ({}; expires {}; retain content {}; computed at {})",
+            e.id,
+            e.name,
+            e.status.as_str(),
+            render_expires_at(e.expires_at),
+            render_retention(e),
+            r.computed_at,
+        )?;
+        writeln!(out, "Variants:")?;
+    }
+
+    let mut variant_rows: Vec<Vec<String>> = r
+        .variants
+        .iter()
+        .map(|v| {
+            vec![
+                v.label.clone(),
+                v.runs.to_string(),
+                v.mixed_runs.to_string(),
+                v.requests.to_string(),
+                v.unbound_requests.to_string(),
+                v.turns.to_string(),
+                usd(v.cost_usd),
+                usd(v.saved_usd),
+                v.tokens.prompt.to_string(),
+                v.tokens.completion.to_string(),
+                v.estimated_rows.to_string(),
+                v.failures.to_string(),
+                v.latency.as_ref().and_then(|l| l.mean_ms).map(one).unwrap_or_else(dash),
+                v.latency_samples.to_string(),
+                pct(v.outcomes.success_rate),
+                yes_no(v.unpriced),
+            ]
+        })
+        .collect();
+    let t = &r.totals;
+    variant_rows.push(vec![
+        "TOTAL".to_string(),
+        t.runs.to_string(),
+        t.mixed_runs.to_string(),
+        t.requests.to_string(),
+        t.unbound_requests.to_string(),
+        t.turns.to_string(),
+        usd(t.cost_usd),
+        usd(t.saved_usd),
+        t.tokens.prompt.to_string(),
+        t.tokens.completion.to_string(),
+        t.estimated_rows.to_string(),
+        t.failures.to_string(),
+        dash(),
+        t.latency_samples.to_string(),
+        pct(t.outcomes.success_rate),
+        yes_no(r.variants.iter().any(|v| v.unpriced)),
+    ]);
+    write_rows(
+        &variant_rows,
+        &[
+            "Variant", "Runs", "Mixed", "Requests", "Unbound", "Turns", "Cost (USD)",
+            "Saved (USD)", "Tokens In", "Tokens Out", "Estimated", "Failures",
+            "Latency (ms)", "Samples", "Success Rate", "Unpriced",
+        ],
+        |row| row.clone(),
+        format.clone(),
+        out,
+    )?;
+
+    let runs = &r.runs;
+    if table {
+        let first = if runs.items.is_empty() { 0 } else { runs.offset + 1 };
+        let last = runs.offset + runs.items.len() as i64;
+        writeln!(out, "Runs {first}-{last} of {}:", runs.total)?;
+    } else {
+        writeln!(out)?;
+    }
+    let run_rows: Vec<Vec<String>> = runs
+        .items
+        .iter()
+        .map(|run| {
+            vec![
+                run.user_id.to_string(),
+                run.correlation_id.clone(),
+                run.variant.clone(),
+                yes_no(run.mixed),
+                run.turns.to_string(),
+                run.unbound_requests.to_string(),
+                usd(run.cost_usd),
+                run.tokens.prompt.to_string(),
+                run.tokens.completion.to_string(),
+                run.failures.to_string(),
+                run.latency.map(|l| one(l.mean_ms)).unwrap_or_else(dash),
+                run.latency_samples.to_string(),
+                one(run.span_secs),
+                run.first_at.clone(),
+                run.last_at.clone(),
+                run.outcome.as_ref().map(|o| o.outcome.clone()).unwrap_or_else(dash),
+            ]
+        })
+        .collect();
+    write_rows(
+        &run_rows,
+        &[
+            "User", "Correlation ID", "Variant", "Mixed", "Turns", "Unbound", "Cost (USD)",
+            "Tokens In", "Tokens Out", "Failures", "Latency (ms)", "Samples", "Span (s)",
+            "First", "Last", "Outcome",
+        ],
+        |row| row.clone(),
+        format,
+        out,
+    )?;
+
+    if table {
+        for v in &r.variants {
+            if v.unpriced {
+                writeln!(
+                    out,
+                    "Unpriced: variant {} includes {} — its cost figures are incomplete.",
+                    v.label,
+                    v.unpriced_models.join(", ")
+                )?;
+            }
+        }
+        if t.mixed_runs > 0 {
+            writeln!(
+                out,
+                "Note: {} run(s) were seen under more than one variant; each is attributed to the variant of its earliest request.",
+                t.mixed_runs
+            )?;
+        }
+        if t.latency_samples == 0 && t.requests > 0 {
+            writeln!(out, "Note: no prompt rows carry a latency measurement, so latency is not reported.")?;
+        }
+        if let Some(bytes) = r.retained_content_bytes {
+            writeln!(out, "Retained content: {bytes} bytes.")?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod experiment_cli_tests {
+    use super::*;
+    use crate::api::admin::experiments::RunPage;
+    use crate::cli::commands::{ExperimentAddArgs, ExperimentArgs, ExperimentCommands};
+    use crate::config::schema::{LbPoolEntry, LoadBalancerConfig, ProviderConfig, Settings};
+    use crate::db::models::NewUser;
+    use crate::db::repositories::audit::AuditRepository;
+    use crate::db::repositories::users::UserRepository;
+    use clap::Parser;
+
+    type Db = Arc<dyn crate::api::app::DatabaseProvider>;
+
+    /// The API test harness's world: a config alias to a priced model, one
+    /// to an unpriced model, a pool, one configured provider and one user.
+    fn settings() -> Settings {
+        let mut s = Settings::default();
+        s.routing
+            .model_aliases
+            .insert("fast".to_string(), "openai/gpt-4o-mini".to_string());
+        s.routing
+            .model_aliases
+            .insert("mystery".to_string(), "openai/gpt-unpriced".to_string());
+        s.providers.insert("openai".to_string(), ProviderConfig::default());
+        s.routing.load_balancer.insert(
+            "pool".to_string(),
+            LoadBalancerConfig {
+                strategy: Default::default(),
+                pool: vec![LbPoolEntry {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                    weight: 1,
+                }],
+            },
+        );
+        s
+    }
+
+    async fn db() -> Db {
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        crate::db::migrations::run_migrations(&db.pool).await.unwrap();
+        UserRepository::create(&db, NewUser { name: "alice".to_string(), email: None })
+            .await
+            .unwrap();
+        Arc::new(db)
+    }
+
+    /// Parse `modelrouter experiment add <flags>` exactly as `main` would.
+    fn parse_add(flags: &[&str]) -> Result<ExperimentAddArgs, clap::Error> {
+        let mut argv = vec!["modelrouter", "experiment", "add"];
+        argv.extend_from_slice(flags);
+        let cli = Cli::try_parse_from(argv)?;
+        match cli.command {
+            Commands::Experiment(ExperimentArgs { command: ExperimentCommands::Add(args) }) => {
+                Ok(args)
+            }
+            _ => panic!("parsed something other than `experiment add`"),
+        }
+    }
+
+    /// Two variants — an empty control and a candidate mapping `fast` —
+    /// plus whatever the test adds.
+    fn good_flags<'a>(name: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+        let mut flags = vec![
+            "--name", name,
+            "--variant", "control=",
+            "--variant", "candidate=fast:openai/gpt-4o",
+        ];
+        flags.extend_from_slice(extra);
+        flags
+    }
+
+    async fn add(db: &Db, flags: &[&str]) -> anyhow::Result<crate::db::models::Experiment> {
+        let args = parse_add(flags).unwrap();
+        experiment_add(db, &settings(), &args).await
+    }
+
+    #[tokio::test]
+    async fn add_then_list_shows_the_row_and_results_json_is_the_document() {
+        let db = db().await;
+        let row = add(
+            &db,
+            &good_flags("exp", &["--expires-at", "never", "--content-retention-days", "0"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.name, "exp");
+        // The candidate's target was resolved and pinned at creation.
+        let pinned = &row.variants["candidate"]["fast"];
+        assert_eq!(pinned.target, "openai/gpt-4o");
+        assert_eq!((pinned.provider.as_str(), pinned.model.as_str()), ("openai", "gpt-4o"));
+        assert!(row.variants["control"].is_empty());
+
+        let listed = experiment_list(&db, "active").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, row.id);
+        let cells = experiment_list_row(&listed[0]);
+        assert_eq!(cells[0], row.id.to_string());
+        assert_eq!(cells[1], "exp");
+        assert_eq!(cells[2], "active");
+        assert_eq!(cells[3], "candidate,control");
+        assert_eq!(cells[4], "never");
+        assert_eq!(cells[5], "no");
+        assert_eq!(cells[7], "-");
+        assert!(experiment_list(&db, "closed").await.unwrap().is_empty());
+        assert_eq!(experiment_list(&db, "all").await.unwrap().len(), 1);
+
+        let results = experiment_results(&db, &settings(), row.id, RunPage::default())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        write_experiment_results(&results, OutputFormat::Json, &mut out).unwrap();
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, serde_json::to_value(&results).unwrap());
+        assert_eq!(printed["experiment"]["id"], row.id);
+        assert_eq!(printed["experiment"]["name"], "exp");
+        assert_eq!(printed["variants"].as_array().unwrap().len(), 2);
+        assert_eq!(printed["runs"]["total"], 0);
+        assert_eq!(printed["runs"]["limit"], 200);
+        assert!(printed.get("retained_content_bytes").is_none());
+
+        // Table and CSV carry the variant summary and the (empty) run page.
+        let mut out = Vec::new();
+        write_experiment_results(&results, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(&format!("Experiment {} 'exp' (active; expires never", row.id)), "{text}");
+        assert!(text.contains("candidate"), "{text}");
+        assert!(text.contains("TOTAL"), "{text}");
+        assert!(text.contains("Runs 0-0 of 0:"), "{text}");
+        let mut out = Vec::new();
+        write_experiment_results(&results, OutputFormat::Csv, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("Variant,Runs,Mixed,Requests"), "{text}");
+        assert!(text.contains("\n\nUser,Correlation ID,Variant"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn expires_at_never_stores_zero_and_rfc3339_stores_the_timestamp() {
+        let db = db().await;
+        let never = add(
+            &db,
+            &good_flags("never", &["--expires-at", "never", "--content-retention-days", "0"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(never.expires_at, 0);
+
+        let dated = add(
+            &db,
+            &good_flags(
+                "dated",
+                &["--expires-at", "2999-01-01T00:00:00Z", "--content-retention-days", "7"],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dated.expires_at, 32_472_144_000);
+        assert_eq!(render_expires_at(dated.expires_at), "2999-01-01T00:00:00Z");
+        assert_eq!(dated.content_retention_days, 7);
+
+        // Not RFC3339 and in the past: refused in the API's words.
+        let err = add(
+            &db,
+            &good_flags("bad", &["--expires-at", "tomorrow", "--content-retention-days", "0"]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "expires_at must be an RFC3339 timestamp or 0 (never)");
+        let err = add(
+            &db,
+            &good_flags(
+                "past",
+                &["--expires-at", "2000-01-01T00:00:00Z", "--content-retention-days", "0"],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "expires_at must be in the future");
+    }
+
+    #[tokio::test]
+    async fn retain_content_with_never_is_rejected_with_the_api_message() {
+        let db = db().await;
+        let err = add(
+            &db,
+            &good_flags(
+                "retain",
+                &["--retain-content", "--expires-at", "never", "--content-retention-days", "30"],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "retain_content: true requires expires_at to be set; an experiment that never \
+             expires cannot retain content"
+        );
+        assert!(experiment_list(&db, "all").await.unwrap().is_empty());
+
+        // With a finite expiry the same flags are accepted and rendered.
+        let row = add(
+            &db,
+            &good_flags(
+                "retain",
+                &[
+                    "--retain-content",
+                    "--expires-at",
+                    "2999-01-01T00:00:00Z",
+                    "--content-retention-days",
+                    "30",
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(row.retain_content);
+        assert_eq!(render_retention(&row), "yes (30d)");
+    }
+
+    #[tokio::test]
+    async fn add_and_close_leave_cli_audit_rows_with_rendered_expiry_and_retention() {
+        let db = db().await;
+        let row = add(
+            &db,
+            &good_flags(
+                "audited",
+                &["--expires-at", "never", "--content-retention-days", "0", "--feed-learning"],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(row.feed_learning);
+
+        let entries = AuditRepository::list(&*db, 10, 0).await.unwrap();
+        let created = entries
+            .iter()
+            .find(|e| e.action == "experiment.create")
+            .expect("experiment.create audit row");
+        assert_eq!(created.actor_name, "cli");
+        assert_eq!(created.actor_id, None);
+        assert_eq!(created.target.as_deref(), Some(format!("experiment:{}", row.id).as_str()));
+        let after: serde_json::Value =
+            serde_json::from_str(created.after_json.as_deref().unwrap()).unwrap();
+        assert_eq!(after["expires_at"], "never");
+        assert_eq!(after["content_retention_days"], "never");
+        assert_eq!(after["name"], "audited");
+        assert_eq!(after["feed_learning"], true);
+
+        let closed = experiment_close(&db, row.id).await.unwrap();
+        assert_eq!(closed.status, crate::db::models::ExperimentStatus::Closed);
+        assert!(closed.closed_at.is_some());
+        let entries = AuditRepository::list(&*db, 10, 0).await.unwrap();
+        let close = entries
+            .iter()
+            .find(|e| e.action == "experiment.close")
+            .expect("experiment.close audit row");
+        assert_eq!(close.actor_name, "cli");
+        assert_eq!(close.target.as_deref(), Some(format!("experiment:{}", row.id).as_str()));
+        let before: serde_json::Value =
+            serde_json::from_str(close.before_json.as_deref().unwrap()).unwrap();
+        assert_eq!(before["status"], "active");
+        assert_eq!(before["closed_at"], serde_json::Value::Null);
+        let after: serde_json::Value =
+            serde_json::from_str(close.after_json.as_deref().unwrap()).unwrap();
+        assert_eq!(after["status"], "closed");
+        assert_eq!(after["closed_at"], closed.closed_at.clone().unwrap());
+        assert_eq!(after["expires_at"], "never");
+        assert_eq!(after["content_retention_days"], "never");
+
+        // The API's close semantics: a second close and an unknown id are errors.
+        let err = experiment_close(&db, row.id).await.unwrap_err();
+        assert_eq!(err.to_string(), format!("experiment {} is already closed", row.id));
+        let err = experiment_close(&db, 999).await.unwrap_err();
+        assert_eq!(err.to_string(), "no experiment with id 999");
+        assert_eq!(experiment_list(&db, "closed").await.unwrap().len(), 1);
+        assert!(experiment_list(&db, "active").await.unwrap().is_empty());
+        assert_eq!(experiment_list_row(&closed)[2], "closed");
+        assert_eq!(experiment_list_row(&closed)[7], closed.closed_at.clone().unwrap());
+    }
+
+    #[test]
+    fn missing_expiry_or_retention_fails_at_clap_naming_the_flag() {
+        let err = parse_add(&good_flags("x", &["--content-retention-days", "0"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--expires-at"), "{err}");
+
+        let err = parse_add(&good_flags("x", &["--expires-at", "never"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--content-retention-days"), "{err}");
+
+        // No default is ever substituted: both present parses, both absent
+        // names both.
+        let err = parse_add(&good_flags("x", &[])).unwrap_err();
+        assert!(err.to_string().contains("--expires-at"), "{err}");
+        assert!(err.to_string().contains("--content-retention-days"), "{err}");
+        let args =
+            parse_add(&good_flags("x", &["--expires-at", "never", "--content-retention-days", "0"]))
+                .unwrap();
+        assert_eq!(args.expires_at, "never");
+        assert_eq!(args.content_retention_days, 0);
+        assert!(!args.retain_content);
+
+        // A variant flag is required too, and retention must be an integer.
+        let err = parse_add(&["--name", "x", "--expires-at", "never", "--content-retention-days", "0"])
+            .unwrap_err();
+        assert!(err.to_string().contains("--variant"), "{err}");
+        let err = parse_add(&good_flags("x", &["--expires-at", "never", "--content-retention-days", "many"]))
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[tokio::test]
+    async fn gate_refuses_unpriced_pools_substitutions_and_unknown_providers_in_the_api_words() {
+        let db = db().await;
+        let flags = |variant: &'static str| {
+            vec![
+                "--name", "gated",
+                "--variant", "control=",
+                "--variant", variant,
+                "--expires-at", "never",
+                "--content-retention-days", "0",
+            ]
+        };
+
+        // The literal the API produces for the same body.
+        let err = add(&db, &flags("candidate=fast:openai/gpt-unpriced")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "variants: variant 'candidate' key 'fast' target 'openai/gpt-unpriced' resolves to \
+             'openai/gpt-unpriced', which has no pricing entry"
+        );
+        // Through a config alias the pinned pair is named.
+        let err = add(&db, &flags("candidate=fast:mystery")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "variants: variant 'candidate' key 'fast' target 'mystery' resolves to \
+             'openai/gpt-unpriced', which has no pricing entry"
+        );
+        let err = add(&db, &flags("candidate=fast:pool")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "variants: variant 'candidate' key 'fast' target 'pool' is a load balancer pool; \
+             an experiment must pin one provider/model"
+        );
+        let err = add(&db, &flags("candidate=fast:no-such-model")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "variants: variant 'candidate' key 'fast' target 'no-such-model' is not an alias or \
+             provider/model and would be substituted with the default model"
+        );
+        // Priced, but `[providers.anthropic]` is not in this config.
+        let err = add(&db, &flags("candidate=fast:anthropic/claude-haiku-4-5")).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "variants: variant 'candidate' key 'fast' target 'anthropic/claude-haiku-4-5' \
+             resolves to unconfigured provider 'anthropic'"
+        );
+        // Nothing was stored by the refused commands.
+        assert!(experiment_list(&db, "all").await.unwrap().is_empty());
+
+        // A runtime alias set through `alias set` resolves like a config one.
+        db.upsert_alias(crate::db::models::NewModelAlias {
+            alias: "runtime".to_string(),
+            target: "fast".to_string(),
+            created_by: Some("cli".to_string()),
+        })
+        .await
+        .unwrap();
+        let row = add(&db, &flags("candidate=fast:runtime")).await.unwrap();
+        let pinned = &row.variants["candidate"]["fast"];
+        assert_eq!(pinned.target, "runtime");
+        assert_eq!(pinned.model, "gpt-4o-mini");
+
+        // The name is unique, in the API's words.
+        let err = add(&db, &flags("candidate=fast:openai/gpt-4o")).await.unwrap_err();
+        assert_eq!(err.to_string(), "name 'gated' is already taken");
+    }
+
+    #[tokio::test]
+    async fn cli_created_experiment_is_bindable_after_registry_reload() {
+        use crate::router::experiments::{ExperimentRegistry, EXPERIMENT_HEADER};
+
+        let db = db().await;
+        let row = add(
+            &db,
+            &good_flags("bind", &["--expires-at", "never", "--content-retention-days", "0"]),
+        )
+        .await
+        .unwrap();
+
+        // What the server's 60-second tick does, without the wait.
+        let registry = ExperimentRegistry::default();
+        assert!(registry.is_empty());
+        registry.load_from(&*db).await.unwrap();
+        assert_eq!(registry.len(), 1);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            EXPERIMENT_HEADER,
+            format!("{}:candidate", row.id).parse().unwrap(),
+        );
+        let binding = registry
+            .bind(&headers, &serde_json::json!({}), Some("run-1"), 1, chrono::Utc::now().timestamp())
+            .unwrap()
+            .expect("bound");
+        assert_eq!(binding.experiment_id, row.id);
+        assert_eq!(binding.variant, "candidate");
+        assert_eq!(binding.overlay.get("fast").map(String::as_str), Some("openai/gpt-4o"));
+        assert!(!binding.retain_content);
+
+        // Closing on the CLI is honoured by the next reload.
+        experiment_close(&db, row.id).await.unwrap();
+        registry.load_from(&*db).await.unwrap();
+        let err = registry
+            .bind(&headers, &serde_json::json!({}), Some("run-1"), 1, chrono::Utc::now().timestamp())
+            .unwrap_err();
+        assert_eq!(err, crate::router::experiments::BindError::Closed(row.id));
+    }
+
+    #[tokio::test]
+    async fn allow_user_resolves_names_and_names_an_unknown_one() {
+        let db = db().await;
+        let alice = UserRepository::find_by_name(&*db, "alice").await.unwrap().unwrap();
+        let row = add(
+            &db,
+            &good_flags(
+                "scoped",
+                &[
+                    "--expires-at", "never",
+                    "--content-retention-days", "0",
+                    "--allow-user", "alice",
+                    "--allow-user", "alice",
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.allowed_user_ids, vec![alice.id]);
+
+        let err = add(
+            &db,
+            &good_flags(
+                "scoped2",
+                &["--expires-at", "never", "--content-retention-days", "0", "--allow-user", "bob"],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "--allow-user: no user named 'bob'");
+    }
+
+    #[test]
+    fn variant_flags_become_the_api_body() {
+        let v = parse_variant_flags(&[
+            "control=".to_string(),
+            "candidate=fast:openai/gpt-4o, deep : anthropic/claude-opus-4-6".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "control": {},
+                "candidate": { "fast": "openai/gpt-4o", "deep": "anthropic/claude-opus-4-6" }
+            })
+        );
+
+        let err = parse_variant_flags(&["control".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("LABEL=KEY:TARGET"), "{err}");
+        let err = parse_variant_flags(&["a=fast".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("must be KEY:TARGET"), "{err}");
+        let err = parse_variant_flags(&["a=fast:x,fast:y".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("key 'fast' appears more than once"), "{err}");
+        let err = parse_variant_flags(&["a=".to_string(), "a=".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "variants: label 'a' appears more than once");
+
+        // A single variant reaches the shared validator and is refused there.
+        let args = parse_add(&["--name", "one", "--variant", "only=", "--expires-at", "never", "--content-retention-days", "0"]).unwrap();
+        let body = experiment_create_body(&args, parse_variant_flags(&args.variants).unwrap(), vec![]);
+        assert_eq!(body["expires_at"], 0);
+        let err = crate::api::admin::experiments::parse_create(&body, chrono::Utc::now()).unwrap_err();
+        assert_eq!(err, "variants must have 2-16 entries, got 1");
+    }
+
+    #[tokio::test]
+    async fn list_status_and_results_page_use_the_endpoint_words() {
+        let db = db().await;
+        let err = experiment_list(&db, "bogus").await.unwrap_err();
+        assert_eq!(err.to_string(), "status must be active, closed or all, got 'bogus'");
+        let err = experiment_results(&db, &settings(), 42, RunPage::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no experiment with id 42");
+        assert_eq!(
+            RunPage::parse(Some("0"), None).unwrap_err(),
+            "limit must be an integer between 1 and 1000"
+        );
     }
 }

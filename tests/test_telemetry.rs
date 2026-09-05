@@ -322,6 +322,7 @@ async fn completions_span_has_required_attributes() {
         callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
