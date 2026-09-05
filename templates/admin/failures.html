@@ -44,12 +44,13 @@
             <th>Correlation ID</th>
             <th>Error</th>
             <th>Created</th>
+            <th>Details</th>
         </tr>
     </thead>
     <tbody>
         {% for f in failures %}
         <tr>
-            <td><a href="/admin/failures/{{ f.id }}" style="color:#0066cc;">{{ f.id }}</a></td>
+            <td>{{ f.id }}</td>
             <td><span style="font-size:0.75rem; padding:0.15rem 0.5rem; border-radius:3px; background:{% if f.stage == 'resolve' %}#fde2e2{% elif f.stage == 'provider' %}#fdf0d5{% elif f.stage == 'policy' %}#e2e8fd{% else %}#eee{% endif %};">{{ f.stage }}</span></td>
             <td>{{ f.endpoint }}</td>
             <td>{{ f.request_model }}</td>
@@ -59,6 +60,10 @@
             <td style="font-size:0.75rem; font-family:monospace;">{{ f.attribution_correlation_id }}</td>
             <td style="max-width:32rem; font-size:0.8rem; word-break:break-word;">{{ f.error_message }}</td>
             <td>{{ f.created_at | fmt_ts }}</td>
+            <td>
+                <button class="btn btn-secondary" hx-get="/admin/failures/{{ f.id }}" hx-target="#failure-detail-{{ f.id }}" hx-swap="innerHTML">Expand</button>
+                <div id="failure-detail-{{ f.id }}"></div>
+            </td>
         </tr>
         {% endfor %}
     </tbody>
