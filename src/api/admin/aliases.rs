@@ -121,16 +121,13 @@ fn would_cycle(map: &HashMap<String, String>, alias: &str, target: &str) -> bool
 
 /// Fetch the catalog and extract all available model IDs (provider/name format).
 /// Returns None if the catalog is unavailable (fetch error), or Some(set) when available.
+/// Uses the shared catalog cache from models.rs (issue #35).
 async fn fetch_available_model_ids(state: &AppState) -> Option<std::collections::HashSet<String>> {
-    let catalog_result = crate::providers::catalog_registry::aggregate_catalogs(
-        &state.live_settings.load().providers,
-    )
-    .await;
+    let catalog = super::models::cached_catalog(state, false).await;
 
-    let providers = match catalog_result.as_object() {
-        Some(obj) => obj,
-        None => return None,
-    };
+    let providers = catalog
+        .get("providers")
+        .and_then(|p| p.as_object())?;
 
     let mut model_ids = std::collections::HashSet::new();
     for (_provider_name, provider_data) in providers.iter() {
@@ -185,9 +182,34 @@ async fn validate_alias(
     }
 
     // Validate target against the catalog when available (issue #35).
+    // On PARTIAL outage: if the target's own provider errored, skip validation
+    // (accept the write) rather than 400ing a target we cannot check.
     match fetch_available_model_ids(state).await {
         Some(available) => {
             if !available.contains(&target) {
+                // Only check for partial outage if target has a provider prefix
+                if target.contains('/') {
+                    let target_provider = target.split('/').next().unwrap_or("");
+
+                    // Check if this provider's catalog entry is missing or errored
+                    let catalog = super::models::cached_catalog(state, false).await;
+                    if let Some(providers) = catalog.get("providers").and_then(|p| p.as_object()) {
+                        if let Some(provider_entry) = providers.get(target_provider) {
+                            // If provider entry exists but has no models or has an error, skip validation
+                            if provider_entry.get("models").is_none() || provider_entry.get("error").is_some() {
+                                tracing::warn!(
+                                    alias = %alias,
+                                    target = %target,
+                                    provider = %target_provider,
+                                    "alias write accepted without validation — target provider catalog unavailable or errored"
+                                );
+                                return Ok((alias, target));
+                            }
+                        }
+                    }
+                }
+
+                // Provider catalog is available but doesn't list this model
                 return Err(format!(
                     "model '{}' not found in provider catalogs — validation can be bypassed when catalog is unavailable",
                     target
@@ -195,7 +217,7 @@ async fn validate_alias(
             }
         }
         None => {
-            // Catalog unavailable — degrade gracefully, accept the write with a warning.
+            // Catalog completely unavailable — degrade gracefully, accept the write with a warning.
             tracing::warn!(
                 alias = %alias,
                 target = %target,
