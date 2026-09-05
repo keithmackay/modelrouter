@@ -48,7 +48,9 @@ use crate::db::repositories::outcomes::OutcomeRepository;
 use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
 use crate::db::repositories::users::UserRepository;
 use crate::router::cost::CostCalculator;
+use crate::router::engine::RequestRouter;
 use crate::router::experiments::{is_valid_label, MAX_LABEL_LEN};
+use crate::router::load_balancer::LoadBalancer;
 
 /// Bounds on a create request. Labels are further limited to
 /// [`MAX_LABEL_LEN`] so they always fit the request header.
@@ -66,14 +68,14 @@ const MAX_ALLOWED_USERS: usize = 64;
 /// Everything a create request must say, after validation but before the
 /// targets are resolved. `variants` still holds the raw expressions.
 #[derive(Debug)]
-struct ParsedCreate {
-    name: String,
-    variants: BTreeMap<String, BTreeMap<String, String>>,
-    allowed_user_ids: Vec<i64>,
-    feed_learning: bool,
-    expires_at: i64,
-    retain_content: bool,
-    content_retention_days: i64,
+pub struct ParsedCreate {
+    pub name: String,
+    pub variants: BTreeMap<String, BTreeMap<String, String>>,
+    pub allowed_user_ids: Vec<i64>,
+    pub feed_learning: bool,
+    pub expires_at: i64,
+    pub retain_content: bool,
+    pub content_retention_days: i64,
 }
 
 
@@ -110,8 +112,9 @@ fn parse_expires_at(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<
 
 /// Walk the body field by field. Shape and bounds only; existence checks
 /// (name uniqueness, user ids, target resolution) need the state and happen
-/// in the handler.
-fn parse_create(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<ParsedCreate, String> {
+/// in the handler. Shared with the CLI, which builds the same body from its
+/// flags so both entry points refuse the same requests with the same words.
+pub fn parse_create(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<ParsedCreate, String> {
     if !body.is_object() {
         return Err("body must be a JSON object".to_string());
     }
@@ -238,29 +241,52 @@ fn parse_create(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<Pars
 
 // ── Pricing gate ──────────────────────────────────────────────────────────────
 
+/// What the creation gate reads, borrowed from wherever the caller has it:
+/// the API hands over its `AppState`, the CLI what it built from settings
+/// (an alias-aware router, the pool map and the price table) without
+/// constructing a provider adapter. Both produce the same refusals.
+pub struct GateSources<'a> {
+    pub router: &'a RequestRouter,
+    pub load_balancer: &'a LoadBalancer,
+    /// Whether a provider name is configured.
+    pub has_provider: Box<dyn Fn(&str) -> bool + 'a>,
+    pub cost_calc: &'a CostCalculator,
+}
+
+impl<'a> GateSources<'a> {
+    pub fn from_state(state: &'a AppState) -> Self {
+        GateSources {
+            router: &state.router,
+            load_balancer: &state.load_balancer,
+            has_provider: Box::new(move |name| state.provider_registry.get(name).is_ok()),
+            cost_calc: &state.cost_calc,
+        }
+    }
+}
+
 /// Resolve and pin one overlay target, refusing anything whose cost could
 /// not be accounted for. The error names the variant, key and target and
 /// says which check failed.
-fn gate_target(state: &AppState, label: &str, key: &str, expr: &str) -> Result<VariantTarget, String> {
+fn gate_target(gate: &GateSources<'_>, label: &str, key: &str, expr: &str) -> Result<VariantTarget, String> {
     let at = format!("variants: variant '{label}' key '{key}' target '{expr}'");
 
-    if state.load_balancer.is_pool(expr) {
+    if gate.load_balancer.is_pool(expr) {
         return Err(format!(
             "{at} is a load balancer pool; an experiment must pin one provider/model"
         ));
     }
 
-    let res = state.router.resolve_detailed(expr);
+    let res = gate.router.resolve_detailed(expr);
     if res.substituted {
         return Err(format!(
             "{at} is not an alias or provider/model and would be substituted with the default model"
         ));
     }
-    if state.provider_registry.get(&res.provider).is_err() {
+    if !(gate.has_provider)(&res.provider) {
         return Err(format!("{at} resolves to unconfigured provider '{}'", res.provider));
     }
     let pinned = format!("{}/{}", res.provider, res.model);
-    if !state.cost_calc.has_price(&pinned) {
+    if !gate.cost_calc.has_price(&pinned) {
         return Err(format!("{at} resolves to '{pinned}', which has no pricing entry"));
     }
 
@@ -272,15 +298,15 @@ fn gate_target(state: &AppState, label: &str, key: &str, expr: &str) -> Result<V
 }
 
 /// Run the gate over every overlay entry, producing the pinned variants.
-fn gate_variants(
-    state: &AppState,
+pub fn gate_variants(
+    gate: &GateSources<'_>,
     raw: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<ExperimentVariants, String> {
     let mut out: ExperimentVariants = BTreeMap::new();
     for (label, overlay) in raw {
         let mut pinned = BTreeMap::new();
         for (key, expr) in overlay {
-            pinned.insert(key.clone(), gate_target(state, label, key, expr)?);
+            pinned.insert(key.clone(), gate_target(gate, label, key, expr)?);
         }
         out.insert(label.clone(), pinned);
     }
@@ -292,7 +318,7 @@ fn gate_variants(
 /// The row as recorded in the audit log: the stored shape, except that the
 /// two zero-means-never fields are spelled out so an auditor never has to
 /// know the convention.
-fn audit_row(exp: &Experiment) -> Value {
+pub fn audit_row(exp: &Experiment) -> Value {
     let mut v = serde_json::to_value(exp).unwrap_or(Value::Null);
     if exp.expires_at == 0 {
         v["expires_at"] = json!("never");
@@ -319,7 +345,7 @@ fn parse_id(id: &str) -> Result<i64, ApiError> {
         .ok_or_else(|| ApiError::InvalidRequest(format!("invalid experiment id: {id}")))
 }
 
-fn is_unique_violation(err: &anyhow::Error) -> bool {
+pub(crate) fn is_unique_violation(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<sqlx::Error>(),
         Some(sqlx::Error::Database(db)) if db.is_unique_violation()
@@ -348,7 +374,8 @@ pub async fn create_experiment_api(
         }
     }
 
-    let variants = gate_variants(&state, &parsed.variants).map_err(ApiError::InvalidRequest)?;
+    let variants = gate_variants(&GateSources::from_state(&state), &parsed.variants)
+        .map_err(ApiError::InvalidRequest)?;
 
     let name = parsed.name;
     let row = ExperimentRepository::create(
