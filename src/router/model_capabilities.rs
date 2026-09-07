@@ -38,6 +38,12 @@ use crate::config::schema::ModelCapabilityEntry;
 const TEMPERATURE_UNSUPPORTED: &[&str] = &[
     "claude-opus-5",
     "claude-sonnet-5",
+    // Both Fable 5 generations reject `temperature` (Vertex 400
+    // "`temperature` is deprecated for this model"). claude-fable-5 was
+    // missing from this list while its sibling was present — that single gap
+    // killed the fable-5 arm of a downstream 3-way model experiment at the
+    // first temperature-carrying call.
+    "claude-fable-5",
     "claude-fable-5-1",
 ];
 
@@ -121,6 +127,8 @@ mod tests {
     fn built_in_table_covers_the_claude_5_family() {
         assert!(!supports_temperature("claude-opus-5", &[]));
         assert!(!supports_temperature("claude-sonnet-5", &[]));
+        assert!(!supports_temperature("claude-fable-5", &[]));
+        assert!(!supports_temperature("anthropic/claude-fable-5", &[]));
         assert!(!supports_temperature("claude-fable-5-1", &[]));
     }
 
