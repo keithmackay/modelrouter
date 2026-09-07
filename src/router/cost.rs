@@ -204,11 +204,30 @@ impl CostCalculator {
         model_key.to_lowercase()
     }
 
+    /// Resolve `model` to its pricing entry.
+    ///
+    /// Tries the prefix-stripped key first (`vertex/anthropic/claude-x` ->
+    /// `anthropic/claude-x`), so a vendor-qualified pricing entry wins when the
+    /// operator defined one. When that misses, falls back to the last path
+    /// segment (`claude-x`) — operators usually price models by bare name, and
+    /// multi-segment targets (e.g. Claude on Vertex) would otherwise never
+    /// match.
+    fn resolve(&self, model: &str) -> Option<&ModelPricing> {
+        let key = Self::pricing_key(model);
+        if let Some(p) = self.pricing.get(&key) {
+            return Some(p);
+        }
+        match key.rfind('/') {
+            Some(pos) => self.pricing.get(&key[pos + 1..]),
+            None => None,
+        }
+    }
+
     /// Whether `model` has a pricing entry. A model without one is recorded in
     /// the ledger at zero cost, so callers presenting cost figures use this to
     /// flag them as incomplete rather than free.
     pub fn has_price(&self, model: &str) -> bool {
-        self.pricing.contains_key(&Self::pricing_key(model))
+        self.resolve(model).is_some()
     }
 
     /// Cost for a request with no cache activity. Equivalent to
@@ -229,7 +248,7 @@ impl CostCalculator {
         cache_read_tokens: u32,
         cache_write_tokens: u32,
     ) -> f64 {
-        match self.pricing.get(&Self::pricing_key(model)) {
+        match self.resolve(model) {
             Some(p) => {
                 (prompt_tokens as f64 / 1_000_000.0) * p.input_per_million
                     + (completion_tokens as f64 / 1_000_000.0) * p.output_per_million
@@ -294,6 +313,64 @@ mod tests {
         let calc = CostCalculator::default();
         assert!(!calc.has_price("not-a-real-model"));
         assert!(!calc.has_price("ollama/llama3"));
+        assert!(!calc.has_price("vertex/anthropic/not-a-real-model"));
+    }
+
+    #[test]
+    fn three_segment_path_falls_back_to_basename() {
+        use crate::config::schema::PricingEntry;
+        let calc = CostCalculator::new_with_config(&[PricingEntry {
+            model: "claude-x".into(),
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        }]);
+        // Only the bare name is priced; the 3-segment pinned target must match it.
+        assert!(calc.has_price("vertex/anthropic/claude-x"));
+        assert!(calc.has_price("vertex/Anthropic/Claude-X"));
+        let cost = calc.calculate("vertex/anthropic/claude-x", 1_000_000, 0);
+        assert!((cost - 1.0).abs() < 0.001, "basename fallback cost: {cost}");
+        let cost = calc.calculate_with_cache("vertex/anthropic/claude-x", 0, 1_000_000, 0, 0);
+        assert!((cost - 2.0).abs() < 0.001, "basename fallback output cost: {cost}");
+    }
+
+    #[test]
+    fn builtin_vertex_style_target_prices_via_basename() {
+        let calc = CostCalculator::default();
+        // Built-in table prices `claude-haiku-4-5`; the pinned 3-segment target
+        // must resolve to it.
+        assert!(calc.has_price("vertex/anthropic/claude-haiku-4-5"));
+        let cost = calc.calculate("vertex/anthropic/claude-haiku-4-5", 1_000_000, 0);
+        assert!((cost - 0.80).abs() < 0.001, "vertex haiku input: {cost}");
+    }
+
+    #[test]
+    fn vendor_prefixed_entry_wins_over_basename() {
+        use crate::config::schema::PricingEntry;
+        let calc = CostCalculator::new_with_config(&[
+            PricingEntry {
+                model: "anthropic/claude-x".into(),
+                input_per_million: 5.0,
+                output_per_million: 10.0,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+            },
+            PricingEntry {
+                model: "claude-x".into(),
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+            },
+        ]);
+        // The stripped key `anthropic/claude-x` is more specific and must win
+        // over the basename entry.
+        let cost = calc.calculate("vertex/anthropic/claude-x", 1_000_000, 0);
+        assert!((cost - 5.0).abs() < 0.001, "vendor-prefixed entry: {cost}");
+        // A plain 2-segment path still uses the basename entry.
+        let cost = calc.calculate("local/claude-x", 1_000_000, 0);
+        assert!((cost - 1.0).abs() < 0.001, "basename entry: {cost}");
     }
 
     #[test]
