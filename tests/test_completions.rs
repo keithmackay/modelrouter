@@ -314,6 +314,9 @@ mod accounting {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 finish_reason: "stop".to_string(),
+                // A recognisable TTFT, so tests can check the handler carried
+                // the adapter's measurement into the prompt row.
+                ttft_ms: Some(42),
                 ..Default::default()
             })
         }
@@ -500,6 +503,8 @@ mod accounting {
         assert_eq!(prompts[0].routed_model, "mini-model");
         assert_eq!(prompts[0].provider, "backup");
         assert!(close_to(prompts[0].cost_usd, 0.015));
+        // The adapter's TTFT measurement lands on the row.
+        assert_eq!(prompts[0].ttft_ms, Some(42));
     }
 
     #[tokio::test]
@@ -554,6 +559,8 @@ mod accounting {
         assert_eq!(prompts[0].completion_tokens, 6);
         assert_eq!(prompts[0].finish_reason.as_deref(), Some("length"));
         assert_eq!(prompts[0].response.as_deref(), Some("Hello"));
+        // Streamed responses record time-to-first-chunk as TTFT.
+        assert!(prompts[0].ttft_ms.is_some(), "streamed row should carry a TTFT");
     }
 
     #[tokio::test]

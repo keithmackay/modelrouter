@@ -1951,6 +1951,9 @@ fn write_comparison(
         row(&format!("Mean latency (ms, n={} / n={})", a.latency.samples, b.latency.samples), opt(a.latency.mean_ms, &one), opt(b.latency.mean_ms, &one), delta(d.mean_ms, &one)),
         row("p50 latency (ms)", opt_i(a.latency.p50_ms), opt_i(b.latency.p50_ms), delta(d.p50_ms, &one)),
         row("p95 latency (ms)", opt_i(a.latency.p95_ms), opt_i(b.latency.p95_ms), delta(d.p95_ms, &one)),
+        row(&format!("Mean TTFT (ms, n={} / n={})", a.ttft.samples, b.ttft.samples), opt(a.ttft.mean_ms, &one), opt(b.ttft.mean_ms, &one), delta(c.ttft.as_ref().and_then(|t| t.delta.mean_ms), &one)),
+        row("p50 TTFT (ms)", opt_i(a.ttft.p50_ms), opt_i(b.ttft.p50_ms), delta(c.ttft.as_ref().and_then(|t| t.delta.p50_ms), &one)),
+        row("p95 TTFT (ms)", opt_i(a.ttft.p95_ms), opt_i(b.ttft.p95_ms), delta(c.ttft.as_ref().and_then(|t| t.delta.p95_ms), &one)),
         row("Cache hit rate", pct(a.hit_rate), pct(b.hit_rate), delta(d.hit_rate, &pct)),
         row("Error rate", pct(a.error_rate), pct(b.error_rate), delta(d.error_rate, &pct)),
         row("Total cost (USD)", usd(a.cost_usd), usd(b.cost_usd), delta(d.cost_usd, &usd)),
@@ -1990,7 +1993,9 @@ fn write_comparison(
                 writeln!(out, "Unpriced: arm {} includes {} — its cost figures are incomplete.", name, m.unpriced_models.join(", "))?;
             }
         }
-        writeln!(out, "{}", c.ttft_note)?;
+        if let Some(note) = c.ttft_note {
+            writeln!(out, "{}", note)?;
+        }
         for caveat in c.caveats {
             writeln!(out, "Note: {}", caveat)?;
         }
@@ -2214,6 +2219,7 @@ mod tests {
                 provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
+                ttft_ms: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
                 experiment_id: None,
                 experiment_variant: None,
@@ -2263,8 +2269,10 @@ mod tests {
         assert!(text.contains("Unpriced: arm A includes m1"), "{}", text);
         assert!(text.contains("quality"), "{}", text);
         assert!(text.contains("stream: false"), "{}", text);
-        assert!(text.contains("not recorded"), "{}", text);
+        // The seeded rows carry no TTFT, so the note explains the dashes.
+        assert!(text.contains("no recorded samples"), "{}", text);
         assert!(text.contains("p95 latency"), "{}", text);
+        assert!(text.contains("p95 TTFT"), "{}", text);
     }
 
     #[tokio::test]
@@ -2294,6 +2302,7 @@ mod tests {
                 provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(100), tags: "[]".into(), project: None,
+                ttft_ms: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
                 experiment_id: None,
                 experiment_variant: None,
@@ -2353,6 +2362,7 @@ mod tests {
                 provider: "p".into(), messages: "[]".into(), response: None, finish_reason: None,
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
+                ttft_ms: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
                 experiment_id: Some(exp.id),
                 experiment_variant: Some(variant.into()),

@@ -11,6 +11,9 @@ use super::{SqliteDb, now_utc};
 /// `0` (or `NULL`), and would otherwise pull every percentile toward zero.
 const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
 
+/// Rows that carry a real time-to-first-token measurement, same rule.
+const TTFT_SAMPLE: &str = "ttft_ms IS NOT NULL AND ttft_ms > 0";
+
 /// Experiment ids bound per `DELETE ... IN (...)` statement in
 /// `purge_older_than_except`, well under SQLite's bound-parameter limit.
 const PURGE_ID_CHUNK: usize = 500;
@@ -18,8 +21,8 @@ const PURGE_ID_CHUNK: usize = 500;
 /// Columns selected when reading a prompt row back.
 const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
                               messages, response, finish_reason, prompt_tokens, completion_tokens, \
-                              cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, tags, \
-                              project, attribution_correlation_id, attribution_tags, \
+                              cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, \
+                              tags, project, attribution_correlation_id, attribution_tags, \
                               experiment_id, experiment_variant, created_at";
 
 #[async_trait]
@@ -31,10 +34,10 @@ impl PromptRepository for SqliteDb {
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
-                cost_usd, latency_ms, tags, project,
+                cost_usd, latency_ms, ttft_ms, tags, project,
                 attribution_correlation_id, attribution_tags,
                 experiment_id, experiment_variant, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -50,6 +53,7 @@ impl PromptRepository for SqliteDb {
         .bind(prompt.cache_write_tokens)
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
+        .bind(prompt.ttft_ms)
         .bind(&prompt.tags)
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
@@ -189,68 +193,16 @@ impl PromptRepository for SqliteDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary> {
-        let (predicate, binds) = arm_predicate(filter);
-        let where_clause = format!(
-            "{} AND created_at >= ? AND created_at < ? AND {}",
-            predicate, LATENCY_SAMPLE
-        );
+        self.ms_summary("latency_ms", LATENCY_SAMPLE, filter, start, end).await
+    }
 
-        let sql = format!("SELECT COUNT(*), AVG(latency_ms) FROM prompts WHERE {}", where_clause);
-        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let (samples, mean_ms) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
-        if samples == 0 {
-            return Ok(LatencySummary::default());
-        }
-
-        // Nearest-rank percentiles: one indexed fetch each, offset computed
-        // here and bound rather than done in SQL. The count above and these
-        // reads are separate statements, so a retention purge in between can
-        // leave the offset past the end; fall back to the largest remaining
-        // value, and if nothing is left treat the arm as empty.
-        let sql = format!(
-            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms ASC LIMIT 1 OFFSET ?",
-            where_clause
-        );
-        let last_sql = format!(
-            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms DESC LIMIT 1",
-            where_clause
-        );
-        let percentile = |q_frac: f64| {
-            let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
-            let sql = sql.clone();
-            let last_sql = last_sql.clone();
-            let binds = binds.clone();
-            async move {
-                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
-                for b in &binds {
-                    q = q.bind(b.clone());
-                }
-                let row = q
-                    .bind(start)
-                    .bind(end)
-                    .bind(offset)
-                    .fetch_optional(&self.pool)
-                    .await?;
-                if let Some((v,)) = row {
-                    return anyhow::Ok(Some(v));
-                }
-                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
-                for b in binds {
-                    q = q.bind(b);
-                }
-                let row = q.bind(start).bind(end).fetch_optional(&self.pool).await?;
-                anyhow::Ok(row.map(|(v,)| v))
-            }
-        };
-        let (p50_ms, p95_ms) = tokio::try_join!(percentile(0.5), percentile(0.95))?;
-        let (Some(p50_ms), Some(p95_ms)) = (p50_ms, p95_ms) else {
-            return Ok(LatencySummary::default());
-        };
-
-        Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
+    async fn ttft_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        self.ms_summary("ttft_ms", TTFT_SAMPLE, filter, start, end).await
     }
 
     async fn experiment_run_latency(
@@ -286,6 +238,82 @@ impl PromptRepository for SqliteDb {
         .fetch_one(&self.pool)
         .await?;
         Ok(bytes)
+    }
+}
+
+impl SqliteDb {
+    /// Shared body of `latency_summary` and `ttft_summary`: count, mean and
+    /// nearest-rank percentiles over one millisecond column of `prompts`.
+    /// `column` and `sample_predicate` are compile-time constants from this
+    /// module, never caller input.
+    async fn ms_summary(
+        &self,
+        column: &str,
+        sample_predicate: &str,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        let (predicate, binds) = arm_predicate(filter);
+        let where_clause = format!(
+            "{} AND created_at >= ? AND created_at < ? AND {}",
+            predicate, sample_predicate
+        );
+
+        let sql = format!("SELECT COUNT(*), AVG({column}) FROM prompts WHERE {where_clause}");
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let (samples, mean_ms) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        if samples == 0 {
+            return Ok(LatencySummary::default());
+        }
+
+        // Nearest-rank percentiles: one indexed fetch each, offset computed
+        // here and bound rather than done in SQL. The count above and these
+        // reads are separate statements, so a retention purge in between can
+        // leave the offset past the end; fall back to the largest remaining
+        // value, and if nothing is left treat the arm as empty.
+        let sql = format!(
+            "SELECT {column} FROM prompts WHERE {where_clause} ORDER BY {column} ASC LIMIT 1 OFFSET ?"
+        );
+        let last_sql = format!(
+            "SELECT {column} FROM prompts WHERE {where_clause} ORDER BY {column} DESC LIMIT 1"
+        );
+        let percentile = |q_frac: f64| {
+            let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
+            let sql = sql.clone();
+            let last_sql = last_sql.clone();
+            let binds = binds.clone();
+            async move {
+                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+                for b in &binds {
+                    q = q.bind(b.clone());
+                }
+                let row = q
+                    .bind(start)
+                    .bind(end)
+                    .bind(offset)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if let Some((v,)) = row {
+                    return anyhow::Ok(Some(v));
+                }
+                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
+                for b in binds {
+                    q = q.bind(b);
+                }
+                let row = q.bind(start).bind(end).fetch_optional(&self.pool).await?;
+                anyhow::Ok(row.map(|(v,)| v))
+            }
+        };
+        let (p50_ms, p95_ms) = tokio::try_join!(percentile(0.5), percentile(0.95))?;
+        let (Some(p50_ms), Some(p95_ms)) = (p50_ms, p95_ms) else {
+            return Ok(LatencySummary::default());
+        };
+
+        Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
     }
 }
 
@@ -337,6 +365,7 @@ mod tests {
                 cache_write_tokens: 0,
                 cost_usd: 0.01,
                 latency_ms: None,
+                ttft_ms: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
@@ -377,6 +406,7 @@ mod tests {
                 cache_write_tokens: 0,
                 cost_usd: 0.01,
                 latency_ms: None,
+                ttft_ms: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
@@ -483,6 +513,89 @@ mod tests {
         assert_eq!(s.mean_ms, Some(420.0));
         assert_eq!(s.p50_ms, Some(420));
         assert_eq!(s.p95_ms, Some(420));
+    }
+
+    /// Minimal prompt row carrying only a TTFT measurement.
+    async fn insert_ttft_row(db: &SqliteDb, routed_model: &str, ttft_ms: Option<i64>, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, \
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, ttft_ms, tags, \
+             attribution_tags, created_at) \
+             VALUES (1, 'req', ?, 'p', '[]', 0, 0, 0.0, 2000, ?, '[]', '{}', ?)",
+        )
+        .bind(routed_model)
+        .bind(ttft_ms)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ttft_summary_reads_ttft_not_latency() {
+        let db = make_db().await;
+        for (i, ms) in [100, 200, 300, 400, 1000].iter().enumerate() {
+            let ts = format!("2026-03-{:02}T00:00:00Z", i + 2);
+            insert_ttft_row(&db, "X", Some(*ms), &ts).await;
+        }
+        // Zero and NULL TTFT are not samples, even with a measured latency.
+        insert_ttft_row(&db, "X", Some(0), "2026-03-10T00:00:00Z").await;
+        insert_ttft_row(&db, "X", None, "2026-03-11T00:00:00Z").await;
+
+        let s = db.ttft_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s.samples, 5);
+        assert_eq!(s.mean_ms, Some(400.0));
+        assert_eq!(s.p50_ms, Some(300));
+        assert_eq!(s.p95_ms, Some(1000));
+
+        // Every row above carries latency 2000, which TTFT must not read.
+        let l = db.latency_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(l.samples, 7);
+        assert_eq!(l.mean_ms, Some(2000.0));
+    }
+
+    #[tokio::test]
+    async fn ttft_summary_with_no_samples_is_empty() {
+        let db = make_db().await;
+        insert_latency_row(&db, "X", "p", None, "{}", Some(300), "2026-03-02T00:00:00Z").await;
+        let s = db.ttft_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s, LatencySummary::default());
+    }
+
+    #[tokio::test]
+    async fn ttft_round_trips_through_create() {
+        let db = make_db().await;
+        let saved = PromptRepository::create(
+            &db,
+            NewPrompt {
+                user_id: 1,
+                session_id: None,
+                request_model: "gpt-4o".to_string(),
+                routed_model: "openai/gpt-4o".to_string(),
+                provider: "openai".to_string(),
+                messages: "[]".to_string(),
+                response: None,
+                finish_reason: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                latency_ms: Some(900),
+                ttft_ms: Some(120),
+                tags: "[]".to_string(),
+                project: None,
+                attribution_correlation_id: None,
+                attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.ttft_ms, Some(120));
+        let fetched = PromptRepository::find_by_id(&db, saved.id).await.unwrap().unwrap();
+        assert_eq!(fetched.ttft_ms, Some(120));
     }
 
     #[tokio::test]

@@ -102,6 +102,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let body = Self::build_body(req);
 
+        let dispatched = std::time::Instant::now();
         let resp = self
             .client
             .post(self.chat_url())
@@ -110,6 +111,8 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             .send()
             .await
             .context("Failed to send request to Azure OpenAI")?;
+        // Headers are in, body not yet read: time to first token.
+        let ttft_ms = dispatched.elapsed().as_millis() as i64;
 
         let status = resp.status();
         if !status.is_success() {
@@ -135,6 +138,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
+            ttft_ms: Some(ttft_ms),
         })
     }
 

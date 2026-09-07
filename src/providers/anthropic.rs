@@ -162,6 +162,7 @@ impl ProviderAdapter for AnthropicAdapter {
             body["max_tokens"] = serde_json::json!(4096);
         }
 
+        let dispatched = std::time::Instant::now();
         let resp = self
             .client
             .post(ANTHROPIC_API_URL)
@@ -172,6 +173,8 @@ impl ProviderAdapter for AnthropicAdapter {
             .send()
             .await
             .context("Failed to send request to Anthropic")?;
+        // Headers are in, body not yet read: time to first token.
+        let ttft_ms = dispatched.elapsed().as_millis() as i64;
 
         let status = resp.status();
         if !status.is_success() {
@@ -199,6 +202,7 @@ impl ProviderAdapter for AnthropicAdapter {
             finish_reason: parsed.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
             cache_read_tokens: parsed.usage.cache_read_input_tokens,
             cache_write_tokens: parsed.usage.cache_creation_input_tokens,
+            ttft_ms: Some(ttft_ms),
         })
     }
 

@@ -644,6 +644,7 @@ async fn chat_completions_inner(
     let completion_tokens = result.completion_tokens;
     let cache_read_tokens = result.cache_read_tokens;
     let cache_write_tokens = result.cache_write_tokens;
+    let ttft_ms = result.ttft_ms;
 
     let skip_log_clone = skip_log;
     let attr_correlation = attribution.correlation_id.clone();
@@ -665,6 +666,7 @@ async fn chat_completions_inner(
                 cache_write_tokens: cache_write_tokens as i64,
                 cost_usd: cost,
                 latency_ms: Some(latency_ms),
+                ttft_ms,
                 tags: "[]".to_string(),
                 project: user_project.clone(),
                 attribution_correlation_id: attr_correlation.clone(),
@@ -880,6 +882,9 @@ fn record_cache_hit(
                 // Zero: the router paid nothing for this response.
                 cost_usd: 0.0,
                 latency_ms: Some(0),
+                // The cached result carries the *original* call's TTFT, which
+                // says nothing about this request. Never persisted on a hit.
+                ttft_ms: None,
                 tags: "[]".to_string(),
                 project: ctx.user_project.clone(),
                 attribution_correlation_id: ctx.attribution.correlation_id.clone(),
@@ -1002,6 +1007,9 @@ struct StreamAcc {
     content: String,
     usage: Option<ReportedUsage>,
     finish_reason: Option<String>,
+    /// Elapsed time at the first body chunk — the stream's time to first
+    /// token, measured from just before the provider dispatch.
+    ttft_ms: Option<i64>,
     /// Set once a ledger write has been spawned so the drop guard never writes
     /// a second row for the same stream.
     recorded: bool,
@@ -1019,6 +1027,7 @@ struct StreamSettlement {
     tokens_estimated: bool,
     cost: f64,
     latency_ms: i64,
+    ttft_ms: Option<i64>,
 }
 
 /// Owns the accounting for one streamed response and writes it exactly once:
@@ -1036,6 +1045,9 @@ impl StreamLogger {
     fn observe(&mut self, chunk_result: anyhow::Result<bytes::Bytes>) -> anyhow::Result<bytes::Bytes> {
         match &chunk_result {
             Ok(chunk) => {
+                if self.acc.ttft_ms.is_none() {
+                    self.acc.ttft_ms = Some(self.ctx.start.elapsed().as_millis() as i64);
+                }
                 let info = parse_sse_chunk(chunk);
                 self.acc.content.push_str(&info.text);
                 if info.usage.is_some() {
@@ -1085,6 +1097,7 @@ impl StreamLogger {
             tokens_estimated,
             cost,
             latency_ms: self.ctx.start.elapsed().as_millis() as i64,
+            ttft_ms: self.acc.ttft_ms,
         }
     }
 
@@ -1190,6 +1203,7 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
             cache_write_tokens: 0,
             cost_usd: s.cost,
             latency_ms: Some(s.latency_ms),
+            ttft_ms: s.ttft_ms,
             tags: "[]".to_string(),
             project: ctx.user_project.clone(),
             attribution_correlation_id: attr_correlation,
@@ -1365,6 +1379,7 @@ mod openai_response_tests {
             finish_reason: "stop".to_string(),
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            ttft_ms: None,
         };
         let response = build_openai_response(
             "chatcmpl-mr-test".to_string(),

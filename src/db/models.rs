@@ -158,6 +158,12 @@ pub struct Prompt {
     pub cache_write_tokens: i64,
     pub cost_usd: f64,
     pub latency_ms: Option<i64>,
+    /// Time to first token: response headers (non-streamed) or first chunk
+    /// (streamed) after dispatching the provider request. `None` where it was
+    /// not measured (older rows, cache hits, SDKs with no header/body split).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub ttft_ms: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     /// Caller-supplied correlation id for this request. See `api::attribution`.
@@ -288,6 +294,8 @@ pub struct NewPrompt {
     pub cache_write_tokens: i64,
     pub cost_usd: f64,
     pub latency_ms: Option<i64>,
+    /// See [`Prompt::ttft_ms`].
+    pub ttft_ms: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     pub attribution_correlation_id: Option<String>,

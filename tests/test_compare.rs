@@ -244,6 +244,15 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
 }
 
 async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: Option<i64>) {
+    seed_prompt_with_ttft(db, s, latency_ms, None).await
+}
+
+async fn seed_prompt_with_ttft(
+    db: &Arc<dyn DatabaseProvider>,
+    s: &Seed<'_>,
+    latency_ms: Option<i64>,
+    ttft_ms: Option<i64>,
+) {
     PromptRepository::create(
         &**db,
         NewPrompt {
@@ -261,6 +270,7 @@ async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: O
             cache_write_tokens: 0,
             cost_usd: 0.0,
             latency_ms,
+            ttft_ms,
             tags: "[]".to_string(),
             project: None,
             attribution_correlation_id: Some(s.run.to_string()),
@@ -410,7 +420,7 @@ async fn provider_dimension_matches_the_expected_document() {
     let caveats = body.as_object_mut().unwrap().remove("caveats").unwrap();
     assert_eq!(caveats.as_array().unwrap().len(), 2);
     let ttft_note = body.as_object_mut().unwrap().remove("ttft_note").unwrap();
-    assert!(ttft_note.as_str().unwrap().contains("not recorded"));
+    assert!(ttft_note.as_str().unwrap().contains("no recorded samples"));
 
     let day = today();
     let expected = json!({
@@ -427,6 +437,7 @@ async fn provider_dimension_matches_the_expected_document() {
             "cache_hits": 0, "hit_rate": 0.0,
             "failures": 1, "error_rate": 0.2,
             "latency": { "samples": 4, "mean_ms": 250.0, "p50_ms": 200, "p95_ms": 400 },
+            "ttft": { "samples": 0, "mean_ms": null, "p50_ms": null, "p95_ms": null },
             "unpriced": true, "unpriced_models": ["m1"],
             "by_day": [{ "key": day, "cost_usd": 2.0, "saved_usd": 0.0, "tokens_in": 40,
                          "tokens_out": 80, "requests": 4, "cache_hits": 0 }]
@@ -440,6 +451,7 @@ async fn provider_dimension_matches_the_expected_document() {
             "cache_hits": 0, "hit_rate": 0.0,
             "failures": 0, "error_rate": 0.0,
             "latency": { "samples": 1, "mean_ms": 400.0, "p50_ms": 400, "p95_ms": 400 },
+            "ttft": { "samples": 0, "mean_ms": null, "p50_ms": null, "p95_ms": null },
             "unpriced": true, "unpriced_models": ["m2"],
             "by_day": [{ "key": day, "cost_usd": 0.25, "saved_usd": 0.0, "tokens_in": 40,
                          "tokens_out": 80, "requests": 1, "cache_hits": 0 }]
@@ -459,8 +471,8 @@ async fn provider_dimension_matches_the_expected_document() {
             "p95_ms": { "abs": 0.0, "pct": 0.0 }
         },
         "coverage": {
-            "a": { "requests": 4, "latency_samples": 4 },
-            "b": { "requests": 1, "latency_samples": 1 },
+            "a": { "requests": 4, "latency_samples": 4, "ttft_samples": 0 },
+            "b": { "requests": 1, "latency_samples": 1, "ttft_samples": 0 },
             "incomplete_pairs": null
         },
         "ttft": null
@@ -494,7 +506,7 @@ async fn latency_and_failures_come_from_seeded_rows_per_arm() {
     assert_eq!(body["b"]["failures"], 0);
     assert_eq!(body["b"]["error_rate"], 0.0);
     assert_eq!(body["b"]["latency"]["samples"], 1);
-    assert_eq!(body["coverage"]["a"], json!({ "requests": 5, "latency_samples": 5 }));
+    assert_eq!(body["coverage"]["a"], json!({ "requests": 5, "latency_samples": 5, "ttft_samples": 0 }));
 }
 
 #[tokio::test]
@@ -507,9 +519,54 @@ async fn caveats_and_ttft_note_are_on_every_response() {
     assert!(caveats[0].to_lowercase().contains("quality"), "{:?}", caveats);
     assert!(caveats[1].to_lowercase().contains("stream"), "{:?}", caveats);
     assert!(body["ttft"].is_null());
-    assert!(body["ttft_note"].as_str().unwrap().contains("not recorded"));
+    assert!(body["ttft_note"].as_str().unwrap().contains("no recorded samples"));
     // Default window is monthly, like the attribution endpoint.
     assert_eq!(body["window"], "monthly");
+}
+
+#[tokio::test]
+async fn ttft_is_populated_from_recorded_samples_and_replaces_the_note() {
+    let (server, db, settings) = build_app().await;
+    let a = Seed { model: "m", provider: "p", run: "r-a", tags: r#"{"arm":"a"}"#, variant: None };
+    let b = Seed { model: "m", provider: "p", run: "r-b", tags: r#"{"arm":"b"}"#, variant: None };
+    for (latency, ttft) in [(500, 100), (600, 200), (700, 300), (800, 400), (900, 1000)] {
+        seed_prompt_with_ttft(&db, &a, Some(latency), Some(ttft)).await;
+    }
+    // A cache hit (0) and a row without TTFT are not samples.
+    seed_prompt_with_ttft(&db, &a, Some(500), Some(0)).await;
+    seed_prompt_with_ttft(&db, &a, Some(500), None).await;
+    // Arm B has no TTFT at all: its side reads 0 samples, but the block is
+    // still present because arm A measured something.
+    seed_prompt(&db, &b, Some(50)).await;
+
+    let (status, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(
+        body["a"]["ttft"],
+        json!({ "samples": 5, "mean_ms": 400.0, "p50_ms": 300, "p95_ms": 1000 })
+    );
+    assert_eq!(body["b"]["ttft"]["samples"], 0);
+    assert_eq!(body["coverage"]["a"]["ttft_samples"], 5);
+    // The top-level block carries both arms; the note is gone.
+    assert_eq!(body["ttft"]["a"]["p95_ms"], 1000);
+    assert!(body["ttft"]["delta"]["mean_ms"].is_null(), "{}", body["ttft"]);
+    assert!(body.get("ttft_note").is_none(), "{}", body);
+    // Latency is unaffected by the TTFT columns.
+    assert_eq!(body["a"]["latency"]["samples"], 7);
+}
+
+#[tokio::test]
+async fn ttft_delta_is_b_minus_a_when_both_arms_measured() {
+    let (server, db, settings) = build_app().await;
+    let a = Seed { model: "m", provider: "p", run: "r-a", tags: r#"{"arm":"a"}"#, variant: None };
+    let b = Seed { model: "m", provider: "p", run: "r-b", tags: r#"{"arm":"b"}"#, variant: None };
+    seed_prompt_with_ttft(&db, &a, Some(500), Some(200)).await;
+    seed_prompt_with_ttft(&db, &b, Some(500), Some(100)).await;
+
+    let (status, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["ttft"]["delta"]["mean_ms"], json!({ "abs": -100.0, "pct": -50.0 }));
+    assert_eq!(body["ttft"]["delta"]["p95_ms"], json!({ "abs": -100.0, "pct": -50.0 }));
 }
 
 // ── Edges ─────────────────────────────────────────────────────────────────────
@@ -530,7 +587,7 @@ async fn zero_row_arm_reports_zeros_absent_percentiles_and_no_division() {
     assert_eq!(a["error_rate"], 0.0);
     assert_eq!(a["unpriced"], false);
     assert_eq!(a["by_day"], json!([]));
-    assert_eq!(body["coverage"]["a"], json!({ "requests": 0, "latency_samples": 0 }));
+    assert_eq!(body["coverage"]["a"], json!({ "requests": 0, "latency_samples": 0, "ttft_samples": 0 }));
     // A is zero: absolute deltas exist, percentages do not.
     assert_eq!(body["delta"]["requests"], json!({ "abs": 1.0, "pct": null }));
     assert!(body["delta"]["cost_per_request"].is_null());
@@ -701,7 +758,7 @@ async fn variant_dimension_compares_two_variants_of_one_experiment() {
     assert_eq!(body["b"]["failures"], 0);
     assert_eq!(body["b"]["latency"]["samples"], 1);
     assert_eq!(body["delta"]["requests"]["abs"], -1.0);
-    assert_eq!(body["coverage"]["a"], json!({ "requests": 3, "latency_samples": 3 }));
+    assert_eq!(body["coverage"]["a"], json!({ "requests": 3, "latency_samples": 3, "ttft_samples": 0 }));
 
     // The experiment rides along, and the quality caveat points at its results.
     assert_eq!(body["experiment"]["id"], exp);

@@ -47,8 +47,12 @@ pub const CAVEAT_QUALITY_VARIANT: &str = "This comparison has no quality column.
 pub const CAVEAT_STREAMING: &str = "Streamed responses record estimated or zero tokens and, on the \
     messages API, a placeholder latency; they are indistinguishable from measured rows here. \
     Send experiment traffic with stream: false.";
-pub const TTFT_NOTE: &str =
-    "Time to first token is not recorded by the router today, so it cannot be compared.";
+/// Shown instead of the `ttft` block when neither arm has a sample. Rows
+/// written before TTFT recording shipped carry none, as do cache hits and
+/// providers whose SDK exposes no header/body split.
+pub const TTFT_NOTE: &str = "Time to first token has no recorded samples for these arms in this \
+    window; TTFT is recorded per request (response headers for non-streamed provider calls, \
+    first chunk for streamed ones), so older rows carry none.";
 
 pub const DIMENSIONS: [&str; 5] = ["model", "provider", "tag", "run", "variant"];
 pub const WINDOWS: [&str; 4] = ["all", "daily", "weekly", "monthly"];
@@ -274,6 +278,9 @@ pub struct ArmMetrics {
     /// `failures / (requests + failures)`; `0.0` when both are zero.
     pub error_rate: f64,
     pub latency: LatencySummary,
+    /// Time to first token over the same prompt rows; `samples` is 0 where
+    /// nothing was measured (see [`TTFT_NOTE`]).
+    pub ttft: LatencySummary,
     /// True when any model in the arm has no pricing entry, so `cost_usd` is
     /// incomplete.
     pub unpriced: bool,
@@ -343,6 +350,7 @@ impl Deltas {
 pub struct CoverageArm {
     pub requests: i64,
     pub latency_samples: i64,
+    pub ttft_samples: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -402,6 +410,42 @@ impl ComparedExperiment {
     }
 }
 
+/// Time to first token, arm against arm. Present only when at least one arm
+/// has a sample; otherwise `ttft` is `null` and `ttft_note` says why.
+#[derive(Debug, Clone, Serialize)]
+pub struct TtftComparison {
+    pub a: LatencySummary,
+    pub b: LatencySummary,
+    pub delta: TtftDeltas,
+}
+
+/// B minus A over the TTFT figures; `None` when either side has no samples.
+#[derive(Debug, Clone, Serialize)]
+pub struct TtftDeltas {
+    pub mean_ms: Option<Delta>,
+    pub p50_ms: Option<Delta>,
+    pub p95_ms: Option<Delta>,
+}
+
+impl TtftComparison {
+    /// `Some` when either arm measured TTFT.
+    fn between(a: &ArmMetrics, b: &ArmMetrics) -> Option<TtftComparison> {
+        if a.ttft.samples == 0 && b.ttft.samples == 0 {
+            return None;
+        }
+        let fi = |v: Option<i64>| v.map(|v| v as f64);
+        Some(TtftComparison {
+            a: a.ttft.clone(),
+            b: b.ttft.clone(),
+            delta: TtftDeltas {
+                mean_ms: Delta::opt(a.ttft.mean_ms, b.ttft.mean_ms),
+                p50_ms: Delta::opt(fi(a.ttft.p50_ms), fi(b.ttft.p50_ms)),
+                p95_ms: Delta::opt(fi(a.ttft.p95_ms), fi(b.ttft.p95_ms)),
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Comparison {
     pub dimension: String,
@@ -415,9 +459,12 @@ pub struct Comparison {
     pub b: ArmMetrics,
     pub delta: Deltas,
     pub coverage: Coverage,
-    /// Never populated today; see `ttft_note`.
-    pub ttft: Option<()>,
-    pub ttft_note: &'static str,
+    /// TTFT of the two arms; `null` (with `ttft_note` set) when neither arm
+    /// has a recorded sample.
+    pub ttft: Option<TtftComparison>,
+    /// Why `ttft` is `null`; absent when it is populated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_note: Option<&'static str>,
     pub caveats: [&'static str; 2],
 }
 
@@ -442,10 +489,20 @@ pub async fn build_comparison(
     )?;
     let delta = Deltas::between(&a, &b);
     let coverage = Coverage {
-        a: CoverageArm { requests: a.requests, latency_samples: a.latency.samples },
-        b: CoverageArm { requests: b.requests, latency_samples: b.latency.samples },
+        a: CoverageArm {
+            requests: a.requests,
+            latency_samples: a.latency.samples,
+            ttft_samples: a.ttft.samples,
+        },
+        b: CoverageArm {
+            requests: b.requests,
+            latency_samples: b.latency.samples,
+            ttft_samples: b.ttft.samples,
+        },
         incomplete_pairs: None,
     };
+    let ttft = TtftComparison::between(&a, &b);
+    let ttft_note = ttft.is_none().then_some(TTFT_NOTE);
     let quality = if experiment.is_some() { CAVEAT_QUALITY_VARIANT } else { CAVEAT_QUALITY };
     Ok(Comparison {
         dimension: q.dimension,
@@ -458,8 +515,8 @@ pub async fn build_comparison(
         b,
         delta,
         coverage,
-        ttft: None,
-        ttft_note: TTFT_NOTE,
+        ttft,
+        ttft_note,
         caveats: [quality, CAVEAT_STREAMING],
     })
 }
@@ -493,11 +550,12 @@ async fn arm_metrics(
     start: &str,
     end: &str,
 ) -> anyhow::Result<ArmMetrics> {
-    let (totals, by_model, by_day, latency, failures) = tokio::try_join!(
+    let (totals, by_model, by_day, latency, ttft, failures) = tokio::try_join!(
         CostRepository::arm_totals(&*sources.db, filter, start, end),
         CostRepository::arm_by_model(&*sources.db, filter, start, end),
         CostRepository::arm_by_day(&*sources.db, filter, start, end),
         PromptRepository::latency_summary(&*sources.prompt_db, filter, start, end),
+        PromptRepository::ttft_summary(&*sources.prompt_db, filter, start, end),
         FailureRepository::count_for_arm(&*sources.db, filter, start, end),
     )?;
 
@@ -528,6 +586,7 @@ async fn arm_metrics(
         failures,
         error_rate,
         latency,
+        ttft,
         unpriced: !unpriced_models.is_empty(),
         unpriced_models,
         by_day,
@@ -756,6 +815,26 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
             a: ms(a.latency.p95_ms),
             b: ms(b.latency.p95_ms),
             delta: fmt_delta(&d.p95_ms, fmt_ms),
+        },
+        // TTFT rows show a dash on rows recorded before it shipped; the
+        // ttft_note on the page says why.
+        MetricRow {
+            label: "Mean TTFT".into(),
+            a: fmt_opt(a.ttft.mean_ms, fmt_ms),
+            b: fmt_opt(b.ttft.mean_ms, fmt_ms),
+            delta: fmt_delta(&c.ttft.as_ref().and_then(|t| t.delta.mean_ms), fmt_ms),
+        },
+        MetricRow {
+            label: "p50 TTFT".into(),
+            a: ms(a.ttft.p50_ms),
+            b: ms(b.ttft.p50_ms),
+            delta: fmt_delta(&c.ttft.as_ref().and_then(|t| t.delta.p50_ms), fmt_ms),
+        },
+        MetricRow {
+            label: "p95 TTFT".into(),
+            a: ms(a.ttft.p95_ms),
+            b: ms(b.ttft.p95_ms),
+            delta: fmt_delta(&c.ttft.as_ref().and_then(|t| t.delta.p95_ms), fmt_ms),
         },
         MetricRow {
             label: "Cache hit rate".into(),

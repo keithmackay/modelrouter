@@ -65,7 +65,9 @@
         B {% if cmp.coverage.b.requests == 0 %}—{% else %}{{ cmp.coverage.b.latency_samples }} / {{ cmp.coverage.b.requests }}{% endif %}.
         Latency comes from the prompt log; an arm with fewer samples than requests was partly served from cache or logged without latency.
     </p>
+    {% if cmp.ttft_note %}
     <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ cmp.ttft_note }}</p>
+    {% endif %}
     {% for c in cmp.caveats %}
     <p style="font-size:0.78rem;color:#777;margin:0.25rem 0 0;">{{ c }}</p>
     {% endfor %}

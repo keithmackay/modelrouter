@@ -794,6 +794,11 @@ pub struct VariantResults {
     /// where storage or retention allows).
     pub latency: Option<LatencySummary>,
     pub latency_samples: i64,
+    /// Time to first token over the variant's prompt rows, same rules as
+    /// `latency`. Recorded for non-streamed provider calls (headers received)
+    /// and streamed ones (first chunk); `null` when no row carries one.
+    pub ttft: Option<LatencySummary>,
+    pub ttft_samples: i64,
     pub per_run: Option<PerRunFigures>,
     pub per_request: Option<PerRequestFigures>,
     pub models: Vec<VariantModelMetrics>,
@@ -822,6 +827,8 @@ impl VariantResults {
             failures: 0,
             latency: None,
             latency_samples: 0,
+            ttft: None,
+            ttft_samples: 0,
             per_run: None,
             per_request: None,
             models: Vec::new(),
@@ -870,6 +877,7 @@ pub struct ExperimentTotals {
     pub estimated_rows: i64,
     pub failures: i64,
     pub latency_samples: i64,
+    pub ttft_samples: i64,
     pub outcomes: OutcomeStats,
 }
 
@@ -1161,13 +1169,28 @@ pub async fn build_results(
         .keys()
         .map(|label| ArmFilter::Variant { experiment_id: id, variant: label.clone() })
         .collect();
-    let summaries = try_join_all(latency_filters.iter().map(|filter| {
-        PromptRepository::latency_summary(&*sources.prompt_db, filter, ALL_TIME_START, ALL_TIME_END)
+    let summaries = try_join_all(latency_filters.iter().map(|filter| async {
+        tokio::try_join!(
+            PromptRepository::latency_summary(
+                &*sources.prompt_db,
+                filter,
+                ALL_TIME_START,
+                ALL_TIME_END
+            ),
+            PromptRepository::ttft_summary(
+                &*sources.prompt_db,
+                filter,
+                ALL_TIME_START,
+                ALL_TIME_END
+            ),
+        )
     }))
     .await?;
-    for (v, summary) in variants.values_mut().zip(summaries) {
-        v.latency_samples = summary.samples;
-        v.latency = (summary.samples > 0).then_some(summary);
+    for (v, (latency, ttft)) in variants.values_mut().zip(summaries) {
+        v.latency_samples = latency.samples;
+        v.latency = (latency.samples > 0).then_some(latency);
+        v.ttft_samples = ttft.samples;
+        v.ttft = (ttft.samples > 0).then_some(ttft);
         v.finish();
     }
 
@@ -1185,6 +1208,7 @@ pub async fn build_results(
         totals.estimated_rows += v.estimated_rows;
         totals.failures += v.failures;
         totals.latency_samples += v.latency_samples;
+        totals.ttft_samples += v.ttft_samples;
     }
     for o in outcomes_by_key.values() {
         totals.outcomes.add(o);
@@ -1708,6 +1732,10 @@ fn variant_card(exp: &Experiment, v: &VariantResults) -> VariantCardView {
         MetricLine {
             label: "Latency",
             value: latency_line(v.latency.as_ref(), v.latency_samples),
+        },
+        MetricLine {
+            label: "TTFT",
+            value: latency_line(v.ttft.as_ref(), v.ttft_samples),
         },
         MetricLine {
             label: "Per run",

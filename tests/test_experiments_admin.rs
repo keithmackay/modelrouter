@@ -657,6 +657,7 @@ mod seed {
                 cache_write_tokens: 0,
                 cost_usd: 0.01,
                 latency_ms: Some(latency_ms),
+                ttft_ms: None,
                 tags: "{}".to_string(),
                 project: None,
                 attribution_correlation_id: Some(run.to_string()),

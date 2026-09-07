@@ -74,6 +74,16 @@ pub trait PromptRepository: Send + Sync {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary>;
+    /// [`latency_summary`](PromptRepository::latency_summary) over `ttft_ms`
+    /// instead of `latency_ms`: time to first token, recorded per request for
+    /// non-streamed provider calls (and time-to-first-chunk for streamed
+    /// ones). Same sampling rule — only positive, non-null values count.
+    async fn ttft_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary>;
     /// Latency samples and mean per run of an experiment, unpaginated; runs
     /// with no prompt rows are absent.
     async fn experiment_run_latency(

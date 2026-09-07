@@ -77,6 +77,7 @@ mod tests {
             cache_write_tokens: 0,
             cost_usd: 0.01,
             latency_ms: Some(123),
+            ttft_ms: None,
             tags: "[]".into(),
             project: None,
             attribution_correlation_id: None,

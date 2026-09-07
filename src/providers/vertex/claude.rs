@@ -56,6 +56,8 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
+        // The adapter, which timed the HTTP send, fills this in.
+        ttft_ms: None,
         finish_reason: v["stop_reason"]
             .as_str()
             .unwrap_or("end_turn")

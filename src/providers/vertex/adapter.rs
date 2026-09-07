@@ -248,6 +248,7 @@ impl ProviderAdapter for VertexAdapter {
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let token = self.token_provider.token().await?;
+        let dispatched = std::time::Instant::now();
         let resp = self
             .client
             .post(&url)
@@ -256,6 +257,8 @@ impl ProviderAdapter for VertexAdapter {
             .send()
             .await
             .context("failed to send request to Vertex AI")?;
+        // Headers are in, body not yet read: time to first token.
+        let ttft_ms = dispatched.elapsed().as_millis() as i64;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -265,11 +268,13 @@ impl ProviderAdapter for VertexAdapter {
             .json()
             .await
             .context("failed to parse Vertex response")?;
-        match publisher {
+        let mut result = match publisher {
             Publisher::Google => gemini::parse_response(v),
             Publisher::Anthropic => claude::parse_response(v),
             Publisher::Maas => maas::parse_response(v),
-        }
+        }?;
+        result.ttft_ms = Some(ttft_ms);
+        Ok(result)
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {

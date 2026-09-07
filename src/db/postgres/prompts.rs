@@ -13,6 +13,9 @@ use super::{PostgresDb, now_utc};
 /// `0` (or `NULL`), and would otherwise pull every percentile toward zero.
 const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
 
+/// Rows that carry a real time-to-first-token measurement, same rule.
+const TTFT_SAMPLE: &str = "ttft_ms IS NOT NULL AND ttft_ms > 0";
+
 /// Experiment ids bound per `DELETE ... IN (...)` statement in
 /// `purge_older_than_except`.
 const PURGE_ID_CHUNK: usize = 500;
@@ -26,15 +29,15 @@ impl PromptRepository for PostgresDb {
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
-                cost_usd, latency_ms, tags, project,
+                cost_usd, latency_ms, ttft_ms, tags, project,
                 attribution_correlation_id, attribution_tags,
                 experiment_id, experiment_variant, created_at
                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20, $21)
+                         $17, $18, $19, $20, $21, $22)
                RETURNING id, user_id, session_id, request_model, routed_model, provider,
                          messages, response, finish_reason, prompt_tokens, completion_tokens,
                          cache_read_tokens, cache_write_tokens,
-                         cost_usd, latency_ms, tags, project,
+                         cost_usd, latency_ms, ttft_ms, tags, project,
                          attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at"#,
         )
@@ -52,6 +55,7 @@ impl PromptRepository for PostgresDb {
         .bind(prompt.cache_write_tokens)
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
+        .bind(prompt.ttft_ms)
         .bind(&prompt.tags)
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
@@ -69,7 +73,7 @@ impl PromptRepository for PostgresDb {
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project,
+                      cost_usd, latency_ms, ttft_ms, tags, project,
                       attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at
                FROM prompts WHERE id = $1"#,
@@ -85,7 +89,7 @@ impl PromptRepository for PostgresDb {
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project,
+                      cost_usd, latency_ms, ttft_ms, tags, project,
                       attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at
                FROM prompts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2"#,
@@ -102,7 +106,7 @@ impl PromptRepository for PostgresDb {
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, tags, project,
+                      cost_usd, latency_ms, ttft_ms, tags, project,
                       attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at
                FROM prompts ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
@@ -199,77 +203,16 @@ impl PromptRepository for PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary> {
-        let (predicate, binds) = arm_predicate(filter);
-        let n = binds.len();
-        let where_clause = format!(
-            "{} AND created_at >= ${} AND created_at < ${} AND {}",
-            predicate,
-            n + 1,
-            n + 2,
-            LATENCY_SAMPLE
-        );
+        self.ms_summary("latency_ms", LATENCY_SAMPLE, filter, start, end).await
+    }
 
-        // AVG over BIGINT yields NUMERIC in Postgres; cast so sqlx decodes f64.
-        let sql = format!(
-            "SELECT COUNT(*), AVG(latency_ms)::float8 FROM prompts WHERE {}",
-            where_clause
-        );
-        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
-        for b in &binds {
-            q = q.bind(b.clone());
-        }
-        let (samples, mean_ms) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
-        if samples == 0 {
-            return Ok(LatencySummary::default());
-        }
-
-        // Nearest-rank percentiles: one indexed fetch each, offset computed
-        // here and bound rather than done in SQL. The count above and these
-        // reads are separate statements, so a retention purge in between can
-        // leave the offset past the end; fall back to the largest remaining
-        // value, and if nothing is left treat the arm as empty.
-        let sql = format!(
-            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms ASC LIMIT 1 OFFSET ${}",
-            where_clause,
-            n + 3
-        );
-        let last_sql = format!(
-            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms DESC LIMIT 1",
-            where_clause
-        );
-        let percentile = |q_frac: f64| {
-            let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
-            let sql = sql.clone();
-            let last_sql = last_sql.clone();
-            let binds = binds.clone();
-            async move {
-                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
-                for b in &binds {
-                    q = q.bind(b.clone());
-                }
-                let row = q
-                    .bind(start)
-                    .bind(end)
-                    .bind(offset)
-                    .fetch_optional(&self.pool)
-                    .await?;
-                if let Some((v,)) = row {
-                    return anyhow::Ok(Some(v));
-                }
-                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
-                for b in binds {
-                    q = q.bind(b);
-                }
-                let row = q.bind(start).bind(end).fetch_optional(&self.pool).await?;
-                anyhow::Ok(row.map(|(v,)| v))
-            }
-        };
-        let (p50_ms, p95_ms) = tokio::try_join!(percentile(0.5), percentile(0.95))?;
-        let (Some(p50_ms), Some(p95_ms)) = (p50_ms, p95_ms) else {
-            return Ok(LatencySummary::default());
-        };
-
-        Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
+    async fn ttft_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        self.ms_summary("ttft_ms", TTFT_SAMPLE, filter, start, end).await
     }
 
     async fn experiment_run_latency(
@@ -305,6 +248,90 @@ impl PromptRepository for PostgresDb {
         .fetch_one(&self.pool)
         .await?;
         Ok(bytes)
+    }
+}
+
+impl PostgresDb {
+    /// Shared body of `latency_summary` and `ttft_summary`: count, mean and
+    /// nearest-rank percentiles over one millisecond column of `prompts`.
+    /// `column` and `sample_predicate` are compile-time constants from this
+    /// module, never caller input.
+    async fn ms_summary(
+        &self,
+        column: &str,
+        sample_predicate: &str,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        let (predicate, binds) = arm_predicate(filter);
+        let n = binds.len();
+        let where_clause = format!(
+            "{} AND created_at >= ${} AND created_at < ${} AND {}",
+            predicate,
+            n + 1,
+            n + 2,
+            sample_predicate
+        );
+
+        // AVG over BIGINT yields NUMERIC in Postgres; cast so sqlx decodes f64.
+        let sql = format!(
+            "SELECT COUNT(*), AVG({column})::float8 FROM prompts WHERE {where_clause}"
+        );
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let (samples, mean_ms) = q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        if samples == 0 {
+            return Ok(LatencySummary::default());
+        }
+
+        // Nearest-rank percentiles: one indexed fetch each, offset computed
+        // here and bound rather than done in SQL. The count above and these
+        // reads are separate statements, so a retention purge in between can
+        // leave the offset past the end; fall back to the largest remaining
+        // value, and if nothing is left treat the arm as empty.
+        let sql = format!(
+            "SELECT {column} FROM prompts WHERE {where_clause} ORDER BY {column} ASC LIMIT 1 OFFSET ${}",
+            n + 3
+        );
+        let last_sql = format!(
+            "SELECT {column} FROM prompts WHERE {where_clause} ORDER BY {column} DESC LIMIT 1"
+        );
+        let percentile = |q_frac: f64| {
+            let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
+            let sql = sql.clone();
+            let last_sql = last_sql.clone();
+            let binds = binds.clone();
+            async move {
+                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+                for b in &binds {
+                    q = q.bind(b.clone());
+                }
+                let row = q
+                    .bind(start)
+                    .bind(end)
+                    .bind(offset)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if let Some((v,)) = row {
+                    return anyhow::Ok(Some(v));
+                }
+                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
+                for b in binds {
+                    q = q.bind(b);
+                }
+                let row = q.bind(start).bind(end).fetch_optional(&self.pool).await?;
+                anyhow::Ok(row.map(|(v,)| v))
+            }
+        };
+        let (p50_ms, p95_ms) = tokio::try_join!(percentile(0.5), percentile(0.95))?;
+        let (Some(p50_ms), Some(p95_ms)) = (p50_ms, p95_ms) else {
+            return Ok(LatencySummary::default());
+        };
+
+        Ok(LatencySummary { samples, mean_ms, p50_ms: Some(p50_ms), p95_ms: Some(p95_ms) })
     }
 }
 

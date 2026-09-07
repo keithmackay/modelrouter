@@ -360,6 +360,8 @@ abridged. Field names and order are what the endpoint returns; the CLI's
       "failures": 0,                           // failure-log rows stamped with this variant
       "latency": { "samples": 121, "mean_ms": 980.6, "p50_ms": 951, "p95_ms": 1610 },  // null when latency_samples == 0
       "latency_samples": 121,                  // prompt-log rows with a measured latency; can be fewer than requests
+      "ttft": { "samples": 121, "mean_ms": 412.2, "p50_ms": 398, "p95_ms": 701 },      // time to first token, same rules; null when ttft_samples == 0
+      "ttft_samples": 121,                     // rows with a measured TTFT; older rows and cache hits have none
       "per_run":     { "turns": 2.95, "cost_usd": 0.003837, "tokens": 3224.4, "span_secs": 36.8 },   // null when runs == 0
       "per_request": { "cost_usd": 0.0013, "tokens_in": 809.1, "tokens_out": 283.5 },              // null when requests == 0
       "models": [                              // the pinned (backing) models this variant actually called
@@ -380,6 +382,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
       "tokens": { "prompt": 96500, "completion": 30100, "total": 126600 },
       "estimated_rows": 0, "failures": 1,
       "latency": { "samples": 118, "mean_ms": 1420.3, "p50_ms": 1388, "p95_ms": 2210 }, "latency_samples": 118,
+      "ttft": { "samples": 118, "mean_ms": 655.1, "p50_ms": 630, "p95_ms": 1105 }, "ttft_samples": 118,
       "per_run": { "turns": 2.95, "cost_usd": 0.005535, "tokens": 3165.0, "span_secs": 41.2 },
       "per_request": { "cost_usd": 0.001876, "tokens_in": 817.8, "tokens_out": 255.1 },
       "models": [ { "model": "gpt-4o-mini", "requests": 118, … } ],
@@ -392,7 +395,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
     "runs": 81, "mixed_runs": 0, "requests": 239, "unbound_requests": 2, "turns": 239,
     "cost_usd": 0.3787, "saved_usd": 0.0,
     "tokens": { "prompt": 194400, "completion": 64400, "total": 258800 },
-    "estimated_rows": 0, "failures": 1, "latency_samples": 239,
+    "estimated_rows": 0, "failures": 1, "latency_samples": 239, "ttft_samples": 239,
     "outcomes": { "reported": 77, "success": 64, "failure": 13, "success_rate": 0.8312,
                   "mean_score": 0.7552, "score_samples": 77, "mean_rating": null, "rating_samples": 0 }
   },
@@ -586,11 +589,16 @@ Decide up front:
 
 The comparison reports, per arm: requests, total and per-request cost,
 tokens in/out (total and per request), cache hits and hit rate, failures and
-error rate, and mean / p50 / p95 latency. It cannot report:
+error rate, mean / p50 / p95 latency, and mean / p50 / p95 time to first
+token. It cannot report:
 
 - **Quality.** There is no quality column. A cheaper, faster arm is not a
   better arm; the application has to judge answers itself.
-- **Time to first token.** Not recorded by the router today.
+- **TTFT for every row.** TTFT is recorded per request — the elapsed time to
+  the provider's response headers for non-streamed calls, to the first body
+  chunk for streamed ones — but rows written before it shipped, cache hits,
+  and providers whose SDK exposes no header/body split (Bedrock) carry none.
+  When neither arm has a sample, `ttft` is null and `ttft_note` says so.
 - **Anything about streamed responses that you can trust.** Streamed calls
   record estimated or zero tokens and, on the messages API, a placeholder
   latency, and those rows are indistinguishable from measured ones. **Send
@@ -735,6 +743,10 @@ document.
       "p50_ms": 1953,                      // nearest-rank percentiles; null when samples == 0
       "p95_ms": 2525
     },
+    "ttft": {
+      "samples": 182,                      // rows with a measured time to first token
+      "mean_ms": 512.4, "p50_ms": 498, "p95_ms": 890
+    },
     "unpriced": false,                     // true if any model in the arm has no price
     "unpriced_models": [],
     "by_day": [
@@ -759,13 +771,20 @@ document.
     "p95_ms":              { "abs": -1093.0,  "pct": -43.3 }
   },
   "coverage": {
-    "a": { "requests": 182, "latency_samples": 182 },
-    "b": { "requests": 182, "latency_samples": 182 },
+    "a": { "requests": 182, "latency_samples": 182, "ttft_samples": 182 },
+    "b": { "requests": 182, "latency_samples": 182, "ttft_samples": 182 },
     "incomplete_pairs": null               // reserved; always null today
   },
   "experiment": null,                       // set for dimension=variant only; see Part 1 §6
-  "ttft": null,
-  "ttft_note": "Time to first token is not recorded by the router today, so it cannot be compared.",
+  "ttft": {                                 // null, with ttft_note explaining why, when neither arm has a sample
+    "a": { "samples": 182, "mean_ms": 512.4, "p50_ms": 498, "p95_ms": 890 },
+    "b": { "samples": 182, "mean_ms": 301.7, "p50_ms": 290, "p95_ms": 540 },
+    "delta": {                              // b − a, like "delta" above
+      "mean_ms": { "abs": -210.7, "pct": -41.1 },
+      "p50_ms":  { "abs": -208.0, "pct": -41.8 },
+      "p95_ms":  { "abs": -350.0, "pct": -39.3 }
+    }
+  },
   "caveats": [
     "This comparison has no quality column. A difference in cost or latency is not evidence of a difference in answer quality.",
     "Streamed responses record estimated or zero tokens and, on the messages API, a placeholder latency; they are indistinguishable from measured rows here. Send experiment traffic with stream: false."
@@ -800,6 +819,9 @@ Compare by tag: A = arm=a  B = arm=b  (window: weekly)
 │ Mean latency (ms, n=182 / n=182) ┆ 1985.5 ┆ 1051.5 ┆ -934.0      ┆ -47.0% │
 │ p50 latency (ms)                 ┆ 1953   ┆ 1027   ┆ -926.0      ┆ -47.4% │
 │ p95 latency (ms)                 ┆ 2525   ┆ 1432   ┆ -1093.0     ┆ -43.3% │
+│ Mean TTFT (ms, n=182 / n=182)    ┆ 512.4  ┆ 301.7  ┆ -210.7      ┆ -41.1% │
+│ p50 TTFT (ms)                    ┆ 498    ┆ 290    ┆ -208.0      ┆ -41.8% │
+│ p95 TTFT (ms)                    ┆ 890    ┆ 540    ┆ -350.0      ┆ -39.3% │
 │ Cache hit rate                   ┆ 6.0%   ┆ 9.3%   ┆ +3.3%       ┆ +54.5% │
 │ Error rate                       ┆ 0.5%   ┆ 1.1%   ┆ +0.5%       ┆ +98.9% │
 │ Total cost (USD)                 ┆ 1.0061 ┆ 0.0619 ┆ -0.9442     ┆ -93.8% │
@@ -809,7 +831,6 @@ Compare by tag: A = arm=a  B = arm=b  (window: weekly)
 │ Failures                         ┆ 1      ┆ 2      ┆ -           ┆ -      │
 └──────────────────────────────────┴────────┴────────┴─────────────┴────────┘
 Coverage: A 182 latency samples of 182 requests; B 182 of 182.
-Time to first token is not recorded by the router today, so it cannot be compared.
 Note: This comparison has no quality column. …
 Note: Streamed responses record estimated or zero tokens …
 ```

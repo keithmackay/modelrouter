@@ -78,6 +78,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
             body["max_tokens"] = serde_json::json!(max);
         }
 
+        let dispatched = std::time::Instant::now();
         let resp = self
             .client
             .post(&url)
@@ -87,6 +88,8 @@ impl ProviderAdapter for OpenAICompatAdapter {
             .send()
             .await
             .context("Failed to send request to OpenAI-compat provider")?;
+        // Headers are in, body not yet read: time to first token.
+        let ttft_ms = dispatched.elapsed().as_millis() as i64;
 
         let status = resp.status();
         if !status.is_success() {
@@ -109,6 +112,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
+            ttft_ms: Some(ttft_ms),
         })
     }
 

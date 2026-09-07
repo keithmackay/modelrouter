@@ -24,6 +24,11 @@ pub struct CompletionResult {
     pub cache_read_tokens: u32,
     /// Tokens written to the provider's prompt cache on this request (billed at a premium rate).
     pub cache_write_tokens: u32,
+    /// Time to first token: elapsed time of the provider HTTP send (headers
+    /// received, body not yet read). `None` where the client gives no
+    /// header/body split (e.g. AWS SDK) — and meaningless on a result replayed
+    /// from the response cache, so cache-hit metering must not persist it.
+    pub ttft_ms: Option<i64>,
 }
 
 impl CompletionResult {
