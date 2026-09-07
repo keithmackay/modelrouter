@@ -21,7 +21,7 @@ commit; `git log v0.1.0..` has the detail.
 - End-to-end test tier that runs the real binary against a mock provider — startup, auth, routing, ledger, cache, streaming. (`docs/testing/e2e-harness.md`)
 - Intelligent model routing design spec, revision 16 — plugin routers, tiered pools, experiments, `/admin/compare`. Design only.
 - Chat completion responses include the resolved backing model. (#46)
-- `/admin/compare`, `GET /admin/api/compare` and `modelrouter report compare`: compare two arms — tag values, correlation ids, models or providers — on cost, tokens, latency percentiles, cache hits and failures, with per-arm coverage and unpriced-model flags. `docs/experiments.md` shows a client application how to run and read an experiment.
+- `/admin/compare`, `GET /admin/api/compare` and `modelrouter report compare`: compare two arms — tag values, correlation ids, models or providers — on cost, tokens, latency percentiles, cache hits and failures, with per-arm coverage and unpriced-model flags. `docs/experiments.md` shows a client application how to run and read an experiment. Follow-up: the unpriced flag also catches rows recorded before a price existed (tokens with zero spend), CSV output carries the latency-sample and unpriced rows, and arm values are capped at 256 characters.
 
 **Fixes**
 - `serve` honours `[server] host`, `port` and `request_body_limit_mb` from config; flags override for a single run. Operators with a non-default port in config now get it. (#55)
