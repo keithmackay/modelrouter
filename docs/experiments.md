@@ -362,6 +362,9 @@ abridged. Field names and order are what the endpoint returns; the CLI's
       "latency_samples": 121,                  // prompt-log rows with a measured latency; can be fewer than requests
       "ttft": { "samples": 121, "mean_ms": 412.2, "p50_ms": 398, "p95_ms": 701 },      // time to first token, same rules; null when ttft_samples == 0
       "ttft_samples": 121,                     // rows with a measured TTFT; older rows and cache hits have none
+      "attempts_tracked": 121,                 // rows that recorded a provider-attempt count
+      "attempts": 124,                         // provider calls behind those rows; > attempts_tracked means retries happened
+      "retried_requests": 3,                   // requests that took more than one attempt (retry or failover hop)
       "per_run":     { "turns": 2.95, "cost_usd": 0.003837, "tokens": 3224.4, "span_secs": 36.8 },   // null when runs == 0
       "per_request": { "cost_usd": 0.0013, "tokens_in": 809.1, "tokens_out": 283.5 },              // null when requests == 0
       "models": [                              // the pinned (backing) models this variant actually called
@@ -383,6 +386,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
       "estimated_rows": 0, "failures": 1,
       "latency": { "samples": 118, "mean_ms": 1420.3, "p50_ms": 1388, "p95_ms": 2210 }, "latency_samples": 118,
       "ttft": { "samples": 118, "mean_ms": 655.1, "p50_ms": 630, "p95_ms": 1105 }, "ttft_samples": 118,
+      "attempts_tracked": 118, "attempts": 118, "retried_requests": 0,
       "per_run": { "turns": 2.95, "cost_usd": 0.005535, "tokens": 3165.0, "span_secs": 41.2 },
       "per_request": { "cost_usd": 0.001876, "tokens_in": 817.8, "tokens_out": 255.1 },
       "models": [ { "model": "gpt-4o-mini", "requests": 118, … } ],
@@ -396,6 +400,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
     "cost_usd": 0.3787, "saved_usd": 0.0,
     "tokens": { "prompt": 194400, "completion": 64400, "total": 258800 },
     "estimated_rows": 0, "failures": 1, "latency_samples": 239, "ttft_samples": 239,
+    "attempts_tracked": 239, "attempts": 242, "retried_requests": 3,
     "outcomes": { "reported": 77, "success": 64, "failure": 13, "success_rate": 0.8312,
                   "mean_score": 0.7552, "score_samples": 77, "mean_rating": null, "rating_samples": 0 }
   },
@@ -589,8 +594,10 @@ Decide up front:
 
 The comparison reports, per arm: requests, total and per-request cost,
 tokens in/out (total and per request), cache hits and hit rate, failures and
-error rate, mean / p50 / p95 latency, and mean / p50 / p95 time to first
-token. It cannot report:
+error rate, mean / p50 / p95 latency, mean / p50 / p95 time to first token,
+and provider attempts (total, plus how many requests were retried — distinct
+from `failures`, which counts requests that never succeeded at all). It
+cannot report:
 
 - **Quality.** There is no quality column. A cheaper, faster arm is not a
   better arm; the application has to judge answers itself.
@@ -747,6 +754,9 @@ document.
       "samples": 182,                      // rows with a measured time to first token
       "mean_ms": 512.4, "p50_ms": 498, "p95_ms": 890
     },
+    "attempts_tracked": 182,               // rows that recorded a provider-attempt count
+    "attempts": 187,                       // provider calls behind them; 1 per request when nothing retried
+    "retried_requests": 4,                 // requests that took more than one attempt
     "unpriced": false,                     // true if any model in the arm has no price
     "unpriced_models": [],
     "by_day": [
@@ -829,6 +839,8 @@ Compare by tag: A = arm=a  B = arm=b  (window: weekly)
 │ Total tokens out                 ┆ 59436  ┆ 66264  ┆ +6828       ┆ +11.5% │
 │ Cache hits                       ┆ 11     ┆ 17     ┆ -           ┆ -      │
 │ Failures                         ┆ 1      ┆ 2      ┆ -           ┆ -      │
+│ Attempts                         ┆ 187 / 182 requests ┆ 184 / 182 requests ┆ - ┆ - │
+│ Retried requests                 ┆ 4      ┆ 2      ┆ -           ┆ -      │
 └──────────────────────────────────┴────────┴────────┴─────────────┴────────┘
 Coverage: A 182 latency samples of 182 requests; B 182 of 182.
 Note: This comparison has no quality column. …
@@ -874,6 +886,12 @@ table. Two things to look for before believing a number:
   completed ones; `/admin/failures` breaks the count down by stage. A small
   absolute count with a large percentage change — `+98.9 %` on 1 vs 2
   failures above — is noise; look at the count.
+- **Attempts and retried requests** separate flakiness from failure. A
+  request that succeeded on its second try is one request, two attempts, and
+  no failure — an arm with `attempts` well above `attempts_tracked` is
+  leaning on the retry budget even though its error rate looks clean. Rows
+  written before attempt tracking shipped carry no count; they are outside
+  these figures, not zeros.
 - **Cache hit rate** differing between arms usually means the arms are not
   seeing equivalent prompts, not that one model caches better. Cache keys do
   not include the label.

@@ -505,6 +505,8 @@ mod accounting {
         assert!(close_to(prompts[0].cost_usd, 0.015));
         // The adapter's TTFT measurement lands on the row.
         assert_eq!(prompts[0].ttft_ms, Some(42));
+        // Primary failed once, the fallback answered: two provider calls.
+        assert_eq!(prompts[0].attempts, Some(2));
     }
 
     #[tokio::test]
@@ -524,6 +526,10 @@ mod accounting {
         assert_eq!(ledger[0].provider, "primary");
         assert!(close_to(ledger[0].cost_usd, 0.15), "cost was {}", ledger[0].cost_usd);
         assert!(!ledger[0].tokens_estimated);
+
+        // First-try success is exactly one attempt.
+        let prompts = PromptRepository::list(&*db, 10, 0).await.unwrap();
+        assert_eq!(prompts[0].attempts, Some(1));
     }
 
     #[tokio::test]
@@ -559,8 +565,10 @@ mod accounting {
         assert_eq!(prompts[0].completion_tokens, 6);
         assert_eq!(prompts[0].finish_reason.as_deref(), Some("length"));
         assert_eq!(prompts[0].response.as_deref(), Some("Hello"));
-        // Streamed responses record time-to-first-chunk as TTFT.
+        // Streamed responses record time-to-first-chunk as TTFT and a single
+        // dispatch as one attempt (the streaming path has no retry loop).
         assert!(prompts[0].ttft_ms.is_some(), "streamed row should carry a TTFT");
+        assert_eq!(prompts[0].attempts, Some(1));
     }
 
     #[tokio::test]

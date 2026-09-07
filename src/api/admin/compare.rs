@@ -281,6 +281,15 @@ pub struct ArmMetrics {
     /// Time to first token over the same prompt rows; `samples` is 0 where
     /// nothing was measured (see [`TTFT_NOTE`]).
     pub ttft: LatencySummary,
+    /// Prompt rows that recorded a provider-attempt count; rows from before
+    /// the column shipped carry none.
+    pub attempts_tracked: i64,
+    /// Total provider calls across those rows; 1 per request when nothing
+    /// was retried. Distinct from `failures`, which counts requests that
+    /// never succeeded at all.
+    pub attempts: i64,
+    /// Requests that took more than one attempt (a retry or failover hop).
+    pub retried_requests: i64,
     /// True when any model in the arm has no pricing entry, so `cost_usd` is
     /// incomplete.
     pub unpriced: bool,
@@ -550,20 +559,21 @@ async fn arm_metrics(
     start: &str,
     end: &str,
 ) -> anyhow::Result<ArmMetrics> {
-    let (totals, by_model, by_day, latency, ttft, failures) = tokio::try_join!(
+    let (totals, by_model, by_day, latency, ttft, attempt_totals, failures) = tokio::try_join!(
         CostRepository::arm_totals(&*sources.db, filter, start, end),
         CostRepository::arm_by_model(&*sources.db, filter, start, end),
         CostRepository::arm_by_day(&*sources.db, filter, start, end),
         PromptRepository::latency_summary(&*sources.prompt_db, filter, start, end),
         PromptRepository::ttft_summary(&*sources.prompt_db, filter, start, end),
+        PromptRepository::attempts_summary(&*sources.prompt_db, filter, start, end),
         FailureRepository::count_for_arm(&*sources.db, filter, start, end),
     )?;
 
     let per_request = |v: f64| {
         if totals.requests == 0 { None } else { Some(v / totals.requests as f64) }
     };
-    let attempts = totals.requests + failures;
-    let error_rate = if attempts == 0 { 0.0 } else { failures as f64 / attempts as f64 };
+    let outcomes = totals.requests + failures;
+    let error_rate = if outcomes == 0 { 0.0 } else { failures as f64 / outcomes as f64 };
     let unpriced_models: Vec<String> = by_model
         .iter()
         .filter(|row| !sources.cost_calc.has_price(&row.key))
@@ -587,6 +597,9 @@ async fn arm_metrics(
         error_rate,
         latency,
         ttft,
+        attempts_tracked: attempt_totals.requests_tracked,
+        attempts: attempt_totals.attempts,
+        retried_requests: attempt_totals.retried_requests,
         unpriced: !unpriced_models.is_empty(),
         unpriced_models,
         by_day,
@@ -891,7 +904,38 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
             b: b.failures.to_string(),
             delta: "—".into(),
         },
+        // Attempts count provider calls behind *successful* requests; a dash
+        // means no row in the arm recorded a count (older rows).
+        MetricRow {
+            label: "Attempts".into(),
+            a: fmt_attempts(a),
+            b: fmt_attempts(b),
+            delta: "—".into(),
+        },
+        MetricRow {
+            label: "Retried requests".into(),
+            a: fmt_retried(a),
+            b: fmt_retried(b),
+            delta: "—".into(),
+        },
     ]
+}
+
+/// Total attempts over the rows that tracked them, or a dash when none did.
+fn fmt_attempts(m: &ArmMetrics) -> String {
+    if m.attempts_tracked == 0 {
+        "—".to_string()
+    } else {
+        format!("{} / {} requests", m.attempts, m.attempts_tracked)
+    }
+}
+
+fn fmt_retried(m: &ArmMetrics) -> String {
+    if m.attempts_tracked == 0 {
+        "—".to_string()
+    } else {
+        m.retried_requests.to_string()
+    }
 }
 
 /// Chart payloads. The chart legend shows the raw arm value, which is what

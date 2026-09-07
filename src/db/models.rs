@@ -164,6 +164,12 @@ pub struct Prompt {
     #[sqlx(default)]
     #[serde(default)]
     pub ttft_ms: Option<i64>,
+    /// Provider calls this request took before the recorded response; 1 is
+    /// first-try success. `None` where it was not tracked (older rows, cache
+    /// hits, endpoints without a retry loop).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub attempts: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     /// Caller-supplied correlation id for this request. See `api::attribution`.
@@ -296,6 +302,8 @@ pub struct NewPrompt {
     pub latency_ms: Option<i64>,
     /// See [`Prompt::ttft_ms`].
     pub ttft_ms: Option<i64>,
+    /// See [`Prompt::attempts`].
+    pub attempts: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     pub attribution_correlation_id: Option<String>,

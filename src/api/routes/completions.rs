@@ -493,6 +493,10 @@ async fn chat_completions_inner(
             next_available_fallback(&state, model)
         }
     };
+    // Provider calls made for this request: first try, backoff retries and
+    // failover hops that reached a provider all count; a circuit-breaker skip
+    // does not (no provider was called). 1 = first-try success.
+    let mut attempts: i64 = 0;
     let result = loop {
         if state.circuit_breaker.is_open(&current_provider) {
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
@@ -511,6 +515,7 @@ async fn chat_completions_inner(
             .map_err(ApiError::ProviderError)?;
         let mut retry_attempt = 0u32;
         let call_result = loop {
+            attempts += 1;
             match adapter
                 .complete(&build_normalized_request(
                     &body,
@@ -645,6 +650,7 @@ async fn chat_completions_inner(
     let cache_read_tokens = result.cache_read_tokens;
     let cache_write_tokens = result.cache_write_tokens;
     let ttft_ms = result.ttft_ms;
+    let attempts = attempts.max(1);
 
     let skip_log_clone = skip_log;
     let attr_correlation = attribution.correlation_id.clone();
@@ -667,6 +673,7 @@ async fn chat_completions_inner(
                 cost_usd: cost,
                 latency_ms: Some(latency_ms),
                 ttft_ms,
+                attempts: Some(attempts),
                 tags: "[]".to_string(),
                 project: user_project.clone(),
                 attribution_correlation_id: attr_correlation.clone(),
@@ -883,8 +890,10 @@ fn record_cache_hit(
                 cost_usd: 0.0,
                 latency_ms: Some(0),
                 // The cached result carries the *original* call's TTFT, which
-                // says nothing about this request. Never persisted on a hit.
+                // says nothing about this request. Never persisted on a hit;
+                // likewise no attempts — no provider was called.
                 ttft_ms: None,
+                attempts: None,
                 tags: "[]".to_string(),
                 project: ctx.user_project.clone(),
                 attribution_correlation_id: ctx.attribution.correlation_id.clone(),
@@ -1204,6 +1213,8 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
             cost_usd: s.cost,
             latency_ms: Some(s.latency_ms),
             ttft_ms: s.ttft_ms,
+            // The streaming path has no retry or fallback loop: one dispatch.
+            attempts: Some(1),
             tags: "[]".to_string(),
             project: ctx.user_project.clone(),
             attribution_correlation_id: attr_correlation,

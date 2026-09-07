@@ -266,6 +266,7 @@ async fn embeddings_inner(
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             ttft_ms: None,
+            attempts: None,
             tags: "[]".to_string(),
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),

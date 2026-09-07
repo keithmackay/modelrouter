@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::prompts::{ExperimentRunLatency, LatencySummary, PromptRepository};
+use crate::db::repositories::prompts::{
+    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository,
+};
 use super::costs::{attribution_predicate, variant_predicate};
 use super::{SqliteDb, now_utc};
 
@@ -22,7 +24,7 @@ const PURGE_ID_CHUNK: usize = 500;
 const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
                               messages, response, finish_reason, prompt_tokens, completion_tokens, \
                               cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, \
-                              tags, project, attribution_correlation_id, attribution_tags, \
+                              attempts, tags, project, attribution_correlation_id, attribution_tags, \
                               experiment_id, experiment_variant, created_at";
 
 #[async_trait]
@@ -34,10 +36,10 @@ impl PromptRepository for SqliteDb {
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
-                cost_usd, latency_ms, ttft_ms, tags, project,
+                cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                 attribution_correlation_id, attribution_tags,
                 experiment_id, experiment_variant, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -54,6 +56,7 @@ impl PromptRepository for SqliteDb {
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
         .bind(prompt.ttft_ms)
+        .bind(prompt.attempts)
         .bind(&prompt.tags)
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
@@ -203,6 +206,29 @@ impl PromptRepository for SqliteDb {
         end: &str,
     ) -> anyhow::Result<LatencySummary> {
         self.ms_summary("ttft_ms", TTFT_SAMPLE, filter, start, end).await
+    }
+
+    async fn attempts_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttemptsSummary> {
+        let (predicate, binds) = arm_predicate(filter);
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(attempts), 0), \
+                    COALESCE(SUM(CASE WHEN attempts > 1 THEN 1 ELSE 0 END), 0) \
+             FROM prompts \
+             WHERE {predicate} AND created_at >= ? AND created_at < ? \
+               AND attempts IS NOT NULL"
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let (requests_tracked, attempts, retried_requests) =
+            q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(AttemptsSummary { requests_tracked, attempts, retried_requests })
     }
 
     async fn experiment_run_latency(
@@ -366,6 +392,7 @@ mod tests {
                 cost_usd: 0.01,
                 latency_ms: None,
                 ttft_ms: None,
+                attempts: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
@@ -407,6 +434,7 @@ mod tests {
                 cost_usd: 0.01,
                 latency_ms: None,
                 ttft_ms: None,
+                attempts: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
@@ -583,6 +611,7 @@ mod tests {
                 cost_usd: 0.01,
                 latency_ms: Some(900),
                 ttft_ms: Some(120),
+                attempts: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
@@ -596,6 +625,49 @@ mod tests {
         assert_eq!(saved.ttft_ms, Some(120));
         let fetched = PromptRepository::find_by_id(&db, saved.id).await.unwrap().unwrap();
         assert_eq!(fetched.ttft_ms, Some(120));
+    }
+
+    /// Minimal prompt row carrying only an attempt count.
+    async fn insert_attempts_row(db: &SqliteDb, routed_model: &str, attempts: Option<i64>, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, \
+             prompt_tokens, completion_tokens, cost_usd, attempts, tags, \
+             attribution_tags, created_at) \
+             VALUES (1, 'req', ?, 'p', '[]', 0, 0, 0.0, ?, '[]', '{}', ?)",
+        )
+        .bind(routed_model)
+        .bind(attempts)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempts_summary_totals_and_retried_counts() {
+        let db = make_db().await;
+        for (i, n) in [1, 1, 3, 2, 1].iter().enumerate() {
+            let ts = format!("2026-03-{:02}T00:00:00Z", i + 2);
+            insert_attempts_row(&db, "X", Some(*n), &ts).await;
+        }
+        // Untracked rows and other models stay outside every figure.
+        insert_attempts_row(&db, "X", None, "2026-03-10T00:00:00Z").await;
+        insert_attempts_row(&db, "Y", Some(9), "2026-03-10T00:00:00Z").await;
+        // Outside the window.
+        insert_attempts_row(&db, "X", Some(5), "2026-04-02T00:00:00Z").await;
+
+        let s = db.attempts_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s.requests_tracked, 5);
+        assert_eq!(s.attempts, 8);
+        assert_eq!(s.retried_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn attempts_summary_with_nothing_tracked_is_zero() {
+        let db = make_db().await;
+        insert_attempts_row(&db, "X", None, "2026-03-02T00:00:00Z").await;
+        let s = db.attempts_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s, crate::db::repositories::prompts::AttemptsSummary::default());
     }
 
     #[tokio::test]

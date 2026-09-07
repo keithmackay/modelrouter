@@ -738,6 +738,13 @@ async fn retries_hide_a_flaky_upstream_and_the_arm_still_reconciles() {
     assert_eq!(candidate["turns"], planned, "every turn ultimately succeeded");
     assert_eq!(candidate["failures"], 0, "a recovered turn is not a failure");
 
+    // The retries the mock saw are exactly what the arm's attempt figures
+    // report: every request tracked, total attempts = planned + refusals,
+    // and each refusal made exactly one request a retried one.
+    assert_eq!(candidate["attempts_tracked"], planned, "{candidate}");
+    assert_eq!(candidate["attempts"], attempts, "{candidate}");
+    assert_eq!(candidate["retried_requests"], refused, "{candidate}");
+
     // Only the successful attempts were billed, and the arm's cost is exactly
     // the sum of what the mock served.
     let served = Served::of(&h.mock, CANDIDATE_MODEL);

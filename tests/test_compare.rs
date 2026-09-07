@@ -244,7 +244,7 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
 }
 
 async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: Option<i64>) {
-    seed_prompt_with_ttft(db, s, latency_ms, None).await
+    seed_prompt_measured(db, s, latency_ms, None, None).await
 }
 
 async fn seed_prompt_with_ttft(
@@ -252,6 +252,16 @@ async fn seed_prompt_with_ttft(
     s: &Seed<'_>,
     latency_ms: Option<i64>,
     ttft_ms: Option<i64>,
+) {
+    seed_prompt_measured(db, s, latency_ms, ttft_ms, None).await
+}
+
+async fn seed_prompt_measured(
+    db: &Arc<dyn DatabaseProvider>,
+    s: &Seed<'_>,
+    latency_ms: Option<i64>,
+    ttft_ms: Option<i64>,
+    attempts: Option<i64>,
 ) {
     PromptRepository::create(
         &**db,
@@ -271,6 +281,7 @@ async fn seed_prompt_with_ttft(
             cost_usd: 0.0,
             latency_ms,
             ttft_ms,
+            attempts,
             tags: "[]".to_string(),
             project: None,
             attribution_correlation_id: Some(s.run.to_string()),
@@ -438,6 +449,7 @@ async fn provider_dimension_matches_the_expected_document() {
             "failures": 1, "error_rate": 0.2,
             "latency": { "samples": 4, "mean_ms": 250.0, "p50_ms": 200, "p95_ms": 400 },
             "ttft": { "samples": 0, "mean_ms": null, "p50_ms": null, "p95_ms": null },
+            "attempts_tracked": 0, "attempts": 0, "retried_requests": 0,
             "unpriced": true, "unpriced_models": ["m1"],
             "by_day": [{ "key": day, "cost_usd": 2.0, "saved_usd": 0.0, "tokens_in": 40,
                          "tokens_out": 80, "requests": 4, "cache_hits": 0 }]
@@ -452,6 +464,7 @@ async fn provider_dimension_matches_the_expected_document() {
             "failures": 0, "error_rate": 0.0,
             "latency": { "samples": 1, "mean_ms": 400.0, "p50_ms": 400, "p95_ms": 400 },
             "ttft": { "samples": 0, "mean_ms": null, "p50_ms": null, "p95_ms": null },
+            "attempts_tracked": 0, "attempts": 0, "retried_requests": 0,
             "unpriced": true, "unpriced_models": ["m2"],
             "by_day": [{ "key": day, "cost_usd": 0.25, "saved_usd": 0.0, "tokens_in": 40,
                          "tokens_out": 80, "requests": 1, "cache_hits": 0 }]
@@ -553,6 +566,30 @@ async fn ttft_is_populated_from_recorded_samples_and_replaces_the_note() {
     assert!(body.get("ttft_note").is_none(), "{}", body);
     // Latency is unaffected by the TTFT columns.
     assert_eq!(body["a"]["latency"]["samples"], 7);
+}
+
+#[tokio::test]
+async fn attempts_and_retried_requests_aggregate_per_arm() {
+    let (server, db, settings) = build_app().await;
+    let a = Seed { model: "m", provider: "p", run: "r-a", tags: r#"{"arm":"a"}"#, variant: None };
+    let b = Seed { model: "m", provider: "p", run: "r-b", tags: r#"{"arm":"b"}"#, variant: None };
+    // Arm A: 1 + 3 + 1 attempts over three requests, one of them retried.
+    for attempts in [1, 3, 1] {
+        seed_prompt_measured(&db, &a, Some(100), None, Some(attempts)).await;
+    }
+    // An old row with no count is outside every figure, not a zero.
+    seed_prompt_measured(&db, &a, Some(100), None, None).await;
+    // Arm B never recorded a count at all.
+    seed_prompt_measured(&db, &b, Some(100), None, None).await;
+
+    let (status, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["a"]["attempts_tracked"], 3);
+    assert_eq!(body["a"]["attempts"], 5);
+    assert_eq!(body["a"]["retried_requests"], 1);
+    assert_eq!(body["b"]["attempts_tracked"], 0);
+    assert_eq!(body["b"]["attempts"], 0);
+    assert_eq!(body["b"]["retried_requests"], 0);
 }
 
 #[tokio::test]

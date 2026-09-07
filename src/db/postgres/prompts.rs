@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::prompts::{ExperimentRunLatency, LatencySummary, PromptRepository};
+use crate::db::repositories::prompts::{
+    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository,
+};
 use super::costs::{attribution_predicate, variant_predicate};
 use super::{PostgresDb, now_utc};
 
@@ -29,15 +31,15 @@ impl PromptRepository for PostgresDb {
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
-                cost_usd, latency_ms, ttft_ms, tags, project,
+                cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                 attribution_correlation_id, attribution_tags,
                 experiment_id, experiment_variant, created_at
                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20, $21, $22)
+                         $17, $18, $19, $20, $21, $22, $23)
                RETURNING id, user_id, session_id, request_model, routed_model, provider,
                          messages, response, finish_reason, prompt_tokens, completion_tokens,
                          cache_read_tokens, cache_write_tokens,
-                         cost_usd, latency_ms, ttft_ms, tags, project,
+                         cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                          attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at"#,
         )
@@ -56,6 +58,7 @@ impl PromptRepository for PostgresDb {
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
         .bind(prompt.ttft_ms)
+        .bind(prompt.attempts)
         .bind(&prompt.tags)
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
@@ -73,7 +76,7 @@ impl PromptRepository for PostgresDb {
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, ttft_ms, tags, project,
+                      cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                       attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at
                FROM prompts WHERE id = $1"#,
@@ -89,7 +92,7 @@ impl PromptRepository for PostgresDb {
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, ttft_ms, tags, project,
+                      cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                       attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at
                FROM prompts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2"#,
@@ -106,7 +109,7 @@ impl PromptRepository for PostgresDb {
             r#"SELECT id, user_id, session_id, request_model, routed_model, provider,
                       messages, response, finish_reason, prompt_tokens, completion_tokens,
                       cache_read_tokens, cache_write_tokens,
-                      cost_usd, latency_ms, ttft_ms, tags, project,
+                      cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                       attribution_correlation_id, attribution_tags,
                       experiment_id, experiment_variant, created_at
                FROM prompts ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
@@ -213,6 +216,33 @@ impl PromptRepository for PostgresDb {
         end: &str,
     ) -> anyhow::Result<LatencySummary> {
         self.ms_summary("ttft_ms", TTFT_SAMPLE, filter, start, end).await
+    }
+
+    async fn attempts_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttemptsSummary> {
+        let (predicate, binds) = arm_predicate(filter);
+        let n = binds.len();
+        // SUM over BIGINT yields NUMERIC in Postgres; cast so sqlx decodes i64.
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(attempts), 0)::BIGINT, \
+                    COALESCE(SUM(CASE WHEN attempts > 1 THEN 1 ELSE 0 END), 0)::BIGINT \
+             FROM prompts \
+             WHERE {predicate} AND created_at >= ${} AND created_at < ${} \
+               AND attempts IS NOT NULL",
+            n + 1,
+            n + 2
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let (requests_tracked, attempts, retried_requests) =
+            q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(AttemptsSummary { requests_tracked, attempts, retried_requests })
     }
 
     async fn experiment_run_latency(

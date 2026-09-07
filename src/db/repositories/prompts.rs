@@ -29,6 +29,22 @@ impl LatencySummary {
     }
 }
 
+/// Provider attempts over one comparison arm's prompt rows in a window.
+///
+/// Only rows that recorded a count (`attempts IS NOT NULL`) participate:
+/// rows written before the column shipped, and cache hits (no provider call
+/// at all), are outside all three figures rather than diluting them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct AttemptsSummary {
+    /// Rows with a recorded attempt count.
+    pub requests_tracked: i64,
+    /// Total provider calls across those rows; equals `requests_tracked`
+    /// when nothing was retried.
+    pub attempts: i64,
+    /// Rows that took more than one attempt (a retry or a failover hop).
+    pub retried_requests: i64,
+}
+
 /// Latency of one experiment run, from the prompt rows stamped with the
 /// experiment that share its `(user_id, correlation_id)` key. Follows the
 /// [`LatencySummary`] sampling rule: only positive `latency_ms` counts.
@@ -84,6 +100,14 @@ pub trait PromptRepository: Send + Sync {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary>;
+    /// Provider attempts over the arm's prompt rows: totals and how many
+    /// requests needed more than one try. See [`AttemptsSummary`].
+    async fn attempts_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttemptsSummary>;
     /// Latency samples and mean per run of an experiment, unpaginated; runs
     /// with no prompt rows are absent.
     async fn experiment_run_latency(

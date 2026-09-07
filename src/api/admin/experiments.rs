@@ -799,6 +799,14 @@ pub struct VariantResults {
     /// and streamed ones (first chunk); `null` when no row carries one.
     pub ttft: Option<LatencySummary>,
     pub ttft_samples: i64,
+    /// Prompt rows that recorded a provider-attempt count (rows from before
+    /// the column shipped carry none and are outside all three figures).
+    pub attempts_tracked: i64,
+    /// Total provider calls across those rows; 1 per request when nothing
+    /// was retried, so `attempts > attempts_tracked` means retries happened.
+    pub attempts: i64,
+    /// Requests that took more than one attempt (a retry or failover hop).
+    pub retried_requests: i64,
     pub per_run: Option<PerRunFigures>,
     pub per_request: Option<PerRequestFigures>,
     pub models: Vec<VariantModelMetrics>,
@@ -829,6 +837,9 @@ impl VariantResults {
             latency_samples: 0,
             ttft: None,
             ttft_samples: 0,
+            attempts_tracked: 0,
+            attempts: 0,
+            retried_requests: 0,
             per_run: None,
             per_request: None,
             models: Vec::new(),
@@ -878,6 +889,9 @@ pub struct ExperimentTotals {
     pub failures: i64,
     pub latency_samples: i64,
     pub ttft_samples: i64,
+    pub attempts_tracked: i64,
+    pub attempts: i64,
+    pub retried_requests: i64,
     pub outcomes: OutcomeStats,
 }
 
@@ -1183,14 +1197,23 @@ pub async fn build_results(
                 ALL_TIME_START,
                 ALL_TIME_END
             ),
+            PromptRepository::attempts_summary(
+                &*sources.prompt_db,
+                filter,
+                ALL_TIME_START,
+                ALL_TIME_END
+            ),
         )
     }))
     .await?;
-    for (v, (latency, ttft)) in variants.values_mut().zip(summaries) {
+    for (v, (latency, ttft, attempts)) in variants.values_mut().zip(summaries) {
         v.latency_samples = latency.samples;
         v.latency = (latency.samples > 0).then_some(latency);
         v.ttft_samples = ttft.samples;
         v.ttft = (ttft.samples > 0).then_some(ttft);
+        v.attempts_tracked = attempts.requests_tracked;
+        v.attempts = attempts.attempts;
+        v.retried_requests = attempts.retried_requests;
         v.finish();
     }
 
@@ -1209,6 +1232,9 @@ pub async fn build_results(
         totals.failures += v.failures;
         totals.latency_samples += v.latency_samples;
         totals.ttft_samples += v.ttft_samples;
+        totals.attempts_tracked += v.attempts_tracked;
+        totals.attempts += v.attempts;
+        totals.retried_requests += v.retried_requests;
     }
     for o in outcomes_by_key.values() {
         totals.outcomes.add(o);
@@ -1736,6 +1762,17 @@ fn variant_card(exp: &Experiment, v: &VariantResults) -> VariantCardView {
         MetricLine {
             label: "TTFT",
             value: latency_line(v.ttft.as_ref(), v.ttft_samples),
+        },
+        MetricLine {
+            label: "Attempts",
+            value: if v.attempts_tracked == 0 {
+                "not tracked".to_string()
+            } else {
+                format!(
+                    "{} over {} requests · {} retried",
+                    v.attempts, v.attempts_tracked, v.retried_requests
+                )
+            },
         },
         MetricLine {
             label: "Per run",

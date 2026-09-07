@@ -1961,6 +1961,24 @@ fn write_comparison(
         row("Total tokens out", int(a.tokens_out), int(b.tokens_out), delta(d.tokens_out, &|v| format!("{:.0}", v))),
         row("Cache hits", int(a.cache_hits), int(b.cache_hits), (dash.clone(), dash.clone())),
         row("Failures", int(a.failures), int(b.failures), (dash.clone(), dash.clone())),
+        {
+            // Attempts count provider calls behind successful requests; a
+            // dash means no row in the arm recorded a count (older rows).
+            let attempts = |m: &crate::api::admin::compare::ArmMetrics| {
+                if m.attempts_tracked == 0 {
+                    dash.clone()
+                } else {
+                    format!("{} / {} requests", m.attempts, m.attempts_tracked)
+                }
+            };
+            row("Attempts", attempts(a), attempts(b), (dash.clone(), dash.clone()))
+        },
+        {
+            let retried = |m: &crate::api::admin::compare::ArmMetrics| {
+                if m.attempts_tracked == 0 { dash.clone() } else { m.retried_requests.to_string() }
+            };
+            row("Retried requests", retried(a), retried(b), (dash.clone(), dash.clone()))
+        },
     ];
     if table {
         writeln!(out, "Compare by {}: A = {}  B = {}  (window: {})", c.dimension, a.label, b.label, c.window)?;
@@ -2220,6 +2238,7 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
                 ttft_ms: None,
+                attempts: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
                 experiment_id: None,
                 experiment_variant: None,
@@ -2303,6 +2322,7 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(100), tags: "[]".into(), project: None,
                 ttft_ms: None,
+                attempts: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
                 experiment_id: None,
                 experiment_variant: None,
@@ -2363,6 +2383,7 @@ mod tests {
                 prompt_tokens: 0, completion_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
                 cost_usd: 0.0, latency_ms: Some(latency), tags: "[]".into(), project: None,
                 ttft_ms: None,
+                attempts: None,
                 attribution_correlation_id: None, attribution_tags: "{}".into(),
                 experiment_id: Some(exp.id),
                 experiment_variant: Some(variant.into()),
