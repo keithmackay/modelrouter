@@ -69,6 +69,7 @@ mod tests {
     fn request_keeps_full_publisher_model_id() {
         let req = NormalizedRequest {
             model: "vertex/mistralai/mistral-medium-3".into(),
+            request_model: "balanced".into(),
             messages: vec![serde_json::json!({"role": "user", "content": "x"})],
             stream: false,
             temperature: Some(0.2),

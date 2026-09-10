@@ -120,6 +120,16 @@ impl BedrockAdapter {
             // Region lives in aws_sdk_bedrockruntime::config::Region (re-exported from aws-types)
             loader = loader.region(Region::new(region.clone()));
         }
+        // Previously unset entirely, so every call ran under the AWS SDK's
+        // own defaults — which the SDK does not name as a stable contract,
+        // and which can differ silently across SDK versions. `config.timeout_secs`
+        // (already read by every other provider adapter) now applies here too,
+        // as an explicit ceiling on both connect and the overall operation.
+        let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+            .connect_timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .operation_timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build();
+        loader = loader.timeout_config(timeout_config);
         let aws_config = loader.load().await;
         let client = aws_sdk_bedrockruntime::Client::new(&aws_config);
         Self { client }

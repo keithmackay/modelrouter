@@ -128,6 +128,7 @@ async fn responses_inner(
 
     let norm_req = NormalizedRequest {
         model: canonical_model.clone(),
+        request_model: model.clone(),
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: false,
         temperature,

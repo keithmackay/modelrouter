@@ -82,6 +82,7 @@ mod gemini_tests {
     fn req(messages: serde_json::Value) -> NormalizedRequest {
         NormalizedRequest {
             model: "gemini-2.5-pro".into(),
+            request_model: "balanced".into(),
             messages: messages.as_array().unwrap().clone(),
             stream: false,
             temperature: Some(0.7),
@@ -193,6 +194,7 @@ mod claude_tests {
     fn req(messages: serde_json::Value) -> NormalizedRequest {
         NormalizedRequest {
             model: "claude-sonnet-4-6@20250514".into(),
+            request_model: "balanced".into(),
             messages: messages.as_array().unwrap().clone(),
             stream: false,
             temperature: Some(0.5),
