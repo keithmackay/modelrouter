@@ -2,7 +2,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures::TryStreamExt;
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
 
 pub struct AnthropicAdapter {
@@ -11,10 +11,14 @@ pub struct AnthropicAdapter {
     /// dedicated constant. Overridable via config.api_base (used by tests).
     api_base: String,
     client: reqwest::Client,
+    /// This provider's configured flat timeout — the fallback `tier_timeouts`
+    /// uses when a request's `request_model` doesn't name a known tier.
+    default_timeout_secs: u64,
+    tier_timeouts: TierTimeoutsConfig,
 }
 
 impl AnthropicAdapter {
-    pub fn new(config: &ProviderConfig) -> Self {
+    pub fn new(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
@@ -26,6 +30,8 @@ impl AnthropicAdapter {
                 .clone()
                 .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
             client,
+            default_timeout_secs: config.timeout_secs,
+            tier_timeouts,
         }
     }
 }
@@ -162,6 +168,7 @@ impl ProviderAdapter for AnthropicAdapter {
             body["max_tokens"] = serde_json::json!(4096);
         }
 
+        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
         let resp = self
             .client
@@ -169,6 +176,7 @@ impl ProviderAdapter for AnthropicAdapter {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
             .await
@@ -227,12 +235,14 @@ impl ProviderAdapter for AnthropicAdapter {
             body["max_tokens"] = serde_json::json!(4096);
         }
 
+        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
             .client
             .post(ANTHROPIC_API_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
             .await
@@ -498,7 +508,10 @@ mod catalog_tests {
         let mut config = crate::config::schema::ProviderConfig::default();
         config.api_base = Some(format!("http://{addr}"));
         config.api_key = "k".into();
-        let models = AnthropicAdapter::new(&config).list_models().await.unwrap();
+        let models = AnthropicAdapter::new(&config, crate::config::schema::TierTimeoutsConfig::default())
+            .list_models()
+            .await
+            .unwrap();
         assert_eq!(models[0].provider, "anthropic");
         assert_eq!(models[0].name, "claude-sonnet-4-5");
         assert_eq!(models[0].display_name.as_deref(), Some("Claude Sonnet 4.5"));

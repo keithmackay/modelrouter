@@ -10,7 +10,7 @@ fn azure_adapter_builds_correct_url() {
         timeout_secs: 60,
         ..Default::default()
     };
-    let adapter = AzureOpenAIAdapter::new(&config);
+    let adapter = AzureOpenAIAdapter::new(&config, modelrouter::config::schema::TierTimeoutsConfig::default());
     assert_eq!(
         adapter.chat_url(),
         "https://my-resource.openai.azure.com/openai/deployments/my-gpt4/chat/completions?api-version=2024-02-01"
@@ -26,7 +26,7 @@ fn azure_adapter_defaults_api_version() {
         timeout_secs: 60,
         ..Default::default()
     };
-    let adapter = AzureOpenAIAdapter::new(&config);
+    let adapter = AzureOpenAIAdapter::new(&config, modelrouter::config::schema::TierTimeoutsConfig::default());
     assert!(adapter.chat_url().contains("api-version=2024-02-01"));
 }
 
@@ -39,7 +39,7 @@ fn azure_adapter_with_both_fields_set() {
         timeout_secs: 30,
         ..Default::default()
     };
-    let adapter = AzureOpenAIAdapter::new(&config);
+    let adapter = AzureOpenAIAdapter::new(&config, modelrouter::config::schema::TierTimeoutsConfig::default());
     let url = adapter.chat_url();
     assert!(url.starts_with("https://res.openai.azure.com"));
     assert!(url.ends_with("api-version=2025-01-01"));

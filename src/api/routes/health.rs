@@ -168,6 +168,7 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
 
     let req = NormalizedRequest {
         model: model.clone(),
+        request_model: requested.clone(),
         messages: vec![json!({"role": "user", "content": "health probe"})],
         stream: false,
         temperature: None,
