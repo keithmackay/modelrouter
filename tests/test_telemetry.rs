@@ -242,18 +242,13 @@ async fn completions_span_has_required_attributes() {
     let db = common::in_memory_db().await;
     use modelrouter::{
         api::app::{AppState, build_router},
-        db::models::NewUser,
         providers::registry::ProviderRegistry,
         router::{cost::CostCalculator, engine::RequestRouter, policy::PolicyEngine},
     };
-    use modelrouter::db::repositories::users::UserRepository;
     use std::collections::HashMap;
 
     let api_key = "test-span-key";
-    db.create(NewUser {
-        name: "span-test-user".to_string(),
-        email: None,
-    }).await.unwrap();
+    common::create_user(&db, "span-test-user", api_key).await;
 
     let mut mock_providers = HashMap::new();
     mock_providers.insert("mock".to_string(), modelrouter::config::schema::ProviderConfig {
