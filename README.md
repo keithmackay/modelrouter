@@ -1165,8 +1165,13 @@ curl http://localhost:8080/health
 
 Proxies web search calls the same way `/v1/chat/completions` proxies LLM calls:
 API-key auth, per-request logging, usage metering, pricing, and inclusion in
-cost reports and OTel/Prometheus metrics. Tavily is the only engine today;
-`src/providers/search_registry.rs` documents how to add another.
+cost reports and OTel/Prometheus metrics. Three engines ship today — `tavily`,
+`vertex` (Gemini + Google Search grounding) and `bing_grounding` (Grounding with
+Bing Search on Azure AI Foundry) — and `src/providers/search_registry.rs`
+documents how to add another. The two grounding engines run a model generation
+as part of the call, so they are slower and need a completion-length
+`timeout_secs`; `bing_grounding` results additionally carry Microsoft's citation
+display obligations (see `docs/local-setup.md`).
 
 Request body:
 
@@ -1179,7 +1184,9 @@ Request body:
 ```
 
 `query` is required and non-empty. `max_results` is optional (1-20, defaults
-to the engine's own default). `engine` is optional and defaults to `"tavily"`.
+to the engine's own default). `engine` is optional; when omitted it falls back
+to `[routing] default_search_engine`, then to the sole configured engine if
+there is exactly one.
 
 Response:
 

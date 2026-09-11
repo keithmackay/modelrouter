@@ -17,11 +17,15 @@ path = "src/lib.rs"
 # default — an unconfigured provider costs nothing at runtime, while a binary
 # missing a compiled feature refuses to start against a config that names it
 # (the fail-loud guard in main), which turns a plain `cargo build` into a trap.
-default = ["vertex", "bedrock"]
+default = ["vertex", "bedrock", "bing-grounding"]
 postgres = ["sqlx/postgres"]
 prometheus = ["dep:prometheus"]
 bedrock = ["dep:aws-sdk-bedrockruntime", "dep:aws-config"]
 vertex = ["dep:google-cloud-auth"]
+# Grounding with Bing Search on Azure AI Foundry. No optional dependencies: the
+# Entra token flow is a form POST over the reqwest client that is already here,
+# which is cheaper than adding the azure_identity/azure_core dependency tree.
+bing-grounding = []
 s3-archival = []
 otel = [
     "dep:opentelemetry",

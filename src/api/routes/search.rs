@@ -61,11 +61,11 @@ fn resolve_engine(
     let available = state.search_registry.configured_engines();
     match available.as_slice() {
         [only] => Ok(only.clone()),
-        [] => Err(ApiError::InvalidRequest(
+        [] => Err(ApiError::InvalidRequest(format!(
             "no search engine configured: add a [providers.<engine>] section \
-             (supported: tavily, vertex) to config.toml"
-                .to_string(),
-        )),
+             (supported by this build: {}) to config.toml",
+            crate::providers::search_registry::supported_engines().join(", ")
+        ))),
         many => Err(ApiError::InvalidRequest(format!(
             "request omitted `engine` and multiple search engines are configured ({}); \
              send `engine` explicitly or set [routing] default_search_engine",
