@@ -52,7 +52,9 @@ thiserror = "1"
 anyhow = "1"
 bcrypt = "0.15"
 rpassword = "7"
-jsonwebtoken = "10"
+# v10 requires exactly one explicit crypto backend; aws_lc_rs is already in
+# the dependency tree as rustls 0.23's default provider.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 comfy-table = "7"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
