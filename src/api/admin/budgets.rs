@@ -321,6 +321,40 @@ pub struct CreateBudgetForm {
     pub model_deny: Option<String>,
 }
 
+/// Validate budget form constraints (date formats, window rules).
+fn validate_budget_form_constraints(form: &CreateBudgetForm) -> Result<(), String> {
+    // Validate any provided dates for total window; blank dates are allowed (no cutoff).
+    if form.window == "total" {
+        let start_ok = form.window_start.as_deref().filter(|s| !s.is_empty())
+            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+            .unwrap_or(true);
+        let end_ok = form.window_end.as_deref().filter(|s| !s.is_empty())
+            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+            .unwrap_or(true);
+        if !start_ok || !end_ok {
+            return Err(
+                r#"<div class="alert alert-danger">Date must be in YYYY-MM-DD format.</div>"#.to_string()
+            );
+        }
+        if let (Some(s), Some(e)) = (
+            form.window_start.as_deref().filter(|s| !s.is_empty()),
+            form.window_end.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            if s >= e {
+                return Err(
+                    r#"<div class="alert alert-danger">Start date must be before end date.</div>"#.to_string()
+                );
+            }
+        }
+    }
+
+    if form.window == "target" && form.scope != "group" {
+        return Err(r#"<div class="alert alert-danger">Target window is only for group rules.</div>"#.to_string());
+    }
+
+    Ok(())
+}
+
 pub async fn post_create_budget(
     State(state): State<AppState>,
     _session: SuperDashboardSession,
@@ -337,33 +371,8 @@ pub async fn post_create_budget(
         ));
     }
 
-    // Validate any provided dates for total window; blank dates are allowed (no cutoff).
-    if form.window == "total" {
-        let start_ok = form.window_start.as_deref().filter(|s| !s.is_empty())
-            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
-            .unwrap_or(true);
-        let end_ok = form.window_end.as_deref().filter(|s| !s.is_empty())
-            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
-            .unwrap_or(true);
-        if !start_ok || !end_ok {
-            return Ok(Html(
-                r#"<div class="alert alert-danger">Date must be in YYYY-MM-DD format.</div>"#.to_string()
-            ));
-        }
-        if let (Some(s), Some(e)) = (
-            form.window_start.as_deref().filter(|s| !s.is_empty()),
-            form.window_end.as_deref().filter(|s| !s.is_empty()),
-        ) {
-            if s >= e {
-                return Ok(Html(
-                    r#"<div class="alert alert-danger">Start date must be before end date.</div>"#.to_string()
-                ));
-            }
-        }
-    }
-
-    if form.window == "target" && form.scope != "group" {
-        return Ok(Html(r#"<div class="alert alert-danger">Target window is only for group rules.</div>"#.to_string()));
+    if let Err(msg) = validate_budget_form_constraints(&form) {
+        return Ok(Html(msg));
     }
 
     let existing_scope = match form.scope.as_str() {

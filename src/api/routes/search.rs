@@ -92,6 +92,101 @@ pub async fn search(
         .await
 }
 
+/// Execute search with fallback chain. Returns (result, serving_engine, latency_ms).
+async fn execute_search_with_fallback(
+    state: &AppState,
+    engine: &str,
+    req: &SearchRequest,
+) -> Result<(crate::providers::search::SearchResponse, String, i64), ApiError> {
+    let chain = state
+        .settings
+        .routing
+        .search_fallback_chains
+        .get(engine)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let mut engines_to_try = vec![engine.to_string()];
+    engines_to_try.extend_from_slice(chain);
+
+    // Dedupe while preserving order (cheap adjacent item #11).
+    let mut seen = std::collections::HashSet::new();
+    engines_to_try.retain(|e| seen.insert(e.clone()));
+
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for (idx, candidate) in engines_to_try.iter().enumerate() {
+        if !crate::providers::search_registry::is_supported_engine(candidate) {
+            tracing::debug!(
+                engine = candidate,
+                "skipping unsupported engine in fallback chain"
+            );
+            continue;
+        }
+
+        let adapter = match state.search_registry.get(candidate) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(
+                    engine = candidate,
+                    error = %e,
+                    "skipping unconfigured engine in fallback chain"
+                );
+                continue;
+            }
+        };
+
+        let start = Instant::now();
+        match adapter.search(req).await {
+            Ok(res) => {
+                let latency_ms = start.elapsed().as_millis() as i64;
+                return Ok((res, candidate.clone(), latency_ms));
+            }
+            Err(e) => {
+                // Classify the error: client errors (4xx except 429) surface
+                // immediately without failover; provider errors (5xx, 429,
+                // timeouts, connection failures) walk the chain.
+                use crate::router::retry::RetryableError;
+                let err_str = e.to_string();
+                let classified = RetryableError::classify(&err_str);
+
+                if matches!(classified, RetryableError::ClientError(_)) {
+                    // Client error (provider 400/404/422 etc) — the caller sent
+                    // a bad query/params. Surface immediately, do not fail over.
+                    tracing::debug!(
+                        engine = candidate,
+                        error = %e,
+                        "client error from search engine, not failing over"
+                    );
+                    return Err(ApiError::ProviderError(e));
+                }
+
+                // Provider error — try the next engine in the chain.
+                let remaining: Vec<_> = engines_to_try[idx + 1..].to_vec();
+                last_error = Some(e);
+                tracing::warn!(
+                    engine = candidate,
+                    error = %last_error.as_ref().unwrap(),
+                    remaining = ?remaining,
+                    "search engine failed, trying next in chain"
+                );
+            }
+        }
+    }
+
+    let tried: Vec<_> = engines_to_try.iter().map(|s| s.as_str()).collect();
+    Err(ApiError::ProviderError(
+        last_error
+            .map(|e| anyhow::anyhow!("all engines exhausted (tried: {}): {}", tried.join(", "), e))
+            .unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "all engines in the fallback chain are unconfigured or unsupported (tried: {})",
+                    tried.join(", ")
+                )
+            }),
+    ))
+}
+
 async fn search_inner(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -223,100 +318,7 @@ async fn search_inner(
         max_results,
     };
 
-    let chain = state
-        .settings
-        .routing
-        .search_fallback_chains
-        .get(&engine)
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-
-    let mut engines_to_try = vec![engine.clone()];
-    engines_to_try.extend_from_slice(chain);
-
-    // Dedupe while preserving order (cheap adjacent item #11).
-    let mut seen = std::collections::HashSet::new();
-    engines_to_try.retain(|e| seen.insert(e.clone()));
-
-    let mut last_error: Option<anyhow::Error> = None;
-    let mut serving_engine = String::new();
-    let mut result = None;
-    let mut latency_ms = 0_i64;
-
-    for (idx, candidate) in engines_to_try.iter().enumerate() {
-        if !crate::providers::search_registry::is_supported_engine(candidate) {
-            tracing::debug!(
-                engine = candidate,
-                "skipping unsupported engine in fallback chain"
-            );
-            continue;
-        }
-
-        let adapter = match state.search_registry.get(candidate) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(
-                    engine = candidate,
-                    error = %e,
-                    "skipping unconfigured engine in fallback chain"
-                );
-                continue;
-            }
-        };
-
-        let start = Instant::now();
-        match adapter.search(&req).await {
-            Ok(res) => {
-                latency_ms = start.elapsed().as_millis() as i64;
-                serving_engine = candidate.clone();
-                result = Some(res);
-                break;
-            }
-            Err(e) => {
-                // Classify the error: client errors (4xx except 429) surface
-                // immediately without failover; provider errors (5xx, 429,
-                // timeouts, connection failures) walk the chain.
-                use crate::router::retry::RetryableError;
-                let err_str = e.to_string();
-                let classified = RetryableError::classify(&err_str);
-
-                if matches!(classified, RetryableError::ClientError(_)) {
-                    // Client error (provider 400/404/422 etc) — the caller sent
-                    // a bad query/params. Surface immediately, do not fail over.
-                    tracing::debug!(
-                        engine = candidate,
-                        error = %e,
-                        "client error from search engine, not failing over"
-                    );
-                    return Err(ApiError::ProviderError(e));
-                }
-
-                // Provider error — try the next engine in the chain.
-                let remaining: Vec<_> = engines_to_try[idx + 1..].to_vec();
-                last_error = Some(e);
-                tracing::warn!(
-                    engine = candidate,
-                    error = %last_error.as_ref().unwrap(),
-                    remaining = ?remaining,
-                    "search engine failed, trying next in chain"
-                );
-            }
-        }
-    }
-
-    let result = result.ok_or_else(|| {
-        let tried: Vec<_> = engines_to_try.iter().map(|s| s.as_str()).collect();
-        ApiError::ProviderError(
-            last_error
-                .map(|e| anyhow::anyhow!("all engines exhausted (tried: {}): {}", tried.join(", "), e))
-                .unwrap_or_else(|| {
-                    anyhow::anyhow!(
-                        "all engines in the fallback chain are unconfigured or unsupported (tried: {})",
-                        tried.join(", ")
-                    )
-                }),
-        )
-    })?;
+    let (result, serving_engine, latency_ms) = execute_search_with_fallback(&state, &engine, &req).await?;
 
     let results_returned = result.results.len() as i64;
 

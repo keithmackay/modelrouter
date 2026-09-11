@@ -33,7 +33,6 @@ async fn responses_inner(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
     crate::api::routes::reject_experiment_header("/v1/responses", &headers)?;
     let user = user.0;
@@ -165,82 +164,26 @@ async fn responses_inner(
     );
 
     // Fire-and-forget cost logging
-    let db = state.db.clone();
-    let prompt_db = state.prompt_db.clone();
-    let storage = state.storage.clone();
-    let user_id = user.id;
-    let api_key_id = user.api_key_id;
-    let user_project = attribution.project_or(user.api_key_project.clone());
-    let model_clone = model.clone();
-    let canonical_clone = canonical_model.clone();
-    let provider_clone = provider_name.clone();
-    let messages_json = serde_json::to_string(
-        &body["messages"].as_array().cloned().unwrap_or_default(),
-    )
-    .unwrap_or_default();
-    let response_clone = result.content.clone();
-    let finish_clone = result.finish_reason.clone();
-    let prompt_tokens = result.prompt_tokens;
-    let completion_tokens = result.completion_tokens;
-    let cache_read_tokens = result.cache_read_tokens;
-    let cache_write_tokens = result.cache_write_tokens;
-
-    tokio::spawn(async move {
-        let prompt = NewPrompt {
-            user_id,
-            session_id: None,
-            request_model: model_clone.clone(),
-            routed_model: canonical_clone.clone(),
-            provider: provider_clone.clone(),
-            messages: messages_json,
-            response: Some(response_clone),
-            finish_reason: Some(finish_clone),
-            prompt_tokens: prompt_tokens as i64,
-            completion_tokens: completion_tokens as i64,
-            cache_read_tokens: cache_read_tokens as i64,
-            cache_write_tokens: cache_write_tokens as i64,
-            cost_usd: cost,
-            latency_ms: Some(latency_ms),
-            ttft_ms: None,
-            attempts: None,
-            tags: "[]".to_string(),
-            project: user_project.clone(),
-            attribution_correlation_id: attr_correlation.clone(),
-            attribution_tags: attr_tags.clone(),
-            experiment_id: None,
-            experiment_variant: None,
-        };
-        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
-        let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
-            Some(p) => match PromptRepository::create(&*prompt_db, p).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    tracing::error!("Failed to record responses prompt: {e}");
-                    None
-                }
-            },
-            None => None,
-        };
-        {
-                let ledger = NewCostLedgerEntry {
-                    user_id,
-                    prompt_id: stored.as_ref().map(|s| s.id),
-                    model: canonical_clone,
-                    provider: provider_clone,
-                    project: user_project.clone(),
-                    tokens_in: prompt_tokens as i64,
-                    tokens_out: completion_tokens as i64,
-                    cost_usd: cost,
-                    api_key_id,
-                    attribution_correlation_id: attr_correlation.clone(),
-                    attribution_tags: attr_tags.clone(),
-                    experiment_id: None,
-                    experiment_variant: None,
-                    tokens_estimated: false,
-                };
-                let _ = CostRepository::create(&*db, ledger).await;
-        }
-    });
+    record_responses_cost(
+        state.clone(),
+        user.id,
+        user.api_key_id,
+        attribution.project_or(user.api_key_project.clone()),
+        model.clone(),
+        canonical_model.clone(),
+        provider_name.clone(),
+        body["messages"].as_array().cloned().unwrap_or_default(),
+        result.content.clone(),
+        result.finish_reason.clone(),
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cache_read_tokens,
+        result.cache_write_tokens,
+        cost,
+        latency_ms,
+        attr_correlation,
+        attr_tags,
+    );
 
     let response_body = serde_json::json!({
         "id": format!("resp_{}", std::time::SystemTime::now()
@@ -257,10 +200,92 @@ async fn responses_inner(
             "finish_reason": result.finish_reason
         }],
         "usage": {
-            "input_tokens": prompt_tokens,
-            "output_tokens": completion_tokens
+            "input_tokens": result.prompt_tokens,
+            "output_tokens": result.completion_tokens
         }
     });
 
     Ok(Json(response_body).into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_responses_cost(
+    state: AppState,
+    user_id: i64,
+    api_key_id: Option<i64>,
+    user_project: Option<String>,
+    request_model: String,
+    routed_model: String,
+    provider: String,
+    messages: Vec<Value>,
+    response: String,
+    finish_reason: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+    cost: f64,
+    latency_ms: i64,
+    attr_correlation: Option<String>,
+    attr_tags: String,
+) {
+    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+
+    tokio::spawn(async move {
+        let messages_json = serde_json::to_string(&messages).unwrap_or_default();
+        let prompt = NewPrompt {
+            user_id,
+            session_id: None,
+            request_model,
+            routed_model: routed_model.clone(),
+            provider: provider.clone(),
+            messages: messages_json,
+            response: Some(response),
+            finish_reason: Some(finish_reason),
+            prompt_tokens: prompt_tokens as i64,
+            completion_tokens: completion_tokens as i64,
+            cache_read_tokens: cache_read_tokens as i64,
+            cache_write_tokens: cache_write_tokens as i64,
+            cost_usd: cost,
+            latency_ms: Some(latency_ms),
+            ttft_ms: None,
+            attempts: None,
+            tags: "[]".to_string(),
+            project: user_project.clone(),
+            attribution_correlation_id: attr_correlation.clone(),
+            attribution_tags: attr_tags.clone(),
+            experiment_id: None,
+            experiment_variant: None,
+        };
+        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
+        let stored = match crate::db::prompt_store::apply_storage_policy(&state.storage.load(), prompt) {
+            Some(p) => match PromptRepository::create(&*state.prompt_db, p).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("Failed to record responses prompt: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        {
+                let ledger = NewCostLedgerEntry {
+                    user_id,
+                    prompt_id: stored.as_ref().map(|s| s.id),
+                    model: routed_model,
+                    provider,
+                    project: user_project,
+                    tokens_in: prompt_tokens as i64,
+                    tokens_out: completion_tokens as i64,
+                    cost_usd: cost,
+                    api_key_id,
+                    attribution_correlation_id: attr_correlation,
+                    attribution_tags: attr_tags,
+                    experiment_id: None,
+                    experiment_variant: None,
+                    tokens_estimated: false,
+                };
+                let _ = CostRepository::create(&*state.db, ledger).await;
+        }
+    });
 }
