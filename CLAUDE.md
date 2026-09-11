@@ -114,3 +114,39 @@ touched. Git history is public too, so catch it before the commit, not after.
 - Migrations tracked via `sqlx::migrate!("./migrations")`
 - API keys stored as SHA-256 hex digest only
 - Hook capabilities are NOT auto-granted — operators must INSERT rows into `hook_permissions`
+
+## Automated Testing & Issue Management
+
+This section configures the `/fix` command for autonomous issue resolution.
+
+### Regression Test Suite
+```bash
+cargo test
+```
+
+### Build Verification
+```bash
+cargo build --release
+```
+
+### Test Framework Details
+
+**Unit Tests**:
+- Framework: Rust built-in test framework (`cargo test`)
+- Location: `src/**` (inline `#[cfg(test)]` modules) and `tests/`
+
+**Feature builds** (verify after dependency changes):
+- `cargo build --features postgres`
+- `cargo build --features bedrock`
+
+### Merge Mode
+```
+merge
+```
+Options: `merge` (auto-merge to the integration branch and push) or `pr` (push feature branch and create a pull request, then stop).
+
+### Integration Branch
+```
+main
+```
+The shared branch all completed work is merged into.
