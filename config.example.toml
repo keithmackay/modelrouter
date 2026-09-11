@@ -70,13 +70,51 @@ api_key  = "ollama"    # Ollama doesn't require a real key
 api_base = "http://localhost:11434/v1"
 timeout_secs = 120
 
-# Web search proxying (POST /v1/search). Tavily is the only engine today;
+# Web search proxying (POST /v1/search). Engines: `tavily`, `vertex`
+# (--features vertex) and `bing_grounding` (--features bing-grounding);
 # additional engines can be added to src/providers/search_registry.rs and
 # configured the same way under [providers.<engine>].
 # [providers.tavily]
 # api_key  = ""          # or set MODELROUTER_PROVIDERS__TAVILY__API_KEY
 # api_base = "https://api.tavily.com"
 # timeout_secs = 30
+
+# Grounding with Bing Search on Azure AI Foundry (requires build with
+# `--features bing-grounding`, which is on by default).
+#
+# There is no bare Bing search REST API any more — the classic Bing Web Search
+# API is retired. Grounding with Bing Search is a Foundry TOOL: provision a
+# "Grounding with Bing Search" resource, connect it to a Foundry project, and
+# the router calls the project's Responses API with the tool attached. So the
+# call embeds a model generation, which is why `timeout_secs` is 300 here and
+# not 30 — this behaves like a completion, not like a search API. The router
+# warns at startup if you set it below 300.
+#
+# Authentication is Microsoft Entra, from the ENVIRONMENT, never from this file:
+#   * AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET (app registration), or
+#   * managed identity via IMDS (nothing to set; the default when the trio is absent).
+# Grant the identity the "Azure AI User" role on the Foundry project. Setting
+# `api_key` here switches to resource-key auth — supported, but it puts a secret
+# on disk; Entra is the intended mode.
+#
+# LEGAL: results from this engine are governed by Microsoft's Grounding with
+# Bing Search Use and Display Requirements
+# (https://www.microsoft.com/bing/apis/grounding-legal). Website URLs and the
+# Bing search query URL must be retained and displayed in the exact form
+# Microsoft returned them. The adapter therefore returns citation URLs VERBATIM
+# — no unescaping, no tracking-parameter stripping, no redirect unwrapping — and
+# anything rendering /v1/search output carries the display obligation. Bing
+# grounding is also billed per query transaction, and query text leaves the
+# Azure compliance boundary.
+#
+# [providers.bing_grounding]
+# foundry_project_endpoint = "https://<resource>.services.ai.azure.com/api/projects/<project>"
+# project_connection_id    = "/subscriptions/.../connections/<bing-connection>"
+# search_model             = "<model-deployment-name>"  # required; no default
+# timeout_secs             = 300
+# api_version              = ""          # omit: the /openai/v1/ surface is version-less
+# custom_search            = false       # true = Bing Custom Search (preview), domain-restricted
+# custom_search_instance   = ""          # required when custom_search = true
 
 # GCP Vertex AI (requires build with `--features vertex`).
 # Supports Gemini (publisher "google") and Claude-on-Vertex (publisher "anthropic").
@@ -183,6 +221,16 @@ fail_open    = true
 # [[pricing]]
 # model = "search/tavily"
 # input_per_million = 0.005
+# output_per_million = 0.0
+#
+# Grounding with Bing Search is billed per query TRANSACTION (one tool call),
+# so it fits the same flat rate. Check the current rate on Microsoft's Bing
+# APIs pricing page; the model deployment the tool runs on is billed separately
+# by Azure OpenAI and is not captured by this entry.
+#
+# [[pricing]]
+# model = "search/bing_grounding"
+# input_per_million = 0.035
 # output_per_million = 0.0
 
 # ---------------------------------------------------------------------------

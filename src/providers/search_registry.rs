@@ -6,16 +6,28 @@ use std::sync::Arc;
 
 /// Search engines supported by the registry's default construction path.
 /// Extend this (and the `match` in `get`) to add a new engine.
-#[cfg(not(feature = "vertex"))]
-const SUPPORTED_ENGINES: &[&str] = &["tavily"];
-/// `vertex` is only listed when the feature is compiled in — otherwise
-/// `api/routes/search.rs` would accept the engine at the gate and then fail in
-/// the registry, reporting a configuration problem for what is a build problem.
-#[cfg(feature = "vertex")]
-const SUPPORTED_ENGINES: &[&str] = &["tavily", "vertex"];
+///
+/// Feature-gated engines are only listed when their feature is compiled in —
+/// otherwise `api/routes/search.rs` would accept the engine at the gate and
+/// then fail in the registry, reporting a configuration problem for what is a
+/// build problem.
+const SUPPORTED_ENGINES: &[&str] = &[
+    "tavily",
+    #[cfg(feature = "vertex")]
+    "vertex",
+    #[cfg(feature = "bing-grounding")]
+    "bing_grounding",
+];
 
 pub fn is_supported_engine(engine: &str) -> bool {
     SUPPORTED_ENGINES.contains(&engine)
+}
+
+/// The engines this binary can serve. Exposed so error messages can name them
+/// instead of carrying a hand-maintained copy of the list that drifts the first
+/// time an engine is added behind a feature (as `bing_grounding` was).
+pub fn supported_engines() -> &'static [&'static str] {
+    SUPPORTED_ENGINES
 }
 
 pub struct SearchRegistry {
@@ -66,6 +78,10 @@ impl SearchRegistry {
             "tavily" => Arc::new(crate::providers::tavily::TavilyAdapter::new(config)),
             #[cfg(feature = "vertex")]
             "vertex" => Arc::new(crate::providers::vertex::VertexSearchAdapter::new(config)?),
+            #[cfg(feature = "bing-grounding")]
+            "bing_grounding" => Arc::new(
+                crate::providers::bing_grounding::BingGroundingAdapter::new(config)?,
+            ),
             other => anyhow::bail!("Unsupported search engine: {}", other),
         };
 

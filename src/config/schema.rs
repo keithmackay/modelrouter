@@ -738,14 +738,40 @@ pub struct ProviderConfig {
     /// store and simply retrieve worse. Omitted from the request when unset.
     #[serde(default)]
     pub embedding_task_type: Option<String>,
-    /// Gemini model used to serve `/v1/search` for this provider.
+    /// Model used to serve `/v1/search` for this provider.
     ///
-    /// Web search on Vertex is grounding on a generative model, so unlike Tavily
-    /// the engine has a model to choose. It is not addressed through
-    /// `[routing.model_aliases]` because the search route resolves an ENGINE,
-    /// not a model. Defaults to `gemini-2.5-flash` when unset.
+    /// Search on a grounding provider is a generation call with a search tool
+    /// attached, so unlike Tavily the engine has a model to choose. It is not
+    /// addressed through `[routing.model_aliases]` because the search route
+    /// resolves an ENGINE, not a model. Vertex defaults to `gemini-2.5-flash`;
+    /// `bing_grounding` has no default (the value is a deployment name that
+    /// only the operator's Foundry project knows) and requires this field.
     #[serde(default)]
     pub search_model: Option<String>,
+    /// Azure AI Foundry project endpoint that serves the Responses API, e.g.
+    /// `https://<resource>.services.ai.azure.com/api/projects/<project>`.
+    /// Used only by the `bing_grounding` search adapter. `api_base` is accepted
+    /// as a fallback so the provider table reads like every other one, but the
+    /// explicit name is preferred because "project endpoint" is what the Azure
+    /// portal calls the value being copied.
+    #[serde(default)]
+    pub foundry_project_endpoint: Option<String>,
+    /// Foundry project connection id of the "Grounding with Bing Search" (or
+    /// "Grounding with Bing Custom Search") resource, as shown on the project's
+    /// Connected resources page. Required by the `bing_grounding` adapter: the
+    /// tool call has no meaning without it, and Bing billing is attached to it.
+    #[serde(default)]
+    pub project_connection_id: Option<String>,
+    /// Use "Grounding with Bing Custom Search" (preview) — the domain-restricted
+    /// variant — instead of the general web tool. Changes only the tool type
+    /// emitted in the request (`bing_custom_search_preview`); the connection id
+    /// must then point at a Custom Search resource.
+    #[serde(default)]
+    pub custom_search: bool,
+    /// Bing Custom Search instance (configuration) name. Required by the
+    /// preview tool, ignored by the general one.
+    #[serde(default)]
+    pub custom_search_instance: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -767,6 +793,10 @@ impl Default for ProviderConfig {
             catalog_publishers: None,
             embedding_task_type: None,
             search_model: None,
+            foundry_project_endpoint: None,
+            project_connection_id: None,
+            custom_search: false,
+            custom_search_instance: None,
         }
     }
 }

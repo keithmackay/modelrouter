@@ -17,6 +17,7 @@ cargo run -- serve     # Start server
 cargo test
 cargo build --features postgres  # Verify postgres feature
 cargo build --features bedrock  # Verify bedrock feature
+cargo build --features bing-grounding  # Verify bing-grounding feature (default)
 ```
 
 ## CLI Commands
