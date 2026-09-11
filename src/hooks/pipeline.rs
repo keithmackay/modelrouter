@@ -116,7 +116,25 @@ async fn run_single_pipeline_hook(
     let duration_ms = hook_start.elapsed().as_millis() as i64;
     let can_mutate = claims_capability; // can only mutate if it both claimed AND has permission (already checked above)
 
-    let outcome = match result {
+    let outcome = process_hook_result(result, &payload, can_mutate, hook);
+
+    let success = outcome.is_ok();
+    let span = tracing::Span::current();
+    span.record("hook.duration_ms", duration_ms);
+    span.record("hook.success", success);
+
+    outcome
+}
+
+/// Process the result of a hook subprocess execution, applying fail_open and
+/// mutability rules to produce the final payload.
+fn process_hook_result(
+    result: Result<anyhow::Result<String>, tokio::time::error::Elapsed>,
+    payload: &serde_json::Value,
+    can_mutate: bool,
+    hook: &PipelineHookConfig,
+) -> anyhow::Result<serde_json::Value> {
+    match result {
         Ok(Ok(output)) => {
             if can_mutate {
                 match serde_json::from_str::<serde_json::Value>(&output) {
@@ -127,7 +145,7 @@ async fn run_single_pipeline_hook(
                                 hook = %hook.name,
                                 "pipeline hook returned invalid JSON (fail_open)"
                             );
-                            Ok(payload)
+                            Ok(payload.clone())
                         } else {
                             Err(anyhow::anyhow!(
                                 "pipeline hook '{}' returned invalid JSON: {}",
@@ -139,12 +157,12 @@ async fn run_single_pipeline_hook(
                 }
             } else {
                 // Read-only hook ran, discard output
-                Ok(payload)
+                Ok(payload.clone())
             }
         }
         Ok(Err(e)) => {
             if hook.fail_open {
-                Ok(payload)
+                Ok(payload.clone())
             } else {
                 Err(e)
             }
@@ -152,19 +170,12 @@ async fn run_single_pipeline_hook(
         Err(_timeout) => {
             if hook.fail_open {
                 tracing::warn!(hook = %hook.name, "pipeline hook timed out (fail_open)");
-                Ok(payload)
+                Ok(payload.clone())
             } else {
                 Err(anyhow::anyhow!("pipeline hook '{}' timed out", hook.name))
             }
         }
-    };
-
-    let success = outcome.is_ok();
-    let span = tracing::Span::current();
-    span.record("hook.duration_ms", duration_ms);
-    span.record("hook.success", success);
-
-    outcome
+    }
 }
 
 async fn run_subprocess_bidirectional(

@@ -231,22 +231,8 @@ impl ProviderAdapter for BedrockAdapter {
         loop {
             match event_stream.recv().await {
                 Ok(Some(event)) => {
-                    use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
-                    if let ConverseStreamOutput::ContentBlockDelta(delta_event) = event {
-                        if let Some(delta) = delta_event.delta() {
-                            if let Ok(text) = delta.as_text() {
-                                let sse = format!(
-                                    "data: {}\n\n",
-                                    serde_json::json!({
-                                        "choices": [{
-                                            "delta": {"content": text},
-                                            "finish_reason": null,
-                                        }]
-                                    })
-                                );
-                                chunks.push(Ok(Bytes::from(sse)));
-                            }
-                        }
+                    if let Some(chunk) = process_stream_event(event) {
+                        chunks.push(Ok(chunk));
                     }
                     // Non-text events (metadata, message start/stop) are silently skipped.
                 }
@@ -265,4 +251,27 @@ impl ProviderAdapter for BedrockAdapter {
         }
         Ok(Box::pin(stream::iter(chunks)))
     }
+}
+
+/// Convert a single Bedrock stream event to an SSE chunk if it contains text.
+fn process_stream_event(event: aws_sdk_bedrockruntime::types::ConverseStreamOutput) -> Option<Bytes> {
+    use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
+
+    if let ConverseStreamOutput::ContentBlockDelta(delta_event) = event {
+        if let Some(delta) = delta_event.delta() {
+            if let Ok(text) = delta.as_text() {
+                let sse = format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "choices": [{
+                            "delta": {"content": text},
+                            "finish_reason": null,
+                        }]
+                    })
+                );
+                return Some(Bytes::from(sse));
+            }
+        }
+    }
+    None
 }

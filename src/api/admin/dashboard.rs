@@ -1303,6 +1303,100 @@ pub struct CostQuery {
     pub model: Option<String>,
 }
 
+/// Resolve user and group filters to effective user IDs.
+async fn resolve_cost_filters(
+    db: &std::sync::Arc<dyn crate::api::app::DatabaseProvider>,
+    users: &[crate::db::models::User],
+    filter_user: &str,
+    filter_group: &str,
+) -> Result<Option<Vec<i64>>, DashboardError> {
+    use crate::db::repositories::groups::GroupRepository;
+
+    // ── Resolve user filter ─────────────────────────────────────────────────
+    let user_filter_ids: Option<Vec<i64>> = if filter_user.is_empty() {
+        None
+    } else {
+        Some(users.iter().filter(|u| u.name == filter_user).map(|u| u.id).collect())
+    };
+
+    // ── Resolve group filter → active member user_ids ──────────────────────
+    let group_filter_ids: Option<Vec<i64>> = if filter_group.is_empty() {
+        None
+    } else {
+        match GroupRepository::find_group_by_name(&**db, filter_group).await {
+            Ok(Some(g)) => {
+                let members = GroupRepository::list_memberships(&**db, g.id)
+                    .await
+                    .unwrap_or_default();
+                Some(
+                    members
+                        .into_iter()
+                        .filter(|m| m.disabled_at.is_none())
+                        .map(|m| m.user_id)
+                        .collect(),
+                )
+            }
+            _ => Some(vec![]), // unknown group → zero results
+        }
+    };
+
+    // ── Intersect user + group filters ─────────────────────────────────────
+    let effective_user_ids: Option<Vec<i64>> = match (user_filter_ids, group_filter_ids) {
+        (Some(u), Some(g)) => {
+            let set: std::collections::HashSet<i64> = g.into_iter().collect();
+            Some(u.into_iter().filter(|id| set.contains(id)).collect())
+        }
+        (Some(u), None) => Some(u),
+        (None, Some(g)) => Some(g),
+        (None, None) => None,
+    };
+
+    Ok(effective_user_ids)
+}
+
+/// Build user_id → comma-separated group names (active memberships only).
+async fn build_user_groups_map(
+    db: &std::sync::Arc<dyn crate::api::app::DatabaseProvider>,
+    groups: &[crate::db::models::Group],
+) -> std::collections::HashMap<i64, Vec<String>> {
+    use crate::db::repositories::groups::GroupRepository;
+
+    let mut user_groups: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for group in groups {
+        let members = GroupRepository::list_memberships(&**db, group.id)
+            .await
+            .unwrap_or_default();
+        for m in members {
+            if m.disabled_at.is_none() {
+                user_groups.entry(m.user_id).or_default().push(group.name.clone());
+            }
+        }
+    }
+    user_groups
+}
+
+/// Build api_key_id → display string map.
+fn build_key_display_map(
+    all_keys: &[crate::db::models::ApiKey],
+    user_map: &std::collections::HashMap<i64, String>,
+) -> std::collections::HashMap<i64, String> {
+    all_keys
+        .iter()
+        .map(|k| {
+            let uname = user_map.get(&k.user_id).cloned().unwrap_or_default();
+            let proj = k.project.as_deref().unwrap_or("—");
+            let label = k.label.as_deref().unwrap_or("");
+            let display = if label.is_empty() {
+                format!("{} / {}", uname, proj)
+            } else {
+                format!("{} / {} ({})", uname, proj, label)
+            };
+            (k.id, display)
+        })
+        .collect()
+}
+
 pub async fn get_cost(
     State(state): State<AppState>,
     _session: DashboardSession,
@@ -1345,81 +1439,15 @@ pub async fn get_cost(
         .await
         .unwrap_or_default();
 
-    // ── Resolve user filter ─────────────────────────────────────────────────
     let filter_user = q.user.as_deref().unwrap_or("").to_string();
-    let user_filter_ids: Option<Vec<i64>> = if filter_user.is_empty() {
-        None
-    } else {
-        Some(users.iter().filter(|u| u.name == filter_user).map(|u| u.id).collect())
-    };
-
-    // ── Resolve group filter → active member user_ids ──────────────────────
     let filter_group = q.group.as_deref().unwrap_or("").to_string();
-    let group_filter_ids: Option<Vec<i64>> = if filter_group.is_empty() {
-        None
-    } else {
-        match GroupRepository::find_group_by_name(&*state.db, &filter_group).await {
-            Ok(Some(g)) => {
-                let members = GroupRepository::list_memberships(&*state.db, g.id)
-                    .await
-                    .unwrap_or_default();
-                Some(
-                    members
-                        .into_iter()
-                        .filter(|m| m.disabled_at.is_none())
-                        .map(|m| m.user_id)
-                        .collect(),
-                )
-            }
-            _ => Some(vec![]), // unknown group → zero results
-        }
-    };
-
-    // ── Intersect user + group filters ─────────────────────────────────────
-    let effective_user_ids: Option<Vec<i64>> = match (user_filter_ids, group_filter_ids) {
-        (Some(u), Some(g)) => {
-            let set: std::collections::HashSet<i64> = g.into_iter().collect();
-            Some(u.into_iter().filter(|id| set.contains(id)).collect())
-        }
-        (Some(u), None) => Some(u),
-        (None, Some(g)) => Some(g),
-        (None, None) => None,
-    };
-
+    let effective_user_ids = resolve_cost_filters(&state.db, &users, &filter_user, &filter_group).await?;
     let filter_project = q.project.as_deref().filter(|s| !s.is_empty());
     let filter_key_id = q.key_id;
     let filter_model = q.model.as_deref().filter(|s| !s.is_empty());
 
-    // ── Build lookup maps ───────────────────────────────────────────────────
-    // user_id → comma-separated group names (active memberships only)
-    let mut user_groups: std::collections::HashMap<i64, Vec<String>> =
-        std::collections::HashMap::new();
-    for group in &groups {
-        let members = GroupRepository::list_memberships(&*state.db, group.id)
-            .await
-            .unwrap_or_default();
-        for m in members {
-            if m.disabled_at.is_none() {
-                user_groups.entry(m.user_id).or_default().push(group.name.clone());
-            }
-        }
-    }
-
-    // api_key_id → display string
-    let key_display: std::collections::HashMap<i64, String> = all_keys
-        .iter()
-        .map(|k| {
-            let uname = user_map.get(&k.user_id).cloned().unwrap_or_default();
-            let proj = k.project.as_deref().unwrap_or("—");
-            let label = k.label.as_deref().unwrap_or("");
-            let display = if label.is_empty() {
-                format!("{} / {}", uname, proj)
-            } else {
-                format!("{} / {} ({})", uname, proj, label)
-            };
-            (k.id, display)
-        })
-        .collect();
+    let user_groups = build_user_groups_map(&state.db, &groups).await;
+    let key_display = build_key_display_map(&all_keys, &user_map);
 
     // ── Query ───────────────────────────────────────────────────────────────
     let raw_rows = CostRepository::cost_rows_grouped(
