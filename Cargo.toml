@@ -34,6 +34,11 @@ otel = [
 [dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
+# Advisory note: rsa 0.9.x (RUSTSEC-2023-0071, Marvin-class timing, no fixed
+# release) appears in Cargo.lock via sqlx-mysql, but no feature of this crate
+# enables the mysql driver (sqlite + optional postgres only), so the code is
+# never compiled into any built configuration. Re-check if a mysql feature is
+# ever added or when sqlx ships an rsa with the fix.
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "migrate", "macros", "chrono", "uuid"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -47,7 +52,9 @@ thiserror = "1"
 anyhow = "1"
 bcrypt = "0.15"
 rpassword = "7"
-jsonwebtoken = "9"
+# v10 requires exactly one explicit crypto backend; aws_lc_rs is already in
+# the dependency tree as rustls 0.23's default provider.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 comfy-table = "7"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
@@ -69,23 +76,24 @@ rand = "0.8"
 base64 = "0.22"
 
 # ── Prometheus (--features prometheus) ─────────────────────────────────
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 # ── AWS Bedrock (--features bedrock) ───────────────────────────────────
-# Note: rustls-webpki 0.101.7 remains reachable via aws-smithy-http-client's
-# rustls 0.21 pin until AWS SDK moves to rustls ≥0.22 (advisory GHSA-82j2-j2ch-gfr8 residual).
-aws-sdk-bedrockruntime = { version = "1", optional = true }
+# default-features = false drops the SDK's legacy `rustls` feature (hyper 0.14 +
+# rustls 0.21 + rustls-webpki 0.101, GHSA-82j2-j2ch-gfr8 et al.); the modern
+# `default-https-client` (hyper 1 + rustls 0.23) is the only TLS stack we keep.
+aws-sdk-bedrockruntime = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config             = { version = "1", optional = true }
 
 # ── GCP Vertex (--features vertex) ─────────────────────────────────────
 google-cloud-auth = { version = "1", optional = true }
 
 # ── OpenTelemetry (--features otel) ────────────────────────────────────
-opentelemetry                  = { version = "0.27", features = ["logs"], optional = true }
-opentelemetry_sdk              = { version = "0.27", features = ["rt-tokio", "logs"], optional = true }
-opentelemetry-otlp             = { version = "0.27", features = ["grpc-tonic", "logs"], optional = true }
-opentelemetry-appender-tracing = { version = "0.27", optional = true }
-tracing-opentelemetry          = { version = "0.28", optional = true }
+opentelemetry                  = { version = "0.32", features = ["logs"], optional = true }
+opentelemetry_sdk              = { version = "0.32", features = ["logs"], optional = true }
+opentelemetry-otlp             = { version = "0.32", features = ["grpc-tonic", "logs"], optional = true }
+opentelemetry-appender-tracing = { version = "0.32", optional = true }
+tracing-opentelemetry          = { version = "0.33", optional = true }
 redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
 
 [dev-dependencies]
@@ -94,7 +102,7 @@ axum-test = "14"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing", "experimental_metrics_periodic_reader_no_runtime"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 
 [profile.release]
 # Pinned ahead of the routing plugin runtime (design spec §4c): plugins will run

@@ -5,15 +5,14 @@ pub mod sampler;
 
 use std::time::Duration;
 use anyhow::Result;
-use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
+    logs::SdkLoggerProvider,
     metrics::{PeriodicReader, SdkMeterProvider},
-    runtime,
-    trace::{BatchConfigBuilder, BatchSpanProcessor, TracerProvider},
+    trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider},
     Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -25,12 +24,15 @@ use sampler::SmartSampler;
 /// Holds pipeline handles. All pipelines are flushed and shut down on Drop.
 pub struct TelemetryShutdownGuard {
     meter_provider: SdkMeterProvider,
-    log_provider: opentelemetry_sdk::logs::LoggerProvider,
+    log_provider: SdkLoggerProvider,
+    trace_provider: SdkTracerProvider,
 }
 
 impl Drop for TelemetryShutdownGuard {
     fn drop(&mut self) {
-        opentelemetry::global::shutdown_tracer_provider();
+        if let Err(e) = self.trace_provider.shutdown() {
+            tracing::warn!("OTel tracer provider shutdown error: {e}");
+        }
         if let Err(e) = self.log_provider.shutdown() {
             tracing::warn!("OTel log provider shutdown error: {e}");
         }
@@ -46,9 +48,9 @@ impl Drop for TelemetryShutdownGuard {
 /// Build all three OTel pipelines and install the layered tracing subscriber.
 /// Returns a guard; drop it to flush on shutdown.
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryShutdownGuard> {
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", config.service_name.clone()),
-    ]);
+    let resource = Resource::builder()
+        .with_service_name(config.service_name.clone())
+        .build();
 
     // ── Traces ──────────────────────────────────────────────────────────
     let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -62,11 +64,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryShutdownGuard
         .with_max_export_batch_size(config.batch_max_export_size)
         .build();
 
-    let trace_provider = TracerProvider::builder()
+    let trace_provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_sampler(SmartSampler::new(config.sample_ratio))
         .with_span_processor(
-            BatchSpanProcessor::builder(trace_exporter, runtime::Tokio)
+            BatchSpanProcessor::builder(trace_exporter)
                 .with_batch_config(batch_config)
                 .build(),
         )
@@ -79,7 +81,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryShutdownGuard
         .with_endpoint(&config.endpoint)
         .build()?;
 
-    let reader = PeriodicReader::builder(metrics_exporter, runtime::Tokio)
+    let reader = PeriodicReader::builder(metrics_exporter)
         .with_interval(Duration::from_secs(15))
         .build();
 
@@ -101,9 +103,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryShutdownGuard
         .build()
         .map_err(|e| anyhow::anyhow!("log exporter build error: {e}"))?;
 
-    let log_provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+    let log_provider = SdkLoggerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(log_exporter, runtime::Tokio)
+        .with_batch_exporter(log_exporter)
         .build();
     let log_bridge = OpenTelemetryTracingBridge::new(&log_provider);
 
@@ -120,5 +122,5 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryShutdownGuard
         .try_init()
         .ok(); // ok to fail if subscriber already set (e.g. in tests)
 
-    Ok(TelemetryShutdownGuard { meter_provider, log_provider })
+    Ok(TelemetryShutdownGuard { meter_provider, log_provider, trace_provider })
 }
