@@ -34,6 +34,11 @@ otel = [
 [dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
+# Advisory note: rsa 0.9.x (RUSTSEC-2023-0071, Marvin-class timing, no fixed
+# release) appears in Cargo.lock via sqlx-mysql, but no feature of this crate
+# enables the mysql driver (sqlite + optional postgres only), so the code is
+# never compiled into any built configuration. Re-check if a mysql feature is
+# ever added or when sqlx ships an rsa with the fix.
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "migrate", "macros", "chrono", "uuid"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -69,7 +74,7 @@ rand = "0.8"
 base64 = "0.22"
 
 # ── Prometheus (--features prometheus) ─────────────────────────────────
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 # ── AWS Bedrock (--features bedrock) ───────────────────────────────────
 # default-features = false drops the SDK's legacy `rustls` feature (hyper 0.14 +
