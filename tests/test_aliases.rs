@@ -531,3 +531,85 @@ async fn alias_write_degrades_when_catalog_unavailable() {
         .await
         .assert_status_ok();
 }
+
+/// Catalog listing degradation: one working provider + one failing provider.
+/// The available-models endpoint should return the working provider's models
+/// rather than failing the entire request (per 09-05 review).
+#[tokio::test]
+async fn catalog_listing_degrades_with_one_provider_failing() {
+    use axum::routing::get;
+
+    // Set up two mock catalog servers: one working, one failing
+    let working_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            axum::Json(json!({
+                "data": [
+                    {"id": "gpt-4o"},
+                    {"id": "gpt-4o-mini"}
+                ]
+            }))
+        }),
+    );
+    let working_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let working_addr = working_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(working_listener, working_router).await.unwrap();
+    });
+    let working_base = format!("http://{}", working_addr);
+
+    let failing_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "provider down")
+        }),
+    );
+    let failing_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failing_addr = failing_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(failing_listener, failing_router).await.unwrap();
+    });
+    let failing_base = format!("http://{}", failing_addr);
+
+    // Give the servers a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Aggregate directly rather than through /admin/api/models/available: the
+    // endpoint serves this aggregation from a process-wide TTL cache that
+    // sibling tests in this binary also populate, so endpoint-level assertions
+    // would race them. The degradation contract lives in the aggregation.
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        modelrouter::config::schema::ProviderConfig {
+            api_base: Some(working_base),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    );
+    providers.insert(
+        "groq".to_string(),
+        modelrouter::config::schema::ProviderConfig {
+            api_base: Some(failing_base),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    );
+
+    let out = modelrouter::providers::catalog_registry::aggregate_catalogs(&providers).await;
+
+    // The working provider's models are present
+    assert_eq!(out["openai"]["supported"], true);
+    let models = out["openai"]["models"].as_array().unwrap();
+    assert!(!models.is_empty(), "working provider should have models");
+    assert_eq!(models[0]["name"], "gpt-4o");
+
+    // The failing provider degrades to an error entry; the aggregate as a
+    // whole still succeeds rather than failing the request.
+    assert_eq!(out["groq"]["supported"], true);
+    assert!(
+        out["groq"]["error"].as_str().unwrap().contains("500"),
+        "failing provider should carry an error"
+    );
+    assert!(out["groq"].get("models").is_none(), "failing provider should have no models");
+}

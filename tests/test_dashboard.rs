@@ -1149,7 +1149,10 @@ async fn failure_detail_route_returns_200_for_existing() {
 }
 
 #[tokio::test]
-async fn failure_detail_route_returns_404_for_missing() {
+async fn failure_detail_route_returns_200_with_message_for_missing() {
+    // Route deliberately returns 200 + "not found" message rather than 404,
+    // following the dashboard pattern of rendering a friendly message in the
+    // existing layout instead of an error page.
     let raw_db = common::in_memory_db().await;
     let settings = Arc::new(Settings::default());
     let token = viewer_jwt(&settings);
