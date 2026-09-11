@@ -1,8 +1,8 @@
 use opentelemetry::{
-    trace::{Link, SamplingDecision, SamplingResult, SpanKind, TraceId, TraceState},
+    trace::{Link, SpanKind, TraceId, TraceState},
     Context, KeyValue, Value,
 };
-use opentelemetry_sdk::trace::ShouldSample;
+use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample};
 
 /// Head-based sampler. Decisions at span start:
 /// 1. Propagate parent sampling flag if parent context is present.

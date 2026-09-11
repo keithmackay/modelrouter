@@ -32,7 +32,7 @@ fn sampler_always_records_force_sample() {
     );
     assert_eq!(
         result.decision,
-        opentelemetry::trace::SamplingDecision::RecordAndSample
+        opentelemetry_sdk::trace::SamplingDecision::RecordAndSample
     );
 }
 
@@ -49,7 +49,7 @@ fn sampler_ratio_zero_drops_without_force_sample() {
     );
     assert_eq!(
         result.decision,
-        opentelemetry::trace::SamplingDecision::Drop
+        opentelemetry_sdk::trace::SamplingDecision::Drop
     );
 }
 
@@ -66,7 +66,7 @@ fn sampler_ratio_one_always_records() {
     );
     assert_eq!(
         result.decision,
-        opentelemetry::trace::SamplingDecision::RecordAndSample
+        opentelemetry_sdk::trace::SamplingDecision::RecordAndSample
     );
 }
 
@@ -100,7 +100,7 @@ fn sampler_propagates_sampled_parent() {
     );
     assert_eq!(
         result.decision,
-        opentelemetry::trace::SamplingDecision::RecordAndSample
+        opentelemetry_sdk::trace::SamplingDecision::RecordAndSample
     );
 }
 
@@ -110,11 +110,10 @@ fn sampler_propagates_sampled_parent() {
 // because the metrics module uses OnceLock<Instruments> — only the first
 // call to init_instruments() takes effect.
 //
-// PeriodicReaderWithOwnThread is used instead of PeriodicReader so that
+// Since 0.28 PeriodicReader runs on its own background thread, so
 // force_flush() works synchronously without a tokio runtime.
 
-use opentelemetry_sdk::metrics::{PeriodicReaderWithOwnThread, SdkMeterProvider};
-use opentelemetry_sdk::testing::metrics::InMemoryMetricExporter;
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use opentelemetry::metrics::MeterProvider;
 use std::sync::OnceLock;
 
@@ -128,7 +127,7 @@ static METRICS_TEST_STATE: OnceLock<MetricsTestState> = OnceLock::new();
 fn metrics_test_state() -> &'static MetricsTestState {
     METRICS_TEST_STATE.get_or_init(|| {
         let exporter = InMemoryMetricExporter::default();
-        let reader = PeriodicReaderWithOwnThread::builder(exporter.clone()).build();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
         let provider = SdkMeterProvider::builder()
             .with_reader(reader)
             .build();
@@ -152,9 +151,9 @@ fn metrics_requests_total_increments() {
     let metrics = state.exporter.get_finished_metrics().unwrap();
     // Verify the metric exists — .expect() panics if absent
     let _req_metric = metrics.iter()
-        .flat_map(|rm| &rm.scope_metrics)
-        .flat_map(|sm| &sm.metrics)
-        .find(|m| m.name == "modelrouter.requests.total")
+        .flat_map(|rm| rm.scope_metrics())
+        .flat_map(|sm| sm.metrics())
+        .find(|m| m.name() == "modelrouter.requests.total")
         .expect("requests.total metric not found");
 }
 
@@ -169,9 +168,9 @@ fn metrics_policy_denied_increments_with_reason() {
 
     let metrics = state.exporter.get_finished_metrics().unwrap();
     let denied = metrics.iter()
-        .flat_map(|rm| &rm.scope_metrics)
-        .flat_map(|sm| &sm.metrics)
-        .find(|m| m.name == "modelrouter.policy.denied");
+        .flat_map(|rm| rm.scope_metrics())
+        .flat_map(|sm| sm.metrics())
+        .find(|m| m.name() == "modelrouter.policy.denied");
     assert!(denied.is_some(), "policy.denied metric not found");
 }
 
@@ -218,20 +217,16 @@ fn telemetry_init_and_shutdown_does_not_panic() {
 async fn completions_span_has_required_attributes() {
     use axum_test::TestServer;
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
-    use opentelemetry_sdk::trace::{SimpleSpanProcessor, TracerProvider};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor};
     use opentelemetry_sdk::Resource;
-    use opentelemetry::KeyValue;
     use tracing_subscriber::prelude::*;
     use std::sync::Arc;
 
     // Set up an in-memory exporter
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
-        .with_resource(Resource::new(vec![
-            KeyValue::new("service.name", "test"),
-        ]))
-        .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+    let provider = SdkTracerProvider::builder()
+        .with_resource(Resource::builder().with_service_name("test").build())
+        .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
         .build();
     opentelemetry::global::set_tracer_provider(provider.clone());
 

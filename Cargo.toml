@@ -82,11 +82,11 @@ aws-config             = { version = "1", optional = true }
 google-cloud-auth = { version = "1", optional = true }
 
 # ── OpenTelemetry (--features otel) ────────────────────────────────────
-opentelemetry                  = { version = "0.27", features = ["logs"], optional = true }
-opentelemetry_sdk              = { version = "0.27", features = ["rt-tokio", "logs"], optional = true }
-opentelemetry-otlp             = { version = "0.27", features = ["grpc-tonic", "logs"], optional = true }
-opentelemetry-appender-tracing = { version = "0.27", optional = true }
-tracing-opentelemetry          = { version = "0.28", optional = true }
+opentelemetry                  = { version = "0.32", features = ["logs"], optional = true }
+opentelemetry_sdk              = { version = "0.32", features = ["logs"], optional = true }
+opentelemetry-otlp             = { version = "0.32", features = ["grpc-tonic", "logs"], optional = true }
+opentelemetry-appender-tracing = { version = "0.32", optional = true }
+tracing-opentelemetry          = { version = "0.33", optional = true }
 redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
 
 [dev-dependencies]
@@ -95,7 +95,7 @@ axum-test = "14"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing", "experimental_metrics_periodic_reader_no_runtime"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 
 [profile.release]
 # Pinned ahead of the routing plugin runtime (design spec §4c): plugins will run
