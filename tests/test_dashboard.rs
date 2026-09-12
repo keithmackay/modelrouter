@@ -1309,3 +1309,176 @@ async fn failures_list_shows_correlation_id_column() {
         "table header for correlation id must be present"
     );
 }
+
+// ── Generate API key tests ────────────────────────────────────────────────────
+
+/// Superadmin can generate a key for a user with email, and the response includes
+/// the raw key and a mailto link.
+#[tokio::test]
+async fn superadmin_generate_key_with_email() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "alice".to_string(),
+            email: Some("alice@example.com".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "superadmin should be able to generate key");
+    let body = resp.text();
+
+    assert!(body.contains("mr-"), "response must contain raw key starting with mr-");
+    assert!(body.contains("Key Generated"), "response must show key generation success message");
+    assert!(body.contains("mailto:"), "response must contain mailto link for user with email");
+    assert!(body.contains("alice@example.com"), "mailto link must include user email");
+    assert!(body.contains("Your%20ModelRouter%20API%20Key"), "subject must be URL-encoded");
+    assert!(!body.contains("Your ModelRouter API Key") || body.contains("Your%20ModelRouter%20API%20Key"),
+        "mailto subject should be URL-encoded, not contain raw spaces in the URL");
+}
+
+/// User without email shows key but no mailto link.
+#[tokio::test]
+async fn superadmin_generate_key_no_email() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "bob".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+
+    assert!(body.contains("mr-"), "response must contain raw key");
+    assert!(body.contains("Key Generated"), "response must show success message");
+    assert!(!body.contains("mailto:"), "response must not contain mailto link when user has no email");
+    assert!(body.contains("No email on file"), "response must indicate no email available");
+}
+
+/// Viewer session cannot generate keys (superadmin only).
+#[tokio::test]
+async fn viewer_cannot_generate_key() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "charlie".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", viewer)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 403, "viewer role should get 403 when trying to generate key");
+}
+
+/// The generated key is stored as a hash, not raw text.
+#[tokio::test]
+async fn generated_key_stored_as_hash() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::models::NewUser;
+    use modelrouter::api::auth::hash_token;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "dave".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db.clone()), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+
+    let raw_key_start = body.find("mr-").expect("response must contain raw key");
+    let raw_key_fragment = &body[raw_key_start..];
+    let raw_key_end = raw_key_fragment.find("</code>").expect("key must be in code block");
+    let raw_key = &raw_key_fragment[..raw_key_end];
+
+    assert!(raw_key.starts_with("mr-"), "extracted key must start with mr-");
+    assert!(raw_key.len() > 10, "key must have reasonable length");
+
+    let keys = ApiKeyRepository::list_api_keys_for_user(&raw_db, user.id)
+        .await
+        .expect("should be able to list keys");
+
+    assert_eq!(keys.len(), 1, "exactly one key should be created");
+    let stored_key = &keys[0];
+
+    assert_ne!(stored_key.key_hash, raw_key, "stored hash must not equal raw key");
+
+    let expected_hash = hash_token(raw_key);
+    assert_eq!(stored_key.key_hash, expected_hash, "stored hash must match SHA-256 of raw key");
+}
