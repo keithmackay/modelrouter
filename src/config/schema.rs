@@ -682,7 +682,9 @@ pub struct ProviderConfig {
     pub api_base: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
+    /// Azure API version (e.g. "2024-02-01"). Used by the `azure` adapter, and
+    /// by `foundry` to override the api-version it would otherwise pick for the
+    /// endpoint's surface.
     #[serde(default)]
     pub api_version: Option<String>,
     /// AWS region for Bedrock (e.g. "us-east-1"). Used only by the Bedrock adapter.
@@ -756,6 +758,31 @@ pub struct ProviderConfig {
     /// portal calls the value being copied.
     #[serde(default)]
     pub foundry_project_endpoint: Option<String>,
+    /// Azure AI Foundry inference endpoint, e.g.
+    /// `https://<resource>.services.ai.azure.com` (the `foundry` provider
+    /// appends `/openai/v1`), or the model-inference endpoint
+    /// `https://<resource>.services.ai.azure.com/models`. Used only by the
+    /// `foundry` provider; `api_base` is accepted as a fallback.
+    ///
+    /// Distinct from `foundry_project_endpoint`, which the `bing_grounding`
+    /// SEARCH adapter uses for the Responses API on a project endpoint. Setting
+    /// `project` alongside this one appends `/api/projects/<project>`, which is
+    /// the same project/region split the `[providers.vertex]` block uses.
+    #[serde(default)]
+    pub foundry_endpoint: Option<String>,
+    /// Override the Microsoft Entra scope (audience) requested for this
+    /// provider, e.g. `https://cognitiveservices.azure.com/.default` or
+    /// `https://ai.azure.com/.default`.
+    ///
+    /// The `foundry` provider derives an audience from the endpoint shape —
+    /// project endpoints take `ai.azure.com`, resource endpoints take
+    /// `cognitiveservices.azure.com` per the published OpenAPI documents — but
+    /// Microsoft's own keyless-auth how-to shows `ai.azure.com` for resource
+    /// endpoints too. Where the published spec and the published prose disagree,
+    /// the operator gets the last word. The resolved value is logged at startup
+    /// and named in the 401/403 error hint.
+    #[serde(default)]
+    pub entra_scope: Option<String>,
     /// Foundry project connection id of the "Grounding with Bing Search" (or
     /// "Grounding with Bing Custom Search") resource, as shown on the project's
     /// Connected resources page. Required by the `bing_grounding` adapter: the
@@ -794,6 +821,8 @@ impl Default for ProviderConfig {
             embedding_task_type: None,
             search_model: None,
             foundry_project_endpoint: None,
+            foundry_endpoint: None,
+            entra_scope: None,
             project_connection_id: None,
             custom_search: false,
             custom_search_instance: None,

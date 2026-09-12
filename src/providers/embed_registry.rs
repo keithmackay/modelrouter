@@ -46,6 +46,19 @@ impl EmbeddingRegistry {
                 "provider \"vertex\" is configured, but this binary was built without the `vertex` \
                  cargo feature — rebuild with `cargo build --release --features vertex`"
             ),
+            // Foundry's embeddings are OpenAI-shaped, but the URL, the
+            // api-version rules and above all the Entra credential chain are
+            // not — the compat adapter would send an `Authorization: Bearer
+            // <empty api_key>` to the wrong path. Named arm, same as vertex.
+            #[cfg(feature = "foundry")]
+            "foundry" => Arc::new(
+                crate::providers::foundry::FoundryEmbeddingAdapter::new(config)?,
+            ),
+            #[cfg(not(feature = "foundry"))]
+            "foundry" => anyhow::bail!(
+                "provider \"foundry\" is configured, but this binary was built without the `foundry` \
+                 cargo feature — rebuild with `cargo build --release --features foundry`"
+            ),
             _ => Arc::new(
                 crate::providers::openai_embed::OpenAIEmbeddingAdapter::new(config),
             ),

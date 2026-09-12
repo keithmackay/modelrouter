@@ -134,6 +134,54 @@ timeout_secs = 120
 # "claude-sonnet-4-6"  = "vertex/anthropic/claude-sonnet-4-6@20250514"
 # "claude-opus-4-5"    = "vertex/anthropic/claude-opus-4-5@20250101"
 
+# Azure AI Foundry model inference (requires build with `--features foundry`,
+# which is on by default). What `[providers.vertex]` is for GCP, this is for
+# Azure: one endpoint fronting every model deployed on the resource — Llama,
+# Mistral, Phi, DeepSeek, Cohere, Grok and the OpenAI models — selected by the
+# deployment name in the request. Chat, streaming, embeddings and model
+# discovery all go through it.
+#
+# NOT the same as `[providers.azure]`, which speaks the older Azure OpenAI
+# surface (`/openai/deployments/<deployment>/...?api-version=`) with an
+# `api-key` header and needs one provider entry per deployment. Keep using that
+# one for an Azure OpenAI resource; use this one for a Foundry / AI Services
+# resource.
+#
+# Which surface you get is the path you configure:
+#   * bare host              -> the OpenAI-compatible surface, `/openai/v1`,
+#                               no api-version (the service defaults to `v1`)
+#   * a path ending /models  -> the Azure AI Model Inference surface, which
+#                               REQUIRES an api-version (sent for you)
+# The Model Inference API is documented as deprecated in favour of the
+# OpenAI-compatible one, which is why a bare host resolves to the latter.
+#
+# Authentication is Microsoft Entra, from the ENVIRONMENT, never from this file:
+#   * AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET (app registration), or
+#   * managed identity via IMDS (nothing to set; the default when the trio is absent).
+# Grant the identity the "Azure AI User" role (or equivalent) on the resource.
+# Setting `api_key` here switches to resource-key auth — supported, but it puts
+# a secret on disk; Entra is the intended mode.
+#
+# [providers.foundry]
+# foundry_endpoint = "https://<resource>.services.ai.azure.com"
+# project          = ""       # optional: appends /api/projects/<project>
+# entra_scope      = ""       # optional audience override; see below
+# api_version      = ""       # optional; overrides the per-surface default
+# timeout_secs     = 120
+#
+# `entra_scope`: the audience is derived from the endpoint — project endpoints
+# take https://ai.azure.com/.default, resource endpoints take
+# https://cognitiveservices.azure.com/.default per the published OpenAPI
+# documents. Microsoft's keyless-auth how-to shows ai.azure.com for resource
+# endpoints too, so where spec and prose disagree this field is the override.
+# The resolved value is logged at startup and named in any 401/403.
+#
+# Aliases map to `foundry/<deployment-name>` — the names `GET /v1/models`
+# lists for this provider are exactly what goes after the slash.
+# [routing.model_aliases]
+# "llama-70b"  = "foundry/Llama-3.3-70B-Instruct"
+# "phi-4"      = "foundry/Phi-4"
+
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
