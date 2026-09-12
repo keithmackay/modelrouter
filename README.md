@@ -637,7 +637,48 @@ config or redeploying. Fallback chains (`[routing.fallback_chains]`) accept any 
 `provider/model` string, including cross-publisher Vertex chains
 (`"vertex/anthropic/claude-…" = ["vertex/google/gemini-…"]`).
 
-**Build note:** default cargo features include every provider (`vertex`, `bedrock`, …).
+### Azure AI Foundry: one endpoint, many deployments
+
+`[providers.foundry]` is to Azure what `[providers.vertex]` is to GCP. A Foundry
+(AI Services) resource fronts every model deployed on it — Llama, Mistral, Phi, DeepSeek,
+Cohere, Grok and the OpenAI models — behind one endpoint, with the deployment named in the
+request body, so `foundry/<deployment>` is all a route needs. Chat, streaming, embeddings
+and `GET /admin/api/models/available` discovery all go through it.
+
+Distinct from `[providers.azure]`, which speaks the older Azure OpenAI surface
+(`/openai/deployments/<deployment>/…?api-version=`) with an `api-key` header and needs one
+provider entry per deployment. Use that for an Azure OpenAI resource, `foundry` for a
+Foundry / AI Services resource.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `foundry_endpoint` | Resource endpoint, e.g. `https://<resource>.services.ai.azure.com` | required (`api_base` accepted) |
+| `project` | Foundry project; appends `/api/projects/<project>` | none (resource-level) |
+| `entra_scope` | Override the Entra audience | derived from the endpoint |
+| `api_version` | Override the per-surface api-version | per surface (see below) |
+
+**The surface is the path you configure.** A bare host resolves to the OpenAI-compatible
+data plane (`/openai/v1`), where `api-version` is optional and the service defaults to
+`v1`. An endpoint ending in `/models` selects the Azure AI Model Inference data plane,
+where `api-version` is *required* — the router supplies it. The Model Inference API is
+documented as deprecated in favour of the OpenAI-compatible one, which is why a bare host
+picks the latter. Discovery always reads the `/openai/v1/models` listing on the same
+resource, because the Model Inference surface has no listing operation at all.
+
+**Authentication is Microsoft Entra, from the environment, never from config** — the same
+credential chain the `bing_grounding` engine uses, sharing the same code:
+`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` for an app registration,
+otherwise managed identity via IMDS. Setting `api_key` switches to resource-key auth
+(`api-key` header) — supported, but it puts a secret on disk.
+
+The **audience** is derived per endpoint: `https://cognitiveservices.azure.com/.default`
+for a resource endpoint (what the published OpenAPI documents declare),
+`https://ai.azure.com/.default` for a project endpoint. Microsoft's keyless-auth how-to
+shows `ai.azure.com` for resource endpoints too, so where spec and prose disagree
+`entra_scope` is the override. The resolved value is logged at startup and named in any
+401/403 response, so the fix is visible without a doc hunt.
+
+**Build note:** default cargo features include every provider (`vertex`, `bedrock`, `foundry`, …).
 An unconfigured provider costs nothing at runtime, while a binary missing a compiled
 feature *refuses to start* against a config that names it — so feature-stripped builds
 turn a plain `cargo build` into a startup trap. Only strip features deliberately.

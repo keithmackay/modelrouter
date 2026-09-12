@@ -47,7 +47,7 @@ use anyhow::Context;
 use std::sync::Arc;
 
 use crate::config::schema::ProviderConfig;
-use crate::providers::bing_grounding::auth::{EntraTokenProvider, TokenProvider};
+use crate::providers::azure_entra::{EntraTokenProvider, TokenProvider, FOUNDRY_PROJECT_SCOPE};
 use crate::providers::search::{SearchAdapter, SearchRequest, SearchResponse, SearchResultItem};
 
 /// Path of the GA ("v1") Responses surface on a Foundry project endpoint.
@@ -110,11 +110,19 @@ pub struct BingGroundingAdapter {
 impl BingGroundingAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let auth = if config.api_key.trim().is_empty() {
-            let provider = EntraTokenProvider::from_env(std::time::Duration::from_secs(
-                config.timeout_secs.min(RECOMMENDED_TIMEOUT_SECS),
-            ))?;
+            // A Foundry PROJECT endpoint (`/api/projects/<project>`), whose
+            // documented audience is `https://ai.azure.com/.default` — not the
+            // `cognitiveservices` audience the resource-level inference
+            // endpoints take. See `providers::azure_entra` for both constants.
+            let provider = EntraTokenProvider::from_env(
+                FOUNDRY_PROJECT_SCOPE,
+                std::time::Duration::from_secs(
+                    config.timeout_secs.min(RECOMMENDED_TIMEOUT_SECS),
+                ),
+            )?;
             tracing::debug!(
                 credential_source = provider.source_label(),
+                scope = provider.scope(),
                 "bing_grounding: authenticating with Entra"
             );
             FoundryAuth::Entra(Arc::new(provider) as Arc<dyn TokenProvider>)
