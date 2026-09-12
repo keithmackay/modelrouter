@@ -354,13 +354,16 @@ fn user_row_html(user: &crate::db::models::User) -> String {
         "\" hx-swap=\"outerHTML\">", toggle_label, "</button>",
     ].concat();
 
-    let email_str = user.email.as_deref().unwrap_or("—");
+    // Name and email are operator-entered but still user-controlled data —
+    // escape them like every other fragment in this file does (issue #75).
+    let name_e = he(&user.name);
+    let email_e = user.email.as_deref().map(he).unwrap_or_else(|| "—".to_string());
 
     [
         "<tr id=\"user-row-", id_s.as_str(), "\">",
         "<td>", id_s.as_str(), "</td>",
-        "<td>", user.name.as_str(), "</td>",
-        "<td>", email_str, "</td>",
+        "<td>", name_e.as_str(), "</td>",
+        "<td>", email_e.as_str(), "</td>",
         "<td>", status_tag, "</td>",
         "<td>", user.created_at.as_str(), "</td>",
         "<td>", toggle_btn.as_str(), "</td>",

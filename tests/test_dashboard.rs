@@ -1482,3 +1482,52 @@ async fn generated_key_stored_as_hash() {
     let expected_hash = hash_token(raw_key);
     assert_eq!(stored_key.key_hash, expected_hash, "stored hash must match SHA-256 of raw key");
 }
+
+// ── User row escaping (issue #75) ──────────────────────────────────────
+
+#[tokio::test]
+async fn user_row_escapes_name_and_email() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "<script>alert(1)</script>".to_string(),
+            email: Some("a@b<img src=x>".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    // The enable endpoint returns the user_row_html fragment.
+    let resp = server
+        .post(&format!("/admin/users/{}/enable", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "name must be HTML-escaped in the row fragment; got: {body}"
+    );
+    assert!(
+        !body.contains("<script>alert(1)</script>"),
+        "raw name markup must not appear in the row fragment"
+    );
+    assert!(
+        body.contains("a@b&lt;img"),
+        "email must be HTML-escaped in the row fragment; got: {body}"
+    );
+    assert!(!body.contains("<img src=x>"), "raw email markup must not appear");
+}
