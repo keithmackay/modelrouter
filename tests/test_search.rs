@@ -863,3 +863,161 @@ async fn provider_client_error_surfaces_immediately_no_failover() {
         "vertex fallback engine must not be called when the primary returns a client error"
     );
 }
+
+// ── Search fallback policy re-checks (issue #72) ─────────────────────────────
+
+#[tokio::test]
+async fn search_fallback_denied_by_model_allow_list_fails_request() {
+    use modelrouter::db::models::NewBudgetRule;
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::providers::search::SearchResultItem;
+
+    // Build app with tavily→vertex fallback chain; tavily errors
+    let chains = HashMap::from([("tavily".to_string(), vec!["vertex".to_string()])]);
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "tavily unavailable".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::MockSearchAdapter {
+                results: vec![SearchResultItem {
+                    title: "result".to_string(),
+                    url: "http://example.com".to_string(),
+                    snippet: "snippet".to_string(),
+                    score: None,
+                    published_date: None,
+                }],
+            }),
+        ),
+    ]);
+    let (server, db) = test_app_with_chain(registry, chains).await;
+
+    // Create budget rule that only allows the primary engine
+    let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec!["search/tavily".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Primary fails, fallback is denied by policy → request fails
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "query": "test query",
+            "engine": "tavily"
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        502,
+        "search fallback denied by policy should fail the request"
+    );
+
+    // No cost recorded: primary failed, fallback was denied
+    let ledger = common::wait_for_ledger_rows(&*db, 0).await;
+    assert_eq!(ledger.len(), 0);
+}
+
+#[tokio::test]
+async fn search_fallback_permitted_by_model_allow_list_serves_request() {
+    use modelrouter::db::models::NewBudgetRule;
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::providers::search::SearchResultItem;
+
+    // Build app with tavily→vertex fallback chain; tavily errors
+    let chains = HashMap::from([("tavily".to_string(), vec!["vertex".to_string()])]);
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "tavily unavailable".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::MockSearchAdapter {
+                results: vec![SearchResultItem {
+                    title: "result".to_string(),
+                    url: "http://example.com".to_string(),
+                    snippet: "snippet".to_string(),
+                    score: None,
+                    published_date: None,
+                }],
+            }),
+        ),
+    ]);
+    let (server, db) = test_app_with_chain(registry, chains).await;
+
+    // Create budget rule that allows both engines
+    let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec!["search/tavily".to_string(), "search/vertex".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Primary fails, fallback is permitted → fallback serves
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "query": "test query",
+            "engine": "tavily"
+        }))
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["engine"], "vertex", "fallback engine served the request");
+
+    // Cost recorded under the serving engine
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger[0].provider, "vertex");
+}

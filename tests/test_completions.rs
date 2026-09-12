@@ -278,20 +278,20 @@ mod accounting {
     /// answering, and whose stream is a script. `new_with_mock` hands the same
     /// adapter out for every provider name, so a fallback chain that crosses
     /// providers still lands here.
-    struct ScriptedAdapter {
+    pub(crate) struct ScriptedAdapter {
         fail_first: AtomicUsize,
         chunks: Vec<Chunk>,
     }
 
     impl ScriptedAdapter {
-        fn streaming(chunks: Vec<Chunk>) -> Self {
+        pub(crate) fn streaming(chunks: Vec<Chunk>) -> Self {
             Self {
                 fail_first: AtomicUsize::new(0),
                 chunks,
             }
         }
 
-        fn failing_first(n: usize) -> Self {
+        pub(crate) fn failing_first(n: usize) -> Self {
             Self {
                 fail_first: AtomicUsize::new(n),
                 chunks: vec![],
@@ -364,7 +364,7 @@ mod accounting {
         ]
     }
 
-    async fn build_app(
+    pub(crate) async fn build_app(
         adapter: ScriptedAdapter,
         chains: HashMap<String, Vec<String>>,
         real_port: bool,
@@ -450,14 +450,14 @@ mod accounting {
         (server, db)
     }
 
-    fn bearer() -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    pub(crate) fn bearer() -> (axum::http::HeaderName, axum::http::HeaderValue) {
         (
             axum::http::header::AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer test-token"),
         )
     }
 
-    fn request_body(stream: bool) -> serde_json::Value {
+    pub(crate) fn request_body(stream: bool) -> serde_json::Value {
         json!({
             "model": "primary/big-model",
             "messages": [{"role": "user", "content": "Hello"}],
@@ -820,4 +820,123 @@ async fn tools_field_with_streaming_returns_400() {
     let body: serde_json::Value = resp.json();
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("tools"), "Error message should mention 'tools' field, got: {}", message);
+}
+
+// ── Fallback policy re-checks (issue #72) ────────────────────────────────────
+
+#[tokio::test]
+async fn fallback_denied_by_user_model_allow_list_fails_request() {
+    use modelrouter::db::models::{NewBudgetRule, BudgetScope};
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+
+    // Build app with primary→fallback chain; primary provider fails
+    let chains = std::collections::HashMap::from([(
+        "big-model".to_string(),
+        vec!["backup/mini-model".to_string()],
+    )]);
+    let (server, db) = accounting::build_app(
+        accounting::ScriptedAdapter::failing_first(1),
+        chains,
+        false,
+    ).await;
+
+    // Create a budget rule that only allows the primary model (not the fallback)
+    // The primary model "big-model" is resolved to "primary/big-model" by the router,
+    // but the policy checks against canonical "big-model" after resolution.
+    let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            // Allow the primary model (as sent in the request) but not the fallback
+            // The primary policy check sees "primary/big-model" (before resolution),
+            // the fallback re-check sees "mini-model" (after resolution of "backup/mini-model")
+            model_allow: vec!["primary/big-model".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Primary provider fails, fallback is denied by policy → request fails
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header(accounting::bearer().0, accounting::bearer().1)
+        .json(&accounting::request_body(false))
+        .await;
+
+    // The request should fail (fallback was skipped by policy)
+    assert_eq!(resp.status_code(), 502, "fallback denied by policy should fail the request");
+
+    // No ledger row: neither the primary (failed) nor the fallback (denied) served
+    let ledger = common::wait_for_ledger_rows(&*db, 0).await;
+    assert_eq!(ledger.len(), 0, "no cost should be recorded when fallback is denied");
+}
+
+#[tokio::test]
+async fn fallback_permitted_by_model_allow_list_serves_request() {
+    use modelrouter::db::models::{NewBudgetRule, BudgetScope};
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+
+    // Build app with primary→fallback chain; primary provider fails
+    let chains = std::collections::HashMap::from([(
+        "big-model".to_string(),
+        vec!["backup/mini-model".to_string()],
+    )]);
+    let (server, db) = accounting::build_app(
+        accounting::ScriptedAdapter::failing_first(1),
+        chains,
+        false,
+    ).await;
+
+    // Create a budget rule that allows both models
+    let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            // Allow both the primary (as sent) and the fallback (after resolution)
+            model_allow: vec!["primary/big-model".to_string(), "mini-model".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Primary fails, fallback is permitted by policy → fallback serves
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header(accounting::bearer().0, accounting::bearer().1)
+        .json(&accounting::request_body(false))
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["model"], "mini-model");
+
+    // Ledger row records the fallback model
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger[0].model, "mini-model");
 }
