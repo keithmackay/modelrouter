@@ -333,6 +333,56 @@ impl PolicyEngine {
         }
         Ok(None)
     }
+
+    /// Model allow/deny evaluation only, for failover re-checks: no rate-limit
+    /// increment, no budget sums (neither is model-dependent). Returns
+    /// Some(reason) when `model` is denied for this user, None when permitted.
+    ///
+    /// CRITICAL: This does NOT increment rate limits or sum budgets. The
+    /// original `check()` already counted the request; re-running it for
+    /// fallback candidates would double-count against rate_rpm. Budget sums
+    /// are model-independent (a $10 monthly limit covers all models), so
+    /// re-summing adds nothing. Failover only needs to know whether the
+    /// SERVING model is permitted.
+    pub async fn model_permitted_denial(&self, user: &User, model: &str) -> anyhow::Result<Option<String>> {
+        use crate::db::repositories::budgets::BudgetRepository;
+
+        // ── Declarative policy rules (config-driven, highest priority) ──────
+        if let Some(ref live) = self.settings {
+            let settings = live.load();
+            if !settings.policy_rules.is_empty() {
+                if let Some(rule) = find_matching_rule(&settings.policy_rules, user, model) {
+                    // Model allow-list check
+                    if !rule.allow_models.is_empty() && !rule.allow_models.contains(&model.to_string()) {
+                        return Ok(Some(format!("model '{}' not permitted by policy rule '{}'", model, rule.name)));
+                    }
+                    // Rule matched and model is permitted — skip DB rules
+                    return Ok(None);
+                }
+            }
+        }
+
+        // ── Fallthrough: existing database-driven rules ──────────────────────
+        // Get budget rules for this user (user-specific first)
+        let mut rules = BudgetRepository::list_for_user(&*self.db, user.id).await?;
+        // Per-key rules take precedence — check them first by prepending
+        if let Some(key_id) = user.api_key_id {
+            let key_rules = BudgetRepository::list_for_key(&*self.db, key_id).await?;
+            rules = key_rules.into_iter().chain(rules).collect();
+        }
+
+        for rule in &rules {
+            // Skip "target" window rules — these are informational group targets, not enforceable limits
+            if rule.window == "target" {
+                continue;
+            }
+            if let Some(reason) = check_model_lists_denial(rule, model) {
+                return Ok(Some(reason));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 /// Record the denial on the current policy span and build the decision.
@@ -343,20 +393,29 @@ fn deny(reason: String, status: u16, budget_context: Option<BudgetContext>) -> P
     PolicyDecision::Deny { reason, status, budget_context }
 }
 
+/// Compute the model allow/deny denial reason without recording it on the span.
+/// Returns Some(reason) when the model is denied, None when permitted.
+fn check_model_lists_denial(
+    rule: &crate::db::models::BudgetRule,
+    model: &str,
+) -> Option<String> {
+    let model_allow: Vec<String> = serde_json::from_str(&rule.model_allow).unwrap_or_default();
+    if !model_allow.is_empty() && !model_allow.contains(&model.to_string()) {
+        return Some(format!("model '{}' not in allow list", model));
+    }
+    let model_deny: Vec<String> = serde_json::from_str(&rule.model_deny).unwrap_or_default();
+    if model_deny.contains(&model.to_string()) {
+        return Some(format!("model '{}' is denied", model));
+    }
+    None
+}
+
 /// Model allow/deny lists on a user/key rule (JSON arrays).
 fn check_model_lists(
     rule: &crate::db::models::BudgetRule,
     model: &str,
 ) -> Option<PolicyDecision> {
-    let model_allow: Vec<String> = serde_json::from_str(&rule.model_allow).unwrap_or_default();
-    if !model_allow.is_empty() && !model_allow.contains(&model.to_string()) {
-        return Some(deny(format!("model '{}' not in allow list", model), 403, None));
-    }
-    let model_deny: Vec<String> = serde_json::from_str(&rule.model_deny).unwrap_or_default();
-    if model_deny.contains(&model.to_string()) {
-        return Some(deny(format!("model '{}' is denied", model), 403, None));
-    }
-    None
+    check_model_lists_denial(rule, model).map(|reason| deny(reason, 403, None))
 }
 
 /// Window start with the user's `spend_reset_at` honored: whichever is later.
@@ -469,6 +528,79 @@ mod tests {
         let engine = PolicyEngine::new(db.clone() as Arc<dyn DatabaseProvider>);
         let decision = engine.check(&user, "claude-sonnet-4-6").await.unwrap();
         assert!(matches!(decision, PolicyDecision::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn model_permitted_denial_denies_model_not_in_allow_list() {
+        let db = make_db().await;
+        let user = make_user(&db).await;
+
+        BudgetRepository::create(&*db, NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None, api_key_id: None, tag: None, project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec!["gpt-4o".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        }).await.unwrap();
+
+        let engine = PolicyEngine::new(db.clone() as Arc<dyn DatabaseProvider>);
+        let denial = engine.model_permitted_denial(&user, "claude-sonnet-4-6").await.unwrap();
+        assert!(denial.is_some());
+        assert!(denial.unwrap().contains("not in allow list"));
+    }
+
+    #[tokio::test]
+    async fn model_permitted_denial_permits_model_in_allow_list() {
+        let db = make_db().await;
+        let user = make_user(&db).await;
+
+        BudgetRepository::create(&*db, NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None, api_key_id: None, tag: None, project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec!["gpt-4o".to_string(), "claude-sonnet-4-6".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        }).await.unwrap();
+
+        let engine = PolicyEngine::new(db.clone() as Arc<dyn DatabaseProvider>);
+        let denial = engine.model_permitted_denial(&user, "claude-sonnet-4-6").await.unwrap();
+        assert!(denial.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_permitted_denial_permits_when_no_lists() {
+        let db = make_db().await;
+        let user = make_user(&db).await;
+
+        BudgetRepository::create(&*db, NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None, api_key_id: None, tag: None, project: None,
+            window: "monthly".to_string(),
+            limit_usd: Some(10.0),
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec![],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        }).await.unwrap();
+
+        let engine = PolicyEngine::new(db.clone() as Arc<dyn DatabaseProvider>);
+        let denial = engine.model_permitted_denial(&user, "any-model").await.unwrap();
+        assert!(denial.is_none());
     }
 }
 

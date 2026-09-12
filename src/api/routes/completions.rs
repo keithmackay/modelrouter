@@ -320,6 +320,7 @@ async fn chat_completions_inner(
         attempts,
     } = complete_with_retry_and_fallback(
         &state,
+        &user,
         &body,
         binding.is_some(),
         provider_name.clone(),
@@ -682,6 +683,7 @@ struct ProviderCallOutcome {
 /// recorded against the variant that did not answer.
 async fn complete_with_retry_and_fallback(
     state: &AppState,
+    user: &crate::db::models::User,
     body: &Value,
     bound: bool,
     provider_name: String,
@@ -690,24 +692,23 @@ async fn complete_with_retry_and_fallback(
     let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model;
     let mut current_provider = provider_name;
-    let next_fallback = |model: &str| {
-        if bound {
-            None
-        } else {
-            next_available_fallback(state, model)
-        }
-    };
     let mut attempts: i64 = 0;
     let result = loop {
         if state.circuit_breaker.is_open(&current_provider) {
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
             let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
-            if let Some((next_provider, next_canonical)) = next_fallback(&current_model) {
-                current_model = next_canonical;
-                current_provider = next_provider;
-                continue;
-            } else {
+            if bound {
                 return Err(ApiError::ProviderError(pseudo_err));
+            }
+            match next_available_fallback_with_policy(state, user, &current_model).await {
+                Some((next_provider, next_canonical)) => {
+                    current_model = next_canonical;
+                    current_provider = next_provider;
+                    continue;
+                }
+                None => {
+                    return Err(ApiError::ProviderError(pseudo_err));
+                }
             }
         }
         let adapter = state
@@ -747,12 +748,18 @@ async fn complete_with_retry_and_fallback(
                     error = %e,
                     "Provider call failed, checking fallback chain"
                 );
-                if let Some((next_provider, next_canonical)) = next_fallback(&current_model) {
-                    current_model = next_canonical;
-                    current_provider = next_provider;
-                    tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
-                } else {
+                if bound {
                     return Err(ApiError::ProviderError(e));
+                }
+                match next_available_fallback_with_policy(state, user, &current_model).await {
+                    Some((next_provider, next_canonical)) => {
+                        current_model = next_canonical;
+                        current_provider = next_provider;
+                        tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
+                    }
+                    None => {
+                        return Err(ApiError::ProviderError(e));
+                    }
                 }
             }
         }
@@ -996,6 +1003,62 @@ struct CacheHitCtx {
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
 /// cost-ledger row with `cache_hit = true`, `cost_usd = 0`, and the avoided cost
 /// in `saved_usd`. Fire-and-forget, matching the live-call logging path.
+/// Next fallback candidate after `current_model` that passes policy model-permission
+/// checks and is not operator-disabled. A candidate denied by policy or disabled by
+/// an administrator is skipped, not fatal — the chain exists to find a working
+/// alternative. Bounded by MAX_FALLBACK_HOPS so a looping chain terminates.
+async fn next_available_fallback_with_policy(
+    state: &AppState,
+    user: &crate::db::models::User,
+    current_model: &str,
+) -> Option<(String, String)> {
+    const MAX_FALLBACK_HOPS: usize = 16;
+
+    let mut cursor = current_model.to_string();
+    for _ in 0..MAX_FALLBACK_HOPS {
+        let next_model = state.fallback.next_after(&cursor)?;
+        let (next_provider, next_canonical) = state.router.resolve(&next_model);
+
+        // Check operator availability first
+        if !state.router.is_available(&next_provider, &next_canonical) {
+            tracing::info!(
+                skipped_model = next_model.as_str(),
+                "fallback candidate is disabled by an administrator, trying the next one"
+            );
+            cursor = next_model;
+            continue;
+        }
+
+        // Check policy model permissions (no rate-limit increment, no budget sum)
+        match state.policy.model_permitted_denial(user, &next_canonical).await {
+            Ok(None) => {
+                // Permitted
+                return Some((next_provider, next_canonical));
+            }
+            Ok(Some(reason)) => {
+                // Policy denies this model for this user — skip it
+                tracing::warn!(
+                    model = next_canonical.as_str(),
+                    user_id = user.id,
+                    reason = reason.as_str(),
+                    "fallback candidate denied by policy, trying the next one"
+                );
+                cursor = next_model;
+            }
+            Err(e) => {
+                // Policy engine error — fail closed for this candidate (skip it)
+                tracing::warn!(
+                    model = next_canonical.as_str(),
+                    error = %e,
+                    "policy check error for fallback candidate, skipping"
+                );
+                cursor = next_model;
+            }
+        }
+    }
+    None
+}
+
 /// Next fallback candidate after `current_model` that an operator has not disabled.
 ///
 /// Operator-disabled entries are *skipped*, not fatal: the chain exists to find a
