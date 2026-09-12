@@ -135,6 +135,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     use crate::api::admin::dashboard::{
         get_login, post_login, post_logout,
         get_overview, get_users, post_create_user, post_disable_user, post_enable_user,
+        post_generate_user_key,
         get_prompts as dash_get_prompts, get_prompt_detail, get_failures, get_failure_detail, post_storage_settings,
         get_cost, get_hooks,
         get_audit as dash_get_audit,
@@ -261,6 +262,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/admin/users", get(get_users).post(post_create_user))
         .route("/admin/users/:id/disable", post(post_disable_user))
         .route("/admin/users/:id/enable", post(post_enable_user))
+        .route("/admin/users/:id/keys/generate", post(post_generate_user_key))
         .route("/admin/keys", get(get_keys).post(post_create_key))
         .route("/admin/keys/:id/disable", post(post_disable_key))
         .route("/admin/keys/:id/rotate", post(post_rotate_key))
