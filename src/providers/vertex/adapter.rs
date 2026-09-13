@@ -244,7 +244,7 @@ impl ProviderAdapter for VertexAdapter {
         let url = build_endpoint_url(&self.project, region, publisher, &model, false);
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req),
+            Publisher::Anthropic => claude::translate_request(req, false),
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let token = self.token_provider.token().await?;
@@ -287,7 +287,7 @@ impl ProviderAdapter for VertexAdapter {
         let url = build_endpoint_url(&self.project, region, publisher, &model, true);
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req),
+            Publisher::Anthropic => claude::translate_request(req, true),
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
         let token = self.token_provider.token().await?;
