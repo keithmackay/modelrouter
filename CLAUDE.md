@@ -116,6 +116,16 @@ touched. Git history is public too, so catch it before the commit, not after.
 - API keys stored as SHA-256 hex digest only
 - Hook capabilities are NOT auto-granted — operators must INSERT rows into `hook_permissions`
 
+### Test Coverage
+
+- **New code must ship with tests — coverage is part of dev completion, not a
+  follow-up.** A change is not done until its new/modified lines are exercised
+  by `cargo test`.
+- Codebase-wide target: **≥80% line coverage**. Don't merge changes that pull a
+  file further below the target.
+- Measure with: `cargo llvm-cov --lcov --output-path coverage/lcov.info`
+  (the `coverage/` directory is scratch output; do not commit it).
+
 ## Automated Testing & Issue Management
 
 This section configures the `/fix` command for autonomous issue resolution.
