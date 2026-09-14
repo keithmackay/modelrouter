@@ -145,6 +145,9 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
         let mut body = Self::build_body(req);
         body["stream"] = serde_json::json!(true);
+        // The router owns usage capture (issue #84): always request the final
+        // usage chunk so the streaming ledger records provider-counted tokens.
+        body["stream_options"] = serde_json::json!({"include_usage": true});
 
         let resp = self
             .client

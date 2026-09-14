@@ -120,3 +120,70 @@ pub fn translate_sse_line(line: &str) -> Option<Bytes> {
     });
     Some(Bytes::from(format!("data: {}\n\n", chunk)))
 }
+
+/// Stateful per-stream translator: forwards content chunks like
+/// [`translate_sse_line`] while harvesting `usageMetadata` and `finishReason`
+/// along the way, so the adapter can close the stream with a final chunk that
+/// carries the provider's real token counts (issue #84). Which frame carries
+/// `usageMetadata` varies by API version — sometimes the last content frame,
+/// sometimes a trailing usage-only frame — so every frame is inspected and the
+/// last value seen wins.
+#[derive(Debug, Default)]
+pub struct GeminiSseTranslator {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    saw_usage: bool,
+    finish_reason: Option<&'static str>,
+}
+
+impl GeminiSseTranslator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Translate one SSE line to an OpenAI-shaped content chunk, absorbing any
+    /// usage or finish metadata the frame carries.
+    pub fn translate_line(&mut self, line: &str) -> Option<Bytes> {
+        let payload = line.strip_prefix("data: ")?;
+        let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let usage = &v["usageMetadata"];
+        if usage.is_object() {
+            if let Some(n) = usage["promptTokenCount"].as_u64() {
+                self.prompt_tokens = n as u32;
+                self.saw_usage = true;
+            }
+            if let Some(n) = usage["candidatesTokenCount"].as_u64() {
+                self.completion_tokens = n as u32;
+                self.saw_usage = true;
+            }
+            if let Some(n) = usage["cachedContentTokenCount"].as_u64() {
+                self.cached_tokens = n as u32;
+            }
+        }
+        if let Some(r) = v["candidates"].get(0).and_then(|c| c["finishReason"].as_str()) {
+            self.finish_reason = Some(map_finish_reason(r));
+        }
+        translate_sse_line(line)
+    }
+
+    /// The stream-terminating bytes: a finish chunk (with real usage when the
+    /// provider reported it) followed by `data: [DONE]`. The adapter emits
+    /// this once, after the upstream body ends.
+    pub fn final_chunk(&self) -> Bytes {
+        let mut chunk = serde_json::json!({
+            "id": "chatcmpl-vertex-stream",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": self.finish_reason.unwrap_or("stop")}]
+        });
+        if self.saw_usage {
+            chunk["usage"] = serde_json::json!({
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.prompt_tokens + self.completion_tokens,
+                "prompt_tokens_details": {"cached_tokens": self.cached_tokens}
+            });
+        }
+        Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", chunk))
+    }
+}

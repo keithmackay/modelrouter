@@ -7,7 +7,6 @@
 //!
 //! MVP scope: string-only message content (consistent with `gemini.rs`).
 
-use bytes::Bytes;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest};
 use crate::providers::anthropic::translate_messages;
 
@@ -71,37 +70,11 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
     })
 }
 
-/// Translate a single Anthropic SSE event line to an OpenAI `chat.completion.chunk` line.
-///
-/// Emits:
-///   - `data: {...}\n\n` on `content_block_delta` with `text_delta` content.
-///   - A single `Bytes` containing both the finalization chunk and the
-///     `data: [DONE]\n\n` sentinel on `message_delta` (the Anthropic event
-///     that carries `stop_reason` and final `usage.output_tokens`). This
-///     matches the direct Anthropic adapter's termination point.
-/// Returns `None` for all other event types (`message_start`, `message_stop`,
-/// `ping`, etc.).
-pub fn translate_sse_line(line: &str) -> Option<Bytes> {
-    let payload = line.strip_prefix("data: ")?;
-    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    match v["type"].as_str()? {
-        "content_block_delta" if v["delta"]["type"] == "text_delta" => {
-            let text = v["delta"]["text"].as_str()?;
-            let chunk = serde_json::json!({
-                "id": "chatcmpl-vertex-stream",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
-            });
-            Some(Bytes::from(format!("data: {}\n\n", chunk)))
-        }
-        "message_delta" => {
-            let chunk = serde_json::json!({
-                "id": "chatcmpl-vertex-stream",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            });
-            Some(Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", chunk)))
-        }
-        _ => None,
-    }
-}
+// Streaming translation for Claude-on-Vertex lives in
+// `crate::providers::anthropic::AnthropicSseTranslator`: Vertex's Anthropic
+// dialect uses the identical SSE event vocabulary (`message_start`,
+// `content_block_delta`, `message_delta`), and the shared stateful translator
+// folds the split usage report (`input_tokens` on message_start,
+// `output_tokens` on message_delta) into a `usage` object on the final chunk
+// so the streaming ledger records provider-counted tokens, not estimates
+// (issue #84).

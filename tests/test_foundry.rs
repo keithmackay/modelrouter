@@ -395,6 +395,9 @@ async fn streaming_sets_the_flag_and_passes_sse_frames_through_untouched() {
     let c = capture.lock().unwrap();
     assert_eq!(c.paths[0], "/openai/v1/chat/completions");
     assert_eq!(c.bodies[0]["stream"], true);
+    // The router owns usage capture (issue #84): the upstream body always
+    // requests the final usage chunk, independent of the client's shape.
+    assert_eq!(c.bodies[0]["stream_options"]["include_usage"], true);
 }
 
 /// A streaming call that fails must fail at `stream()`, not hand back a stream

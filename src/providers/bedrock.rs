@@ -227,14 +227,23 @@ impl ProviderAdapter for BedrockAdapter {
             .stream;
 
         let mut chunks: Vec<anyhow::Result<Bytes>> = Vec::new();
+        // The stream's Metadata event carries what Bedrock actually metered.
+        // Harvest it so the finish chunk reports real token counts and the
+        // streaming ledger doesn't fall back to estimates (issue #84).
+        let mut usage: Option<(u32, u32)> = None;
 
         loop {
             match event_stream.recv().await {
                 Ok(Some(event)) => {
+                    if let aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(m) = &event {
+                        if let Some(u) = m.usage() {
+                            usage = Some((u.input_tokens().max(0) as u32, u.output_tokens().max(0) as u32));
+                        }
+                    }
                     if let Some(chunk) = process_stream_event(event) {
                         chunks.push(Ok(chunk));
                     }
-                    // Non-text events (metadata, message start/stop) are silently skipped.
+                    // Other non-text events (message start/stop) are silently skipped.
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -244,9 +253,23 @@ impl ProviderAdapter for BedrockAdapter {
             }
         }
 
-        // Only emit [DONE] on clean end-of-stream — not after an error event
+        // Only emit the finish chunk and [DONE] on clean end-of-stream — not
+        // after an error event.
         let had_error = chunks.iter().any(|c| c.is_err());
         if !had_error {
+            let mut chunk = serde_json::json!({
+                "id": "chatcmpl-bedrock-stream",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            });
+            if let Some((prompt, completion)) = usage {
+                chunk["usage"] = serde_json::json!({
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt + completion,
+                });
+            }
+            chunks.push(Ok(Bytes::from(format!("data: {}\n\n", chunk))));
             chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
         }
         Ok(Box::pin(stream::iter(chunks)))

@@ -124,6 +124,11 @@ impl FoundryAdapter {
             "messages": req.messages,
             "stream": stream,
         });
+        // The router owns usage capture (issue #84): always request the final
+        // usage chunk so the streaming ledger records provider-counted tokens.
+        if stream {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
         if let Some(temp) = req.temperature {
             body["temperature"] = serde_json::json!(temp);
         }

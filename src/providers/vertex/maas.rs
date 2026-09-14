@@ -18,6 +18,12 @@ pub fn translate_request(req: &NormalizedRequest, model: &str, streaming: bool) 
         "messages": req.messages,
         "stream": streaming,
     });
+    // The router owns usage capture (issue #84): always ask the provider to
+    // append the final usage chunk, regardless of what the client requested,
+    // so the streaming ledger records provider-counted tokens.
+    if streaming {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
     if let Some(temp) = req.temperature {
         body["temperature"] = serde_json::json!(temp);
     }
@@ -79,5 +85,23 @@ mod tests {
         assert_eq!(body["model"], "mistralai/mistral-medium-3");
         assert_eq!(body["stream"], false);
         assert_eq!(body["max_tokens"], 100);
+        // Non-streaming bodies must not carry stream_options — some
+        // OpenAI-compatible backends reject it outside a streaming request.
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn streaming_request_always_asks_for_usage(/* issue #84 */) {
+        let req = NormalizedRequest {
+            model: "vertex/mistralai/mistral-medium-3".into(),
+            messages: vec![serde_json::json!({"role": "user", "content": "x"})],
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            extra_params: serde_json::Value::Null,
+        };
+        let body = translate_request(&req, "mistralai/mistral-medium-3", true);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 }

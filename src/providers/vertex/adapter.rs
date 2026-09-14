@@ -345,7 +345,18 @@ impl ProviderAdapter for VertexAdapter {
         // Body chunks carry no line-boundary guarantee: one SSE event can be
         // split across chunks, and translating per-chunk drops both halves
         // silently. Buffer to newline boundaries and translate complete lines.
+        //
+        // Both translators are stateful (issue #84): they harvest the
+        // provider's native usage report as frames pass, so the final chunk
+        // carries real token counts and the streaming ledger records what the
+        // provider billed rather than a character-count estimate. Gemini's
+        // state is shared with the end-of-stream chain below because Gemini
+        // has no terminal SSE event — its usage can only be flushed once the
+        // body ends.
         let mut pending = String::new();
+        let mut claude_tx = crate::providers::anthropic::AnthropicSseTranslator::new();
+        let gemini_tx = Arc::new(std::sync::Mutex::new(gemini::GeminiSseTranslator::new()));
+        let gemini_tx_lines = gemini_tx.clone();
         let translated = resp
             .bytes_stream()
             .map_err(|e| anyhow::anyhow!("stream error: {}", e))
@@ -356,10 +367,14 @@ impl ProviderAdapter for VertexAdapter {
                     let raw: String = pending.drain(..=pos).collect();
                     let line = raw.trim_end_matches(['\r', '\n']);
                     let translated = match publisher {
-                        Publisher::Google => gemini::translate_sse_line(line),
-                        Publisher::Anthropic => claude::translate_sse_line(line),
+                        Publisher::Google => {
+                            gemini_tx_lines.lock().expect("gemini translator lock").translate_line(line)
+                        }
+                        Publisher::Anthropic => claude_tx.translate_line(line),
                         // MaaS streams are already OpenAI-shaped SSE — pass
-                        // frames through untouched (including `data: [DONE]`).
+                        // frames through untouched (including `data: [DONE]`
+                        // and the usage chunk `stream_options.include_usage`
+                        // makes the provider append).
                         Publisher::Maas => {
                             if line.is_empty() {
                                 None
@@ -403,16 +418,18 @@ impl ProviderAdapter for VertexAdapter {
             }))
             .try_filter(|b| futures::future::ready(!b.is_empty()));
 
-        // Gemini's SSE has no terminal event — its final frame carries only
-        // `usageMetadata` with no candidates, which `gemini::translate_sse_line`
-        // deliberately drops. Append `data: [DONE]\n\n` here so the downstream
-        // SSE consumer (log_streaming_request) can detect stream end and commit
-        // cost ledger rows, audit entries, and lifecycle hooks. Claude-on-Vertex
-        // emits DONE on `message_delta` inside the translator already.
+        // Gemini's SSE has no terminal event, so the translator can't know
+        // which frame is last. Close the stream here instead: one finish
+        // chunk carrying the harvested `usageMetadata` (real token counts for
+        // the streaming ledger and for callers), then `data: [DONE]` so the
+        // downstream SSE consumer (log_streaming_request) can detect stream
+        // end and commit cost ledger rows, audit entries, and lifecycle
+        // hooks. Claude-on-Vertex emits its usage-bearing finish chunk and
+        // DONE on `message_delta` inside the shared translator already.
         let stream = if matches!(publisher, Publisher::Google) {
             guarded
-                .chain(futures::stream::once(async {
-                    Ok(Bytes::from_static(b"data: [DONE]\n\n"))
+                .chain(futures::stream::once(async move {
+                    Ok(gemini_tx.lock().expect("gemini translator lock").final_chunk())
                 }))
                 .boxed()
         } else {
@@ -653,6 +670,83 @@ mod tests {
         assert!(out.contains("\"content\":\"b\""), "{out}");
         assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
         assert_eq!(out.matches("[DONE]").count(), 1, "exactly one sentinel: {out}");
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_reports_real_usage_in_final_chunk(/* issue #84 */) {
+        // The trailing usage-only frame has no candidates and forwards
+        // nothing itself — but its counts must surface in the adapter's
+        // final chunk so the streaming ledger records provider-counted
+        // tokens instead of estimating.
+        let router = Router::new().fallback(post(|| async {
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a\"}]},\"finishReason\":\"STOP\"}]}\n\
+             data: {\"usageMetadata\":{\"promptTokenCount\":13,\"candidatesTokenCount\":6,\"cachedContentTokenCount\":2}}\n"
+        }));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("google/gemini-2.5-pro"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(out.contains("\"prompt_tokens\":13"), "{out}");
+        assert!(out.contains("\"completion_tokens\":6"), "{out}");
+        assert!(out.contains("\"cached_tokens\":2"), "{out}");
+        assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn claude_stream_reports_real_usage_in_final_chunk(/* issue #84 */) {
+        // Anthropic splits its usage report: input_tokens on message_start,
+        // output_tokens on message_delta. Both must be folded into the final
+        // OpenAI-shaped chunk.
+        let router = Router::new().fallback(post(|| async {
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\
+             data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n"
+        }));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("anthropic/claude-sonnet-4-5"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(out.contains("\"prompt_tokens\":9"), "{out}");
+        assert!(out.contains("\"completion_tokens\":3"), "{out}");
+        assert!(out.contains("\"total_tokens\":12"), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn maas_stream_asks_the_provider_for_usage(/* issue #84 */) {
+        // The router owns usage capture: the upstream body must carry
+        // stream_options.include_usage regardless of the client's shape.
+        let seen = Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let seen_handler = seen.clone();
+        let router = Router::new().fallback(post(move |body: String| {
+            let seen = seen_handler.clone();
+            async move {
+                *seen.lock().unwrap() = serde_json::from_str(&body).unwrap();
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n"
+            }
+        }));
+        let (base, _s) = serve(router).await;
+
+        collect(
+            adapter(&base, "us-central1")
+                .stream(&req("mistralai/mistral-medium-3"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let body = seen.lock().unwrap().clone();
+        assert_eq!(body["stream_options"]["include_usage"], serde_json::json!(true), "{body}");
     }
 
     #[tokio::test]

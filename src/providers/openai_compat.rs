@@ -123,6 +123,10 @@ impl ProviderAdapter for OpenAICompatAdapter {
             "model": req.model,
             "messages": req.messages,
             "stream": true,
+            // The router owns usage capture (issue #84): always request the
+            // final usage chunk so the streaming ledger records
+            // provider-counted tokens, independent of the client's shape.
+            "stream_options": {"include_usage": true},
         });
 
         if let Some(temp) = req.temperature {

@@ -180,14 +180,56 @@ mod gemini_tests {
         assert!(translate_sse_line("\n").is_none());
         assert!(translate_sse_line("event: ping").is_none());
     }
+
+    #[test]
+    fn stream_translator_harvests_usage_and_finish_reason() {
+        // Gemini has no terminal SSE event; the translator accumulates
+        // usageMetadata and finishReason as frames pass, and the adapter
+        // flushes them in the final chunk at end-of-body (issue #84).
+        use modelrouter::providers::vertex::gemini::GeminiSseTranslator;
+        let mut tx = GeminiSseTranslator::new();
+        let out = tx
+            .translate_line(r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out).contains(r#""content":"Hi""#));
+        // Usage-only trailing frame: no candidates, nothing forwarded, but
+        // the counts must be captured.
+        assert!(tx
+            .translate_line(r#"data: {"usageMetadata":{"promptTokenCount":21,"candidatesTokenCount":8,"cachedContentTokenCount":5}}"#)
+            .is_none());
+        let last = String::from_utf8_lossy(&tx.final_chunk()).to_string();
+        assert!(last.contains(r#""prompt_tokens":21"#), "{last}");
+        assert!(last.contains(r#""completion_tokens":8"#), "{last}");
+        assert!(last.contains(r#""cached_tokens":5"#), "{last}");
+        assert!(last.ends_with("data: [DONE]\n\n"), "{last}");
+    }
+
+    #[test]
+    fn stream_translator_maps_finish_reason() {
+        use modelrouter::providers::vertex::gemini::GeminiSseTranslator;
+        let mut tx = GeminiSseTranslator::new();
+        tx.translate_line(r#"data: {"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"MAX_TOKENS"}]}"#);
+        let last = String::from_utf8_lossy(&tx.final_chunk()).to_string();
+        assert!(last.contains(r#""finish_reason":"length""#), "{last}");
+    }
+
+    #[test]
+    fn stream_translator_without_usage_omits_usage_field() {
+        // No usageMetadata seen → no usage object, so the streaming ledger
+        // knows to fall back to its estimate rather than record zeros.
+        use modelrouter::providers::vertex::gemini::GeminiSseTranslator;
+        let tx = GeminiSseTranslator::new();
+        let last = String::from_utf8_lossy(&tx.final_chunk()).to_string();
+        assert!(!last.contains(r#""usage""#), "{last}");
+        assert!(last.contains(r#""finish_reason":"stop""#), "{last}");
+    }
 }
 
 #[cfg(feature = "vertex")]
 mod claude_tests {
     use modelrouter::providers::adapter::NormalizedRequest;
-    use modelrouter::providers::vertex::claude::{
-        translate_request, parse_response, translate_sse_line,
-    };
+    use modelrouter::providers::anthropic::AnthropicSseTranslator;
+    use modelrouter::providers::vertex::claude::{translate_request, parse_response};
     use serde_json::json;
 
     fn req(messages: serde_json::Value) -> NormalizedRequest {
@@ -243,26 +285,51 @@ mod claude_tests {
         assert_eq!(cr.finish_reason, "end_turn");
     }
 
+    // Claude-on-Vertex streams share the direct-Anthropic translator: the SSE
+    // event vocabulary is identical, and the shared translator folds the
+    // split usage report into the final chunk (issue #84).
+
     #[test]
     fn translate_sse_content_delta_becomes_openai_chunk() {
+        let mut tx = AnthropicSseTranslator::new();
         let line = r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#;
-        let out = translate_sse_line(line).unwrap();
+        let out = tx.translate_line(line).unwrap();
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains(r#""delta":{"content":"Hi"}"#));
     }
 
     #[test]
     fn translate_sse_message_delta_emits_done() {
+        let mut tx = AnthropicSseTranslator::new();
         let line = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#;
-        let out = translate_sse_line(line).unwrap();
+        let out = tx.translate_line(line).unwrap();
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("[DONE]"));
     }
 
     #[test]
+    fn stream_usage_is_folded_into_the_final_chunk() {
+        // input_tokens arrive on message_start, output_tokens on
+        // message_delta; the final chunk must carry both in OpenAI shape so
+        // the streaming ledger records provider-counted usage (issue #84).
+        let mut tx = AnthropicSseTranslator::new();
+        assert!(tx
+            .translate_line(r#"data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_input_tokens":4}}}"#)
+            .is_none());
+        let out = tx
+            .translate_line(r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#)
+            .unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(r#""prompt_tokens":15"#), "11 input + 4 cached: {s}");
+        assert!(s.contains(r#""completion_tokens":7"#), "{s}");
+        assert!(s.contains(r#""cached_tokens":4"#), "{s}");
+    }
+
+    #[test]
     fn translate_sse_message_stop_returns_none() {
+        let mut tx = AnthropicSseTranslator::new();
         let line = r#"data: {"type":"message_stop"}"#;
-        assert!(translate_sse_line(line).is_none(),
+        assert!(tx.translate_line(line).is_none(),
             "message_stop is a trailing no-op; finalization happens on message_delta");
     }
 }
