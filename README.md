@@ -30,6 +30,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 - **Drop-in OpenAI compatibility** — any SDK that speaks `POST /v1/chat/completions` works without modification
 - **Multi-provider routing** — route to OpenAI, Anthropic, Google Gemini, or Ollama; switch providers by changing one config line
+- **Streaming from every provider, with router-owned usage capture** — `"stream": true` yields OpenAI-shaped SSE from all upstreams (native Vertex Claude/Gemini and Bedrock streams are translated in flight); the router always obtains real token counts from the provider — independent of the client's request shape — meters streamed traffic exactly (budgets, attribution, experiment variants), and hands every caller a normalized final `usage` chunk
 - **Routing shortcuts** — use `:fastest` or `:cheapest` as the model name to route to your configured fastest or cheapest model without changing client code
 - **Runtime model aliases** — point an alias like `deep` at any `provider/model` from the admin UI or CLI, with no restart; DB aliases override config, and resolution is depth-capped so a cycle cannot hang a request
 - **Operator disable** — take a model or a whole provider out of rotation with a recorded reason; disabled targets return **403** naming the reason instead of reaching the provider, and stay disabled until explicitly re-enabled (unlike a circuit-breaker trip)
@@ -1312,6 +1313,56 @@ two models, two providers or two variants of a controlled experiment — use
 `/admin/compare` page. [docs/experiments.md](docs/experiments.md) walks a
 client application through labelling traffic, retrieving the comparison,
 and reading it.
+
+### Streaming
+
+Set `"stream": true` on `/v1/chat/completions` — same contract as OpenAI —
+and the router streams SSE chunks in OpenAI shape from every provider it
+fronts, including the ones whose native streams look nothing like OpenAI's:
+Claude and Gemini on Vertex (`:streamRawPredict` / `:streamGenerateContent`
+events are translated in flight), Bedrock (ConverseStream events), Azure AI
+Foundry, and every OpenAI-compatible upstream. SSE events split across
+network chunk boundaries are reassembled before translation, and a streaming
+request whose upstream answers with something that produces no SSE events at
+all fails loudly with an SSE `error` event rather than a silent empty 200.
+
+**The router owns usage capture on streamed responses.** The upstream request
+always asks the provider for usage — `stream_options: {"include_usage": true}`
+is injected into every OpenAI-shaped upstream body, and the native usage
+frames are harvested on the translated paths (Anthropic's split
+`message_start`/`message_delta` report, Gemini's `usageMetadata`, Bedrock's
+stream metadata) — regardless of what the client sent. The counts flow two
+ways:
+
+- **To the ledgers**: streamed requests are metered with provider-counted
+  tokens (`tokens_estimated = false`), so budgets, cost reports, attribution
+  and per-experiment-variant accounting are exact for streamed traffic. A
+  character-count estimate (flagged as such) remains only as a fallback for
+  upstreams that report nothing.
+- **To the caller**: the final chunk carries a normalized OpenAI-shaped
+  `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`,
+  `prompt_tokens_details.cached_tokens`) whether or not the client asked for
+  `include_usage`. On translated providers it rides the finish chunk, so
+  `choices` is never empty and strict chunk parsers are safe.
+
+This means experiment-bound traffic (`x-modelrouter-experiment`) can stream:
+per-variant usage is recorded server-side, so there is no accounting reason
+to force `stream: false`.
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vertex/anthropic/claude-sonnet-4-5@20250929",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+# data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null,...}],...}
+# data: {"choices":[{"delta":{},"finish_reason":"stop",...}],
+#        "usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12,...}}
+# data: [DONE]
+```
 
 ### Controlled experiments
 
