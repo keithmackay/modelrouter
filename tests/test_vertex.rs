@@ -204,7 +204,7 @@ mod claude_tests {
     #[test]
     fn translate_request_includes_anthropic_version_and_omits_model() {
         let r = req(json!([{"role": "user", "content": "Hi"}]));
-        let body = translate_request(&r);
+        let body = translate_request(&r, false);
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
         assert!(body.get("model").is_none(), "model must live in URL, not body");
         assert_eq!(body["max_tokens"], 2048);
@@ -216,7 +216,7 @@ mod claude_tests {
             {"role": "system", "content": "Be brief."},
             {"role": "user", "content": "Hi"}
         ]));
-        let body = translate_request(&r);
+        let body = translate_request(&r, false);
         assert_eq!(body["system"], "Be brief.");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     }
@@ -225,7 +225,7 @@ mod claude_tests {
     fn translate_request_defaults_max_tokens_when_missing() {
         let mut r = req(json!([{"role": "user", "content": "Hi"}]));
         r.max_tokens = None;
-        let body = translate_request(&r);
+        let body = translate_request(&r, false);
         assert!(body["max_tokens"].as_u64().unwrap() > 0, "Anthropic requires max_tokens");
     }
 

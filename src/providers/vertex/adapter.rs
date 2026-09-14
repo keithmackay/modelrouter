@@ -278,7 +278,7 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req),
+            Publisher::Anthropic => claude::translate_request(req, false),
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let token = self.token_provider.token().await?;
@@ -324,7 +324,7 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req),
+            Publisher::Anthropic => claude::translate_request(req, true),
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
         let token = self.token_provider.token().await?;
@@ -342,13 +342,19 @@ impl ProviderAdapter for VertexAdapter {
             anyhow::bail!("Vertex AI streaming returned {}: {}", status, text);
         }
 
+        // Body chunks carry no line-boundary guarantee: one SSE event can be
+        // split across chunks, and translating per-chunk drops both halves
+        // silently. Buffer to newline boundaries and translate complete lines.
+        let mut pending = String::new();
         let translated = resp
             .bytes_stream()
             .map_err(|e| anyhow::anyhow!("stream error: {}", e))
             .map_ok(move |chunk| {
-                let text = String::from_utf8_lossy(&chunk);
+                pending.push_str(&String::from_utf8_lossy(&chunk));
                 let mut out = String::new();
-                for line in text.lines() {
+                while let Some(pos) = pending.find('\n') {
+                    let raw: String = pending.drain(..=pos).collect();
+                    let line = raw.trim_end_matches(['\r', '\n']);
                     let translated = match publisher {
                         Publisher::Google => gemini::translate_sse_line(line),
                         Publisher::Anthropic => claude::translate_sse_line(line),
@@ -369,6 +375,34 @@ impl ProviderAdapter for VertexAdapter {
                 Bytes::from(out)
             });
 
+        // Mismatch guard (issue #83): if the upstream body carried bytes but
+        // NONE of them translated to SSE frames — e.g. a proxy or a contract
+        // drift hands back a raw JSON object for a streaming request — the
+        // old behaviour was an empty 200, which OpenAI-compatible clients
+        // parse as a silent empty answer. Fail loudly with an SSE error
+        // event instead.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let received = Arc::new(AtomicBool::new(false));
+        let emitted = Arc::new(AtomicBool::new(false));
+        let (received_tail, emitted_tail) = (received.clone(), emitted.clone());
+        let guarded = translated
+            .inspect_ok(move |b| {
+                received.store(true, Ordering::Relaxed);
+                if !b.is_empty() {
+                    emitted.store(true, Ordering::Relaxed);
+                }
+            })
+            .chain(futures::stream::once(async move {
+                if received_tail.load(Ordering::Relaxed) && !emitted_tail.load(Ordering::Relaxed) {
+                    Ok(Bytes::from_static(
+                        b"data: {\"error\":{\"message\":\"upstream returned a body that produced no SSE events for a streaming request\",\"type\":\"upstream_error\"}}\n\n",
+                    ))
+                } else {
+                    Ok(Bytes::new())
+                }
+            }))
+            .try_filter(|b| futures::future::ready(!b.is_empty()));
+
         // Gemini's SSE has no terminal event — its final frame carries only
         // `usageMetadata` with no candidates, which `gemini::translate_sse_line`
         // deliberately drops. Append `data: [DONE]\n\n` here so the downstream
@@ -376,13 +410,13 @@ impl ProviderAdapter for VertexAdapter {
         // cost ledger rows, audit entries, and lifecycle hooks. Claude-on-Vertex
         // emits DONE on `message_delta` inside the translator already.
         let stream = if matches!(publisher, Publisher::Google) {
-            translated
+            guarded
                 .chain(futures::stream::once(async {
                     Ok(Bytes::from_static(b"data: [DONE]\n\n"))
                 }))
                 .boxed()
         } else {
-            translated.boxed()
+            guarded.boxed()
         };
         Ok(stream)
     }
@@ -642,6 +676,158 @@ mod tests {
             1,
             "the adapter must not append a second sentinel: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_stream_asks_vertex_for_a_stream(/* issue #83 */) {
+        // `:streamRawPredict` only answers with SSE when the Anthropic body
+        // carries `"stream": true`; without it Vertex returns one raw JSON
+        // object, no `data:` lines survive translation, and the caller gets
+        // an empty 200 — the exact fleet-wide symptom in issue #83. The mock
+        // mimics that contract instead of serving SSE unconditionally.
+        let seen = Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let sink = seen.clone();
+        let router = Router::new().fallback(post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    let streaming = body["stream"] == true;
+                    *sink.lock().unwrap() = body;
+                    if streaming {
+                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\
+                         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n"
+                            .to_string()
+                    } else {
+                        "{\"content\":[{\"type\":\"text\",\"text\":\"OK\"}],\"usage\":{}}".to_string()
+                    }
+                }
+            },
+        ));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("anthropic/claude-sonnet-4-5"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            seen.lock().unwrap()["stream"],
+            serde_json::json!(true),
+            "the streaming call must set stream:true in the Anthropic body"
+        );
+        assert!(out.contains("\"content\":\"OK\""), "stream produced no frames: {out:?}");
+        assert!(out.contains("[DONE]"), "{out}");
+
+        // The non-streaming call must NOT ask for a stream.
+        adapter(&base, "global").complete(&req("anthropic/claude-sonnet-4-5")).await.unwrap();
+        assert_eq!(seen.lock().unwrap().get("stream"), None);
+    }
+
+    #[tokio::test]
+    async fn sse_events_split_across_chunks_are_reassembled() {
+        // TCP gives no line-boundary guarantees: one SSE event can arrive
+        // split across body chunks. Per-chunk `lines()` translation dropped
+        // the halves silently; the adapter must buffer to line boundaries.
+        let router = Router::new().fallback(post(|| async {
+            let frames: Vec<Result<Bytes, std::io::Error>> = vec![
+                Ok(Bytes::from_static(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"te")),
+                Ok(Bytes::from_static(b"xt_delta\",\"text\":\"split\"}}\ndata: {\"type\":\"message_del")),
+                Ok(Bytes::from_static(b"ta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n")),
+            ];
+            axum::response::Response::new(axum::body::Body::from_stream(
+                futures::stream::iter(frames),
+            ))
+        }));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("anthropic/claude-sonnet-4-5"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(out.contains("\"content\":\"split\""), "split event was dropped: {out:?}");
+        assert!(out.contains("[DONE]"), "terminal event was dropped: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_answered_with_raw_json_fails_loudly_not_empty(/* issue #83 */) {
+        // Invalid combination: streaming request, non-SSE answer (contract
+        // drift, interfering proxy). The guard must emit an SSE error event
+        // rather than the silent empty 200 that clients parse as an empty
+        // answer.
+        let router = Router::new().fallback(post(|| async {
+            "{\"content\":[{\"type\":\"text\",\"text\":\"not sse\"}],\"usage\":{}}"
+        }));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("anthropic/claude-sonnet-4-5"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!out.is_empty(), "empty stream must not be silent");
+        assert!(out.contains("\"error\""), "expected a loud SSE error event: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_of_untranslatable_bytes_fails_loudly() {
+        // Same invalid combination via the Google arm: bytes arrive but none
+        // translate. Without the guard the client would see only the
+        // adapter-appended [DONE] — still a silent empty answer.
+        let router = Router::new().fallback(post(|| async { "<html>502 from a proxy</html>\n" }));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("google/gemini-2.5-pro"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(out.contains("\"error\""), "expected a loud SSE error event: {out:?}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_upstream_body_stays_empty_without_a_spurious_error() {
+        // Zero bytes received (upstream closed without writing) is a
+        // transport-level condition the accounting layer already handles;
+        // the mismatch guard must not invent an error event for it.
+        let router = Router::new().fallback(post(|| async { "" }));
+        let (base, _s) = serve(router).await;
+
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&req("anthropic/claude-sonnet-4-5"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!out.contains("\"error\""), "no bytes received → no mismatch: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_answered_with_sse_fails_loudly_not_empty(/* issue #83 */) {
+        // The mirror-image invalid combination: non-streaming request, SSE
+        // answer. Parsing must fail with an error, not succeed with empty
+        // content.
+        let router = Router::new().fallback(post(|| async {
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        }));
+        let (base, _s) = serve(router).await;
+
+        let err = adapter(&base, "global")
+            .complete(&req("anthropic/claude-sonnet-4-5"))
+            .await
+            .err()
+            .expect("SSE body for a non-streaming request must be an error");
+        assert!(err.to_string().contains("parse"), "{err}");
     }
 
     #[tokio::test]

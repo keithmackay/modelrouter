@@ -20,7 +20,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Translate an OpenAI-shaped request to a Vertex Anthropic `:rawPredict` body.
 /// NOTE: `model` is intentionally omitted — it lives in the URL path.
-pub fn translate_request(req: &NormalizedRequest) -> serde_json::Value {
+pub fn translate_request(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
     let (system_text, messages) = translate_messages(&req.messages);
 
     let mut body = serde_json::json!({
@@ -33,6 +33,12 @@ pub fn translate_request(req: &NormalizedRequest) -> serde_json::Value {
     }
     if let Some(t) = req.temperature {
         body["temperature"] = serde_json::json!(t);
+    }
+    // `:streamRawPredict` only serves SSE when the body asks for it; without
+    // this flag Vertex answers with one raw JSON object, the SSE translator
+    // finds no `data:` lines, and the client receives an empty 200 (#83).
+    if stream {
+        body["stream"] = serde_json::json!(true);
     }
     body
 }
