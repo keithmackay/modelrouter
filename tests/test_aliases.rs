@@ -398,34 +398,9 @@ async fn v1_models_lists_config_and_db_aliases() {
     assert_eq!(quick["owned_by"], "openai");
 }
 
-/// Issue #35: catalog validation when the catalog is available.
-#[tokio::test]
-async fn alias_target_validated_against_available_catalog() {
-    use axum::routing::get;
-
-    // Set up a mock catalog server
-    let catalog_router = axum::Router::new().route(
-        "/models",
-        get(|| async {
-            axum::Json(json!({
-                "data": [
-                    {"id": "gpt-4o"},
-                    {"id": "gpt-4o-mini"}
-                ]
-            }))
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let catalog_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, catalog_router).await.unwrap();
-    });
-    let catalog_base = format!("http://{}", catalog_addr);
-
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    // Build server with the catalog provider configured
+/// Build a server whose `openai` provider points at `catalog_base`, so alias
+/// writes validate against that live catalog (issues #35, #81).
+async fn build_server_with_catalog(catalog_base: String) -> (TestServer, Arc<Settings>) {
     let db = common::in_memory_db().await;
     {
         use modelrouter::db::models::NewAdminUser;
@@ -495,6 +470,36 @@ async fn alias_target_validated_against_available_catalog() {
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
+    (server, settings)
+}
+
+/// Issue #35: catalog validation when the catalog is available.
+#[tokio::test]
+async fn alias_target_validated_against_available_catalog() {
+    use axum::routing::get;
+
+    // Set up a mock catalog server
+    let catalog_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            axum::Json(json!({
+                "data": [
+                    {"id": "gpt-4o"},
+                    {"id": "gpt-4o-mini"}
+                ]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catalog_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, catalog_router).await.unwrap();
+    });
+    // Give the server a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let (server, settings) =
+        build_server_with_catalog(format!("http://{}", catalog_addr)).await;
     let (hk, hv) = bearer(&jwt(&settings, "superadmin"));
 
     // Model present in catalog → success (full provider/name format)
@@ -505,13 +510,59 @@ async fn alias_target_validated_against_available_catalog() {
         .await
         .assert_status_ok();
 
-    // Model absent from catalog → degrades gracefully when catalog is malformed.
-    // (The mock catalog returns OpenAI format which doesn't match CatalogModel schema,
-    // so aggregate_catalogs returns empty, triggering degradation.)
+    // Model absent from an AVAILABLE catalog → rejected. This asserted OK
+    // before issue #81: the process-global catalog cache let another test's
+    // empty catalog satisfy this server's validation, and the pass depended
+    // on that pollution. With the cache keyed by settings generation this
+    // server sees its own (populated) catalog, so the write must 400.
     server
         .put("/admin/api/aliases/slow")
         .add_header(hk.clone(), hv.clone())
         .json(&json!({ "target": "missing-model" }))
+        .await
+        .assert_status_bad_request();
+}
+
+/// Issue #81: the catalog cache is process-global, so several servers in one
+/// test binary share it. An entry cached for one server's settings must not
+/// satisfy validation for a server with different settings — the flake was
+/// alias writes 400ing against a catalog that belonged to a different test.
+#[tokio::test]
+async fn alias_validation_not_poisoned_by_other_servers_catalog() {
+    use axum::routing::get;
+
+    let catalog_router = axum::Router::new().route(
+        "/models",
+        get(|| async { axum::Json(json!({ "data": [ {"id": "gpt-4o"} ] })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catalog_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, catalog_router).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Server A has a live catalog; a bogus target is rejected, which also
+    // proves A's (populated) catalog is now in the shared cache.
+    let (server_a, settings_a) =
+        build_server_with_catalog(format!("http://{}", catalog_addr)).await;
+    let (hk, hv) = bearer(&jwt(&settings_a, "superadmin"));
+    server_a
+        .put("/admin/api/aliases/poisoned")
+        .add_header(hk, hv)
+        .json(&json!({ "target": "openai/nope" }))
+        .await
+        .assert_status_bad_request();
+
+    // Server B has NO catalog providers: its own catalog is unavailable, so
+    // the same bogus target must be accepted (graceful degradation). Before
+    // the fix B hit A's cached catalog and 400'd here.
+    let (server_b, settings_b, _router, _db) = build_server().await;
+    let (hk, hv) = bearer(&jwt(&settings_b, "superadmin"));
+    server_b
+        .put("/admin/api/aliases/poisoned")
+        .add_header(hk, hv)
+        .json(&json!({ "target": "openai/nope" }))
         .await
         .assert_status_ok();
 }

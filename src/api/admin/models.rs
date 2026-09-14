@@ -660,8 +660,23 @@ pub async fn get_provider_rows(
 
 /// TTL cache for the aggregated catalog: provider catalog calls cost quota,
 /// and the mapping UI refetches freely. 15 minutes, bypassed by ?refresh=true.
-static CATALOG_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>> =
-    std::sync::OnceLock::new();
+///
+/// The entry is keyed by the `Arc<Settings>` it was aggregated from (issue #81):
+/// the cache is process-global, so without the key a hit could serve a catalog
+/// built for a *different* settings generation — a stale catalog after a hot
+/// reload in production, or another server's catalog when several coexist in
+/// one process (the integration-test binaries). Holding the `Arc` itself makes
+/// `Arc::ptr_eq` airtight: the allocation cannot be reused while the entry
+/// keeps it alive.
+static CATALOG_CACHE: std::sync::OnceLock<
+    tokio::sync::Mutex<
+        Option<(
+            std::sync::Arc<crate::config::schema::Settings>,
+            std::time::Instant,
+            serde_json::Value,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
 const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(serde::Deserialize)]
@@ -676,24 +691,23 @@ pub(crate) async fn cached_catalog(
     state: &AppState,
     refresh: bool,
 ) -> serde_json::Value {
+    let settings = state.live_settings.load_full();
     let cache = CATALOG_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
     let mut guard = cache.lock().await;
     if !refresh {
-        if let Some((at, value)) = guard.as_ref() {
-            if at.elapsed() < CATALOG_TTL {
+        if let Some((for_settings, at, value)) = guard.as_ref() {
+            if std::sync::Arc::ptr_eq(for_settings, &settings) && at.elapsed() < CATALOG_TTL {
                 return value.clone();
             }
         }
     }
-    let providers = crate::providers::catalog_registry::aggregate_catalogs(
-        &state.live_settings.load().providers,
-    )
-    .await;
+    let providers =
+        crate::providers::catalog_registry::aggregate_catalogs(&settings.providers).await;
     let value = serde_json::json!({
         "providers": providers,
         "ttl_seconds": CATALOG_TTL.as_secs(),
     });
-    *guard = Some((std::time::Instant::now(), value.clone()));
+    *guard = Some((settings, std::time::Instant::now(), value.clone()));
     value
 }
 
