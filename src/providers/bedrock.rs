@@ -275,3 +275,124 @@ fn process_stream_event(event: aws_sdk_bedrockruntime::types::ConverseStreamOutp
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    //! The SDK-type builders and the stream-event decoder are pure functions
+    //! over AWS SDK types, so they are testable without credentials. What is
+    //! not: `complete` and `stream` issue signed calls through
+    //! `aws_sdk_bedrockruntime::Client`, which this adapter constructs itself
+    //! from the ambient AWS credential chain — there is no endpoint seam to
+    //! point at a local server, so those two remain live-AWS territory.
+
+    use super::*;
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDelta, ContentBlockDeltaEvent, ConverseStreamOutput, MessageStartEvent,
+        ToolUseBlockDelta,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn sdk_messages_drop_system_and_map_roles() {
+        let messages = vec![
+            json!({"role": "system", "content": "be brief"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+            // An unrecognised role is treated as the caller, not dropped —
+            // losing a turn silently would change the conversation.
+            json!({"role": "tool", "content": "42"}),
+        ];
+        let sdk = to_sdk_messages(&messages).unwrap();
+        assert_eq!(sdk.len(), 3, "the system turn is not a Converse message");
+        assert_eq!(sdk[0].role(), &ConversationRole::User);
+        assert_eq!(sdk[1].role(), &ConversationRole::Assistant);
+        assert_eq!(sdk[2].role(), &ConversationRole::User);
+        assert_eq!(sdk[0].content()[0].as_text().unwrap(), "hello");
+    }
+
+    #[test]
+    fn sdk_messages_tolerate_a_missing_or_non_string_content() {
+        let messages = vec![json!({"role": "user"}), json!({"role": "user", "content": 7})];
+        let sdk = to_sdk_messages(&messages).unwrap();
+        assert_eq!(sdk.len(), 2);
+        assert_eq!(sdk[0].content()[0].as_text().unwrap(), "");
+        assert_eq!(sdk[1].content()[0].as_text().unwrap(), "");
+    }
+
+    #[test]
+    fn sdk_system_keeps_only_system_turns() {
+        let messages = vec![
+            json!({"role": "system", "content": "be brief"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "system", "content": "and polite"}),
+        ];
+        let system = to_sdk_system(&messages);
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0].as_text().unwrap(), "be brief");
+        assert_eq!(system[1].as_text().unwrap(), "and polite");
+
+        assert!(
+            to_sdk_system(&[json!({"role": "user", "content": "hello"})]).is_empty(),
+            "no system turns means no system block"
+        );
+    }
+
+    #[test]
+    fn a_text_delta_becomes_one_openai_shaped_sse_frame() {
+        let event = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .delta(ContentBlockDelta::Text("wor".to_string()))
+                .content_block_index(0)
+                .build()
+                .unwrap(),
+        );
+        let bytes = process_stream_event(event).expect("a text delta produces a frame");
+        let frame = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(frame.starts_with("data: "), "{frame}");
+        assert!(frame.ends_with("\n\n"), "{frame}");
+        let payload: serde_json::Value =
+            serde_json::from_str(frame.trim_start_matches("data: ").trim_end()).unwrap();
+        assert_eq!(payload["choices"][0]["delta"]["content"], "wor");
+        assert!(payload["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn non_text_events_produce_no_frame() {
+        // A tool-use delta carries no assistant text.
+        let tool_delta = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .delta(ContentBlockDelta::ToolUse(
+                    ToolUseBlockDelta::builder().input("{}").build().unwrap(),
+                ))
+                .content_block_index(0)
+                .build()
+                .unwrap(),
+        );
+        assert!(process_stream_event(tool_delta).is_none());
+
+        // So does a lifecycle event.
+        let start = ConverseStreamOutput::MessageStart(
+            MessageStartEvent::builder()
+                .role(ConversationRole::Assistant)
+                .build()
+                .unwrap(),
+        );
+        assert!(process_stream_event(start).is_none());
+    }
+
+    #[tokio::test]
+    async fn new_honours_a_configured_region() {
+        // Region from config short-circuits the region chain, so no metadata
+        // lookup happens and construction stays offline.
+        let config = ProviderConfig {
+            region: Some("us-east-1".to_string()),
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let adapter = BedrockAdapter::new(&config).await;
+        assert_eq!(
+            adapter.client.config().region().map(|r| r.as_ref()),
+            Some("us-east-1")
+        );
+    }
+}

@@ -664,3 +664,177 @@ async fn catalog_listing_degrades_with_one_provider_failing() {
     );
     assert!(out["groq"].get("models").is_none(), "failing provider should have no models");
 }
+
+// ── Dashboard (htmx form) surface ────────────────────────────────────────────
+//
+// The JSON API above and the dashboard form handlers are separate code paths
+// over the same validation: the form answers with an HTML fragment and a
+// session cookie instead of a JSON body and a bearer token, so an error that
+// only bites the form (a 500 where an inline alert belongs, a row fragment
+// that never renders) is invisible to the API tests.
+
+fn session(token: &str) -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    (
+        axum::http::header::COOKIE,
+        axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn dashboard_form_creates_then_updates_an_alias_and_renders_rows() {
+    let (server, settings, router, db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "superadmin"));
+
+    // Empty table first: the fragment says so rather than rendering nothing.
+    let empty = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    empty.assert_status_ok();
+    assert!(empty.text().contains("No runtime aliases defined"), "{}", empty.text());
+
+    // Create.
+    let created = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "anthropic/claude-sonnet-4-5")])
+        .await;
+    created.assert_status_ok();
+    let body = created.text();
+    assert!(body.contains("saved and live"), "{body}");
+    assert!(body.contains("balanced"), "{body}");
+    assert_eq!(router.resolve("balanced").1, "claude-sonnet-4-5");
+
+    // The row fragment now renders the alias, its target and a delete control.
+    let rows = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    let rows_html = rows.text();
+    assert!(rows_html.contains("alias-row-balanced"), "{rows_html}");
+    assert!(rows_html.contains("anthropic/claude-sonnet-4-5"), "{rows_html}");
+    assert!(rows_html.contains("/admin/aliases/balanced/delete"), "{rows_html}");
+    assert!(rows_html.contains("superadmin-user"), "created_by is shown: {rows_html}");
+
+    // Update the same alias — upsert, not a duplicate row, and audited as an update.
+    server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "openai/gpt-5-mini")])
+        .await
+        .assert_status_ok();
+    let rows_html = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await
+        .text();
+    assert_eq!(
+        rows_html.matches("<tr id=\"alias-row-balanced\"").count(),
+        1,
+        "upsert replaces the row, it does not add one: {rows_html}"
+    );
+    assert!(rows_html.contains("openai/gpt-5-mini"), "{rows_html}");
+
+    use modelrouter::db::repositories::audit::AuditRepository;
+    let entries = AuditRepository::list(&*db, 50, 0).await.unwrap();
+    let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+    assert!(actions.contains(&"alias.create"), "{actions:?}");
+    assert!(actions.contains(&"alias.update"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn dashboard_form_reports_validation_failures_inline() {
+    let (server, settings, _router, _db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "superadmin"));
+
+    // Missing target: an inline alert, not a 4xx the htmx swap would discard.
+    let blank = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "   ")])
+        .await;
+    blank.assert_status_ok();
+    assert!(blank.text().contains("alert-danger"), "{}", blank.text());
+    assert!(blank.text().contains("required"), "{}", blank.text());
+
+    // Reserved ':' prefix.
+    let reserved = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", ":fast"), ("target", "openai/gpt-4o")])
+        .await;
+    reserved.assert_status_ok();
+    assert!(reserved.text().contains("alert-danger"), "{}", reserved.text());
+
+    // Self-reference, and the message is HTML-escaped on the way back out.
+    let cycle = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "<b>loop</b>"), ("target", "<b>loop</b>")])
+        .await;
+    cycle.assert_status_ok();
+    let text = cycle.text();
+    assert!(text.contains("alert-danger"), "{text}");
+    assert!(!text.contains("<b>loop</b>"), "message must be escaped: {text}");
+}
+
+#[tokio::test]
+async fn dashboard_form_deletes_an_alias() {
+    let (server, settings, router, _db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "superadmin"));
+
+    server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "openai/gpt-4o")])
+        .await
+        .assert_status_ok();
+    assert_eq!(router.resolve("balanced").1, "gpt-4o");
+
+    // htmx swaps the row out, so the delete handler answers with an empty body.
+    let deleted = server
+        .post("/admin/aliases/balanced/delete")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    deleted.assert_status_ok();
+    assert!(deleted.text().is_empty(), "{:?}", deleted.text());
+
+    let rows = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    assert!(rows.text().contains("No runtime aliases defined"), "{}", rows.text());
+
+    // Deleting an alias that is already gone is idempotent on this surface —
+    // the row the swap targets is removed either way.
+    server
+        .post("/admin/aliases/balanced/delete")
+        .add_header(ck, cv)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn dashboard_alias_writes_require_a_superadmin_session() {
+    let (server, settings, _router, _db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "viewer"));
+
+    for resp in [
+        server
+            .post("/admin/aliases")
+            .add_header(ck.clone(), cv.clone())
+            .form(&[("alias", "balanced"), ("target", "openai/gpt-4o")])
+            .await,
+        server
+            .post("/admin/aliases/balanced/delete")
+            .add_header(ck.clone(), cv.clone())
+            .await,
+        server.get("/admin/aliases/rows").add_header(ck, cv).await,
+    ] {
+        assert!(
+            !resp.status_code().is_success(),
+            "a viewer session must not reach alias writes, got {}",
+            resp.status_code()
+        );
+    }
+}

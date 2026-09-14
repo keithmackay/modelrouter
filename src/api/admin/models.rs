@@ -721,3 +721,16 @@ pub async fn get_available_models(
     let value = cached_catalog(&state, q.refresh).await;
     Ok(axum::Json(value))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn he_escapes_html_entities() {
+        assert_eq!(he("<script>"), "&lt;script&gt;");
+        assert_eq!(he("foo & bar"), "foo &amp; bar");
+        assert_eq!(he("\"test\""), "&quot;test&quot;");
+        assert_eq!(he("<>&\""), "&lt;&gt;&amp;&quot;");
+    }
+}
