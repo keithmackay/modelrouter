@@ -243,14 +243,19 @@ model and the pinned model as its routed model; the cost ledger records the
 pinned model, which is what the per-model breakdown in the results shows.
 The `x-no-log` header is honoured as always.
 
-**Where.** Experiments run on `POST /v1/chat/completions` only. Every other
-`/v1/*` endpoint — `/v1/messages`, `/v1/responses`, `/v1/embeddings`,
-`/v1/feedback`, … — refuses the header with `400 x-modelrouter-experiment is
-not supported on this endpoint`, so a misrouted call is a visible error, not
-unmarked traffic.
+**Where.** Experiments run on `POST /v1/chat/completions` and
+`POST /v1/embeddings`. The embedding path has the same semantics: the
+variant's overlay pins the requested embedding model to a concrete
+`provider/model`, a bound request never falls back, and its prompt and
+cost-ledger rows carry the experiment id and variant. Every other `/v1/*`
+endpoint — `/v1/messages`, `/v1/responses`, `/v1/feedback`, … — refuses the
+header with `400 x-modelrouter-experiment is not supported on this
+endpoint`, so a misrouted call is a visible error, not unmarked traffic.
 
-**Send `"stream": false`.** Streamed calls estimate token counts locally;
-those rows are counted in `estimated_rows` and their cost is an estimate.
+**Streaming is fine.** The router captures usage server-side on streamed
+completions (provider-counted tokens, independent of the client's request
+shape), so streamed experiment rows are exact. `estimated_rows` counts only
+rows from upstreams that reported no usage at all.
 
 ### The 400 catalogue
 
@@ -273,7 +278,7 @@ only after it has passed the character-set check.
 | `x-modelrouter-experiment: experiment N has no variant '<label>'` | unknown label |
 | `session_id is required when x-modelrouter-experiment names no variant` | id-only header, no `session_id` |
 | `session_id must be a string` | `session_id` present but not a string |
-| `x-modelrouter-experiment is not supported on this endpoint` | header on a non-chat endpoint |
+| `x-modelrouter-experiment is not supported on this endpoint` | header on an endpoint that does not run experiments |
 
 An unknown experiment or variant is a `400`, never silent normal routing: a
 typo in the header must not quietly put a run in the wrong bucket.

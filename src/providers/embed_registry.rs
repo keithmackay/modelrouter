@@ -72,6 +72,13 @@ impl EmbeddingRegistry {
         Ok(entry.clone())
     }
 
+    /// Register an adapter under an explicit provider name. Used by tests to
+    /// pin mocks under arbitrary providers; production adapters are built
+    /// lazily in [`Self::get`] from config.
+    pub fn register<A: EmbeddingAdapter + 'static>(&self, provider: &str, adapter: A) {
+        self.adapters.insert(provider.to_string(), Arc::new(adapter));
+    }
+
     /// Test helper: create registry with a single mock adapter for any provider.
     pub fn new_with_mock<A: EmbeddingAdapter + 'static>(mock: A) -> Self {
         let registry = Self {
