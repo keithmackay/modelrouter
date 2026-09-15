@@ -86,6 +86,8 @@ mod gemini_tests {
             stream: false,
             temperature: Some(0.7),
             max_tokens: Some(1024),
+            tools: None,
+            tool_choice: None,
             extra_params: json!({}),
         }
     }
@@ -239,6 +241,8 @@ mod claude_tests {
             stream: false,
             temperature: Some(0.5),
             max_tokens: Some(2048),
+            tools: None,
+            tool_choice: None,
             extra_params: json!({}),
         }
     }

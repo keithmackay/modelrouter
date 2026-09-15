@@ -85,6 +85,8 @@ async fn azure_stream_body_always_requests_usage() {
         stream: true,
         temperature: None,
         max_tokens: None,
+        tools: None,
+        tool_choice: None,
         extra_params: serde_json::json!({}),
     };
     let mut stream = adapter.stream(&req).await.unwrap();
@@ -134,6 +136,8 @@ async fn openai_compat_stream_body_always_requests_usage() {
         stream: true,
         temperature: None,
         max_tokens: None,
+        tools: None,
+        tool_choice: None,
         extra_params: serde_json::json!({}),
     };
     let mut stream = adapter.stream(&req).await.unwrap();

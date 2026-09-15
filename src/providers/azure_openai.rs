@@ -61,6 +61,13 @@ impl AzureOpenAIAdapter {
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
         }
+        // Azure serves the OpenAI wire shape: tools pass through verbatim (issue #88).
+        if let Some(tools) = &req.tools {
+            body["tools"] = serde_json::json!(tools);
+        }
+        if let Some(tc) = &req.tool_choice {
+            body["tool_choice"] = tc.clone();
+        }
 
         body
     }
@@ -81,6 +88,8 @@ struct AzureChoice {
 #[derive(serde::Deserialize)]
 struct AzureMessage {
     content: Option<String>,
+    /// Raw JSON, forwarded verbatim (issue #88).
+    tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -139,6 +148,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
             ttft_ms: Some(ttft_ms),
+            tool_calls: choice.message.tool_calls.filter(|tc| !tc.is_null()),
         })
     }
 
@@ -169,5 +179,10 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             .map_err(|e| anyhow::anyhow!("Stream error: {}", e));
 
         Ok(Box::pin(stream))
+    }
+
+    /// Azure serves the OpenAI wire shape: `tools` pass through verbatim (issue #88).
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
     }
 }

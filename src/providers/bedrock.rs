@@ -190,6 +190,7 @@ impl ProviderAdapter for BedrockAdapter {
             // The AWS SDK's converse() resolves only once the whole response
             // is in — there is no header/body split to time, so no TTFT.
             ttft_ms: None,
+            tool_calls: None,
         })
     }
 

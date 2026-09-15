@@ -317,6 +317,7 @@ mod accounting {
                 // A recognisable TTFT, so tests can check the handler carried
                 // the adapter's measurement into the prompt row.
                 ttft_ms: Some(42),
+                tool_calls: None,
                 ..Default::default()
             })
         }

@@ -131,6 +131,8 @@ async fn responses_inner(
         stream: false,
         temperature,
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        tools: None,
+        tool_choice: None,
         extra_params: serde_json::Value::Object(Default::default()),
     };
 

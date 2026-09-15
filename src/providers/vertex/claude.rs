@@ -8,7 +8,10 @@
 //! MVP scope: string-only message content (consistent with `gemini.rs`).
 
 use crate::providers::adapter::{CompletionResult, NormalizedRequest};
-use crate::providers::anthropic::translate_messages;
+use crate::providers::anthropic::{
+    map_stop_reason, text_from_content, tool_calls_from_content, translate_messages,
+    translate_tool_choice, translate_tools,
+};
 
 /// Vertex-specific anthropic_version required on every Claude-on-Vertex call.
 pub const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
@@ -33,6 +36,14 @@ pub fn translate_request(req: &NormalizedRequest, stream: bool) -> serde_json::V
     if let Some(t) = req.temperature {
         body["temperature"] = serde_json::json!(t);
     }
+    // Same Anthropic dialect as the direct adapter: OpenAI tools translate to
+    // native tools; tool_choice only rides along with them (issue #88).
+    if let Some(tools) = &req.tools {
+        body["tools"] = serde_json::Value::Array(translate_tools(tools));
+        if let Some(tc) = req.tool_choice.as_ref().and_then(translate_tool_choice) {
+            body["tool_choice"] = tc;
+        }
+    }
     // `:streamRawPredict` only serves SSE when the body asks for it; without
     // this flag Vertex answers with one raw JSON object, the SSE translator
     // finds no `data:` lines, and the client receives an empty 200 (#83).
@@ -44,29 +55,17 @@ pub fn translate_request(req: &NormalizedRequest, stream: bool) -> serde_json::V
 
 /// Parse a Vertex Anthropic non-streaming response into the shared `CompletionResult`.
 pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> {
-    let content: String = v["content"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|c| c["type"] == "text")
-                .filter_map(|c| c["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default();
     let usage = &v["usage"];
     Ok(CompletionResult {
-        content,
+        content: text_from_content(&v["content"]),
         prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
-        finish_reason: v["stop_reason"]
-            .as_str()
-            .unwrap_or("end_turn")
-            .to_string(),
+        finish_reason: map_stop_reason(v["stop_reason"].as_str().unwrap_or("end_turn")),
+        tool_calls: tool_calls_from_content(&v["content"]),
     })
 }
 
@@ -78,3 +77,56 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
 // `output_tokens` on message_delta) into a `usage` object on the final chunk
 // so the streaming ledger records provider-counted tokens, not estimates
 // (issue #84).
+
+#[cfg(test)]
+mod tools_tests {
+    use super::*;
+
+    #[test]
+    fn tools_translate_into_the_vertex_body(/* issue #88 */) {
+        let req = NormalizedRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![serde_json::json!({"role": "user", "content": "weather?"})],
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            })]),
+            tool_choice: Some(serde_json::json!("required")),
+            ..Default::default()
+        };
+        let body = translate_request(&req, false);
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["tool_choice"]["type"], "any");
+        assert_eq!(body["anthropic_version"], VERTEX_ANTHROPIC_VERSION);
+    }
+
+    #[test]
+    fn tool_use_response_parses_to_openai_tool_calls(/* issue #88 */) {
+        let v = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Oslo"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let r = parse_response(v).unwrap();
+        assert_eq!(r.content, "Checking.");
+        assert_eq!(r.finish_reason, "tool_calls");
+        let calls = r.tool_calls.unwrap();
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn plain_response_keeps_no_tool_calls(/* issue #88 */) {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let r = parse_response(v).unwrap();
+        assert!(r.tool_calls.is_none());
+        assert_eq!(r.finish_reason, "end_turn");
+    }
+}

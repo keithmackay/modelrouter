@@ -273,6 +273,8 @@ fn req(model: &str) -> NormalizedRequest {
         stream: false,
         temperature: Some(0.1),
         max_tokens: Some(8),
+        tools: None,
+        tool_choice: None,
         extra_params: json!({}),
     }
 }

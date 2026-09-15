@@ -44,6 +44,9 @@ struct OpenAIChoice {
 #[derive(serde::Deserialize)]
 struct OpenAIMessage {
     content: Option<String>,
+    /// Kept as raw JSON: the router forwards tool calls verbatim (issue #88),
+    /// so retyping the array would only invite shape drift.
+    tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -76,6 +79,13 @@ impl ProviderAdapter for OpenAICompatAdapter {
         }
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
+        }
+        // Same wire shape on both sides: tools pass through verbatim (issue #88).
+        if let Some(tools) = &req.tools {
+            body["tools"] = serde_json::json!(tools);
+        }
+        if let Some(tc) = &req.tool_choice {
+            body["tool_choice"] = tc.clone();
         }
 
         let dispatched = std::time::Instant::now();
@@ -113,6 +123,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
             ttft_ms: Some(ttft_ms),
+            tool_calls: choice.message.tool_calls.filter(|tc| !tc.is_null()),
         })
     }
 
@@ -134,6 +145,14 @@ impl ProviderAdapter for OpenAICompatAdapter {
         }
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
+        }
+        // Same wire shape on both sides: tools pass through verbatim, and the
+        // tool_call deltas stream back to the client untranslated (issue #88).
+        if let Some(tools) = &req.tools {
+            body["tools"] = serde_json::json!(tools);
+        }
+        if let Some(tc) = &req.tool_choice {
+            body["tool_choice"] = tc.clone();
         }
 
         let resp = self
@@ -158,6 +177,12 @@ impl ProviderAdapter for OpenAICompatAdapter {
             .map_ok(Bytes::from);
 
         Ok(Box::pin(stream))
+    }
+
+    /// OpenAI wire shape end to end: every model behind this adapter takes
+    /// `tools` verbatim (issue #88).
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
     }
 }
 
@@ -196,6 +221,111 @@ impl crate::providers::catalog::ProviderCatalog for OpenAICompatAdapter {
                 display_name: None,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tools_tests {
+    use super::*;
+    use crate::providers::adapter::ProviderAdapter;
+    use axum::{routing::post, Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    fn adapter_for(base: &str) -> OpenAICompatAdapter {
+        let mut config = crate::config::schema::ProviderConfig::default();
+        config.api_base = Some(base.to_string());
+        config.api_key = "k".into();
+        OpenAICompatAdapter::new(&config)
+    }
+
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn openai_compat_supports_tools_for_every_model(/* issue #88 */) {
+        let mut config = crate::config::schema::ProviderConfig::default();
+        config.api_key = "k".into();
+        let adapter = OpenAICompatAdapter::new(&config);
+        assert!(adapter.supports_tools("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn tools_pass_through_and_tool_calls_parse_back(/* issue #88 */) {
+        // Capture the outbound body so the passthrough is verified on the
+        // wire, not inferred from the response.
+        let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let seen_handler = seen.clone();
+        let base = serve(Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                *seen_handler.lock().unwrap() = Some(body);
+                async {
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "get_weather", "arguments": "{}"}
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+                    }))
+                }
+            }),
+        ))
+        .await;
+
+        let req = NormalizedRequest {
+            model: "gpt-4o".into(),
+            messages: vec![serde_json::json!({"role": "user", "content": "weather?"})],
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            })]),
+            tool_choice: Some(serde_json::json!("auto")),
+            ..Default::default()
+        };
+        let result = adapter_for(&base).complete(&req).await.unwrap();
+
+        let sent = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(sent["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(sent["tool_choice"], "auto");
+
+        assert_eq!(result.finish_reason, "tool_calls");
+        assert_eq!(result.content, "");
+        let calls = result.tool_calls.unwrap();
+        assert_eq!(calls[0]["id"], "call_1");
+    }
+
+    #[tokio::test]
+    async fn plain_response_has_no_tool_calls(/* issue #88 */) {
+        let base = serve(Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }),
+        ))
+        .await;
+        let req = NormalizedRequest {
+            model: "gpt-4o".into(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            ..Default::default()
+        };
+        let result = adapter_for(&base).complete(&req).await.unwrap();
+        assert!(result.tool_calls.is_none());
+        assert_eq!(result.content, "hi");
     }
 }
 

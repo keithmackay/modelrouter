@@ -55,7 +55,7 @@ modelrouter install-service  (macOS/Linux)
 |---|---|
 | `GET /health` | Liveness check |
 | `GET /v1/models` | List available models |
-| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
+| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); forwards `tools`/`tool_choice` to tool-capable backends (translated for Anthropic-shaped upstreams); `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
 | `POST /v1/feedback` | Report a run's outcome by attribution correlation id (API key) |
 | `GET /admin/users` | List users (admin JWT required) |
 | `POST /admin/users` | Create user (superadmin JWT required) |

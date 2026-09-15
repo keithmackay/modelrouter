@@ -265,6 +265,18 @@ impl VertexAdapter {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for VertexAdapter {
+    /// Tool forwarding is per-publisher (issue #88): Claude bodies translate
+    /// through the shared Anthropic layer and MaaS is OpenAI-shaped
+    /// passthrough. Gemini's `functionDeclarations` dialect is not yet
+    /// implemented, so those models keep the clear 400 at the gate rather
+    /// than a silent tool drop.
+    fn supports_tools(&self, model: &str) -> bool {
+        matches!(
+            parse_model_id(model),
+            Ok((Publisher::Anthropic | Publisher::Maas, _))
+        )
+    }
+
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let (publisher, model) = parse_model_id(&req.model)?;
         let region = if matches!(publisher, Publisher::Maas) {
@@ -479,6 +491,8 @@ mod tests {
             stream: false,
             temperature: Some(0.2),
             max_tokens: Some(16),
+            tools: None,
+            tool_choice: None,
             extra_params: serde_json::Value::Null,
         }
     }

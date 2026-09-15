@@ -217,6 +217,7 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
         cache_write_tokens: 0,
         ttft_ms: None,
+        tool_calls: None,
     })
 }
 
@@ -334,6 +335,8 @@ mod tests {
             stream: false,
             temperature: Some(0.2),
             max_tokens: Some(16),
+            tools: None,
+            tool_choice: None,
             extra_params: serde_json::json!({}),
         }
     }

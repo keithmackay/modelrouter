@@ -1364,6 +1364,32 @@ curl -N http://localhost:8080/v1/chat/completions \
 # data: [DONE]
 ```
 
+### Tool calling (function tools)
+
+`POST /v1/chat/completions` forwards OpenAI-shaped `tools` and `tool_choice`
+to backing models that support tool calling, translating where the upstream
+speaks a different dialect:
+
+- **OpenAI-compatible upstreams** (OpenAI, Azure OpenAI, Groq/Ollama-style
+  bases, Vertex MaaS): tools, tool-call responses and streamed tool-call
+  deltas pass through verbatim.
+- **Anthropic-shaped upstreams** (direct Anthropic, Claude on Vertex): tools
+  translate to native `tools`/`input_schema`, assistant `tool_calls` turns
+  and `tool`-role results translate to `tool_use`/`tool_result` blocks, and
+  responses translate back — including streaming, where `tool_use` deltas
+  are re-emitted as OpenAI `tool_calls` chunks and `stop_reason: "tool_use"`
+  becomes `finish_reason: "tool_calls"`.
+
+The agentic loop (assistant calls a tool → client sends the `tool` result →
+model continues) round-trips through the router on every provider above.
+Fallback routing never substitutes a backend that cannot take tools: a
+request carrying tools skips such candidates in the fallback chain.
+
+Backends without tool forwarding (Bedrock, Gemini, Azure AI Foundry agents)
+reject tool-carrying requests with a clear 400 naming the resolved
+provider/model, rather than silently dropping the tools. A `tool_choice`
+without a non-empty `tools` array is rejected as malformed.
+
 ### Controlled experiments
 
 A router-managed A/B run. Create an experiment with named variants — each

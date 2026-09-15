@@ -30,6 +30,13 @@ pub fn translate_request(req: &NormalizedRequest, model: &str, streaming: bool) 
     if let Some(max) = req.max_tokens {
         body["max_tokens"] = serde_json::json!(max);
     }
+    // OpenAI-compatible endpoint: tools pass through verbatim (issue #88).
+    if let Some(tools) = &req.tools {
+        body["tools"] = serde_json::json!(tools);
+    }
+    if let Some(tc) = &req.tool_choice {
+        body["tool_choice"] = tc.clone();
+    }
     body
 }
 
@@ -51,6 +58,10 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         cache_write_tokens: 0,
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
+        tool_calls: choice["message"]["tool_calls"]
+            .as_array()
+            .filter(|tc| !tc.is_empty())
+            .map(|tc| serde_json::Value::Array(tc.clone())),
     })
 }
 
@@ -79,6 +90,8 @@ mod tests {
             stream: false,
             temperature: Some(0.2),
             max_tokens: Some(100),
+            tools: None,
+            tool_choice: None,
             extra_params: serde_json::Value::Null,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", false);
@@ -98,6 +111,8 @@ mod tests {
             stream: true,
             temperature: None,
             max_tokens: None,
+            tools: None,
+            tool_choice: None,
             extra_params: serde_json::Value::Null,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", true);
