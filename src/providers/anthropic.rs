@@ -66,6 +66,52 @@ impl crate::providers::catalog::ProviderCatalog for AnthropicAdapter {
     }
 }
 
+/// Translate one OpenAI content part to its Anthropic-native block.
+///
+/// OpenAI `image_url` parts become Anthropic `image` blocks — Anthropic-family
+/// backends reject the OpenAI tag with 400 `Input tag 'image_url' ... invalid`
+/// (ey-org/athena2#2232). A data URL (`data:<media_type>;base64,<data>`)
+/// becomes a `base64` source; any other URL becomes a `url` source. Every
+/// other part — text blocks, already-native image blocks — passes through
+/// verbatim, and an `image_url` part with no usable URL or a malformed data
+/// URL also passes through so the provider's own error names the real problem.
+fn translate_content_block(part: &serde_json::Value) -> serde_json::Value {
+    if part["type"] != "image_url" {
+        return part.clone();
+    }
+    // OpenAI nests the URL (`image_url: {url}`); some OpenAI-compatible
+    // clients send the legacy flat string form (`image_url: "..."`).
+    let url = part["image_url"]["url"]
+        .as_str()
+        .or_else(|| part["image_url"].as_str());
+    let Some(url) = url else {
+        return part.clone();
+    };
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, data)) = rest.split_once(',') {
+            if let Some(media_type) = meta.strip_suffix(";base64") {
+                return serde_json::json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                });
+            }
+        }
+        // Malformed data URL: no comma, or not base64-encoded.
+        return part.clone();
+    }
+    serde_json::json!({
+        "type": "image",
+        "source": {"type": "url", "url": url},
+    })
+}
+
+/// Map an OpenAI content array to Anthropic-native blocks (see
+/// [`translate_content_block`]). Identity for arrays with no `image_url`
+/// parts, so text-only content stays byte-identical.
+fn translate_content_blocks(parts: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    parts.iter().map(translate_content_block).collect()
+}
+
 /// Extract system messages (concatenated) and translate the rest to Anthropic
 /// Messages shape, including the agentic tool loop (issue #88): an assistant
 /// message carrying OpenAI `tool_calls` becomes `tool_use` content blocks, and
@@ -108,8 +154,12 @@ pub fn translate_messages(
     for m in messages {
         match m["role"].as_str() {
             Some("user") => {
-                if m["content"].is_string() || m["content"].is_array() {
+                if m["content"].is_string() {
                     translated.push(m.clone());
+                } else if let Some(arr) = m["content"].as_array() {
+                    let mut msg = m.clone();
+                    msg["content"] = serde_json::Value::Array(translate_content_blocks(arr));
+                    translated.push(msg);
                 }
             }
             Some("assistant") => {
@@ -124,7 +174,7 @@ pub fn translate_messages(
                             blocks.push(serde_json::json!({"type": "text", "text": text}));
                         }
                     } else if let Some(arr) = m["content"].as_array() {
-                        blocks.extend(arr.iter().cloned());
+                        blocks.extend(translate_content_blocks(arr));
                     }
                     for call in calls {
                         // OpenAI carries arguments as a JSON *string*;
@@ -143,14 +193,20 @@ pub fn translate_messages(
                         }));
                     }
                     translated.push(serde_json::json!({"role": "assistant", "content": blocks}));
-                } else if m["content"].is_string() || m["content"].is_array() {
+                } else if m["content"].is_string() {
                     translated.push(m.clone());
+                } else if let Some(arr) = m["content"].as_array() {
+                    let mut msg = m.clone();
+                    msg["content"] = serde_json::Value::Array(translate_content_blocks(arr));
+                    translated.push(msg);
                 }
             }
             Some("tool") => {
                 let content = match &m["content"] {
                     serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
-                    v @ serde_json::Value::Array(_) => v.clone(),
+                    serde_json::Value::Array(arr) => {
+                        serde_json::Value::Array(translate_content_blocks(arr))
+                    }
                     serde_json::Value::Null => serde_json::Value::String(String::new()),
                     other => serde_json::Value::String(other.to_string()),
                 };
@@ -730,6 +786,162 @@ mod tests {
         assert_eq!(results[0]["content"], "result 1");
         assert_eq!(results[1]["tool_use_id"], "call_2");
         assert_eq!(translated[2]["content"], "thanks");
+    }
+}
+
+#[cfg(test)]
+mod image_content_tests {
+    // OpenAI `image_url` content parts must translate to Anthropic-native
+    // `image` blocks — Anthropic-family backends reject the OpenAI tag with
+    // 400 "Input tag 'image_url' ... invalid" (ey-org/athena2#2232).
+    use super::translate_messages;
+
+    #[test]
+    fn string_content_is_byte_identical() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        let (_, translated) = translate_messages(&messages);
+        assert_eq!(translated[0], messages[0]);
+    }
+
+    #[test]
+    fn text_only_content_arrays_are_byte_identical() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "text", "text": "part two"}
+            ]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        assert_eq!(translated[0], messages[0]);
+    }
+
+    #[test]
+    fn data_url_image_becomes_base64_image_block() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}
+            }]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let block = &translated[0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], "image/png");
+        assert_eq!(block["source"]["data"], "iVBORw0KGgo=");
+        assert!(block.get("image_url").is_none());
+    }
+
+    #[test]
+    fn https_image_url_becomes_url_source_block() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/diagram.png"}
+            }]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let block = &translated[0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "url");
+        assert_eq!(block["source"]["url"], "https://example.com/diagram.png");
+    }
+
+    #[test]
+    fn legacy_flat_string_image_url_is_translated() {
+        // Some OpenAI-compatible clients send `image_url` as a bare string
+        // instead of the nested `{url}` object.
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": "https://example.com/a.jpg"}]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let block = &translated[0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "url");
+        assert_eq!(block["source"]["url"], "https://example.com/a.jpg");
+    }
+
+    #[test]
+    fn mixed_text_and_image_parts_keep_order_and_text_untouched() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What does this show?"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
+                {"type": "text", "text": "Answer briefly."}
+            ]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let blocks = translated[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], messages[0]["content"][0]);
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[2], messages[0]["content"][2]);
+    }
+
+    #[test]
+    fn malformed_data_url_passes_through_without_panic() {
+        // No comma separator, and a non-base64 encoding marker: neither can
+        // become a valid Anthropic block, so both pass through verbatim and
+        // the provider's own error names the real problem.
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64"}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;utf8,notbase64"}}
+            ]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let blocks = translated[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0], messages[0]["content"][0]);
+        assert_eq!(blocks[1], messages[0]["content"][1]);
+    }
+
+    #[test]
+    fn image_url_part_without_a_url_passes_through() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {}}]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        assert_eq!(translated[0], messages[0]);
+    }
+
+    #[test]
+    fn native_anthropic_image_blocks_pass_through_unchanged() {
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+            }]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        assert_eq!(translated[0], messages[0]);
+    }
+
+    #[test]
+    fn tool_result_content_arrays_are_translated_too() {
+        // Anthropic tool_result blocks accept image blocks, not `image_url`.
+        let messages = vec![serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+                {"type": "text", "text": "screenshot:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let result = &translated[0]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][0], messages[0]["content"][0]);
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["source"]["data"], "AAAA");
     }
 }
 
