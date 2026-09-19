@@ -119,6 +119,34 @@ mod tools_tests {
     }
 
     #[test]
+    fn image_url_parts_reach_vertex_as_anthropic_image_blocks(/* ey-org/athena2#2232 */) {
+        // Vertex Anthropic 400s on OpenAI `image_url` parts ("Input tag
+        // 'image_url' ... invalid"); they must arrive as native image blocks.
+        let req = NormalizedRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this diagram."},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]
+            })],
+            ..Default::default()
+        };
+        let body = translate_request(&req, false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "/9j/4AAQ");
+        assert_eq!(blocks[2]["type"], "image");
+        assert_eq!(blocks[2]["source"]["type"], "url");
+        assert_eq!(blocks[2]["source"]["url"], "https://example.com/x.png");
+    }
+
+    #[test]
     fn plain_response_keeps_no_tool_calls(/* issue #88 */) {
         let v = serde_json::json!({
             "content": [{"type": "text", "text": "hi"}],
