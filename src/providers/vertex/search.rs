@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::config::schema::ProviderConfig;
 use crate::providers::search::{SearchAdapter, SearchRequest, SearchResponse, SearchResultItem};
 use crate::providers::vertex::adapter::build_endpoint_url;
-use crate::providers::vertex::auth::{GoogleCloudAuthProvider, TokenProvider};
+use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::Publisher;
 
 /// Grounding requires a Gemini model; `gemini-2.5-flash` is the cheapest one
@@ -248,16 +248,18 @@ impl SearchAdapter for VertexSearchAdapter {
             &self.model,
             false,
         );
-        let token = self.token_provider.token().await?;
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("Content-Type", "application/json")
-            .json(&build_search_body(req))
-            .send()
-            .await
-            .context("Failed to send search request to Vertex AI")?;
+        let resp = send_with_401_retry(
+            &self.token_provider,
+            "Failed to send search request to Vertex AI",
+            |token| {
+                self.client
+                    .post(&url)
+                    .bearer_auth(token)
+                    .header("Content-Type", "application/json")
+                    .json(&build_search_body(req))
+            },
+        )
+        .await?;
 
         let status = resp.status();
         if !status.is_success() {
