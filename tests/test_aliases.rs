@@ -398,34 +398,9 @@ async fn v1_models_lists_config_and_db_aliases() {
     assert_eq!(quick["owned_by"], "openai");
 }
 
-/// Issue #35: catalog validation when the catalog is available.
-#[tokio::test]
-async fn alias_target_validated_against_available_catalog() {
-    use axum::routing::get;
-
-    // Set up a mock catalog server
-    let catalog_router = axum::Router::new().route(
-        "/models",
-        get(|| async {
-            axum::Json(json!({
-                "data": [
-                    {"id": "gpt-4o"},
-                    {"id": "gpt-4o-mini"}
-                ]
-            }))
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let catalog_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, catalog_router).await.unwrap();
-    });
-    let catalog_base = format!("http://{}", catalog_addr);
-
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    // Build server with the catalog provider configured
+/// Build a server whose `openai` provider points at `catalog_base`, so alias
+/// writes validate against that live catalog (issues #35, #81).
+async fn build_server_with_catalog(catalog_base: String) -> (TestServer, Arc<Settings>) {
     let db = common::in_memory_db().await;
     {
         use modelrouter::db::models::NewAdminUser;
@@ -495,6 +470,36 @@ async fn alias_target_validated_against_available_catalog() {
     };
 
     let server = TestServer::new(build_router(state)).unwrap();
+    (server, settings)
+}
+
+/// Issue #35: catalog validation when the catalog is available.
+#[tokio::test]
+async fn alias_target_validated_against_available_catalog() {
+    use axum::routing::get;
+
+    // Set up a mock catalog server
+    let catalog_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            axum::Json(json!({
+                "data": [
+                    {"id": "gpt-4o"},
+                    {"id": "gpt-4o-mini"}
+                ]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catalog_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, catalog_router).await.unwrap();
+    });
+    // Give the server a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let (server, settings) =
+        build_server_with_catalog(format!("http://{}", catalog_addr)).await;
     let (hk, hv) = bearer(&jwt(&settings, "superadmin"));
 
     // Model present in catalog → success (full provider/name format)
@@ -505,13 +510,59 @@ async fn alias_target_validated_against_available_catalog() {
         .await
         .assert_status_ok();
 
-    // Model absent from catalog → degrades gracefully when catalog is malformed.
-    // (The mock catalog returns OpenAI format which doesn't match CatalogModel schema,
-    // so aggregate_catalogs returns empty, triggering degradation.)
+    // Model absent from an AVAILABLE catalog → rejected. This asserted OK
+    // before issue #81: the process-global catalog cache let another test's
+    // empty catalog satisfy this server's validation, and the pass depended
+    // on that pollution. With the cache keyed by settings generation this
+    // server sees its own (populated) catalog, so the write must 400.
     server
         .put("/admin/api/aliases/slow")
         .add_header(hk.clone(), hv.clone())
         .json(&json!({ "target": "missing-model" }))
+        .await
+        .assert_status_bad_request();
+}
+
+/// Issue #81: the catalog cache is process-global, so several servers in one
+/// test binary share it. An entry cached for one server's settings must not
+/// satisfy validation for a server with different settings — the flake was
+/// alias writes 400ing against a catalog that belonged to a different test.
+#[tokio::test]
+async fn alias_validation_not_poisoned_by_other_servers_catalog() {
+    use axum::routing::get;
+
+    let catalog_router = axum::Router::new().route(
+        "/models",
+        get(|| async { axum::Json(json!({ "data": [ {"id": "gpt-4o"} ] })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let catalog_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, catalog_router).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Server A has a live catalog; a bogus target is rejected, which also
+    // proves A's (populated) catalog is now in the shared cache.
+    let (server_a, settings_a) =
+        build_server_with_catalog(format!("http://{}", catalog_addr)).await;
+    let (hk, hv) = bearer(&jwt(&settings_a, "superadmin"));
+    server_a
+        .put("/admin/api/aliases/poisoned")
+        .add_header(hk, hv)
+        .json(&json!({ "target": "openai/nope" }))
+        .await
+        .assert_status_bad_request();
+
+    // Server B has NO catalog providers: its own catalog is unavailable, so
+    // the same bogus target must be accepted (graceful degradation). Before
+    // the fix B hit A's cached catalog and 400'd here.
+    let (server_b, settings_b, _router, _db) = build_server().await;
+    let (hk, hv) = bearer(&jwt(&settings_b, "superadmin"));
+    server_b
+        .put("/admin/api/aliases/poisoned")
+        .add_header(hk, hv)
+        .json(&json!({ "target": "openai/nope" }))
         .await
         .assert_status_ok();
 }
@@ -530,4 +581,260 @@ async fn alias_write_degrades_when_catalog_unavailable() {
         .json(&json!({ "target": "anthropic/claude-opus-4-6" }))
         .await
         .assert_status_ok();
+}
+
+/// Catalog listing degradation: one working provider + one failing provider.
+/// The available-models endpoint should return the working provider's models
+/// rather than failing the entire request (per 09-05 review).
+#[tokio::test]
+async fn catalog_listing_degrades_with_one_provider_failing() {
+    use axum::routing::get;
+
+    // Set up two mock catalog servers: one working, one failing
+    let working_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            axum::Json(json!({
+                "data": [
+                    {"id": "gpt-4o"},
+                    {"id": "gpt-4o-mini"}
+                ]
+            }))
+        }),
+    );
+    let working_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let working_addr = working_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(working_listener, working_router).await.unwrap();
+    });
+    let working_base = format!("http://{}", working_addr);
+
+    let failing_router = axum::Router::new().route(
+        "/models",
+        get(|| async {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "provider down")
+        }),
+    );
+    let failing_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failing_addr = failing_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(failing_listener, failing_router).await.unwrap();
+    });
+    let failing_base = format!("http://{}", failing_addr);
+
+    // Give the servers a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Aggregate directly rather than through /admin/api/models/available: the
+    // endpoint serves this aggregation from a process-wide TTL cache that
+    // sibling tests in this binary also populate, so endpoint-level assertions
+    // would race them. The degradation contract lives in the aggregation.
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        modelrouter::config::schema::ProviderConfig {
+            api_base: Some(working_base),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    );
+    providers.insert(
+        "groq".to_string(),
+        modelrouter::config::schema::ProviderConfig {
+            api_base: Some(failing_base),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    );
+
+    let out = modelrouter::providers::catalog_registry::aggregate_catalogs(&providers).await;
+
+    // The working provider's models are present
+    assert_eq!(out["openai"]["supported"], true);
+    let models = out["openai"]["models"].as_array().unwrap();
+    assert!(!models.is_empty(), "working provider should have models");
+    assert_eq!(models[0]["name"], "gpt-4o");
+
+    // The failing provider degrades to an error entry; the aggregate as a
+    // whole still succeeds rather than failing the request.
+    assert_eq!(out["groq"]["supported"], true);
+    assert!(
+        out["groq"]["error"].as_str().unwrap().contains("500"),
+        "failing provider should carry an error"
+    );
+    assert!(out["groq"].get("models").is_none(), "failing provider should have no models");
+}
+
+// ── Dashboard (htmx form) surface ────────────────────────────────────────────
+//
+// The JSON API above and the dashboard form handlers are separate code paths
+// over the same validation: the form answers with an HTML fragment and a
+// session cookie instead of a JSON body and a bearer token, so an error that
+// only bites the form (a 500 where an inline alert belongs, a row fragment
+// that never renders) is invisible to the API tests.
+
+fn session(token: &str) -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    (
+        axum::http::header::COOKIE,
+        axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn dashboard_form_creates_then_updates_an_alias_and_renders_rows() {
+    let (server, settings, router, db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "superadmin"));
+
+    // Empty table first: the fragment says so rather than rendering nothing.
+    let empty = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    empty.assert_status_ok();
+    assert!(empty.text().contains("No runtime aliases defined"), "{}", empty.text());
+
+    // Create.
+    let created = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "anthropic/claude-sonnet-4-5")])
+        .await;
+    created.assert_status_ok();
+    let body = created.text();
+    assert!(body.contains("saved and live"), "{body}");
+    assert!(body.contains("balanced"), "{body}");
+    assert_eq!(router.resolve("balanced").1, "claude-sonnet-4-5");
+
+    // The row fragment now renders the alias, its target and a delete control.
+    let rows = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    let rows_html = rows.text();
+    assert!(rows_html.contains("alias-row-balanced"), "{rows_html}");
+    assert!(rows_html.contains("anthropic/claude-sonnet-4-5"), "{rows_html}");
+    assert!(rows_html.contains("/admin/aliases/balanced/delete"), "{rows_html}");
+    assert!(rows_html.contains("superadmin-user"), "created_by is shown: {rows_html}");
+
+    // Update the same alias — upsert, not a duplicate row, and audited as an update.
+    server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "openai/gpt-5-mini")])
+        .await
+        .assert_status_ok();
+    let rows_html = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await
+        .text();
+    assert_eq!(
+        rows_html.matches("<tr id=\"alias-row-balanced\"").count(),
+        1,
+        "upsert replaces the row, it does not add one: {rows_html}"
+    );
+    assert!(rows_html.contains("openai/gpt-5-mini"), "{rows_html}");
+
+    use modelrouter::db::repositories::audit::AuditRepository;
+    let entries = AuditRepository::list(&*db, 50, 0).await.unwrap();
+    let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+    assert!(actions.contains(&"alias.create"), "{actions:?}");
+    assert!(actions.contains(&"alias.update"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn dashboard_form_reports_validation_failures_inline() {
+    let (server, settings, _router, _db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "superadmin"));
+
+    // Missing target: an inline alert, not a 4xx the htmx swap would discard.
+    let blank = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "   ")])
+        .await;
+    blank.assert_status_ok();
+    assert!(blank.text().contains("alert-danger"), "{}", blank.text());
+    assert!(blank.text().contains("required"), "{}", blank.text());
+
+    // Reserved ':' prefix.
+    let reserved = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", ":fast"), ("target", "openai/gpt-4o")])
+        .await;
+    reserved.assert_status_ok();
+    assert!(reserved.text().contains("alert-danger"), "{}", reserved.text());
+
+    // Self-reference, and the message is HTML-escaped on the way back out.
+    let cycle = server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "<b>loop</b>"), ("target", "<b>loop</b>")])
+        .await;
+    cycle.assert_status_ok();
+    let text = cycle.text();
+    assert!(text.contains("alert-danger"), "{text}");
+    assert!(!text.contains("<b>loop</b>"), "message must be escaped: {text}");
+}
+
+#[tokio::test]
+async fn dashboard_form_deletes_an_alias() {
+    let (server, settings, router, _db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "superadmin"));
+
+    server
+        .post("/admin/aliases")
+        .add_header(ck.clone(), cv.clone())
+        .form(&[("alias", "balanced"), ("target", "openai/gpt-4o")])
+        .await
+        .assert_status_ok();
+    assert_eq!(router.resolve("balanced").1, "gpt-4o");
+
+    // htmx swaps the row out, so the delete handler answers with an empty body.
+    let deleted = server
+        .post("/admin/aliases/balanced/delete")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    deleted.assert_status_ok();
+    assert!(deleted.text().is_empty(), "{:?}", deleted.text());
+
+    let rows = server
+        .get("/admin/aliases/rows")
+        .add_header(ck.clone(), cv.clone())
+        .await;
+    assert!(rows.text().contains("No runtime aliases defined"), "{}", rows.text());
+
+    // Deleting an alias that is already gone is idempotent on this surface —
+    // the row the swap targets is removed either way.
+    server
+        .post("/admin/aliases/balanced/delete")
+        .add_header(ck, cv)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn dashboard_alias_writes_require_a_superadmin_session() {
+    let (server, settings, _router, _db) = build_server().await;
+    let (ck, cv) = session(&jwt(&settings, "viewer"));
+
+    for resp in [
+        server
+            .post("/admin/aliases")
+            .add_header(ck.clone(), cv.clone())
+            .form(&[("alias", "balanced"), ("target", "openai/gpt-4o")])
+            .await,
+        server
+            .post("/admin/aliases/balanced/delete")
+            .add_header(ck.clone(), cv.clone())
+            .await,
+        server.get("/admin/aliases/rows").add_header(ck, cv).await,
+    ] {
+        assert!(
+            !resp.status_code().is_success(),
+            "a viewer session must not reach alias writes, got {}",
+            resp.status_code()
+        );
+    }
 }

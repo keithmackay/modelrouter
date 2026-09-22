@@ -95,6 +95,30 @@ impl ProviderAdapter for RecordingAdapter {
     }
 }
 
+/// An embedding adapter that records the model of every call and fails on
+/// demand — the embedding-side mirror of [`RecordingAdapter`] (issue #85).
+struct RecordingEmbeddingAdapter {
+    calls: Arc<Mutex<Vec<String>>>,
+    fail_models: Arc<Mutex<HashSet<String>>>,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::embedding::EmbeddingAdapter for RecordingEmbeddingAdapter {
+    async fn embed(
+        &self,
+        req: &modelrouter::providers::embedding::EmbeddingRequest,
+    ) -> anyhow::Result<modelrouter::providers::embedding::EmbeddingResult> {
+        self.calls.lock().unwrap().push(req.model.clone());
+        if self.fail_models.lock().unwrap().contains(&req.model) {
+            anyhow::bail!("mock embedding upstream refused {}", req.model);
+        }
+        Ok(modelrouter::providers::embedding::EmbeddingResult {
+            embeddings: vec![vec![0.1_f32, 0.2]; req.input.len()],
+            prompt_tokens: 8,
+        })
+    }
+}
+
 /// A callback backend that keeps every event it is handed, so a test can
 /// assert that the observability egress stayed shut.
 struct RecordingBackend {
@@ -111,6 +135,7 @@ struct Harness {
     server: TestServer,
     db: Arc<dyn DatabaseProvider>,
     calls: Arc<Mutex<Vec<String>>>,
+    embed_calls: Arc<Mutex<Vec<String>>>,
     events: Arc<Mutex<Vec<CallbackEvent>>>,
     fail_models: Arc<Mutex<HashSet<String>>>,
     router: Arc<RequestRouter>,
@@ -122,6 +147,11 @@ impl Harness {
     /// Models the provider has been asked for, in order.
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Models the embedding adapter has been asked for, in order.
+    fn embed_calls(&self) -> Vec<String> {
+        self.embed_calls.lock().unwrap().clone()
     }
 
     fn fail(&self, model: &str) {
@@ -301,6 +331,7 @@ async fn build_app(opts: Options) -> Harness {
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
 
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let embed_calls = Arc::new(Mutex::new(Vec::new()));
     let fail_models = Arc::new(Mutex::new(HashSet::new()));
     let router = Arc::new(RequestRouter::new(settings.clone()));
     let session_affinity = Arc::new(SessionAffinityMap::new(1800));
@@ -331,11 +362,20 @@ async fn build_app(opts: Options) -> Harness {
             ttl_seconds: 60,
             ..Default::default()
         })),
-        embedding_registry: Arc::new(EmbeddingRegistry::new_with_mock(
-            common::MockEmbeddingAdapter {
-                embedding: vec![0.1_f32, 0.2],
-            },
-        )),
+        embedding_registry: {
+            // The recording adapter sits under "mock" — the provider every
+            // model in this harness resolves to — sharing the fail set with
+            // the chat adapter so tests can fail a pinned embedding model.
+            let registry = EmbeddingRegistry::new(HashMap::new());
+            registry.register(
+                "mock",
+                RecordingEmbeddingAdapter {
+                    calls: embed_calls.clone(),
+                    fail_models: fail_models.clone(),
+                },
+            );
+            Arc::new(registry)
+        },
         search_registry: Arc::new(SearchRegistry::new_with_mock(common::MockSearchAdapter {
             results: vec![],
         })),
@@ -364,6 +404,7 @@ async fn build_app(opts: Options) -> Harness {
         server: TestServer::new(build_router(state)).unwrap(),
         db,
         calls,
+        embed_calls,
         events,
         fail_models,
         router,
@@ -411,6 +452,168 @@ async fn complete(
         req = req.add_header(name, value);
     }
     req.json(body).await
+}
+
+/// An embeddings body for `model` carrying correlation id `run`.
+fn embed_body(model: &str, run: &str) -> Value {
+    json!({
+        "model": model,
+        "input": ["plan the week"],
+        "attribution": { "correlation_id": run },
+    })
+}
+
+/// POST an embedding, optionally under the experiment header.
+async fn embed(
+    h: &Harness,
+    token: &str,
+    header: Option<&str>,
+    body: &Value,
+) -> axum_test::TestResponse {
+    let mut req = h
+        .server
+        .post("/v1/embeddings")
+        .add_header(bearer(token).0, bearer(token).1);
+    if let Some(value) = header {
+        let (name, value) = experiment_header(value);
+        req = req.add_header(name, value);
+    }
+    req.json(body).await
+}
+
+// ── Embedding binding (issue #85) ───────────────────────────────────────────
+
+#[tokio::test]
+async fn bound_embedding_is_answered_by_the_pinned_model_and_stamped() {
+    let h = build_app(Options::default()).await;
+    let id = h.seed_experiment(vec![], false).await;
+
+    let resp = embed(
+        &h,
+        TOKEN_A,
+        Some(&format!("{id}:candidate")),
+        &embed_body("planner", "run-emb-1"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body: Value = resp.json();
+    assert_eq!(body["model"], "model-b");
+    assert_eq!(h.embed_calls(), vec!["model-b"]);
+
+    let ledger = h.wait_for_ledger_rows(1).await;
+    assert_eq!(ledger[0].model, "model-b");
+    assert_eq!(ledger[0].provider, "mock");
+    assert_eq!(ledger[0].experiment_id, Some(id));
+    assert_eq!(ledger[0].experiment_variant.as_deref(), Some("candidate"));
+    assert_eq!(
+        ledger[0].attribution_correlation_id.as_deref(),
+        Some("run-emb-1")
+    );
+
+    // The prompt row records the caller's name as the request model and the
+    // pinned model as the routed model — same rule as chat.
+    let prompts = h.prompts().await;
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].request_model, "planner");
+    assert_eq!(prompts[0].routed_model, "model-b");
+    assert_eq!(prompts[0].experiment_id, Some(id));
+    assert_eq!(prompts[0].experiment_variant.as_deref(), Some("candidate"));
+}
+
+#[tokio::test]
+async fn control_embedding_routes_the_callers_name_and_still_stamps() {
+    let h = build_app(Options::default()).await;
+    let id = h.seed_experiment(vec![], false).await;
+
+    // `control` has an empty overlay: `planner` routes through the alias to
+    // model-a as usual, and the rows still carry the variant.
+    let resp = embed(
+        &h,
+        TOKEN_A,
+        Some(&format!("{id}:control")),
+        &embed_body("planner", "run-emb-2"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(h.embed_calls(), vec!["model-a"]);
+
+    let ledger = h.wait_for_ledger_rows(1).await;
+    assert_eq!(ledger[0].model, "model-a");
+    assert_eq!(ledger[0].experiment_id, Some(id));
+    assert_eq!(ledger[0].experiment_variant.as_deref(), Some("control"));
+}
+
+#[tokio::test]
+async fn bound_embedding_never_falls_back() {
+    let h = build_app(Options::default()).await;
+    let id = h.seed_experiment(vec![], false).await;
+    h.fail("model-b");
+
+    // Unbound first: model-b fails, the chain hands the request to model-a.
+    let resp = embed(&h, TOKEN_A, None, &embed_body("mock/model-b", "run-emb-3")).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(h.embed_calls(), vec!["model-b", "model-a"]);
+
+    // Bound: the pinned model's failure is the arm's result — no fallback.
+    let resp = embed(
+        &h,
+        TOKEN_A,
+        Some(&format!("{id}:candidate")),
+        &embed_body("planner", "run-emb-4"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 502, "{}", resp.text());
+    assert_eq!(
+        h.embed_calls(),
+        vec!["model-b", "model-a", "model-b"],
+        "the bound attempt must stop at the pinned model"
+    );
+}
+
+#[tokio::test]
+async fn embedding_header_with_unknown_experiment_is_refused() {
+    let h = build_app(Options::default()).await;
+    let resp = embed(
+        &h,
+        TOKEN_A,
+        Some("424242"),
+        &embed_body("planner", "run-emb-5"),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 400, "{}", resp.text());
+    assert!(
+        resp.text().contains("experiment 424242 not found"),
+        "{}",
+        resp.text()
+    );
+    assert!(h.embed_calls().is_empty(), "no provider call on a refused bind");
+}
+
+#[tokio::test]
+async fn embedding_binding_requires_a_correlation_id() {
+    let h = build_app(Options::default()).await;
+    let id = h.seed_experiment(vec![], false).await;
+    let resp = embed(
+        &h,
+        TOKEN_A,
+        Some(&format!("{id}:candidate")),
+        &json!({"model": "planner", "input": ["hi"]}),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 400, "{}", resp.text());
+    assert!(resp.text().contains("correlation_id"), "{}", resp.text());
+}
+
+#[tokio::test]
+async fn embedding_without_the_header_is_untouched() {
+    let h = build_app(Options::default()).await;
+    let _ = h.seed_experiment(vec![], false).await;
+    let resp = embed(&h, TOKEN_A, None, &embed_body("planner", "run-emb-6")).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(h.embed_calls(), vec!["model-a"]);
+    let ledger = h.wait_for_ledger_rows(1).await;
+    assert_eq!(ledger[0].experiment_id, None);
+    assert_eq!(ledger[0].experiment_variant, None);
 }
 
 #[tokio::test]
@@ -708,7 +911,6 @@ async fn header_is_refused_on_every_other_v1_endpoint() {
         ),
         ("/v1/search", json!({"query": "hi"})),
         ("/v1/feedback", json!({"correlation_id": "run-1", "outcome": "success"})),
-        ("/v1/embeddings", json!({"model": "planner", "input": ["hi"]})),
         (
             "/v1/responses",
             json!({"model": "planner", "input": "hi"}),

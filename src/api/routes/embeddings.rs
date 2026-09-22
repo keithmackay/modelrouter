@@ -62,15 +62,52 @@ async fn embeddings_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
-    crate::api::routes::reject_experiment_header("/v1/embeddings", &headers)?;
     let user = user.0;
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
-    let model = body["model"]
+    // Experiment binding (issue #85), same semantics as the chat path: the
+    // variant's overlay pins the requested embedding model to a concrete
+    // `provider/model`, and a bound request never falls back — a pinned
+    // model failing is the experiment's result, not something a substitute
+    // should answer for. `None` when the header is absent.
+    let binding = state
+        .experiments
+        .bind(
+            &headers,
+            &body,
+            attribution.correlation_id.as_deref(),
+            user.id,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|e| super::experiment_bind_rejected("/v1/embeddings", e))?;
+    let experiment_id = binding.as_ref().map(|b| b.experiment_id);
+    let experiment_variant = binding.as_ref().map(|b| b.variant.clone());
+    let retain_content = binding.as_ref().is_some_and(|b| b.retain_content);
+
+    let requested_model = body["model"]
         .as_str()
         .unwrap_or("text-embedding-3-small")
         .to_string();
+    // The overlay wins where it names the requested model; a name it does not
+    // map routes as usual (and is still stamped) — same rule as chat.
+    let model = match &binding {
+        Some(b) => b
+            .overlay
+            .get(&requested_model)
+            .cloned()
+            .unwrap_or_else(|| requested_model.clone()),
+        None => requested_model.clone(),
+    };
+    if let Some(b) = &binding {
+        tracing::info!(
+            experiment_id = b.experiment_id,
+            variant = b.variant.as_str(),
+            requested_model = requested_model.as_str(),
+            model = model.as_str(),
+            "embedding request bound to experiment variant"
+        );
+    }
 
     // Policy check
     let policy_result = state
@@ -178,6 +215,12 @@ async fn embeddings_inner(
                         error = %e,
                         "Embedding call failed, checking fallback chain"
                     );
+                    // A bound request is pinned to its variant's model: the
+                    // experiment measures that model, so a failure is the
+                    // arm's result, never a fallback's answer (issue #85).
+                    if binding.is_some() {
+                        return Err(ApiError::ProviderError(e));
+                    }
                     if hops >= MAX_FALLBACK_HOPS {
                         tracing::error!(
                             model = current_model.as_str(),
@@ -239,9 +282,12 @@ async fn embeddings_inner(
         metrics.record_cost(&canonical_model, &provider_name, cost);
     }
 
-    // Fire-and-forget cost recording
+    // Fire-and-forget cost recording. Under a binding the rows record the
+    // name the caller sent as the request model — the overlay is the
+    // experiment's doing, and the per-variant comparison runs on the
+    // caller's name — while routed_model records what actually answered.
     let state_clone = state.clone();
-    let model_clone = model.clone();
+    let model_clone = requested_model.clone();
     let canonical_clone = canonical_model.clone();
     let provider_clone = provider_name.clone();
     let user_id = user.id;
@@ -271,11 +317,25 @@ async fn embeddings_inner(
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
-            experiment_id: None,
-            experiment_variant: None,
+            experiment_id,
+            experiment_variant: experiment_variant.clone(),
         };
-        // Storage policy (issue #4): the prompt row is optional; the cost row is not.
-        let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
+        // Storage policy (issue #4): the prompt row is optional; the cost row
+        // is not. A retaining experiment forces the prompt row on — its rows
+        // are the experiment's evidence — same override as the chat path.
+        let effective_storage = {
+            let global = state_clone.storage.load();
+            if retain_content {
+                crate::config::schema::StorageConfig {
+                    store_prompts: true,
+                    store_prompt_content: true,
+                    ..(**global).clone()
+                }
+            } else {
+                (**global).clone()
+            }
+        };
+        let stored = match crate::db::prompt_store::apply_storage_policy(&effective_storage, prompt) {
             Some(p) => match PromptRepository::create(&*state_clone.prompt_db, p).await {
                 Ok(s) => Some(s),
                 Err(e) => {
@@ -298,8 +358,8 @@ async fn embeddings_inner(
                     api_key_id,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
-                    experiment_id: None,
-                    experiment_variant: None,
+                    experiment_id,
+                    experiment_variant: experiment_variant.clone(),
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {

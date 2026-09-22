@@ -65,6 +65,13 @@ impl AzureOpenAIAdapter {
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
         }
+        // Azure serves the OpenAI wire shape: tools pass through verbatim (issue #88).
+        if let Some(tools) = &req.tools {
+            body["tools"] = serde_json::json!(tools);
+        }
+        if let Some(tc) = &req.tool_choice {
+            body["tool_choice"] = tc.clone();
+        }
 
         body
     }
@@ -85,6 +92,8 @@ struct AzureChoice {
 #[derive(serde::Deserialize)]
 struct AzureMessage {
     content: Option<String>,
+    /// Raw JSON, forwarded verbatim (issue #88).
+    tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -145,12 +154,16 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
             ttft_ms: Some(ttft_ms),
+            tool_calls: choice.message.tool_calls.filter(|tc| !tc.is_null()),
         })
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
         let mut body = Self::build_body(req);
         body["stream"] = serde_json::json!(true);
+        // The router owns usage capture (issue #84): always request the final
+        // usage chunk so the streaming ledger records provider-counted tokens.
+        body["stream_options"] = serde_json::json!({"include_usage": true});
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
@@ -174,5 +187,10 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             .map_err(|e| anyhow::anyhow!("Stream error: {}", e));
 
         Ok(Box::pin(stream))
+    }
+
+    /// Azure serves the OpenAI wire shape: `tools` pass through verbatim (issue #88).
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
     }
 }

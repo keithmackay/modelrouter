@@ -65,6 +65,13 @@ impl ProviderRegistry {
                  cargo feature — rebuild with `cargo build --release --features bedrock`"
             );
         }
+        #[cfg(not(feature = "foundry"))]
+        if provider_name == "foundry" {
+            anyhow::bail!(
+                "provider \"foundry\" is configured, but this binary was built without the `foundry` \
+                 cargo feature — rebuild with `cargo build --release --features foundry`"
+            );
+        }
 
         let adapter: Arc<dyn ProviderAdapter> = if provider_name == "anthropic" {
             Arc::new(crate::providers::anthropic::AnthropicAdapter::new(
@@ -80,6 +87,15 @@ impl ProviderRegistry {
             #[cfg(feature = "vertex")]
             if provider_name == "vertex" {
                 let adapter = crate::providers::vertex::VertexAdapter::new(config)?;
+                let entry = self
+                    .adapters
+                    .entry(provider_name.to_string())
+                    .or_insert(Arc::new(adapter));
+                return Ok(entry.clone());
+            }
+            #[cfg(feature = "foundry")]
+            if provider_name == "foundry" {
+                let adapter = crate::providers::foundry::FoundryAdapter::new(config)?;
                 let entry = self
                     .adapters
                     .entry(provider_name.to_string())

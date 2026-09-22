@@ -17,6 +17,7 @@ cargo run -- serve     # Start server
 cargo test
 cargo build --features postgres  # Verify postgres feature
 cargo build --features bedrock  # Verify bedrock feature
+cargo build --features bing-grounding  # Verify bing-grounding feature (default)
 ```
 
 ## CLI Commands
@@ -54,7 +55,7 @@ modelrouter install-service  (macOS/Linux)
 |---|---|
 | `GET /health` | Liveness check |
 | `GET /v1/models` | List available models |
-| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
+| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); forwards `tools`/`tool_choice` to tool-capable backends (translated for Anthropic-shaped upstreams); `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
 | `POST /v1/feedback` | Report a run's outcome by attribution correlation id (API key) |
 | `GET /admin/users` | List users (admin JWT required) |
 | `POST /admin/users` | Create user (superadmin JWT required) |
@@ -114,3 +115,49 @@ touched. Git history is public too, so catch it before the commit, not after.
 - Migrations tracked via `sqlx::migrate!("./migrations")`
 - API keys stored as SHA-256 hex digest only
 - Hook capabilities are NOT auto-granted — operators must INSERT rows into `hook_permissions`
+
+### Test Coverage
+
+- **New code must ship with tests — coverage is part of dev completion, not a
+  follow-up.** A change is not done until its new/modified lines are exercised
+  by `cargo test`.
+- Codebase-wide target: **≥80% line coverage**. Don't merge changes that pull a
+  file further below the target.
+- Measure with: `cargo llvm-cov --lcov --output-path coverage/lcov.info`
+  (the `coverage/` directory is scratch output; do not commit it).
+
+## Automated Testing & Issue Management
+
+This section configures the `/fix` command for autonomous issue resolution.
+
+### Regression Test Suite
+```bash
+cargo test
+```
+
+### Build Verification
+```bash
+cargo build --release
+```
+
+### Test Framework Details
+
+**Unit Tests**:
+- Framework: Rust built-in test framework (`cargo test`)
+- Location: `src/**` (inline `#[cfg(test)]` modules) and `tests/`
+
+**Feature builds** (verify after dependency changes):
+- `cargo build --features postgres`
+- `cargo build --features bedrock`
+
+### Merge Mode
+```
+merge
+```
+Options: `merge` (auto-merge to the integration branch and push) or `pr` (push feature branch and create a pull request, then stop).
+
+### Integration Branch
+```
+main
+```
+The shared branch all completed work is merged into.

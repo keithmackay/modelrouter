@@ -181,12 +181,21 @@ async fn validate_alias(
         ));
     }
 
-    // Validate target against the catalog when available (issue #35).
-    // On PARTIAL outage: if the target's own provider errored, skip validation
-    // (accept the write) rather than 400ing a target we cannot check.
+    validate_alias_against_catalog(state, &alias, &target).await?;
+    Ok((alias, target))
+}
+
+/// Validate target against the catalog when available (issue #35).
+/// On PARTIAL outage: if the target's own provider errored, skip validation
+/// (accept the write) rather than 400ing a target we cannot check.
+async fn validate_alias_against_catalog(
+    state: &AppState,
+    alias: &str,
+    target: &str,
+) -> Result<(), String> {
     match fetch_available_model_ids(state).await {
         Some(available) => {
-            if !available.contains(&target) {
+            if !available.contains(target) {
                 // Only check for partial outage if target has a provider prefix
                 if target.contains('/') {
                     let target_provider = target.split('/').next().unwrap_or("");
@@ -203,7 +212,7 @@ async fn validate_alias(
                                     provider = %target_provider,
                                     "alias write accepted without validation — target provider catalog unavailable or errored"
                                 );
-                                return Ok((alias, target));
+                                return Ok(());
                             }
                         }
                     }
@@ -225,8 +234,7 @@ async fn validate_alias(
             );
         }
     }
-
-    Ok((alias, target))
+    Ok(())
 }
 
 // ── JSON admin API ────────────────────────────────────────────────────────────

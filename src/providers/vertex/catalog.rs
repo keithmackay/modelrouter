@@ -135,33 +135,43 @@ impl ProviderCatalog for VertexAdapter {
                 models.append(&mut publisher_models);
                 continue;
             }
-            let Some(maas_region) = self.maas_region() else {
-                tracing::warn!(
-                    publisher,
-                    "maas_region unset — omitting MaaS publisher from catalog (its models \
-                     would be listed but uncallable; set `maas_region` under [providers.vertex])"
-                );
-                continue;
-            };
-            let probes = publisher_models.into_iter().map(|m| {
-                let token = token.clone();
-                async move {
-                    let accessible = self
-                        .probe_maas_access(&m.name, maas_region, &token)
-                        .await
-                        .unwrap_or(true); // transient probe failure: list optimistically
-                    (m, accessible)
-                }
-            });
-            for (m, accessible) in futures::future::join_all(probes).await {
-                if accessible {
-                    models.push(m);
-                } else {
-                    tracing::info!(model = m.name.as_str(), "omitted from catalog: project lacks Model Garden access");
-                }
-            }
+            filter_maas_models(&mut models, publisher_models, self, &token).await;
         }
         Ok(models)
+    }
+}
+
+/// Filter MaaS publisher models to only those accessible to this project.
+/// Models lacking Model Garden access are omitted from the catalog.
+async fn filter_maas_models(
+    models: &mut Vec<CatalogModel>,
+    publisher_models: Vec<CatalogModel>,
+    adapter: &VertexAdapter,
+    token: &str,
+) {
+    let Some(maas_region) = adapter.maas_region() else {
+        tracing::warn!(
+            "maas_region unset — omitting MaaS publisher from catalog (its models \
+             would be listed but uncallable; set `maas_region` under [providers.vertex])"
+        );
+        return;
+    };
+    let probes = publisher_models.into_iter().map(|m| {
+        let token = token.to_string();
+        async move {
+            let accessible = adapter
+                .probe_maas_access(&m.name, maas_region, &token)
+                .await
+                .unwrap_or(true); // transient probe failure: list optimistically
+            (m, accessible)
+        }
+    });
+    for (m, accessible) in futures::future::join_all(probes).await {
+        if accessible {
+            models.push(m);
+        } else {
+            tracing::info!(model = m.name.as_str(), "omitted from catalog: project lacks Model Garden access");
+        }
     }
 }
 

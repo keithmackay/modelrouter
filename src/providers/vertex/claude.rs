@@ -7,9 +7,11 @@
 //!
 //! MVP scope: string-only message content (consistent with `gemini.rs`).
 
-use bytes::Bytes;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest};
-use crate::providers::anthropic::translate_messages;
+use crate::providers::anthropic::{
+    map_stop_reason, text_from_content, tool_calls_from_content, translate_messages,
+    translate_tool_choice, translate_tools,
+};
 
 /// Vertex-specific anthropic_version required on every Claude-on-Vertex call.
 pub const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
@@ -20,7 +22,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Translate an OpenAI-shaped request to a Vertex Anthropic `:rawPredict` body.
 /// NOTE: `model` is intentionally omitted — it lives in the URL path.
-pub fn translate_request(req: &NormalizedRequest) -> serde_json::Value {
+pub fn translate_request(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
     let (system_text, messages) = translate_messages(&req.messages);
 
     let mut body = serde_json::json!({
@@ -34,68 +36,125 @@ pub fn translate_request(req: &NormalizedRequest) -> serde_json::Value {
     if let Some(t) = req.temperature {
         body["temperature"] = serde_json::json!(t);
     }
+    // Same Anthropic dialect as the direct adapter: OpenAI tools translate to
+    // native tools; tool_choice only rides along with them (issue #88).
+    if let Some(tools) = &req.tools {
+        body["tools"] = serde_json::Value::Array(translate_tools(tools));
+        if let Some(tc) = req.tool_choice.as_ref().and_then(translate_tool_choice) {
+            body["tool_choice"] = tc;
+        }
+    }
+    // `:streamRawPredict` only serves SSE when the body asks for it; without
+    // this flag Vertex answers with one raw JSON object, the SSE translator
+    // finds no `data:` lines, and the client receives an empty 200 (#83).
+    if stream {
+        body["stream"] = serde_json::json!(true);
+    }
     body
 }
 
 /// Parse a Vertex Anthropic non-streaming response into the shared `CompletionResult`.
 pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> {
-    let content: String = v["content"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|c| c["type"] == "text")
-                .filter_map(|c| c["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default();
     let usage = &v["usage"];
     Ok(CompletionResult {
-        content,
+        content: text_from_content(&v["content"]),
         prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
-        finish_reason: v["stop_reason"]
-            .as_str()
-            .unwrap_or("end_turn")
-            .to_string(),
+        finish_reason: map_stop_reason(v["stop_reason"].as_str().unwrap_or("end_turn")),
+        tool_calls: tool_calls_from_content(&v["content"]),
     })
 }
 
-/// Translate a single Anthropic SSE event line to an OpenAI `chat.completion.chunk` line.
-///
-/// Emits:
-///   - `data: {...}\n\n` on `content_block_delta` with `text_delta` content.
-///   - A single `Bytes` containing both the finalization chunk and the
-///     `data: [DONE]\n\n` sentinel on `message_delta` (the Anthropic event
-///     that carries `stop_reason` and final `usage.output_tokens`). This
-///     matches the direct Anthropic adapter's termination point.
-/// Returns `None` for all other event types (`message_start`, `message_stop`,
-/// `ping`, etc.).
-pub fn translate_sse_line(line: &str) -> Option<Bytes> {
-    let payload = line.strip_prefix("data: ")?;
-    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    match v["type"].as_str()? {
-        "content_block_delta" if v["delta"]["type"] == "text_delta" => {
-            let text = v["delta"]["text"].as_str()?;
-            let chunk = serde_json::json!({
-                "id": "chatcmpl-vertex-stream",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
-            });
-            Some(Bytes::from(format!("data: {}\n\n", chunk)))
-        }
-        "message_delta" => {
-            let chunk = serde_json::json!({
-                "id": "chatcmpl-vertex-stream",
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            });
-            Some(Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", chunk)))
-        }
-        _ => None,
+// Streaming translation for Claude-on-Vertex lives in
+// `crate::providers::anthropic::AnthropicSseTranslator`: Vertex's Anthropic
+// dialect uses the identical SSE event vocabulary (`message_start`,
+// `content_block_delta`, `message_delta`), and the shared stateful translator
+// folds the split usage report (`input_tokens` on message_start,
+// `output_tokens` on message_delta) into a `usage` object on the final chunk
+// so the streaming ledger records provider-counted tokens, not estimates
+// (issue #84).
+
+#[cfg(test)]
+mod tools_tests {
+    use super::*;
+
+    #[test]
+    fn tools_translate_into_the_vertex_body(/* issue #88 */) {
+        let req = NormalizedRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![serde_json::json!({"role": "user", "content": "weather?"})],
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            })]),
+            tool_choice: Some(serde_json::json!("required")),
+            ..Default::default()
+        };
+        let body = translate_request(&req, false);
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["tool_choice"]["type"], "any");
+        assert_eq!(body["anthropic_version"], VERTEX_ANTHROPIC_VERSION);
+    }
+
+    #[test]
+    fn tool_use_response_parses_to_openai_tool_calls(/* issue #88 */) {
+        let v = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Oslo"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let r = parse_response(v).unwrap();
+        assert_eq!(r.content, "Checking.");
+        assert_eq!(r.finish_reason, "tool_calls");
+        let calls = r.tool_calls.unwrap();
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn image_url_parts_reach_vertex_as_anthropic_image_blocks(/* ey-org/athena2#2232 */) {
+        // Vertex Anthropic 400s on OpenAI `image_url` parts ("Input tag
+        // 'image_url' ... invalid"); they must arrive as native image blocks.
+        let req = NormalizedRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this diagram."},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]
+            })],
+            ..Default::default()
+        };
+        let body = translate_request(&req, false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "/9j/4AAQ");
+        assert_eq!(blocks[2]["type"], "image");
+        assert_eq!(blocks[2]["source"]["type"], "url");
+        assert_eq!(blocks[2]["source"]["url"], "https://example.com/x.png");
+    }
+
+    #[test]
+    fn plain_response_keeps_no_tool_calls(/* issue #88 */) {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let r = parse_response(v).unwrap();
+        assert!(r.tool_calls.is_none());
+        assert_eq!(r.finish_reason, "end_turn");
     }
 }

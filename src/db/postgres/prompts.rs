@@ -8,7 +8,7 @@ use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{
     AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository,
 };
-use super::costs::{attribution_predicate, variant_predicate};
+use super::costs::arm_predicate;
 use super::{PostgresDb, now_utc};
 
 /// Rows that carry a real latency measurement. Cache hits are logged with
@@ -224,7 +224,8 @@ impl PromptRepository for PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<AttemptsSummary> {
-        let (predicate, binds) = arm_predicate(filter);
+        // Model arms match the model actually served, not the alias asked for.
+        let (predicate, binds) = arm_predicate(filter, "routed_model");
         let n = binds.len();
         // SUM over BIGINT yields NUMERIC in Postgres; cast so sqlx decodes i64.
         let sql = format!(
@@ -294,7 +295,8 @@ impl PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<LatencySummary> {
-        let (predicate, binds) = arm_predicate(filter);
+        // Model arms match the model actually served, not the alias asked for.
+        let (predicate, binds) = arm_predicate(filter, "routed_model");
         let n = binds.len();
         let where_clause = format!(
             "{} AND created_at >= ${} AND created_at < ${} AND {}",
@@ -365,13 +367,3 @@ impl PostgresDb {
     }
 }
 
-/// Predicate for a comparison arm against `prompts`. Model arms match the
-/// model actually served (`routed_model`), not the alias the caller asked for.
-fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
-    match filter {
-        ArmFilter::Model(m) => ("routed_model = $1".to_string(), vec![m.clone()]),
-        ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
-        ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
-    }
-}

@@ -30,6 +30,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 
 - **Drop-in OpenAI compatibility** — any SDK that speaks `POST /v1/chat/completions` works without modification
 - **Multi-provider routing** — route to OpenAI, Anthropic, Google Gemini, or Ollama; switch providers by changing one config line
+- **Streaming from every provider, with router-owned usage capture** — `"stream": true` yields OpenAI-shaped SSE from all upstreams (native Vertex Claude/Gemini and Bedrock streams are translated in flight); the router always obtains real token counts from the provider — independent of the client's request shape — meters streamed traffic exactly (budgets, attribution, experiment variants), and hands every caller a normalized final `usage` chunk
 - **Routing shortcuts** — use `:fastest` or `:cheapest` as the model name to route to your configured fastest or cheapest model without changing client code
 - **Runtime model aliases** — point an alias like `deep` at any `provider/model` from the admin UI or CLI, with no restart; DB aliases override config, and resolution is depth-capped so a cycle cannot hang a request
 - **Operator disable** — take a model or a whole provider out of rotation with a recorded reason; disabled targets return **403** naming the reason instead of reaching the provider, and stay disabled until explicitly re-enabled (unlike a circuit-breaker trip)
@@ -637,7 +638,48 @@ config or redeploying. Fallback chains (`[routing.fallback_chains]`) accept any 
 `provider/model` string, including cross-publisher Vertex chains
 (`"vertex/anthropic/claude-…" = ["vertex/google/gemini-…"]`).
 
-**Build note:** default cargo features include every provider (`vertex`, `bedrock`, …).
+### Azure AI Foundry: one endpoint, many deployments
+
+`[providers.foundry]` is to Azure what `[providers.vertex]` is to GCP. A Foundry
+(AI Services) resource fronts every model deployed on it — Llama, Mistral, Phi, DeepSeek,
+Cohere, Grok and the OpenAI models — behind one endpoint, with the deployment named in the
+request body, so `foundry/<deployment>` is all a route needs. Chat, streaming, embeddings
+and `GET /admin/api/models/available` discovery all go through it.
+
+Distinct from `[providers.azure]`, which speaks the older Azure OpenAI surface
+(`/openai/deployments/<deployment>/…?api-version=`) with an `api-key` header and needs one
+provider entry per deployment. Use that for an Azure OpenAI resource, `foundry` for a
+Foundry / AI Services resource.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `foundry_endpoint` | Resource endpoint, e.g. `https://<resource>.services.ai.azure.com` | required (`api_base` accepted) |
+| `project` | Foundry project; appends `/api/projects/<project>` | none (resource-level) |
+| `entra_scope` | Override the Entra audience | derived from the endpoint |
+| `api_version` | Override the per-surface api-version | per surface (see below) |
+
+**The surface is the path you configure.** A bare host resolves to the OpenAI-compatible
+data plane (`/openai/v1`), where `api-version` is optional and the service defaults to
+`v1`. An endpoint ending in `/models` selects the Azure AI Model Inference data plane,
+where `api-version` is *required* — the router supplies it. The Model Inference API is
+documented as deprecated in favour of the OpenAI-compatible one, which is why a bare host
+picks the latter. Discovery always reads the `/openai/v1/models` listing on the same
+resource, because the Model Inference surface has no listing operation at all.
+
+**Authentication is Microsoft Entra, from the environment, never from config** — the same
+credential chain the `bing_grounding` engine uses, sharing the same code:
+`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` for an app registration,
+otherwise managed identity via IMDS. Setting `api_key` switches to resource-key auth
+(`api-key` header) — supported, but it puts a secret on disk.
+
+The **audience** is derived per endpoint: `https://cognitiveservices.azure.com/.default`
+for a resource endpoint (what the published OpenAPI documents declare),
+`https://ai.azure.com/.default` for a project endpoint. Microsoft's keyless-auth how-to
+shows `ai.azure.com` for resource endpoints too, so where spec and prose disagree
+`entra_scope` is the override. The resolved value is logged at startup and named in any
+401/403 response, so the fix is visible without a doc hunt.
+
+**Build note:** default cargo features include every provider (`vertex`, `bedrock`, `foundry`, …).
 An unconfigured provider costs nothing at runtime, while a binary missing a compiled
 feature *refuses to start* against a config that names it — so feature-stripped builds
 turn a plain `cargo build` into a startup trap. Only strip features deliberately.
@@ -1165,8 +1207,13 @@ curl http://localhost:8080/health
 
 Proxies web search calls the same way `/v1/chat/completions` proxies LLM calls:
 API-key auth, per-request logging, usage metering, pricing, and inclusion in
-cost reports and OTel/Prometheus metrics. Tavily is the only engine today;
-`src/providers/search_registry.rs` documents how to add another.
+cost reports and OTel/Prometheus metrics. Three engines ship today — `tavily`,
+`vertex` (Gemini + Google Search grounding) and `bing_grounding` (Grounding with
+Bing Search on Azure AI Foundry) — and `src/providers/search_registry.rs`
+documents how to add another. The two grounding engines run a model generation
+as part of the call, so they are slower and need a completion-length
+`timeout_secs`; `bing_grounding` results additionally carry Microsoft's citation
+display obligations (see `docs/local-setup.md`).
 
 Request body:
 
@@ -1179,7 +1226,9 @@ Request body:
 ```
 
 `query` is required and non-empty. `max_results` is optional (1-20, defaults
-to the engine's own default). `engine` is optional and defaults to `"tavily"`.
+to the engine's own default). `engine` is optional; when omitted it falls back
+to `[routing] default_search_engine`, then to the sole configured engine if
+there is exactly one.
 
 Response:
 
@@ -1264,6 +1313,82 @@ two models, two providers or two variants of a controlled experiment — use
 `/admin/compare` page. [docs/experiments.md](docs/experiments.md) walks a
 client application through labelling traffic, retrieving the comparison,
 and reading it.
+
+### Streaming
+
+Set `"stream": true` on `/v1/chat/completions` — same contract as OpenAI —
+and the router streams SSE chunks in OpenAI shape from every provider it
+fronts, including the ones whose native streams look nothing like OpenAI's:
+Claude and Gemini on Vertex (`:streamRawPredict` / `:streamGenerateContent`
+events are translated in flight), Bedrock (ConverseStream events), Azure AI
+Foundry, and every OpenAI-compatible upstream. SSE events split across
+network chunk boundaries are reassembled before translation, and a streaming
+request whose upstream answers with something that produces no SSE events at
+all fails loudly with an SSE `error` event rather than a silent empty 200.
+
+**The router owns usage capture on streamed responses.** The upstream request
+always asks the provider for usage — `stream_options: {"include_usage": true}`
+is injected into every OpenAI-shaped upstream body, and the native usage
+frames are harvested on the translated paths (Anthropic's split
+`message_start`/`message_delta` report, Gemini's `usageMetadata`, Bedrock's
+stream metadata) — regardless of what the client sent. The counts flow two
+ways:
+
+- **To the ledgers**: streamed requests are metered with provider-counted
+  tokens (`tokens_estimated = false`), so budgets, cost reports, attribution
+  and per-experiment-variant accounting are exact for streamed traffic. A
+  character-count estimate (flagged as such) remains only as a fallback for
+  upstreams that report nothing.
+- **To the caller**: the final chunk carries a normalized OpenAI-shaped
+  `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`,
+  `prompt_tokens_details.cached_tokens`) whether or not the client asked for
+  `include_usage`. On translated providers it rides the finish chunk, so
+  `choices` is never empty and strict chunk parsers are safe.
+
+This means experiment-bound traffic (`x-modelrouter-experiment`) can stream:
+per-variant usage is recorded server-side, so there is no accounting reason
+to force `stream: false`.
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vertex/anthropic/claude-sonnet-4-5@20250929",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+# data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null,...}],...}
+# data: {"choices":[{"delta":{},"finish_reason":"stop",...}],
+#        "usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12,...}}
+# data: [DONE]
+```
+
+### Tool calling (function tools)
+
+`POST /v1/chat/completions` forwards OpenAI-shaped `tools` and `tool_choice`
+to backing models that support tool calling, translating where the upstream
+speaks a different dialect:
+
+- **OpenAI-compatible upstreams** (OpenAI, Azure OpenAI, Groq/Ollama-style
+  bases, Vertex MaaS): tools, tool-call responses and streamed tool-call
+  deltas pass through verbatim.
+- **Anthropic-shaped upstreams** (direct Anthropic, Claude on Vertex): tools
+  translate to native `tools`/`input_schema`, assistant `tool_calls` turns
+  and `tool`-role results translate to `tool_use`/`tool_result` blocks, and
+  responses translate back — including streaming, where `tool_use` deltas
+  are re-emitted as OpenAI `tool_calls` chunks and `stop_reason: "tool_use"`
+  becomes `finish_reason: "tool_calls"`.
+
+The agentic loop (assistant calls a tool → client sends the `tool` result →
+model continues) round-trips through the router on every provider above.
+Fallback routing never substitutes a backend that cannot take tools: a
+request carrying tools skips such candidates in the fallback chain.
+
+Backends without tool forwarding (Bedrock, Gemini, Azure AI Foundry agents)
+reject tool-carrying requests with a clear 400 naming the resolved
+provider/model, rather than silently dropping the tools. A `tool_choice`
+without a non-empty `tools` array is rejected as malformed.
 
 ### Controlled experiments
 

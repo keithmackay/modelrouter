@@ -26,6 +26,15 @@ pub fn catalog_for(provider_name: &str, config: &ProviderConfig) -> Option<Arc<d
             .map(|a| Arc::new(a) as Arc<dyn ProviderCatalog>),
         #[cfg(not(feature = "vertex"))]
         "vertex" => None,
+        // Foundry lists the resource's deployments. `new` fails when the
+        // provider table names no endpoint, which reports as "not supported"
+        // rather than an error per fetch.
+        #[cfg(feature = "foundry")]
+        "foundry" => crate::providers::foundry::FoundryAdapter::new(config)
+            .ok()
+            .map(|a| Arc::new(a) as Arc<dyn ProviderCatalog>),
+        #[cfg(not(feature = "foundry"))]
+        "foundry" => None,
         // Catalog listing never dispatches via complete()/stream(), so the
         // per-tier lookup this adapter also carries is never consulted here
         // — a default is fine.
@@ -139,5 +148,9 @@ mod tests {
         assert!(catalog_for("bedrock", &ProviderConfig::default()).is_none());
         #[cfg(not(feature = "vertex"))]
         assert!(catalog_for("vertex", &ProviderConfig::default()).is_none());
+        // "foundry" resolves to None either way with an empty config —
+        // compiled out by the explicit arm, compiled in because construction
+        // needs an endpoint. What must never happen is a compat catalog.
+        assert!(catalog_for("foundry", &ProviderConfig::default()).is_none());
     }
 }

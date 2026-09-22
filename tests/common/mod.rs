@@ -1,5 +1,8 @@
 pub mod e2e;
 pub mod mock_llm;
+pub mod mock_audio;
+pub mod mock_anthropic;
+pub mod mock_oidc;
 
 use modelrouter::api::app::DatabaseProvider;
 use modelrouter::api::auth::hash_token;

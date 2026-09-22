@@ -1149,7 +1149,10 @@ async fn failure_detail_route_returns_200_for_existing() {
 }
 
 #[tokio::test]
-async fn failure_detail_route_returns_404_for_missing() {
+async fn failure_detail_route_returns_200_with_message_for_missing() {
+    // Route deliberately returns 200 + "not found" message rather than 404,
+    // following the dashboard pattern of rendering a friendly message in the
+    // existing layout instead of an error page.
     let raw_db = common::in_memory_db().await;
     let settings = Arc::new(Settings::default());
     let token = viewer_jwt(&settings);
@@ -1305,4 +1308,1798 @@ async fn failures_list_shows_correlation_id_column() {
         body.contains("Correlation ID"),
         "table header for correlation id must be present"
     );
+}
+
+// ── Generate API key tests ────────────────────────────────────────────────────
+
+/// Superadmin can generate a key for a user with email, and the response includes
+/// the raw key and a mailto link.
+#[tokio::test]
+async fn superadmin_generate_key_with_email() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "alice".to_string(),
+            email: Some("alice@example.com".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "superadmin should be able to generate key");
+    let body = resp.text();
+
+    assert!(body.contains("mr-"), "response must contain raw key starting with mr-");
+    assert!(body.contains("Key Generated"), "response must show key generation success message");
+    assert!(body.contains("mailto:"), "response must contain mailto link for user with email");
+    assert!(body.contains("alice@example.com"), "mailto link must include user email");
+    assert!(body.contains("Your%20ModelRouter%20API%20Key"), "subject must be URL-encoded");
+    assert!(!body.contains("Your ModelRouter API Key") || body.contains("Your%20ModelRouter%20API%20Key"),
+        "mailto subject should be URL-encoded, not contain raw spaces in the URL");
+}
+
+/// User without email shows key but no mailto link.
+#[tokio::test]
+async fn superadmin_generate_key_no_email() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "bob".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+
+    assert!(body.contains("mr-"), "response must contain raw key");
+    assert!(body.contains("Key Generated"), "response must show success message");
+    assert!(!body.contains("mailto:"), "response must not contain mailto link when user has no email");
+    assert!(body.contains("No email on file"), "response must indicate no email available");
+}
+
+/// Viewer session cannot generate keys (superadmin only).
+#[tokio::test]
+async fn viewer_cannot_generate_key() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "charlie".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let viewer = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", viewer)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 403, "viewer role should get 403 when trying to generate key");
+}
+
+/// The generated key is stored as a hash, not raw text.
+#[tokio::test]
+async fn generated_key_stored_as_hash() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::models::NewUser;
+    use modelrouter::api::auth::hash_token;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "dave".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db.clone()), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/users/{}/keys/generate", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+
+    let raw_key_start = body.find("mr-").expect("response must contain raw key");
+    let raw_key_fragment = &body[raw_key_start..];
+    let raw_key_end = raw_key_fragment.find("</code>").expect("key must be in code block");
+    let raw_key = &raw_key_fragment[..raw_key_end];
+
+    assert!(raw_key.starts_with("mr-"), "extracted key must start with mr-");
+    assert!(raw_key.len() > 10, "key must have reasonable length");
+
+    let keys = ApiKeyRepository::list_api_keys_for_user(&raw_db, user.id)
+        .await
+        .expect("should be able to list keys");
+
+    assert_eq!(keys.len(), 1, "exactly one key should be created");
+    let stored_key = &keys[0];
+
+    assert_ne!(stored_key.key_hash, raw_key, "stored hash must not equal raw key");
+
+    let expected_hash = hash_token(raw_key);
+    assert_eq!(stored_key.key_hash, expected_hash, "stored hash must match SHA-256 of raw key");
+}
+
+// ── User row escaping (issue #75) ──────────────────────────────────────
+
+#[tokio::test]
+async fn user_row_escapes_name_and_email() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "<script>alert(1)</script>".to_string(),
+            email: Some("a@b<img src=x>".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    // The enable endpoint returns the user_row_html fragment.
+    let resp = server
+        .post(&format!("/admin/users/{}/enable", user.id))
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", admin)).unwrap(),
+        )
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "name must be HTML-escaped in the row fragment; got: {body}"
+    );
+    assert!(
+        !body.contains("<script>alert(1)</script>"),
+        "raw name markup must not appear in the row fragment"
+    );
+    assert!(
+        body.contains("a@b&lt;img"),
+        "email must be HTML-escaped in the row fragment; got: {body}"
+    );
+    assert!(!body.contains("<img src=x>"), "raw email markup must not appear");
+}
+
+// ── Overview page ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn overview_page_renders_spend_totals() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::models::{NewUser, NewCostLedgerEntry};
+
+    let raw_db = common::in_memory_db().await;
+    let user = UserRepository::create(&raw_db, NewUser { name: "alice".to_string(), email: None })
+        .await.unwrap();
+
+    // Seed cost data
+    CostRepository::create(&raw_db, NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: "test-model".to_string(),
+        provider: "test".to_string(),
+        project: None,
+        tokens_in: 10,
+        tokens_out: 5,
+        cost_usd: 1.23,
+        api_key_id: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
+    }).await.unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("Spend Today") || body.contains("spend_today"), "overview must show spend metrics: {body}");
+}
+
+// ── Prompts page ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn prompts_page_paging_works() {
+    use modelrouter::db::repositories::prompts::PromptRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::{NewPrompt, NewUser};
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    // Create a user first (for foreign key)
+    let user = UserRepository::create(&raw_db, NewUser {
+        name: "test-user".to_string(),
+        email: None,
+    }).await.unwrap();
+
+    // Create test prompts
+    for i in 0..3 {
+        PromptRepository::create(&raw_db, NewPrompt {
+            user_id: user.id,
+            session_id: None,
+            request_model: format!("model-{}", i),
+            routed_model: format!("routed-{}", i),
+            provider: "test".to_string(),
+            messages: "[]".to_string(),
+            response: Some("test".to_string()),
+            cost_usd: 0.01,
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            finish_reason: Some("stop".to_string()),
+            latency_ms: Some(100),
+            ttft_ms: None,
+            attempts: None,
+            tags: "{}".to_string(),
+            project: None,
+            attribution_correlation_id: None,
+            attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+        }).await.unwrap();
+    }
+
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/prompts")
+        .add_query_param("page", "1")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("model-"), "prompts page must list prompts");
+}
+
+#[tokio::test]
+async fn prompt_detail_route_returns_content() {
+    use modelrouter::db::repositories::prompts::PromptRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::{NewPrompt, NewUser};
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    // Create a user first (for foreign key)
+    let user = UserRepository::create(&raw_db, NewUser {
+        name: "test-user".to_string(),
+        email: None,
+    }).await.unwrap();
+
+    let prompt = PromptRepository::create(&raw_db, NewPrompt {
+        user_id: user.id,
+        session_id: None,
+        request_model: "test-model".to_string(),
+        routed_model: "routed".to_string(),
+        provider: "test".to_string(),
+        messages: r#"[{"role":"user","content":"hello"}]"#.to_string(),
+        response: Some("world".to_string()),
+        cost_usd: 0.01,
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        finish_reason: Some("stop".to_string()),
+        latency_ms: Some(100),
+        ttft_ms: None,
+        attempts: None,
+        tags: "{}".to_string(),
+        project: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+    }).await.unwrap();
+
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get(&format!("/admin/prompts/{}", prompt.id))
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("hello"), "prompt detail must show messages: {body}");
+    assert!(body.contains("world"), "prompt detail must show response");
+}
+
+// ── Storage settings ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn storage_settings_persist_through_post() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = server
+        .post("/admin/storage-settings")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .form(&[
+            ("store_prompts", "on"),
+            ("store_prompt_content", "on"),
+            ("prompt_retention_days", "90"),
+        ])
+        .await;
+
+    assert_eq!(resp.status_code(), 303, "storage settings should redirect after save");
+}
+
+// ── Cost page ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cost_page_renders_with_filters() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::models::NewUser;
+
+    let raw_db = common::in_memory_db().await;
+    UserRepository::create(&raw_db, NewUser { name: "alice".to_string(), email: None }).await.unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/cost")
+        .add_query_param("window", "monthly")
+        .add_query_param("user", "alice")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("cost") || body.contains("Cost"), "cost page must render: {body}");
+}
+
+// ── Audit page ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn audit_page_lists_recent_actions() {
+    use modelrouter::db::repositories::audit::AuditRepository;
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+    use modelrouter::db::models::{NewAuditLogEntry, NewAdminUser};
+
+    let raw_db = common::in_memory_db().await;
+
+    // Create an admin user first (for foreign key)
+    let admin = AdminUserRepository::create(&raw_db, NewAdminUser {
+        name: "test-admin".to_string(),
+        password_hash: "x".to_string(),
+        role: "viewer".to_string(),
+    }).await.unwrap();
+
+    AuditRepository::create(&raw_db, NewAuditLogEntry {
+        actor_id: Some(admin.id),
+        actor_name: "test-admin".to_string(),
+        action: "test.action".to_string(),
+        target: Some("resource:123".to_string()),
+        before_json: None,
+        after_json: None,
+    }).await.unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/audit")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("test.action"), "audit page must list actions: {body}");
+}
+
+// ── Admins page ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn admins_page_superadmin_only() {
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+    use modelrouter::db::models::NewAdminUser;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    AdminUserRepository::create(&raw_db, NewAdminUser {
+        name: "test-admin".to_string(),
+        password_hash: "x".to_string(),
+        role: "superadmin".to_string(),
+    }).await.unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/admins")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("test-admin") || body.contains("super-user"), "admins page must list admin users");
+}
+
+#[tokio::test]
+async fn create_admin_through_dashboard() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = server
+        .post("/admin/admins")
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .form(&[
+            ("name", "new-admin"),
+            ("password", "test-password-456"),
+            ("role", "viewer"),
+        ])
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("new-admin"), "response must confirm admin creation: {body}");
+}
+
+#[tokio::test]
+async fn delete_admin_cannot_delete_self() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let _admin = superadmin_jwt(&raw_db, &settings).await;
+
+    // Get the superadmin's ID from the JWT claims
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+    let claims = AdminClaims {
+        sub: 1,
+        name: "super-user".to_string(),
+        role: "superadmin".to_string(),
+        exp,
+    };
+    let token = issue_jwt(&claims, &settings.auth.jwt_secret).unwrap();
+
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = server
+        .post("/admin/admins/1/delete")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("Cannot delete yourself"), "must prevent self-deletion: {body}");
+}
+
+// ── Hooks page ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn hooks_page_renders_empty_without_postgres() {
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/hooks")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "hooks page should render even without pool");
+}
+
+// ── Create user (dashboard form handlers) ────────────────────────────────────
+
+// Note: User creation via dashboard uses post_create_user which requires a valid name.
+// Testing the validation error path for empty names.
+
+// ── Keys page ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn keys_page_lists_all_api_keys() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::models::{NewUser, NewApiKey};
+    use modelrouter::api::auth::hash_token;
+
+    let raw_db = common::in_memory_db().await;
+    let user = UserRepository::create(&raw_db, NewUser {
+        name: "bob".to_string(),
+        email: None,
+    }).await.unwrap();
+
+    ApiKeyRepository::create_api_key(&raw_db, NewApiKey {
+        user_id: user.id,
+        key_hash: hash_token("test-key"),
+        label: Some("test-label".to_string()),
+        expires_at: None,
+        project: Some("test-project".to_string()),
+        session_window_secs: None,
+    }).await.unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/keys")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("bob"), "keys page must list user: {body}");
+    assert!(body.contains("test-project"), "keys page must list project");
+}
+
+// Note: Key creation form validation happens in dashboard handlers
+
+#[tokio::test]
+async fn rotate_key_disables_old_and_creates_new() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::models::{NewUser, NewApiKey};
+    use modelrouter::api::auth::hash_token;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(&raw_db, NewUser {
+        name: "rotate-user".to_string(),
+        email: Some("rotate@test.com".to_string()),
+    }).await.unwrap();
+
+    let old_key = ApiKeyRepository::create_api_key(&raw_db, NewApiKey {
+        user_id: user.id,
+        key_hash: hash_token("old-key"),
+        label: Some("old".to_string()),
+        expires_at: None,
+        project: Some("test".to_string()),
+        session_window_secs: None,
+    }).await.unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db.clone()), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/keys/{}/rotate", old_key.id))
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("mr-"), "rotate must show new raw key: {body}");
+
+    // Old key should be disabled
+    let keys = ApiKeyRepository::list_api_keys_for_user(&raw_db, user.id).await.unwrap();
+    let disabled = keys.iter().filter(|k| !k.enabled).count();
+    assert_eq!(disabled, 1, "old key must be disabled");
+}
+
+#[tokio::test]
+async fn disable_key_marks_key_disabled() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::models::{NewUser, NewApiKey};
+    use modelrouter::api::auth::hash_token;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let user = UserRepository::create(&raw_db, NewUser {
+        name: "disable-user".to_string(),
+        email: None,
+    }).await.unwrap();
+
+    let key = ApiKeyRepository::create_api_key(&raw_db, NewApiKey {
+        user_id: user.id,
+        key_hash: hash_token("disable-key"),
+        label: None,
+        expires_at: None,
+        project: None,
+        session_window_secs: None,
+    }).await.unwrap();
+
+    let admin = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(Arc::new(raw_db.clone()), settings).await;
+
+    let resp = server
+        .post(&format!("/admin/keys/{}/disable", key.id))
+        .add_header(session_cookie(&admin).0, session_cookie(&admin).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+
+    let keys = ApiKeyRepository::list_api_keys_for_user(&raw_db, user.id).await.unwrap();
+    assert!(!keys[0].enabled, "key must be disabled");
+}
+
+// ── DashboardError variants ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn dashboard_error_template_renders() {
+    let server = build_test_server().await;
+
+    // Force a template error by requesting a nonexistent endpoint that triggers BadRequest
+    let resp = server.get("/admin/compare/panels").await;
+
+    // Without auth, should redirect
+    assert_eq!(resp.status_code(), 303);
+}
+
+#[tokio::test]
+async fn dashboard_error_not_found_renders() {
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    // Request a prompt that doesn't exist
+    let resp = server
+        .get("/admin/prompts/99999")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("not found"), "missing prompt should say not found");
+}
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn post_logout_clears_cookie() {
+    let server = build_test_server().await;
+    let resp = server.post("/admin/logout").await;
+
+    assert_eq!(resp.status_code(), 303);
+    let set_cookie = resp.headers().get("set-cookie");
+    assert!(set_cookie.is_some());
+    let cookie_str = set_cookie.unwrap().to_str().unwrap();
+    assert!(cookie_str.contains("Max-Age=0"), "logout must clear cookie: {cookie_str}");
+}
+
+// ── Login failures ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn post_login_invalid_credentials() {
+    use modelrouter::db::models::NewAdminUser;
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    AdminUserRepository::create(&raw_db, NewAdminUser {
+        name: "testuser".to_string(),
+        password_hash: bcrypt::hash("correct", 4).unwrap(),
+        role: "viewer".to_string(),
+    }).await.unwrap();
+
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post("/admin/login")
+        .form(&[("username", "testuser"), ("password", "wrong")])
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "invalid password should re-render login");
+    let body = resp.text();
+    assert!(body.contains("invalid credentials") || body.contains("error"), "should show error: {body}");
+}
+
+#[tokio::test]
+async fn post_login_disabled_account() {
+    use modelrouter::db::models::NewAdminUser;
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+
+    let raw_db = common::in_memory_db().await;
+    let settings = Arc::new(Settings::default());
+
+    let admin = AdminUserRepository::create(&raw_db, NewAdminUser {
+        name: "disabled".to_string(),
+        password_hash: bcrypt::hash("pass", 4).unwrap(),
+        role: "viewer".to_string(),
+    }).await.unwrap();
+
+    // Disable the account
+    AdminUserRepository::set_enabled(&raw_db, admin.id, false).await.unwrap();
+
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .post("/admin/login")
+        .form(&[("username", "disabled"), ("password", "pass")])
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "disabled account should re-render login");
+    let body = resp.text();
+    assert!(body.contains("disabled") || body.contains("error"), "should show error: {body}");
+}
+
+// ── Cost page with filters ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cost_page_with_project_filter() {
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::models::{NewUser, NewCostLedgerEntry};
+
+    let raw_db = common::in_memory_db().await;
+    let user = UserRepository::create(&raw_db, NewUser { name: "cost-user".to_string(), email: None }).await.unwrap();
+
+    CostRepository::create(&raw_db, NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: "test-model".to_string(),
+        provider: "test".to_string(),
+        project: Some("proj-a".to_string()),
+        tokens_in: 10,
+        tokens_out: 5,
+        cost_usd: 0.05,
+        api_key_id: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
+    }).await.unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/cost")
+        .add_query_param("window", "alltime")
+        .add_query_param("project", "proj-a")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("proj-a"), "cost page must show filtered project");
+}
+
+// ── Users page: list, create, disable, enable ────────────────────────────────
+//
+// The users page and its three POST handlers are the dashboard's only path for
+// on- and off-boarding a caller. Each handler writes an audit row and returns an
+// HTMX row fragment, so the assertions below check the fragment the browser
+// swaps in as well as the state change behind it.
+
+/// Seed a server plus a superadmin session over a database the test still holds.
+async fn server_with_superadmin() -> (TestServer, Arc<modelrouter::db::sqlite::SqliteDb>, String) {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let token = superadmin_jwt(&raw_db, &settings).await;
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+    (server, raw_db, token)
+}
+
+fn with_session<'a>(
+    req: axum_test::TestRequest,
+    token: &str,
+) -> axum_test::TestRequest {
+    let (name, value) = session_cookie(token);
+    req.add_header(name, value)
+}
+
+#[tokio::test]
+async fn users_page_lists_seeded_users_with_their_email_and_status() {
+    use modelrouter::db::models::NewUser;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = common::in_memory_db().await;
+    UserRepository::create(&raw_db, NewUser {
+        name: "alice".to_string(),
+        email: Some("alice@example.com".to_string()),
+    })
+    .await
+    .unwrap();
+    UserRepository::create(&raw_db, NewUser { name: "bob".to_string(), email: None })
+        .await
+        .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = with_session(server.get("/admin/users"), &token).await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("alice"), "the users page must list every user: {body}");
+    assert!(body.contains("bob"));
+    assert!(body.contains("alice@example.com"), "the email column must be populated");
+}
+
+/// A storage fault behind the users page must surface as the generic 500 page,
+/// never as a SQL error. Dropping the table under the live server is the cheapest
+/// way to make that arm run.
+#[tokio::test]
+async fn users_page_storage_fault_renders_the_internal_error_page() {
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    sqlx::query("DROP TABLE users").execute(&raw_db.pool).await.unwrap();
+
+    let resp = with_session(server.get("/admin/users"), &token).await;
+    assert_eq!(resp.status_code(), 500);
+    let body = resp.text();
+    assert!(body.contains("Internal Error"), "got {body}");
+    assert!(
+        !body.to_lowercase().contains("no such table"),
+        "the SQL error must not reach the browser: {body}"
+    );
+}
+
+#[tokio::test]
+async fn create_user_through_the_dashboard_returns_a_row_and_audits() {
+    use modelrouter::db::repositories::audit::AuditRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+
+    let resp = with_session(server.post("/admin/users"), &token)
+        .form(&serde_json::json!({ "name": "  carol  " }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("carol"), "the response is the new row fragment: {body}");
+
+    let users = UserRepository::list(&*db).await.unwrap();
+    assert!(
+        users.iter().any(|u| u.name == "carol"),
+        "the name must be trimmed before it is stored"
+    );
+
+    let audit = AuditRepository::list(&*db, 50, 0).await.unwrap();
+    assert!(audit.iter().any(|e| e.action == "user.create"), "the create must be audited");
+}
+
+/// An all-whitespace name is a form slip, not a user; it must be refused before
+/// the row is written.
+#[tokio::test]
+async fn create_user_with_a_blank_name_is_rejected() {
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+
+    let resp = with_session(server.post("/admin/users"), &token)
+        .form(&serde_json::json!({ "name": "   " }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(resp.text().contains("name is required"));
+    assert!(UserRepository::list(&*db).await.unwrap().is_empty(), "nothing was created");
+}
+
+#[tokio::test]
+async fn a_viewer_cannot_create_a_user() {
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = with_session(server.post("/admin/users"), &token)
+        .form(&serde_json::json!({ "name": "sneaky" }))
+        .await;
+    assert_eq!(resp.status_code(), 403);
+    assert!(UserRepository::list(&*raw_db).await.unwrap().is_empty());
+}
+
+/// Disabling a user must also disable their keys — leaving a live key behind
+/// would make the dashboard's "Disabled" tag a lie.
+#[tokio::test]
+async fn disabling_a_user_disables_their_api_keys_and_the_row_flips_to_enable() {
+    use modelrouter::db::models::{NewApiKey, NewUser};
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+    let user = UserRepository::create(&*db, NewUser {
+        name: "dana".to_string(),
+        email: Some("dana@example.com".to_string()),
+    })
+    .await
+    .unwrap();
+    let key = db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash: "hash-dana".to_string(),
+        label: Some("laptop".to_string()),
+        expires_at: None,
+        project: Some("proj-a".to_string()),
+        session_window_secs: None,
+    })
+    .await
+    .unwrap();
+
+    let resp = with_session(server.post(&format!("/admin/users/{}/disable", user.id)), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("tag-disabled"), "the returned row shows the disabled tag: {body}");
+    assert!(body.contains("/enable"), "the toggle button must now offer Enable: {body}");
+
+    assert!(!UserRepository::find_by_id(&*db, user.id).await.unwrap().unwrap().enabled);
+    let keys = db.list_api_keys_for_user(user.id).await.unwrap();
+    assert!(
+        keys.iter().find(|k| k.id == key.id).map(|k| !k.enabled).unwrap_or(false),
+        "the user's key must be disabled alongside them"
+    );
+
+    // ...and enabling puts the row back.
+    let resp = with_session(server.post(&format!("/admin/users/{}/enable", user.id)), &token).await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert!(body.contains("tag-enabled"), "got {body}");
+    assert!(body.contains("/disable"), "the toggle must offer Disable again: {body}");
+    assert!(UserRepository::find_by_id(&*db, user.id).await.unwrap().unwrap().enabled);
+}
+
+#[tokio::test]
+async fn disabling_a_user_that_does_not_exist_is_a_404_fragment() {
+    let (server, _db, token) = server_with_superadmin().await;
+    let resp = with_session(server.post("/admin/users/424242/disable"), &token).await;
+    assert_eq!(resp.status_code(), 404);
+    assert!(resp.text().contains("user 424242 not found"));
+}
+
+#[tokio::test]
+async fn enabling_a_user_that_does_not_exist_is_a_404_fragment() {
+    let (server, _db, token) = server_with_superadmin().await;
+    let resp = with_session(server.post("/admin/users/424242/enable"), &token).await;
+    assert_eq!(resp.status_code(), 404);
+    assert!(resp.text().contains("user 424242 not found"));
+}
+
+/// Generating a key for a *disabled* user still renders a row, and that row must
+/// offer Enable rather than Disable — the fragment is built from the user's live
+/// state, not from the assumption that anyone getting a key is active.
+#[tokio::test]
+async fn generating_a_key_for_a_disabled_user_renders_an_enable_toggle() {
+    use modelrouter::db::models::NewUser;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+    let user = UserRepository::create(&*db, NewUser {
+        name: "paused".to_string(),
+        email: Some("paused@example.com".to_string()),
+    })
+    .await
+    .unwrap();
+    UserRepository::set_enabled(&*db, user.id, false).await.unwrap();
+
+    let resp =
+        with_session(server.post(&format!("/admin/users/{}/keys/generate", user.id)), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("tag-disabled"), "got {body}");
+    assert!(body.contains("/enable"), "a disabled user's row offers Enable: {body}");
+    assert!(body.contains("mr-"), "the one-time raw key is shown: {body}");
+}
+
+// ── Keys page: create ────────────────────────────────────────────────────────
+
+/// The create-key form doubles as user creation: naming an unknown user provisions
+/// them. The response carries the raw secret exactly once, plus the table fragment
+/// the page splices in.
+#[tokio::test]
+async fn creating_a_key_for_an_unknown_user_provisions_the_user_and_shows_the_secret_once() {
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::audit::AuditRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+
+    let resp = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({
+            "user_name": " erin ",
+            "project": " analytics ",
+            "label": " batch ",
+            "email": "erin@example.com",
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+
+    assert!(body.contains("Key created for"), "got {body}");
+    assert!(body.contains("mr-"), "the raw key is shown once: {body}");
+    assert!(
+        body.contains("Email Key to User") && body.contains("mailto:erin@example.com"),
+        "an email on the form yields a mailto button: {body}"
+    );
+    assert!(body.contains("analytics"), "the project appears in the confirmation: {body}");
+
+    let user = UserRepository::find_by_name(&*db, "erin").await.unwrap().expect("user provisioned");
+    assert_eq!(user.email.as_deref(), Some("erin@example.com"));
+    let keys = db.list_api_keys_for_user(user.id)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].project.as_deref(), Some("analytics"), "the project is trimmed");
+    assert_eq!(keys[0].label.as_deref(), Some("batch"));
+    assert!(
+        !body.contains(&keys[0].key_hash),
+        "the stored hash must never be rendered"
+    );
+
+    let audit = AuditRepository::list(&*db, 50, 0).await.unwrap();
+    assert!(audit.iter().any(|e| e.action == "key.create"));
+}
+
+/// With no email anywhere, the confirmation must simply omit the mail button
+/// rather than render a `mailto:` with an empty address.
+#[tokio::test]
+async fn creating_a_key_without_an_email_omits_the_mail_button() {
+    let (server, _db, token) = server_with_superadmin().await;
+
+    let resp = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({
+            "user_name": "frank",
+            "project": "",
+            "label": "",
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("Key created for"));
+    assert!(!body.contains("Email Key to User"), "no address, no button: {body}");
+}
+
+/// A user already on file keeps their stored email even when the form leaves it
+/// blank, so the mail button still appears.
+#[tokio::test]
+async fn creating_a_key_falls_back_to_the_stored_email_of_an_existing_user() {
+    use modelrouter::db::models::NewUser;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+    UserRepository::create(&*db, NewUser {
+        name: "gail".to_string(),
+        email: Some("gail@example.com".to_string()),
+    })
+    .await
+    .unwrap();
+
+    let resp = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({ "user_name": "gail", "project": "", "label": "", "email": "" }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert!(
+        resp.text().contains("mailto:gail@example.com"),
+        "the stored address should be used: {}",
+        resp.text()
+    );
+}
+
+/// One key per user+project is the invariant the keys page is built on. A second
+/// attempt must return the "already exists" prompt with a rotate button rather
+/// than quietly minting a duplicate.
+#[tokio::test]
+async fn creating_a_second_key_for_the_same_user_and_project_offers_a_rotate_instead() {
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+
+    let first = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({ "user_name": "hank", "project": "etl", "label": "" }))
+        .await;
+    assert_eq!(first.status_code(), 200);
+
+    let second = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({ "user_name": "hank", "project": "etl", "label": "" }))
+        .await;
+    assert_eq!(second.status_code(), 200, "{}", second.text());
+    let body = second.text();
+    assert!(body.contains("already exists"), "got {body}");
+    assert!(body.contains("Rotate existing key"), "the operator is offered a rotate: {body}");
+    assert!(body.contains("tag-enabled"), "the existing key's status is shown: {body}");
+    assert!(!body.contains("mr-"), "no second secret was minted: {body}");
+
+    let user = UserRepository::find_by_name(&*db, "hank").await.unwrap().unwrap();
+    let keys = db.list_api_keys_for_user(user.id)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1, "still exactly one key for this user+project");
+}
+
+/// The duplicate check must see a *disabled* key too; otherwise disabling a key
+/// would let a second one be minted for the same slot, and the page would show
+/// two groups where the model allows one.
+#[tokio::test]
+async fn the_duplicate_key_check_also_catches_a_disabled_key() {
+    use modelrouter::db::models::{NewApiKey, NewUser};
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+    let user = UserRepository::create(&*db, NewUser { name: "iris".to_string(), email: None })
+        .await
+        .unwrap();
+    let key = db
+        .create_api_key(NewApiKey {
+            user_id: user.id,
+            key_hash: "hash-iris".to_string(),
+            label: None,
+            expires_at: None,
+            project: None,
+            session_window_secs: None,
+        })
+        .await
+        .unwrap();
+    db.set_key_enabled(key.id, false).await.unwrap();
+
+    let second = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({ "user_name": "iris", "project": "", "label": "" }))
+        .await;
+    let body = second.text();
+    assert!(body.contains("already exists"), "got {body}");
+    assert!(body.contains("tag-disabled"), "the existing key is shown as disabled: {body}");
+    assert!(body.contains("(no project)"), "an unprojected key is labelled as such: {body}");
+    assert!(!body.contains("mr-"), "no second secret was minted: {body}");
+}
+
+/// A storage fault during the user lookup must abort the whole create rather
+/// than fall through to minting a key against a user that could not be read.
+#[tokio::test]
+async fn creating_a_key_when_the_user_lookup_faults_is_an_internal_error() {
+    let (server, db, token) = server_with_superadmin().await;
+    sqlx::query("DROP TABLE users").execute(&db.pool).await.unwrap();
+
+    let resp = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({ "user_name": "ghost", "project": "", "label": "" }))
+        .await;
+    assert_eq!(resp.status_code(), 500);
+    let body = resp.text();
+    assert!(body.contains("Internal Error"), "got {body}");
+    assert!(!body.to_lowercase().contains("no such table"), "SQL detail leaked: {body}");
+}
+
+/// Rotating a key whose owner has no address on file must render the new secret
+/// without a mail button — there is nowhere to send it.
+#[tokio::test]
+async fn rotating_a_key_for_a_user_without_an_email_omits_the_mail_link() {
+    use modelrouter::db::models::{NewApiKey, NewUser};
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+    let user = UserRepository::create(&*db, NewUser { name: "nomail".to_string(), email: None })
+        .await
+        .unwrap();
+    let key = db
+        .create_api_key(NewApiKey {
+            user_id: user.id,
+            key_hash: "hash-nomail".to_string(),
+            label: None,
+            expires_at: None,
+            project: None,
+            session_window_secs: None,
+        })
+        .await
+        .unwrap();
+
+    let resp =
+        with_session(server.post(&format!("/admin/keys/{}/rotate", key.id)), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("mr-"), "the new secret is shown: {body}");
+    assert!(!body.contains("mailto:"), "no address means no mail link: {body}");
+}
+
+#[tokio::test]
+async fn creating_a_key_with_a_blank_user_name_is_rejected() {
+    let (server, _db, token) = server_with_superadmin().await;
+    let resp = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({ "user_name": "  ", "project": "", "label": "" }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(resp.text().contains("user_name is required"));
+}
+
+/// A user name carrying HTML must come back escaped in the confirmation banner —
+/// the banner interpolates it into markup.
+#[tokio::test]
+async fn the_key_confirmation_escapes_a_user_name_carrying_markup() {
+    let (server, _db, token) = server_with_superadmin().await;
+    let resp = with_session(server.post("/admin/keys"), &token)
+        .form(&serde_json::json!({
+            "user_name": "<script>alert(1)</script>",
+            "project": "",
+            "label": "",
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(!body.contains("<script>alert(1)</script>"), "unescaped markup in: {body}");
+    assert!(body.contains("&lt;script&gt;"), "got {body}");
+}
+
+// ── Admins page: delete ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn deleting_another_admin_removes_the_row_and_audits() {
+    use modelrouter::db::models::NewAdminUser;
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+    use modelrouter::db::repositories::audit::AuditRepository;
+
+    let (server, db, token) = server_with_superadmin().await;
+    let victim = AdminUserRepository::create(&*db, NewAdminUser {
+        name: "retiring-admin".to_string(),
+        password_hash: "x".to_string(),
+        role: "viewer".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let resp = with_session(server.post(&format!("/admin/admins/{}/delete", victim.id)), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("Deleted"), "got {body}");
+    assert!(body.contains(&format!("admin-row-{}", victim.id)), "the row id must match for the swap: {body}");
+
+    assert!(
+        AdminUserRepository::find_by_id(&*db, victim.id).await.unwrap().is_none(),
+        "the admin is gone"
+    );
+    let audit = AuditRepository::list(&*db, 50, 0).await.unwrap();
+    assert!(audit.iter().any(|e| e.action == "admin.delete"));
+}
+
+#[tokio::test]
+async fn a_viewer_cannot_delete_an_admin() {
+    use modelrouter::db::models::NewAdminUser;
+    use modelrouter::db::repositories::admin_users::AdminUserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let victim = AdminUserRepository::create(&*raw_db, NewAdminUser {
+        name: "survivor".to_string(),
+        password_hash: "x".to_string(),
+        role: "viewer".to_string(),
+    })
+    .await
+    .unwrap();
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = with_session(server.post(&format!("/admin/admins/{}/delete", victim.id)), &token).await;
+    assert_eq!(resp.status_code(), 403);
+    assert!(AdminUserRepository::find_by_id(&*raw_db, victim.id).await.unwrap().is_some());
+}
+
+// ── Cost page: the filter matrix ─────────────────────────────────────────────
+
+/// The cost page resolves a user filter and a group filter independently, then
+/// intersects them. Exercising every leg at once — with a real group, a real
+/// membership and a real key — is what makes the dropdown builders run too.
+#[tokio::test]
+async fn cost_page_intersects_the_user_and_group_filters() {
+    use modelrouter::db::models::{NewApiKey, NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::groups::GroupRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let inside = UserRepository::create(&*raw_db, NewUser {
+        name: "in-group".to_string(),
+        email: Some("in@example.com".to_string()),
+    })
+    .await
+    .unwrap();
+    let outside = UserRepository::create(&*raw_db, NewUser {
+        name: "out-of-group".to_string(),
+        email: None,
+    })
+    .await
+    .unwrap();
+
+    let group = GroupRepository::create_group(&*raw_db, "platform", 10).await.unwrap();
+    GroupRepository::add_member(&*raw_db, group.id, inside.id).await.unwrap();
+    // A disabled membership must not widen the filter.
+    let lapsed = GroupRepository::add_member(&*raw_db, group.id, outside.id).await.unwrap();
+    GroupRepository::disable_membership(&*raw_db, lapsed.id).await.unwrap();
+
+    let key = raw_db.create_api_key(NewApiKey {
+        user_id: inside.id,
+        key_hash: "hash-in-group".to_string(),
+        label: Some("ci".to_string()),
+        expires_at: None,
+        project: Some("pipeline".to_string()),
+        session_window_secs: None,
+    })
+    .await
+    .unwrap();
+    // A second key with no label and no project, so both display shapes render.
+    raw_db.create_api_key(NewApiKey {
+        user_id: outside.id,
+        key_hash: "hash-out-of-group".to_string(),
+        label: None,
+        expires_at: None,
+        project: None,
+        session_window_secs: None,
+    })
+    .await
+    .unwrap();
+
+    for (user_id, model) in [(inside.id, "model-a"), (outside.id, "model-b")] {
+        CostRepository::create(&*raw_db, NewCostLedgerEntry {
+            user_id,
+            prompt_id: None,
+            model: model.to_string(),
+            provider: "test".to_string(),
+            project: Some("pipeline".to_string()),
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 2.5,
+            api_key_id: Some(key.id),
+            attribution_correlation_id: None,
+            attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
+        })
+        .await
+        .unwrap();
+    }
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    // Group filter alone: only the active member is in scope.
+    let resp = with_session(server.get("/admin/cost").add_query_param("group", "platform"), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("in-group"), "the active member must appear: {body}");
+    assert!(
+        body.contains("ci") && body.contains("pipeline"),
+        "the key dropdown is built from labelled and unlabelled keys: {body}"
+    );
+
+    // User ∩ group, where the user is in the group.
+    let resp = with_session(
+        server
+            .get("/admin/cost")
+            .add_query_param("group", "platform")
+            .add_query_param("user", "in-group"),
+        &token,
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200);
+
+    // User ∩ group, where the user is *not* in the group: the intersection is
+    // empty and the page must still render rather than fall back to "all".
+    let resp = with_session(
+        server
+            .get("/admin/cost")
+            .add_query_param("group", "platform")
+            .add_query_param("user", "out-of-group"),
+        &token,
+    )
+    .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+}
+
+/// A group name that does not exist must narrow to zero rows, not silently widen
+/// to every user — that is the difference between "no data" and a data leak.
+#[tokio::test]
+async fn cost_page_with_an_unknown_group_yields_no_rows() {
+    use modelrouter::db::models::{NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let user = UserRepository::create(&*raw_db, NewUser {
+        name: "solo-spender".to_string(),
+        email: None,
+    })
+    .await
+    .unwrap();
+    CostRepository::create(&*raw_db, NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: "expensive-model".to_string(),
+        provider: "test".to_string(),
+        project: None,
+        tokens_in: 1000,
+        tokens_out: 1000,
+        cost_usd: 99.0,
+        api_key_id: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
+    })
+    .await
+    .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp =
+        with_session(server.get("/admin/cost").add_query_param("group", "no-such-group"), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert!(
+        !resp.text().contains("99"),
+        "an unknown group must not fall through to everyone's spend: {}",
+        resp.text()
+    );
+}
+
+/// The remaining filters — project, model, key and window — all reach the same
+/// query builder; driving them together keeps the page honest about each one
+/// being wired to something.
+#[tokio::test]
+async fn cost_page_accepts_the_project_model_and_key_filters() {
+    use modelrouter::db::models::{NewApiKey, NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::api_keys::ApiKeyRepository;
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let user =
+        UserRepository::create(&*raw_db, NewUser { name: "jess".to_string(), email: None })
+            .await
+            .unwrap();
+    let key = raw_db.create_api_key(NewApiKey {
+        user_id: user.id,
+        key_hash: "hash-jess".to_string(),
+        label: None,
+        expires_at: None,
+        project: Some("reporting".to_string()),
+        session_window_secs: None,
+    })
+    .await
+    .unwrap();
+    CostRepository::create(&*raw_db, NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: "tracked-model".to_string(),
+        provider: "test".to_string(),
+        project: Some("reporting".to_string()),
+        tokens_in: 7,
+        tokens_out: 3,
+        cost_usd: 0.75,
+        api_key_id: Some(key.id),
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
+    })
+    .await
+    .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    for window in ["daily", "weekly", "monthly"] {
+        let resp = with_session(
+            server
+                .get("/admin/cost")
+                .add_query_param("window", window)
+                .add_query_param("project", "reporting")
+                .add_query_param("model", "tracked-model")
+                .add_query_param("key_id", key.id),
+            &token,
+        )
+        .await;
+        assert_eq!(resp.status_code(), 200, "window={window}: {}", resp.text());
+        assert!(
+            resp.text().contains("tracked-model"),
+            "the model dropdown is built from the ledger: {}",
+            resp.text()
+        );
+    }
+}
+
+// ── Overview: budget warnings ────────────────────────────────────────────────
+
+/// The overview's warning band is the only place an operator sees a budget about
+/// to bite. It must fire at the 80% mark and name the user, the window and both
+/// numbers — and must stay silent for a user comfortably under.
+#[tokio::test]
+async fn overview_warns_about_a_user_near_their_budget_limit() {
+    use modelrouter::db::models::{NewBudgetRule, NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+
+    let spend = |db: Arc<modelrouter::db::sqlite::SqliteDb>, user_id: i64, usd: f64| async move {
+        CostRepository::create(&*db, NewCostLedgerEntry {
+            user_id,
+            prompt_id: None,
+            model: "m".to_string(),
+            provider: "test".to_string(),
+            project: None,
+            tokens_in: 1,
+            tokens_out: 1,
+            cost_usd: usd,
+            api_key_id: None,
+            attribution_correlation_id: None,
+            attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
+        })
+        .await
+        .unwrap();
+    };
+
+    let rule_for = |user_id: i64, limit: f64, window: &str| NewBudgetRule {
+        user_id: Some(user_id),
+        group_name: None,
+        api_key_id: None,
+        tag: None,
+        window: window.to_string(),
+        limit_usd: Some(limit),
+        limit_tokens: None,
+        model_allow: vec![],
+        model_deny: vec![],
+        rate_rpm: None,
+        max_concurrent: None,
+        project: None,
+        window_start: None,
+        window_end: None,
+    };
+
+    // Over 80% of a monthly limit → warn.
+    let hot = UserRepository::create(&*raw_db, NewUser { name: "hot-spender".to_string(), email: None })
+        .await
+        .unwrap();
+    BudgetRepository::create(&*raw_db, rule_for(hot.id, 10.0, "monthly")).await.unwrap();
+    spend(raw_db.clone(), hot.id, 9.0).await;
+
+    // Under 80% of a daily limit → stay quiet.
+    let cool = UserRepository::create(&*raw_db, NewUser { name: "cool-spender".to_string(), email: None })
+        .await
+        .unwrap();
+    BudgetRepository::create(&*raw_db, rule_for(cool.id, 100.0, "daily")).await.unwrap();
+    spend(raw_db.clone(), cool.id, 1.0).await;
+
+    // A weekly rule with a zero limit must never divide-by-zero into a warning.
+    let unlimited =
+        UserRepository::create(&*raw_db, NewUser { name: "unlimited".to_string(), email: None })
+            .await
+            .unwrap();
+    BudgetRepository::create(&*raw_db, rule_for(unlimited.id, 0.0, "weekly")).await.unwrap();
+    spend(raw_db.clone(), unlimited.id, 5.0).await;
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = with_session(server.get("/admin"), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(body.contains("hot-spender"), "the near-limit user must be named: {body}");
+    assert!(!body.contains("cool-spender"), "a user at 1% must not be warned about: {body}");
+    assert!(!body.contains("unlimited"), "a zero limit is not a breach: {body}");
+}
+
+// ── Login failure re-render ──────────────────────────────────────────────────
+
+/// A bad password re-renders the login form carrying the error, rather than
+/// redirecting or 500-ing — and must not hand out a session cookie.
+#[tokio::test]
+async fn a_failed_login_re_renders_the_form_with_an_error() {
+    let (server, db, _token) = server_with_superadmin().await;
+    let _ = &db;
+
+    let resp = server
+        .post("/admin/login")
+        .form(&serde_json::json!({ "username": "super-user", "password": "definitely-wrong" }))
+        .await;
+
+    assert_eq!(resp.status_code(), 200, "the form comes back, it does not redirect");
+    let body = resp.text();
+    assert!(body.contains("password") || body.contains("Password"), "got {body}");
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "a failed login must not set a session cookie"
+    );
+}
+
+#[tokio::test]
+async fn a_login_for_an_unknown_admin_re_renders_the_form() {
+    let server = build_test_server().await;
+    let resp = server
+        .post("/admin/login")
+        .form(&serde_json::json!({ "username": "nobody-here", "password": "x" }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert!(resp.headers().get("set-cookie").is_none());
+}
+
+// ── Prompts page: user labels ────────────────────────────────────────────────
+
+/// A prompt's author is shown as "name (email)" when an address is on file, so
+/// two callers with similar names stay distinguishable.
+#[tokio::test]
+async fn prompts_page_labels_an_author_with_their_email() {
+    use modelrouter::db::models::{NewPrompt, NewUser};
+    use modelrouter::db::repositories::prompts::PromptRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let with_email = UserRepository::create(&*raw_db, NewUser {
+        name: "kim".to_string(),
+        email: Some("kim@example.com".to_string()),
+    })
+    .await
+    .unwrap();
+    let without_email =
+        UserRepository::create(&*raw_db, NewUser { name: "lee".to_string(), email: None })
+            .await
+            .unwrap();
+
+    for uid in [with_email.id, without_email.id] {
+        PromptRepository::create(&*raw_db, NewPrompt {
+            user_id: uid,
+            session_id: None,
+            request_model: "m".to_string(),
+            routed_model: "m".to_string(),
+            provider: "test".to_string(),
+            messages: "[]".to_string(),
+            response: Some("ok".to_string()),
+            finish_reason: Some("stop".to_string()),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: 0.01,
+            latency_ms: Some(1),
+            ttft_ms: None,
+            attempts: None,
+            tags: "{}".to_string(),
+            project: None,
+            attribution_correlation_id: None,
+            attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = with_session(server.get("/admin/prompts"), &token).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let body = resp.text();
+    assert!(
+        body.contains("kim (kim@example.com)"),
+        "an author with an email is labelled with it: {body}"
+    );
+    assert!(body.contains("lee"), "an author without one falls back to the bare name: {body}");
+}
+
+// ── DashboardError rendering ─────────────────────────────────────────────────
+
+/// Every error variant has a distinct status and body. The template arm has no
+/// HTTP route that can reach it — the templates are embedded and valid — so it is
+/// rendered directly, which is also the only way to pin its status.
+#[tokio::test]
+async fn every_dashboard_error_variant_renders_its_own_status_and_body() {
+    use axum::response::IntoResponse;
+    use modelrouter::api::admin::dashboard::DashboardError;
+
+    let cases = [
+        (DashboardError::Template("jinja exploded".to_string()), 500, "Template error"),
+        (DashboardError::Forbidden, 403, "403 Forbidden"),
+        (DashboardError::BadRequest("bad input".to_string()), 400, "Bad Request"),
+        (DashboardError::NotFound("gone".to_string()), 404, "Not Found"),
+        (DashboardError::Internal, 500, "Internal Error"),
+    ];
+
+    for (err, want_status, want_body) in cases {
+        let resp = err.into_response();
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, want_status, "body was {body}");
+        assert!(body.contains(want_body), "expected {want_body:?} in {body}");
+    }
+
+    // Unauthorized is the odd one out: it redirects rather than rendering.
+    let resp = DashboardError::Unauthorized.into_response();
+    assert_eq!(resp.status().as_u16(), 303);
+    assert_eq!(resp.headers().get("location").unwrap(), "/admin/login");
 }

@@ -287,5 +287,9 @@ mod tests {
 
         let b = vec![0.0_f32, 1.0, 0.0];
         assert!((cosine_similarity(&a, &b)).abs() < 1e-6);
+
+        let zero = vec![0.0_f32, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&zero, &a), 0.0);
+        assert_eq!(cosine_similarity(&a, &zero), 0.0);
     }
 }
