@@ -5,7 +5,7 @@
 
 <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem;padding:1rem;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">User</label>
+        <label for="rf-user" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">User</label>
         <select name="user" id="rf-user"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
@@ -17,7 +17,7 @@
         </select>
     </div>
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Project</label>
+        <label for="rf-project" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Project</label>
         <select name="project" id="rf-project"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
@@ -29,7 +29,7 @@
         </select>
     </div>
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Model</label>
+        <label for="rf-model" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Model</label>
         <select name="model" id="rf-model"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
@@ -41,7 +41,7 @@
         </select>
     </div>
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Group</label>
+        <label for="rf-group" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Group</label>
         <select name="group" id="rf-group"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
@@ -53,7 +53,7 @@
         </select>
     </div>
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Window</label>
+        <label for="rf-window" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Window</label>
         <select name="window" id="rf-window"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
@@ -64,7 +64,7 @@
         </select>
     </div>
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Attribution</label>
+        <label for="rf-attr-key" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Attribution</label>
         <select name="key" id="rf-attr-key"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"
@@ -76,7 +76,7 @@
         </select>
     </div>
     <div>
-        <label style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Value</label>
+        <label for="rf-attr-value" style="display:block;font-size:0.8rem;font-weight:600;margin-bottom:0.3rem;">Value</label>
         <select name="value" id="rf-attr-value"
             hx-get="/admin/reports/panels" hx-target="#panels" hx-trigger="change"
             hx-include="#rf-user,#rf-project,#rf-model,#rf-group,#rf-window,#rf-attr-key,#rf-attr-value"

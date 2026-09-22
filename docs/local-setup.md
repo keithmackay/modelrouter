@@ -186,6 +186,134 @@ Tokens are OAuth2 access tokens with scope `cloud-platform`; `google-cloud-auth`
 
 ---
 
+## (Optional) Use Azure AI Foundry models
+
+What the Vertex section above does for GCP, this does for Azure. A Foundry (AI Services) resource fronts every model you have deployed on it — Llama, Mistral, Phi, DeepSeek, Cohere, Grok and the OpenAI models alike — behind **one** endpoint, with the deployment named in the request body. modelrouter routes `foundry/<deployment>` to it and supports chat completions, streaming, embeddings and model discovery.
+
+This is **not** `[providers.azure]`. That provider speaks the older Azure OpenAI surface (`/openai/deployments/<deployment>/chat/completions?api-version=`) with an `api-key` header, and needs one provider entry per deployment. Keep it for an Azure OpenAI resource; use `foundry` for a Foundry / AI Services resource.
+
+The adapter is compiled in by default; `cargo build --release --features foundry` names it explicitly. A binary built *without* it refuses to start against a config that declares `[providers.foundry]`, rather than silently routing those requests somewhere else.
+
+**1. Copy the endpoint.** In the Azure AI Foundry portal, take the resource endpoint — `https://<resource>.services.ai.azure.com`. Note the **deployment names** on the resource; those are what you route to.
+
+Which data plane you get is decided by the path you configure:
+
+| You configure | Surface | `api-version` |
+|---|---|---|
+| `https://<resource>.services.ai.azure.com` | OpenAI-compatible, `/openai/v1` | none sent (service defaults to `v1`) |
+| `https://<resource>.services.ai.azure.com/models` | Azure AI Model Inference | required — sent for you |
+
+The Model Inference API is documented as deprecated in favour of the OpenAI-compatible one, so a bare host resolves to the latter. Set `api_version` only to override the per-surface default.
+
+**2. Set up authentication.** Credentials come from the environment, never from `config.toml` — the same chain the Bing grounding adapter uses, sharing the same code. In order:
+
+1. **App registration** — `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` present in the environment. The router requests a token from `{AZURE_AUTHORITY_HOST}/{tenant}/oauth2/v2.0/token`.
+2. **Managed identity** — the fallback when the trio is absent. IMDS at `http://169.254.169.254/metadata/identity/oauth2/token`. Set `AZURE_CLIENT_ID` alone for a user-assigned identity.
+
+Grant the identity the **Azure AI User** role (or equivalent) on the resource. Tokens are cached in-process and refreshed five minutes before expiry.
+
+The **audience** is derived from the endpoint: a resource endpoint gets `https://cognitiveservices.azure.com/.default` (what the published OpenAPI documents declare), a project endpoint gets `https://ai.azure.com/.default`. Microsoft's own keyless-auth how-to shows `ai.azure.com` for resource endpoints as well, so where the spec and the prose disagree, `entra_scope` in the provider table overrides the derived value. The resolved scope is logged at startup alongside `credential_source`, and named in any 401/403 — start there when troubleshooting.
+
+Setting `api_key` in the provider table switches to resource-key auth (`api-key` header) instead. It works, but it puts a secret on disk; Entra is the intended mode.
+
+**3. Add to `~/.modelrouter/config.toml`:**
+
+```toml
+[providers.foundry]
+foundry_endpoint = "https://<resource>.services.ai.azure.com"
+timeout_secs     = 120
+# project        = "<foundry-project>"   # appends /api/projects/<project>
+# entra_scope    = "https://ai.azure.com/.default"   # audience override
+# api_version    = "2025-04-01"          # overrides the per-surface default
+
+[routing.model_aliases]
+"llama-70b" = "foundry/Llama-3.3-70B-Instruct"
+"phi-4"     = "foundry/Phi-4"
+```
+
+Embeddings work through the same provider — point an embedding-capable deployment at it and call `/v1/embeddings` with `foundry/<deployment>`. Widths are verified against a requested `dimensions` before the vector is returned, so a deployment that ignores the parameter fails the call instead of quietly storing a wrong-shaped vector.
+
+**4. Test:**
+
+```bash
+# What is actually deployed on the resource:
+curl -sS http://localhost:8080/v1/models -H "Authorization: Bearer $MODELROUTER_KEY" | jq
+
+curl -sS http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $MODELROUTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama-70b","messages":[{"role":"user","content":"hi"}]}' | jq
+```
+
+`GET /health/deep` probes the provider end to end once it is configured, so a bad endpoint, a missing role assignment or a wrong audience shows up there rather than on a user's first request.
+
+---
+
+## (Optional) Use Grounding with Bing Search (Azure AI Foundry) for `/v1/search`
+
+Bing is no longer reachable as a bare search REST API — the classic Bing Web Search API is retired. **Grounding with Bing Search** is a *tool* of Azure AI Foundry: you provision a Grounding with Bing Search resource, connect it to a Foundry project, and attach the tool to a model call. modelrouter wraps that as an ordinary search engine (`engine: "bing_grounding"` on `POST /v1/search`), so callers see the same `{title, url, snippet}` results they get from Tavily or Vertex.
+
+The adapter is compiled in by default; `cargo build --release --features bing-grounding` names it explicitly.
+
+**1. Provision and connect the resource.** In the Azure portal, create a *Grounding with Bing Search* resource in the same resource group as your Foundry project, then add it to the project as a connection. Copy the **project endpoint** and the **connection id** from the project's overview and Connected resources pages. You also need the name of a **model deployment** in that project for the tool to run on — note that `gpt-4o-mini (2024-07-18)` and the `gpt-5` family are documented as unsupported by this tool.
+
+**2. Set up authentication.** Credentials come from the environment, never from `config.toml`, mirroring the Vertex ADC pattern. The adapter picks, in order:
+
+1. **App registration** — `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` present in the environment. The router requests a token from `{AZURE_AUTHORITY_HOST}/{tenant}/oauth2/v2.0/token` for scope `https://ai.azure.com/.default`.
+2. **Managed identity** — the fallback when the trio is absent. IMDS at `http://169.254.169.254/metadata/identity/oauth2/token`, resource `https://ai.azure.com`. Set `AZURE_CLIENT_ID` alone for a user-assigned identity.
+
+Grant the identity the **Azure AI User** role on the Foundry project. Tokens are cached in-process and refreshed five minutes before expiry. The chosen credential source is logged at startup (`credential_source=client_credentials|managed_identity`), and acquisition failures log the endpoint and the AADSTS body — start there when troubleshooting.
+
+Setting `api_key` in the provider table switches to resource-key auth (`api-key` header) instead. It works, but it puts a secret on disk; Entra is the intended mode.
+
+**3. Add to `~/.modelrouter/config.toml`:**
+
+```toml
+[providers.bing_grounding]
+foundry_project_endpoint = "https://<resource>.services.ai.azure.com/api/projects/<project>"
+project_connection_id    = "/subscriptions/.../connections/<bing-connection>"
+search_model             = "<model-deployment-name>"
+timeout_secs             = 300
+
+# Optional: Grounding with Bing Custom Search (preview) — same surface,
+# restricted to the domains configured on the Custom Search instance.
+# custom_search          = true
+# custom_search_instance = "<instance-name>"
+```
+
+`timeout_secs = 300` is not a typo. Unlike Tavily, this call runs a Bing search **and** a model generation before it returns, so it is a completion-length operation; the router logs a warning if you leave it at a search-length value. The endpoint is the version-less `/openai/v1/responses` surface, so no `api-version` is sent — set `api_version` only to reach a preview surface.
+
+**4. Record the price.** Grounding with Bing Search is billed per query transaction. Add a flat-rate pricing row so `/v1/search` calls are metered (see `config.example.toml`); the underlying model deployment is billed separately by Azure OpenAI and is not covered by that row.
+
+```toml
+[[pricing]]
+model = "search/bing_grounding"
+input_per_million = 0.035   # dollars per query; confirm the current rate
+output_per_million = 0.0
+```
+
+**5. Test:**
+
+```bash
+curl -sS http://localhost:8080/v1/search \
+  -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"engine":"bing_grounding","query":"who won the match yesterday","max_results":5}' | jq
+```
+
+Failures behave like any other engine: a provider error walks the `[routing.search_fallback_chains]` chain, so a grounding outage degrades to whichever search providers you have configured behind it.
+
+### Legal: citation display obligations
+
+Grounding with Bing Search is governed by Microsoft's [Grounding with Bing Search Use and Display Requirements](https://www.microsoft.com/bing/apis/grounding-legal). Two consequences you own, not the router:
+
+- **Citations must be displayed in the exact form Microsoft returned them.** The adapter therefore returns citation URLs **verbatim** — no percent-decoding, no tracking-parameter stripping, no redirect unwrapping (contrast the Vertex engine, which must unwrap Google's redirector). Anything rendering `/v1/search` output must show those URLs unmodified, alongside the Bing search query URL, which is logged at debug level from the tool-call item in the response.
+- **Query text leaves the Azure compliance boundary.** The Bing search query and your resource key are sent to the Grounding with Bing Search service, which is subject to Bing's terms rather than Foundry's. Assess that against your own requirements before enabling this engine.
+
+Only paid/pay-as-you-go Azure subscriptions can deploy a Grounding with Bing Search resource, and the tool does not work through VPN or Private Endpoints.
+
+---
+
 ## Step 6: (Optional) Connect Arize Phoenix for tracing
 
 If you built with `--features otel`, you can send traces and metrics to [Arize Phoenix](https://docs.arize.com/phoenix).

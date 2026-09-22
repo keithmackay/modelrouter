@@ -29,6 +29,10 @@ async fn image_generations_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    crate::api::routes::reject_experiment_header(
+        "/v1/images/generations",
+        &headers,
+    )?;
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
@@ -145,10 +149,14 @@ async fn image_generations_inner(
             cache_write_tokens: 0,
             cost_usd: cost,
             latency_ms: None,
+            ttft_ms: None,
+            attempts: None,
             tags: "[]".to_string(),
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
             attribution_tags: attr_tags.clone(),
+            experiment_id: None,
+            experiment_variant: None,
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
@@ -174,6 +182,9 @@ async fn image_generations_inner(
                     api_key_id,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
+                    experiment_id: None,
+                    experiment_variant: None,
+                    tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record image cost: {}", e);

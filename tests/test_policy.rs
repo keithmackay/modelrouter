@@ -208,10 +208,14 @@ async fn budget_exceeded_returns_deny() {
             cache_write_tokens: 0,
             cost_usd: 1.0,
             latency_ms: None,
+            ttft_ms: None,
+            attempts: None,
             tags: "[]".to_string(),
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -232,6 +236,9 @@ async fn budget_exceeded_returns_deny() {
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await
@@ -303,10 +310,14 @@ async fn test_policy_token_limit_under_budget() {
             cache_write_tokens: 0,
             cost_usd: 0.001,
             latency_ms: None,
+            ttft_ms: None,
+            attempts: None,
             tags: "[]".to_string(),
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -327,6 +338,9 @@ async fn test_policy_token_limit_under_budget() {
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await
@@ -398,10 +412,14 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             cache_write_tokens: 0,
             cost_usd: 0.001,
             latency_ms: None,
+            ttft_ms: None,
+            attempts: None,
             tags: "[]".to_string(),
             project: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
         },
     )
     .await
@@ -422,6 +440,9 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             api_key_id: None,
             attribution_correlation_id: None,
             attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         },
     )
     .await

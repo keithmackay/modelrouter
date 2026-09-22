@@ -172,6 +172,8 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
         stream: false,
         temperature: None,
         max_tokens: Some(1),
+        tools: None,
+        tool_choice: None,
         extra_params: json!({}),
     };
     let started = Instant::now();
@@ -283,7 +285,7 @@ fn record_probe_usage(
     tokens_out: i64,
     cost_usd: f64,
 ) {
-    use crate::db::models::{NewCostLedgerEntry, NewUser};
+    use crate::db::models::{empty_json_object, NewCostLedgerEntry, NewUser};
     use crate::db::repositories::{costs::CostRepository, users::UserRepository};
 
     const PROBE_USER: &str = "health-probe";
@@ -321,7 +323,10 @@ fn record_probe_usage(
             cost_usd,
             api_key_id: None,
             attribution_correlation_id: None,
-            attribution_tags: "[]".to_string(),
+            attribution_tags: empty_json_object(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
         };
         if let Err(e) = CostRepository::create(&*state.db, entry).await {
             tracing::error!(error = %e, "failed to record health-probe usage");

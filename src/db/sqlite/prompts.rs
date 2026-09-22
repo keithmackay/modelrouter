@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 
 use crate::db::models::{NewPrompt, Prompt};
+use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
-use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
+use crate::db::repositories::prompts::{
+    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository,
+};
 use super::costs::arm_predicate;
 use super::{SqliteDb, now_utc};
 
@@ -10,11 +13,19 @@ use super::{SqliteDb, now_utc};
 /// `0` (or `NULL`), and would otherwise pull every percentile toward zero.
 const LATENCY_SAMPLE: &str = "latency_ms IS NOT NULL AND latency_ms > 0";
 
+/// Rows that carry a real time-to-first-token measurement, same rule.
+const TTFT_SAMPLE: &str = "ttft_ms IS NOT NULL AND ttft_ms > 0";
+
+/// Experiment ids bound per `DELETE ... IN (...)` statement in
+/// `purge_older_than_except`, well under SQLite's bound-parameter limit.
+const PURGE_ID_CHUNK: usize = 500;
+
 /// Columns selected when reading a prompt row back.
 const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
                               messages, response, finish_reason, prompt_tokens, completion_tokens, \
-                              cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, tags, \
-                              project, attribution_correlation_id, attribution_tags, created_at";
+                              cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, \
+                              attempts, tags, project, attribution_correlation_id, attribution_tags, \
+                              experiment_id, experiment_variant, created_at";
 
 #[async_trait]
 impl PromptRepository for SqliteDb {
@@ -25,9 +36,10 @@ impl PromptRepository for SqliteDb {
                 user_id, session_id, request_model, routed_model, provider,
                 messages, response, finish_reason, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens,
-                cost_usd, latency_ms, tags, project,
-                attribution_correlation_id, attribution_tags, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                cost_usd, latency_ms, ttft_ms, attempts, tags, project,
+                attribution_correlation_id, attribution_tags,
+                experiment_id, experiment_variant, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -43,10 +55,14 @@ impl PromptRepository for SqliteDb {
         .bind(prompt.cache_write_tokens)
         .bind(prompt.cost_usd)
         .bind(prompt.latency_ms)
+        .bind(prompt.ttft_ms)
+        .bind(prompt.attempts)
         .bind(&prompt.tags)
         .bind(&prompt.project)
         .bind(&prompt.attribution_correlation_id)
         .bind(&prompt.attribution_tags)
+        .bind(prompt.experiment_id)
+        .bind(&prompt.experiment_variant)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -114,8 +130,153 @@ impl PromptRepository for SqliteDb {
         Ok(result.rows_affected())
     }
 
+    async fn purge_older_than_except(
+        &self,
+        cutoff_rfc3339: &str,
+        except_experiment_ids: &[i64],
+    ) -> anyhow::Result<u64> {
+        if except_experiment_ids.is_empty() {
+            return PromptRepository::purge_older_than(self, cutoff_rfc3339).await;
+        }
+        // Unstamped rows first, then the stamped ones by experiment. Deleting
+        // by a positive `IN` list of the experiments that are NOT protected
+        // keeps the statement correct when the list has to be chunked (a
+        // `NOT IN` split across chunks would delete a protected row in the
+        // chunk that does not name it).
+        let result = sqlx::query(
+            "DELETE FROM prompts WHERE created_at < ? AND experiment_id IS NULL",
+        )
+        .bind(cutoff_rfc3339)
+        .execute(&self.pool)
+        .await?;
+        let mut deleted = result.rows_affected();
+
+        let stamped: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT experiment_id FROM prompts \
+             WHERE created_at < ? AND experiment_id IS NOT NULL",
+        )
+        .bind(cutoff_rfc3339)
+        .fetch_all(&self.pool)
+        .await?;
+        let expendable: Vec<i64> = stamped
+            .into_iter()
+            .map(|(id,)| id)
+            .filter(|id| !except_experiment_ids.contains(id))
+            .collect();
+        for chunk in expendable.chunks(PURGE_ID_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM prompts WHERE created_at < ? AND experiment_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql).bind(cutoff_rfc3339);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            deleted += q.execute(&self.pool).await?.rows_affected();
+        }
+        Ok(deleted)
+    }
+
+    async fn redact_experiment_content(&self, experiment_id: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE prompts SET messages = ?, response = NULL \
+             WHERE experiment_id = ? AND (messages != ? OR response IS NOT NULL)",
+        )
+        .bind(CONTENT_NOT_STORED)
+        .bind(experiment_id)
+        .bind(CONTENT_NOT_STORED)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn latency_summary(
         &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        self.ms_summary("latency_ms", LATENCY_SAMPLE, filter, start, end).await
+    }
+
+    async fn ttft_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<LatencySummary> {
+        self.ms_summary("ttft_ms", TTFT_SAMPLE, filter, start, end).await
+    }
+
+    async fn attempts_summary(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<AttemptsSummary> {
+        // Model arms match the model actually served, not the alias asked for.
+        let (predicate, binds) = arm_predicate(filter, "routed_model");
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(attempts), 0), \
+                    COALESCE(SUM(CASE WHEN attempts > 1 THEN 1 ELSE 0 END), 0) \
+             FROM prompts \
+             WHERE {predicate} AND created_at >= ? AND created_at < ? \
+               AND attempts IS NOT NULL"
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql);
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let (requests_tracked, attempts, retried_requests) =
+            q.bind(start).bind(end).fetch_one(&self.pool).await?;
+        Ok(AttemptsSummary { requests_tracked, attempts, retried_requests })
+    }
+
+    async fn experiment_run_latency(
+        &self,
+        experiment_id: i64,
+    ) -> anyhow::Result<Vec<ExperimentRunLatency>> {
+        let sql = format!(
+            "SELECT user_id, attribution_correlation_id, COUNT(*), AVG(latency_ms) FROM prompts \
+             WHERE experiment_id = ? AND attribution_correlation_id IS NOT NULL AND {} \
+             GROUP BY user_id, attribution_correlation_id \
+             ORDER BY user_id ASC, attribution_correlation_id ASC",
+            LATENCY_SAMPLE
+        );
+        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(&sql)
+            .bind(experiment_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, correlation_id, samples, mean_ms)| ExperimentRunLatency {
+                user_id, correlation_id, samples, mean_ms,
+            })
+            .collect())
+    }
+
+    async fn experiment_content_bytes(&self, experiment_id: i64) -> anyhow::Result<i64> {
+        let (bytes,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(LENGTH(CAST(messages AS BLOB)) \
+                                 + LENGTH(CAST(COALESCE(response, '') AS BLOB))), 0) \
+             FROM prompts WHERE experiment_id = ?",
+        )
+        .bind(experiment_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(bytes)
+    }
+}
+
+impl SqliteDb {
+    /// Shared body of `latency_summary` and `ttft_summary`: count, mean and
+    /// nearest-rank percentiles over one millisecond column of `prompts`.
+    /// `column` and `sample_predicate` are compile-time constants from this
+    /// module, never caller input.
+    async fn ms_summary(
+        &self,
+        column: &str,
+        sample_predicate: &str,
         filter: &ArmFilter,
         start: &str,
         end: &str,
@@ -124,10 +285,10 @@ impl PromptRepository for SqliteDb {
         let (predicate, binds) = arm_predicate(filter, "routed_model");
         let where_clause = format!(
             "{} AND created_at >= ? AND created_at < ? AND {}",
-            predicate, LATENCY_SAMPLE
+            predicate, sample_predicate
         );
 
-        let sql = format!("SELECT COUNT(*), AVG(latency_ms) FROM prompts WHERE {}", where_clause);
+        let sql = format!("SELECT COUNT(*), AVG({column}) FROM prompts WHERE {where_clause}");
         let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
         for b in &binds {
             q = q.bind(b.clone());
@@ -143,12 +304,10 @@ impl PromptRepository for SqliteDb {
         // leave the offset past the end; fall back to the largest remaining
         // value, and if nothing is left treat the arm as empty.
         let sql = format!(
-            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms ASC LIMIT 1 OFFSET ?",
-            where_clause
+            "SELECT {column} FROM prompts WHERE {where_clause} ORDER BY {column} ASC LIMIT 1 OFFSET ?"
         );
         let last_sql = format!(
-            "SELECT latency_ms FROM prompts WHERE {} ORDER BY latency_ms DESC LIMIT 1",
-            where_clause
+            "SELECT {column} FROM prompts WHERE {where_clause} ORDER BY {column} DESC LIMIT 1"
         );
         let percentile = |q_frac: f64| {
             let offset = LatencySummary::nearest_rank_offset(samples, q_frac);
@@ -224,10 +383,14 @@ mod tests {
                 cache_write_tokens: 0,
                 cost_usd: 0.01,
                 latency_ms: None,
+                ttft_ms: None,
+                attempts: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
                 attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
             },
         )
         .await
@@ -262,10 +425,14 @@ mod tests {
                 cache_write_tokens: 0,
                 cost_usd: 0.01,
                 latency_ms: None,
+                ttft_ms: None,
+                attempts: None,
                 tags: "[]".to_string(),
                 project: None,
                 attribution_correlation_id: None,
                 attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
             },
         )
         .await
@@ -368,6 +535,133 @@ mod tests {
         assert_eq!(s.p95_ms, Some(420));
     }
 
+    /// Minimal prompt row carrying only a TTFT measurement.
+    async fn insert_ttft_row(db: &SqliteDb, routed_model: &str, ttft_ms: Option<i64>, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, \
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, ttft_ms, tags, \
+             attribution_tags, created_at) \
+             VALUES (1, 'req', ?, 'p', '[]', 0, 0, 0.0, 2000, ?, '[]', '{}', ?)",
+        )
+        .bind(routed_model)
+        .bind(ttft_ms)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ttft_summary_reads_ttft_not_latency() {
+        let db = make_db().await;
+        for (i, ms) in [100, 200, 300, 400, 1000].iter().enumerate() {
+            let ts = format!("2026-03-{:02}T00:00:00Z", i + 2);
+            insert_ttft_row(&db, "X", Some(*ms), &ts).await;
+        }
+        // Zero and NULL TTFT are not samples, even with a measured latency.
+        insert_ttft_row(&db, "X", Some(0), "2026-03-10T00:00:00Z").await;
+        insert_ttft_row(&db, "X", None, "2026-03-11T00:00:00Z").await;
+
+        let s = db.ttft_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s.samples, 5);
+        assert_eq!(s.mean_ms, Some(400.0));
+        assert_eq!(s.p50_ms, Some(300));
+        assert_eq!(s.p95_ms, Some(1000));
+
+        // Every row above carries latency 2000, which TTFT must not read.
+        let l = db.latency_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(l.samples, 7);
+        assert_eq!(l.mean_ms, Some(2000.0));
+    }
+
+    #[tokio::test]
+    async fn ttft_summary_with_no_samples_is_empty() {
+        let db = make_db().await;
+        insert_latency_row(&db, "X", "p", None, "{}", Some(300), "2026-03-02T00:00:00Z").await;
+        let s = db.ttft_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s, LatencySummary::default());
+    }
+
+    #[tokio::test]
+    async fn ttft_round_trips_through_create() {
+        let db = make_db().await;
+        let saved = PromptRepository::create(
+            &db,
+            NewPrompt {
+                user_id: 1,
+                session_id: None,
+                request_model: "gpt-4o".to_string(),
+                routed_model: "openai/gpt-4o".to_string(),
+                provider: "openai".to_string(),
+                messages: "[]".to_string(),
+                response: None,
+                finish_reason: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                latency_ms: Some(900),
+                ttft_ms: Some(120),
+                attempts: None,
+                tags: "[]".to_string(),
+                project: None,
+                attribution_correlation_id: None,
+                attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.ttft_ms, Some(120));
+        let fetched = PromptRepository::find_by_id(&db, saved.id).await.unwrap().unwrap();
+        assert_eq!(fetched.ttft_ms, Some(120));
+    }
+
+    /// Minimal prompt row carrying only an attempt count.
+    async fn insert_attempts_row(db: &SqliteDb, routed_model: &str, attempts: Option<i64>, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, \
+             prompt_tokens, completion_tokens, cost_usd, attempts, tags, \
+             attribution_tags, created_at) \
+             VALUES (1, 'req', ?, 'p', '[]', 0, 0, 0.0, ?, '[]', '{}', ?)",
+        )
+        .bind(routed_model)
+        .bind(attempts)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempts_summary_totals_and_retried_counts() {
+        let db = make_db().await;
+        for (i, n) in [1, 1, 3, 2, 1].iter().enumerate() {
+            let ts = format!("2026-03-{:02}T00:00:00Z", i + 2);
+            insert_attempts_row(&db, "X", Some(*n), &ts).await;
+        }
+        // Untracked rows and other models stay outside every figure.
+        insert_attempts_row(&db, "X", None, "2026-03-10T00:00:00Z").await;
+        insert_attempts_row(&db, "Y", Some(9), "2026-03-10T00:00:00Z").await;
+        // Outside the window.
+        insert_attempts_row(&db, "X", Some(5), "2026-04-02T00:00:00Z").await;
+
+        let s = db.attempts_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s.requests_tracked, 5);
+        assert_eq!(s.attempts, 8);
+        assert_eq!(s.retried_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn attempts_summary_with_nothing_tracked_is_zero() {
+        let db = make_db().await;
+        insert_attempts_row(&db, "X", None, "2026-03-02T00:00:00Z").await;
+        let s = db.attempts_summary(&model("X"), W_START, W_END).await.unwrap();
+        assert_eq!(s, crate::db::repositories::prompts::AttemptsSummary::default());
+    }
+
     #[tokio::test]
     async fn latency_summary_provider_tag_and_run_arms() {
         let db = make_db().await;
@@ -390,6 +684,121 @@ mod tests {
         assert_eq!(r.p50_ms, Some(100));
     }
 
+    // ---- retention -----------------------------------------------------------
+
+    /// A prompt row with content, stamped with `experiment_id`.
+    async fn insert_stamped_row(db: &SqliteDb, experiment_id: Option<i64>, created_at: &str) -> i64 {
+        let r = sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, response, \
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, tags, attribution_tags, \
+             experiment_id, experiment_variant, created_at) \
+             VALUES (1, 'req', 'X', 'p', '[{\"role\":\"user\",\"content\":\"hello\"}]', 'world', \
+             10, 20, 0.01, 300, '[]', '{}', ?, ?, ?)",
+        )
+        .bind(experiment_id)
+        .bind(experiment_id.map(|_| "control"))
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        r.last_insert_rowid()
+    }
+
+    async fn exists(db: &SqliteDb, id: i64) -> bool {
+        PromptRepository::find_by_id(db, id).await.unwrap().is_some()
+    }
+
+    const OLD: &str = "2026-01-01T00:00:00Z";
+    const NEW: &str = "2026-03-15T00:00:00Z";
+    const CUTOFF: &str = "2026-03-01T00:00:00Z";
+
+    #[tokio::test]
+    async fn purge_older_than_except_spares_the_listed_experiments() {
+        let db = make_db().await;
+        let old_plain = insert_stamped_row(&db, None, OLD).await;
+        let old_kept = insert_stamped_row(&db, Some(7), OLD).await;
+        let old_kept_too = insert_stamped_row(&db, Some(8), OLD).await;
+        let old_gone = insert_stamped_row(&db, Some(9), OLD).await;
+        let new_plain = insert_stamped_row(&db, None, NEW).await;
+        let new_gone_exp = insert_stamped_row(&db, Some(9), NEW).await;
+
+        let n = db.purge_older_than_except(CUTOFF, &[7, 8]).await.unwrap();
+        assert_eq!(n, 2);
+        assert!(!exists(&db, old_plain).await);
+        assert!(exists(&db, old_kept).await);
+        assert!(exists(&db, old_kept_too).await);
+        assert!(!exists(&db, old_gone).await);
+        assert!(exists(&db, new_plain).await);
+        assert!(exists(&db, new_gone_exp).await);
+
+        // Nothing old and unprotected is left: a second call is a no-op.
+        assert_eq!(db.purge_older_than_except(CUTOFF, &[7, 8]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_except_with_no_exceptions_is_a_plain_purge() {
+        let db = make_db().await;
+        let old_plain = insert_stamped_row(&db, None, OLD).await;
+        let old_exp = insert_stamped_row(&db, Some(7), OLD).await;
+        let new_exp = insert_stamped_row(&db, Some(7), NEW).await;
+
+        assert_eq!(db.purge_older_than_except(CUTOFF, &[]).await.unwrap(), 2);
+        assert!(!exists(&db, old_plain).await);
+        assert!(!exists(&db, old_exp).await);
+        assert!(exists(&db, new_exp).await);
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_except_handles_more_experiments_than_one_chunk() {
+        let db = make_db().await;
+        // Old rows for more distinct experiments than fit one IN-list chunk,
+        // every other one protected.
+        let total = PURGE_ID_CHUNK as i64 * 2 + 3;
+        let mut rows = Vec::new();
+        for id in 1..=total {
+            rows.push((id, insert_stamped_row(&db, Some(id), OLD).await));
+        }
+        let protected: Vec<i64> = (1..=total).filter(|id| id % 2 == 0).collect();
+
+        let n = db.purge_older_than_except(CUTOFF, &protected).await.unwrap();
+        assert_eq!(n as i64, total - protected.len() as i64);
+        for (id, row) in rows {
+            assert_eq!(exists(&db, row).await, id % 2 == 0, "experiment {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn redact_experiment_content_is_scoped_and_idempotent() {
+        let db = make_db().await;
+        let target = insert_stamped_row(&db, Some(7), OLD).await;
+        let target_new = insert_stamped_row(&db, Some(7), NEW).await;
+        let other = insert_stamped_row(&db, Some(8), OLD).await;
+        let plain = insert_stamped_row(&db, None, OLD).await;
+
+        assert_eq!(db.redact_experiment_content(7).await.unwrap(), 2);
+        for id in [target, target_new] {
+            let row = PromptRepository::find_by_id(&db, id).await.unwrap().unwrap();
+            assert_eq!(row.messages, CONTENT_NOT_STORED);
+            assert_eq!(row.response, None);
+            // Everything the results page reads survives.
+            assert_eq!(row.latency_ms, Some(300));
+            assert_eq!(row.prompt_tokens, 10);
+            assert_eq!(row.completion_tokens, 20);
+            assert_eq!(row.cost_usd, 0.01);
+            assert_eq!(row.experiment_id, Some(7));
+            assert_eq!(row.experiment_variant.as_deref(), Some("control"));
+        }
+        for id in [other, plain] {
+            let row = PromptRepository::find_by_id(&db, id).await.unwrap().unwrap();
+            assert!(row.messages.contains("hello"));
+            assert_eq!(row.response.as_deref(), Some("world"));
+        }
+
+        // Already redacted rows are not rewritten.
+        assert_eq!(db.redact_experiment_content(7).await.unwrap(), 0);
+        assert_eq!(db.redact_experiment_content(99).await.unwrap(), 0);
+    }
+
     #[test]
     fn nearest_rank_offset_is_clamped() {
         assert_eq!(LatencySummary::nearest_rank_offset(5, 0.5), 2);
@@ -400,5 +809,65 @@ mod tests {
         assert_eq!(LatencySummary::nearest_rank_offset(0, 0.5), 0);
         assert_eq!(LatencySummary::nearest_rank_offset(3, 1.0), 2);
         assert_eq!(LatencySummary::nearest_rank_offset(3, 0.0), 0);
+    }
+
+    async fn insert_experiment_prompt(
+        db: &SqliteDb,
+        run: &str,
+        experiment: (i64, &str),
+        latency_ms: Option<i64>,
+        messages: &str,
+        response: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO prompts (user_id, request_model, routed_model, provider, messages, response, \
+             prompt_tokens, completion_tokens, cost_usd, latency_ms, tags, \
+             attribution_correlation_id, attribution_tags, experiment_id, experiment_variant, \
+             created_at) \
+             VALUES (1, 'req', 'X', 'p', ?, ?, 0, 0, 0.0, ?, '[]', ?, '{}', ?, ?, '2026-03-02T00:00:00Z')",
+        )
+        .bind(messages)
+        .bind(response)
+        .bind(latency_ms)
+        .bind(run)
+        .bind(experiment.0)
+        .bind(experiment.1)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_run_latency_averages_positive_samples_per_run() {
+        let db = make_db().await;
+        insert_experiment_prompt(&db, "a", (7, "control"), Some(100), "[]", None).await;
+        insert_experiment_prompt(&db, "a", (7, "control"), Some(300), "[]", None).await;
+        insert_experiment_prompt(&db, "a", (7, "control"), None, "[]", None).await;
+        insert_experiment_prompt(&db, "b", (7, "candidate"), Some(0), "[]", None).await;
+        insert_experiment_prompt(&db, "c", (8, "control"), Some(50), "[]", None).await;
+
+        let rows = db.experiment_run_latency(7).await.unwrap();
+        assert_eq!(rows.len(), 1, "run b has no positive sample: {rows:?}");
+        assert_eq!((rows[0].user_id, rows[0].correlation_id.as_str()), (1, "a"));
+        assert_eq!(rows[0].samples, 2);
+        assert_eq!(rows[0].mean_ms, Some(200.0));
+
+        let variant = ArmFilter::Variant { experiment_id: 7, variant: "control".to_string() };
+        let summary = db.latency_summary(&variant, "1970-01-01T00:00:00Z", "9999-12-31T00:00:00Z").await.unwrap();
+        assert_eq!(summary.samples, 2);
+        assert_eq!(summary.mean_ms, Some(200.0));
+        assert_eq!(variant.label(), "experiment=7:control");
+    }
+
+    #[tokio::test]
+    async fn experiment_content_bytes_sum_messages_and_responses() {
+        let db = make_db().await;
+        insert_experiment_prompt(&db, "a", (7, "control"), None, "[\"héllo\"]", Some("ok")).await;
+        insert_experiment_prompt(&db, "b", (7, "candidate"), None, "[]", None).await;
+        insert_experiment_prompt(&db, "c", (8, "control"), None, "[\"other\"]", Some("no")).await;
+
+        let expected = ("[\"héllo\"]".len() + "ok".len() + "[]".len()) as i64;
+        assert_eq!(db.experiment_content_bytes(7).await.unwrap(), expected);
+        assert_eq!(db.experiment_content_bytes(9).await.unwrap(), 0);
     }
 }

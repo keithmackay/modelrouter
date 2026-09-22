@@ -1,0 +1,169 @@
+{% if message %}
+<div class="stat-card" style="padding:1.25rem;">
+    <p style="color:#c0392b;margin:0;"><strong>Cannot show results:</strong> {{ message }}</p>
+</div>
+{% else %}
+<div class="stat-card" id="experiment-results" style="margin-bottom:1.25rem;">
+    <h3 style="margin-top:0;">
+        Results: <code>{{ experiment.name }}</code>
+        {% if experiment.status == "active" %}
+        <span class="tag tag-enabled">{{ experiment.status }}</span>
+        {% else %}
+        <span class="tag tag-disabled">{{ experiment.status }}</span>
+        {% endif %}
+        {% if experiment.retain_content %}
+        <span class="tag" style="background:#e8e4f5;color:#4a3b8c;">retains content · {{ experiment.retention }}</span>
+        {% endif %}
+        <span style="font-size:0.75rem;color:#999;font-weight:normal;margin-left:0.5rem;">computed {{ computed_at }} UTC · expires {{ experiment.expires }}</span>
+    </h3>
+    <div class="stat-grid" style="margin-bottom:0.5rem;">
+        <div>
+            <div class="stat-label">Runs</div>
+            <div class="stat-value">{{ totals.runs }}</div>
+            <div style="font-size:0.75rem;color:#777;">{{ totals.mixed_runs }} mixed</div>
+        </div>
+        <div>
+            <div class="stat-label">Requests</div>
+            <div class="stat-value">{{ totals.requests }}</div>
+            <div style="font-size:0.75rem;color:#777;">{{ totals.unbound_requests }} unbound · {{ totals.failures }} failed</div>
+        </div>
+        <div>
+            <div class="stat-label">Cost</div>
+            <div class="stat-value">{{ totals.cost }}</div>
+            <div style="font-size:0.75rem;color:#777;">saved {{ totals.saved }} · {{ totals.tokens }} tokens</div>
+        </div>
+        {% if retained_content_bytes is not none %}
+        <div>
+            <div class="stat-label">Retained content</div>
+            <div class="stat-value">{{ retained_content_bytes }}</div>
+            <div style="font-size:0.75rem;color:#777;">bytes of stored prompts and responses</div>
+        </div>
+        {% endif %}
+        <div>
+            <div class="stat-label">Outcomes</div>
+            <div class="stat-value">{{ totals.success_rate }}</div>
+            <div style="font-size:0.75rem;color:#777;">success rate over {{ totals.outcomes_reported }} reported</div>
+        </div>
+    </div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1.25rem;margin-bottom:1.25rem;">
+    {% for v in cards %}
+    <div class="stat-card variant-card">
+        <h3 style="margin-top:0;">
+            <code>{{ v.label }}</code>
+            {% if v.unpriced %}
+            <span style="background:#fff3cd;color:#856404;padding:0.15rem 0.5rem;border-radius:3px;font-weight:600;font-size:0.75rem;">unpriced</span>
+            {% endif %}
+        </h3>
+        <p style="font-size:0.78rem;color:#777;margin:0 0 0.75rem;">
+            {% for t in v.targets %}<code>{{ t }}</code>{% if not loop.last %}<br>{% endif %}{% endfor %}
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:0.85rem;box-shadow:none;">
+            <tbody>
+                {% for line in v.lines %}
+                <tr>
+                    <td style="padding:0.3rem 0.5rem;color:#555;">{{ line.label }}</td>
+                    <td style="padding:0.3rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ line.value }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% if v.unpriced %}
+        <p style="font-size:0.78rem;color:#856404;margin:0.5rem 0 0;">
+            Cost is understated: no price is configured for
+            {% for m in v.unpriced_models %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+        </p>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+
+<div class="stat-card" style="margin-bottom:1.25rem;">
+    <h3 style="margin-top:0;">Per model</h3>
+    <table style="box-shadow:none;">
+        <thead>
+            <tr>
+                <th>Variant</th>
+                <th>Model</th>
+                <th style="text-align:right;">Requests</th>
+                <th style="text-align:right;">Cost</th>
+                <th style="text-align:right;">Saved</th>
+                <th style="text-align:right;">Tokens in</th>
+                <th style="text-align:right;">Tokens out</th>
+                <th style="text-align:right;">Estimated rows</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for m in models %}
+            <tr>
+                <td><code>{{ m.variant }}</code></td>
+                <td><code>{{ m.model }}</code>{% if m.unpriced %} <span style="background:#fff3cd;color:#856404;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.7rem;">unpriced</span>{% endif %}</td>
+                <td style="text-align:right;">{{ m.requests }}</td>
+                <td style="text-align:right;">{{ m.cost_usd|money }}</td>
+                <td style="text-align:right;">{{ m.saved_usd|money }}</td>
+                <td style="text-align:right;">{{ m.tokens_in }}</td>
+                <td style="text-align:right;">{{ m.tokens_out }}</td>
+                <td style="text-align:right;">{{ m.estimated_rows }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" style="color:#999;font-style:italic;">No stamped requests yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="stat-card">
+    <h3 style="margin-top:0;">
+        Runs
+        <span style="font-size:0.75rem;color:#999;font-weight:normal;margin-left:0.5rem;">
+            {% if paging.total == 0 %}none{% else %}{{ paging.from }}–{{ paging.to }} of {{ paging.total }}{% endif %}
+        </span>
+    </h3>
+    <table id="experiment-runs" style="box-shadow:none;">
+        <thead>
+            <tr>
+                <th>Variant</th>
+                <th>User</th>
+                <th>Correlation id</th>
+                <th style="text-align:right;">Turns</th>
+                <th style="text-align:right;">Requests</th>
+                <th style="text-align:right;">Cost</th>
+                <th style="text-align:right;">Span</th>
+                <th style="text-align:right;">Latency</th>
+                <th style="text-align:right;">Failures</th>
+                <th>Outcome</th>
+                <th>Last activity</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in runs %}
+            <tr class="run-row">
+                <td><code>{{ r.variant }}</code>{% if r.mixed %} <span class="tag" style="background:#fff3cd;color:#856404;" title="Seen under more than one variant">mixed</span>{% endif %}</td>
+                <td>{{ r.user }}</td>
+                <td><code>{{ r.correlation_id }}</code></td>
+                <td style="text-align:right;">{{ r.turns }}</td>
+                <td style="text-align:right;">{{ r.requests }}{% if r.unbound_requests > 0 %} <span style="color:#999;" title="Requests sent without the experiment header">+{{ r.unbound_requests }} unbound</span>{% endif %}</td>
+                <td style="text-align:right;">{{ r.cost_usd|money }}</td>
+                <td style="text-align:right;">{{ r.span }}</td>
+                <td style="text-align:right;">{{ r.latency }}</td>
+                <td style="text-align:right;">{{ r.failures }}</td>
+                <td>{{ r.outcome }}</td>
+                <td style="white-space:nowrap;">{{ r.last_at }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="11" style="color:#999;font-style:italic;">No runs recorded.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <div class="pagination">
+        {% if paging.prev %}<a href="#experiment-results" hx-get="{{ paging.prev }}" hx-target="#panels" hx-swap="innerHTML">← Previous</a>{% endif %}
+        {% if paging.next %}<a href="#experiment-results" hx-get="{{ paging.next }}" hx-target="#panels" hx-swap="innerHTML">Next →</a>{% endif %}
+    </div>
+    <p style="font-size:0.78rem;color:#777;margin:0.75rem 0 0;">
+        A run is every request sharing a user and correlation id. Run-level figures follow the variant of the
+        run's earliest stamped request; request-level figures follow the variant stamped on each request, so
+        a mixed run is split. Latency comes from the prompt log and is absent where nothing was measured.
+    </p>
+</div>
+{% endif %}

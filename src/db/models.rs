@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -156,6 +158,18 @@ pub struct Prompt {
     pub cache_write_tokens: i64,
     pub cost_usd: f64,
     pub latency_ms: Option<i64>,
+    /// Time to first token: response headers (non-streamed) or first chunk
+    /// (streamed) after dispatching the provider request. `None` where it was
+    /// not measured (older rows, cache hits, SDKs with no header/body split).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub ttft_ms: Option<i64>,
+    /// Provider calls this request took before the recorded response; 1 is
+    /// first-try success. `None` where it was not tracked (older rows, cache
+    /// hits, endpoints without a retry loop).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub attempts: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     /// Caller-supplied correlation id for this request. See `api::attribution`.
@@ -166,6 +180,14 @@ pub struct Prompt {
     #[sqlx(default)]
     #[serde(default = "empty_json_object")]
     pub attribution_tags: String,
+    /// Experiment this request was bound to, and the variant label, when the
+    /// caller sent `x-modelrouter-experiment`. See `db::models::Experiment`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub experiment_id: Option<i64>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub experiment_variant: Option<String>,
     pub created_at: String,
 }
 
@@ -229,6 +251,13 @@ pub struct RequestFailure {
     pub project: Option<String>,
     pub attribution_correlation_id: Option<String>,
     pub attribution_tags: String,
+    /// Experiment binding of the failed request, when there was one.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub experiment_id: Option<i64>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub experiment_variant: Option<String>,
     pub created_at: String,
 }
 
@@ -251,6 +280,8 @@ pub struct NewRequestFailure {
     pub project: Option<String>,
     pub attribution_correlation_id: Option<String>,
     pub attribution_tags: String,
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
 }
 
 #[derive(Debug)]
@@ -269,10 +300,16 @@ pub struct NewPrompt {
     pub cache_write_tokens: i64,
     pub cost_usd: f64,
     pub latency_ms: Option<i64>,
+    /// See [`Prompt::ttft_ms`].
+    pub ttft_ms: Option<i64>,
+    /// See [`Prompt::attempts`].
+    pub attempts: Option<i64>,
     pub tags: String,
     pub project: Option<String>,
     pub attribution_correlation_id: Option<String>,
     pub attribution_tags: String,
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -308,6 +345,18 @@ pub struct CostLedgerEntry {
     #[sqlx(default)]
     #[serde(default = "empty_json_object")]
     pub attribution_tags: String,
+    /// Experiment binding of the request that produced this row, when any.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub experiment_id: Option<i64>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub experiment_variant: Option<String>,
+    /// True when the provider reported no usage and the token counts were
+    /// estimated locally, so aggregates can say how much is measured.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +372,9 @@ pub struct NewCostLedgerEntry {
     pub api_key_id: Option<i64>,
     pub attribution_correlation_id: Option<String>,
     pub attribution_tags: String,
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
+    pub tokens_estimated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -504,6 +556,117 @@ pub struct NewModelAlias {
     pub alias: String,
     pub target: String,
     pub created_by: Option<String>,
+}
+
+/// Where one variant sends a requested model (spec §7a).
+///
+/// `target` is the expression the operator wrote (an alias or `provider/model`);
+/// `provider` and `model` are what it resolved to when the experiment was
+/// created. Binding uses the resolved pair, so an alias edit afterwards changes
+/// ordinary traffic but never an active experiment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantTarget {
+    pub target: String,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Variant label -> (requested model -> pinned target).
+pub type ExperimentVariants = BTreeMap<String, BTreeMap<String, VariantTarget>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExperimentStatus {
+    Active,
+    Closed,
+}
+
+impl ExperimentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExperimentStatus::Active => "active",
+            ExperimentStatus::Closed => "closed",
+        }
+    }
+
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "active" => Ok(ExperimentStatus::Active),
+            "closed" => Ok(ExperimentStatus::Closed),
+            other => anyhow::bail!("unknown experiment status: {other}"),
+        }
+    }
+}
+
+/// A controlled experiment (spec §7a). See migrations/029_experiments.sql.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Experiment {
+    pub id: i64,
+    pub name: String,
+    pub variants: ExperimentVariants,
+    /// User ids allowed to bind. Empty means every key may bind.
+    pub allowed_user_ids: Vec<i64>,
+    pub status: ExperimentStatus,
+    /// Stored and returned for the later learning work; nothing reads it yet.
+    pub feed_learning: bool,
+    /// Unix seconds; 0 means never.
+    pub expires_at: i64,
+    pub created_at: String,
+    pub closed_at: Option<String>,
+    pub retain_content: bool,
+    /// Days after close that retained content is kept; 0 means forever.
+    pub content_retention_days: i64,
+}
+
+/// An experiment to create. `expires_at` and `content_retention_days` are
+/// deliberately not defaulted anywhere: the caller must say `0` to mean never.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewExperiment {
+    pub name: String,
+    pub variants: ExperimentVariants,
+    pub allowed_user_ids: Vec<i64>,
+    pub feed_learning: bool,
+    pub expires_at: i64,
+    pub retain_content: bool,
+    pub content_retention_days: i64,
+}
+
+/// The reported result of one run, keyed by user and correlation id. See
+/// migrations/029_experiments.sql.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RunOutcome {
+    pub user_id: i64,
+    pub attribution_correlation_id: String,
+    /// `success` or `failure`.
+    pub outcome: String,
+    pub score: Option<f64>,
+    pub rating: Option<i64>,
+    /// Bounded metadata; never prompt or response content.
+    pub note: Option<String>,
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRunOutcome {
+    pub user_id: i64,
+    pub attribution_correlation_id: String,
+    pub outcome: String,
+    pub score: Option<f64>,
+    pub rating: Option<i64>,
+    pub note: Option<String>,
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
+}
+
+/// The experiment binding of a run, read from its earliest stamped ledger row.
+/// Both fields are `None` when the run has ledger rows but none was stamped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunStamp {
+    pub experiment_id: Option<i64>,
+    pub experiment_variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

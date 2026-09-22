@@ -250,22 +250,29 @@ fn validate_project(raw: &str) -> Result<String, AttributionError> {
 }
 
 fn validate_correlation_id(raw: &str) -> Result<String, AttributionError> {
+    validate_correlation_id_field("attribution.correlation_id", raw)
+}
+
+/// Shape rules for a correlation id wherever a caller supplies one; `field`
+/// names the offending input in the error so each surface reports its own
+/// field path.
+pub(crate) fn validate_correlation_id_field(
+    field: &str,
+    raw: &str,
+) -> Result<String, AttributionError> {
     let v = raw.trim();
     if v.is_empty() {
-        return Err(AttributionError(
-            "attribution.correlation_id must not be empty".to_string(),
-        ));
+        return Err(AttributionError(format!("{field} must not be empty")));
     }
     if v.chars().count() > MAX_CORRELATION_LEN {
         return Err(AttributionError(format!(
-            "attribution.correlation_id must be at most {} characters",
-            MAX_CORRELATION_LEN
+            "{field} must be at most {MAX_CORRELATION_LEN} characters"
         )));
     }
     if !is_safe(v) {
-        return Err(AttributionError(
-            "attribution.correlation_id contains unsupported characters".to_string(),
-        ));
+        return Err(AttributionError(format!(
+            "{field} contains unsupported characters"
+        )));
     }
     Ok(v.to_string())
 }

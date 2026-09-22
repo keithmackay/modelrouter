@@ -1,9 +1,12 @@
 //! Side-by-side comparison of two experiment arms (spec §7b).
 //!
 //! An arm is a slice of recorded traffic — one model, one provider, one tag
-//! value or one correlation id. The router never assigns arms; a client forms
-//! them by choosing a model per arm and tagging each request, and this module
-//! partitions what the ledger, the prompt log and the failure log recorded.
+//! value, one correlation id, or one variant of a controlled experiment (spec
+//! §7a). For the first four the router never assigns arms; a client forms them
+//! by choosing a model per arm and tagging each request. A variant arm is the
+//! rows the router stamped while the request was bound to that variant. Either
+//! way this module only partitions what the ledger, the prompt log and the
+//! failure log recorded.
 //!
 //! One builder serves three consumers: the JSON endpoint here, the dashboard
 //! panels, and `modelrouter report compare`. The dashboard and CLI must show
@@ -18,12 +21,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::app::{AppState, DatabaseProvider};
 use crate::api::error::ApiError;
+use crate::db::models::{Experiment, ExperimentStatus};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals, CostRepository,
 };
+use crate::db::repositories::experiments::{ExperimentRepository, ExperimentStatusFilter};
 use crate::db::repositories::failures::FailureRepository;
 use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
 use crate::router::cost::CostCalculator;
+use crate::router::experiments::is_valid_label;
 
 use super::attribution::{window_range, FACET_LIMIT};
 use super::auth::AdminSession;
@@ -33,13 +39,22 @@ use super::dashboard::{DashboardError, DashboardSession};
 /// them verbatim; tests pin their presence, not their wording.
 pub const CAVEAT_QUALITY: &str = "This comparison has no quality column. A difference in cost or \
     latency is not evidence of a difference in answer quality.";
+/// Replaces `CAVEAT_QUALITY` for the variant dimension: an experiment's runs
+/// can carry reported outcomes, but they are read on its results page, not here.
+pub const CAVEAT_QUALITY_VARIANT: &str = "This comparison has no quality column. A difference \
+    in cost or latency is not evidence of a difference in answer quality; the outcomes reported \
+    for this experiment's runs are on its results page under /admin/experiments.";
 pub const CAVEAT_STREAMING: &str = "Streamed responses record estimated or zero tokens and, on the \
     messages API, a placeholder latency; they are indistinguishable from measured rows here. \
     Send experiment traffic with stream: false.";
-pub const TTFT_NOTE: &str =
-    "Time to first token is not recorded by the router today, so it cannot be compared.";
+/// Shown instead of the `ttft` block when neither arm has a sample. Rows
+/// written before TTFT recording shipped carry none, as do cache hits and
+/// providers whose SDK exposes no header/body split.
+pub const TTFT_NOTE: &str = "Time to first token has no recorded samples for these arms in this \
+    window; TTFT is recorded per request (response headers for non-streamed provider calls, \
+    first chunk for streamed ones), so older rows carry none.";
 
-pub const DIMENSIONS: [&str; 4] = ["model", "provider", "tag", "run"];
+pub const DIMENSIONS: [&str; 5] = ["model", "provider", "tag", "run", "variant"];
 pub const WINDOWS: [&str; 4] = ["all", "daily", "weekly", "monthly"];
 /// Longest arm value accepted. Wider than every ingest bound in
 /// `api::attribution` (correlation ids and tag values stop at 128) so any
@@ -53,7 +68,8 @@ pub const MAX_ARM_LEN: usize = 256;
 pub struct CompareQuery {
     #[serde(default)]
     pub dimension: String,
-    /// Tag key; required when `dimension = tag`, ignored otherwise.
+    /// Tag key when `dimension = tag`; experiment id when `dimension =
+    /// variant`; ignored otherwise.
     #[serde(default)]
     pub key: String,
     #[serde(default)]
@@ -69,6 +85,8 @@ pub struct CompareQuery {
 pub struct ValidatedQuery {
     pub dimension: String,
     pub key: Option<String>,
+    /// The parsed `key` when `dimension = variant`.
+    pub experiment_id: Option<i64>,
     pub a: String,
     pub b: String,
     pub arm_a: ArmFilter,
@@ -115,6 +133,7 @@ impl CompareQuery {
             )));
         }
 
+        let mut experiment_id = None;
         let key = match dimension {
             "tag" => {
                 let key = self.key.trim();
@@ -137,6 +156,33 @@ impl CompareQuery {
                 }
                 Some(key.to_string())
             }
+            "variant" => {
+                // The id and the labels are checked here, without the
+                // database, so the CLI fails fast on a typo; whether the
+                // experiment exists and declares the labels is checked by
+                // `build_comparison`, which is the first place with a handle.
+                let key = self.key.trim();
+                let id = match key.parse::<i64>() {
+                    Ok(id) if id > 0 => id,
+                    _ => {
+                        return Err(CompareError::Invalid(
+                            "key must be an experiment id (a positive integer) when dimension=variant"
+                                .to_string(),
+                        ))
+                    }
+                };
+                for (field, label) in [("a", a), ("b", b)] {
+                    if !is_valid_label(label) {
+                        return Err(CompareError::Invalid(format!(
+                            "{field} must be a variant label: letters, digits, '_', '.' or '-', \
+                             at most {} characters",
+                            crate::router::experiments::MAX_LABEL_LEN
+                        )));
+                    }
+                }
+                experiment_id = Some(id);
+                Some(id.to_string())
+            }
             _ => None,
         };
 
@@ -147,6 +193,10 @@ impl CompareQuery {
                 key: key.clone().unwrap_or_default(),
                 value: value.to_string(),
             }),
+            "variant" => ArmFilter::Variant {
+                experiment_id: experiment_id.unwrap_or_default(),
+                variant: value.to_string(),
+            },
             _ => ArmFilter::Attribution(AttributionFilter::CorrelationId(value.to_string())),
         };
         let (arm_a, arm_b) = (arm(a), arm(b));
@@ -154,6 +204,7 @@ impl CompareQuery {
         Ok(ValidatedQuery {
             dimension: dimension.to_string(),
             key,
+            experiment_id,
             a: a.to_string(),
             b: b.to_string(),
             arm_a,
@@ -204,7 +255,8 @@ impl From<CompareError> for super::dashboard::DashboardError {
 /// assembles it from settings without constructing an `AppState`.
 #[derive(Clone)]
 pub struct CompareSources {
-    /// Ledger and failure log.
+    /// Ledger, failure log and the `experiments` table (the variant
+    /// dimension reads the experiment through `ExperimentRepository` here).
     pub db: Arc<dyn DatabaseProvider>,
     /// Prompt log, which may live in a separate database.
     pub prompt_db: Arc<dyn DatabaseProvider>,
@@ -244,6 +296,18 @@ pub struct ArmMetrics {
     /// `failures / (requests + failures)`; `0.0` when both are zero.
     pub error_rate: f64,
     pub latency: LatencySummary,
+    /// Time to first token over the same prompt rows; `samples` is 0 where
+    /// nothing was measured (see [`TTFT_NOTE`]).
+    pub ttft: LatencySummary,
+    /// Prompt rows that recorded a provider-attempt count; rows from before
+    /// the column shipped carry none.
+    pub attempts_tracked: i64,
+    /// Total provider calls across those rows; 1 per request when nothing
+    /// was retried. Distinct from `failures`, which counts requests that
+    /// never succeeded at all.
+    pub attempts: i64,
+    /// Requests that took more than one attempt (a retry or failover hop).
+    pub retried_requests: i64,
     /// True when any model in the arm is unpriced — it has no pricing entry
     /// now, or its ledger rows carry tokens but no spend (recorded before a
     /// price existed) — so `cost_usd` is incomplete.
@@ -314,6 +378,7 @@ impl Deltas {
 pub struct CoverageArm {
     pub requests: i64,
     pub latency_samples: i64,
+    pub ttft_samples: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -324,6 +389,91 @@ pub struct Coverage {
     pub incomplete_pairs: Option<i64>,
 }
 
+/// The experiment behind a variant comparison (R21): enough for the page and
+/// the CLI to say what the arms are and whether their content was stored.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ComparedExperiment {
+    pub id: i64,
+    pub name: String,
+    pub status: ExperimentStatus,
+    pub retain_content: bool,
+    /// Days after close that retained content is kept; 0 means forever.
+    pub content_retention_days: i64,
+    /// Whether the prompt log holds the content behind both arms; printed
+    /// verbatim by the page and the CLI.
+    pub stored_content_note: String,
+}
+
+impl ComparedExperiment {
+    fn from_experiment(exp: &Experiment) -> Self {
+        let stored_content_note = if exp.retain_content {
+            let kept = if exp.content_retention_days == 0 {
+                "are never purged".to_string()
+            } else {
+                format!(
+                    "are purged {} days after the experiment closes",
+                    exp.content_retention_days
+                )
+            };
+            format!(
+                "Stored content: experiment {} retains content, so the prompts and responses \
+                 behind both arms are in the prompt log and {}.",
+                exp.name, kept
+            )
+        } else {
+            format!(
+                "Stored content: experiment {} does not retain content; prompts and responses \
+                 behind these arms are stored only as the global prompt log settings allow.",
+                exp.name
+            )
+        };
+        Self {
+            id: exp.id,
+            name: exp.name.clone(),
+            status: exp.status,
+            retain_content: exp.retain_content,
+            content_retention_days: exp.content_retention_days,
+            stored_content_note,
+        }
+    }
+}
+
+/// Time to first token, arm against arm. Present only when at least one arm
+/// has a sample; otherwise `ttft` is `null` and `ttft_note` says why.
+#[derive(Debug, Clone, Serialize)]
+pub struct TtftComparison {
+    pub a: LatencySummary,
+    pub b: LatencySummary,
+    pub delta: TtftDeltas,
+}
+
+/// B minus A over the TTFT figures; `None` when either side has no samples.
+#[derive(Debug, Clone, Serialize)]
+pub struct TtftDeltas {
+    pub mean_ms: Option<Delta>,
+    pub p50_ms: Option<Delta>,
+    pub p95_ms: Option<Delta>,
+}
+
+impl TtftComparison {
+    /// `Some` when either arm measured TTFT.
+    fn between(a: &ArmMetrics, b: &ArmMetrics) -> Option<TtftComparison> {
+        if a.ttft.samples == 0 && b.ttft.samples == 0 {
+            return None;
+        }
+        let fi = |v: Option<i64>| v.map(|v| v as f64);
+        Some(TtftComparison {
+            a: a.ttft.clone(),
+            b: b.ttft.clone(),
+            delta: TtftDeltas {
+                mean_ms: Delta::opt(a.ttft.mean_ms, b.ttft.mean_ms),
+                p50_ms: Delta::opt(fi(a.ttft.p50_ms), fi(b.ttft.p50_ms)),
+                p95_ms: Delta::opt(fi(a.ttft.p95_ms), fi(b.ttft.p95_ms)),
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Comparison {
     pub dimension: String,
@@ -331,13 +481,18 @@ pub struct Comparison {
     pub window: String,
     pub start: String,
     pub end: String,
+    /// Set for the variant dimension only.
+    pub experiment: Option<ComparedExperiment>,
     pub a: ArmMetrics,
     pub b: ArmMetrics,
     pub delta: Deltas,
     pub coverage: Coverage,
-    /// Never populated today; see `ttft_note`.
-    pub ttft: Option<()>,
-    pub ttft_note: &'static str,
+    /// TTFT of the two arms; `null` (with `ttft_note` set) when neither arm
+    /// has a recorded sample.
+    pub ttft: Option<TtftComparison>,
+    /// Why `ttft` is `null`; absent when it is populated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_note: Option<&'static str>,
     pub caveats: [&'static str; 2],
 }
 
@@ -359,30 +514,68 @@ pub async fn build_comparison(
     query: &CompareQuery,
 ) -> Result<Comparison, CompareError> {
     let q = query.validate()?;
+    let experiment = match q.experiment_id {
+        Some(id) => Some(load_experiment(sources, id, &q.a, &q.b).await?),
+        None => None,
+    };
     let (a, b) = tokio::try_join!(
         arm_metrics(sources, &q.arm_a, &q.a, &q.start, &q.end),
         arm_metrics(sources, &q.arm_b, &q.b, &q.start, &q.end),
     )?;
     let delta = Deltas::between(&a, &b);
     let coverage = Coverage {
-        a: CoverageArm { requests: a.requests, latency_samples: a.latency.samples },
-        b: CoverageArm { requests: b.requests, latency_samples: b.latency.samples },
+        a: CoverageArm {
+            requests: a.requests,
+            latency_samples: a.latency.samples,
+            ttft_samples: a.ttft.samples,
+        },
+        b: CoverageArm {
+            requests: b.requests,
+            latency_samples: b.latency.samples,
+            ttft_samples: b.ttft.samples,
+        },
         incomplete_pairs: None,
     };
+    let ttft = TtftComparison::between(&a, &b);
+    let ttft_note = ttft.is_none().then_some(TTFT_NOTE);
+    let quality = if experiment.is_some() { CAVEAT_QUALITY_VARIANT } else { CAVEAT_QUALITY };
     Ok(Comparison {
         dimension: q.dimension,
         key: q.key,
         window: q.window,
         start: q.start,
         end: q.end,
+        experiment,
         a,
         b,
         delta,
         coverage,
-        ttft: None,
-        ttft_note: TTFT_NOTE,
-        caveats: [CAVEAT_QUALITY, CAVEAT_STREAMING],
+        ttft,
+        ttft_note,
+        caveats: [quality, CAVEAT_STREAMING],
     })
+}
+
+/// The experiment behind a variant comparison, or the validation error the
+/// CLI and the dashboard both report: no such id, or a label it never
+/// declared. Labels have passed the charset check, so echoing them is safe.
+async fn load_experiment(
+    sources: &CompareSources,
+    id: i64,
+    a: &str,
+    b: &str,
+) -> Result<ComparedExperiment, CompareError> {
+    let exp = ExperimentRepository::get(&*sources.db, id)
+        .await?
+        .ok_or_else(|| CompareError::Invalid(format!("key: experiment {id} does not exist")))?;
+    for (field, label) in [("a", a), ("b", b)] {
+        if !exp.variants.contains_key(label) {
+            return Err(CompareError::Invalid(format!(
+                "{field}: experiment {id} has no variant {label}"
+            )));
+        }
+    }
+    Ok(ComparedExperiment::from_experiment(&exp))
 }
 
 /// Rows that consumed tokens on a real provider call yet recorded no spend
@@ -399,19 +592,21 @@ async fn arm_metrics(
     start: &str,
     end: &str,
 ) -> anyhow::Result<ArmMetrics> {
-    let (totals, by_model, by_day, latency, failures) = tokio::try_join!(
+    let (totals, by_model, by_day, latency, ttft, attempt_totals, failures) = tokio::try_join!(
         CostRepository::arm_totals(&*sources.db, filter, start, end),
         CostRepository::arm_by_model(&*sources.db, filter, start, end),
         CostRepository::arm_by_day(&*sources.db, filter, start, end),
         PromptRepository::latency_summary(&*sources.prompt_db, filter, start, end),
+        PromptRepository::ttft_summary(&*sources.prompt_db, filter, start, end),
+        PromptRepository::attempts_summary(&*sources.prompt_db, filter, start, end),
         FailureRepository::count_for_arm(&*sources.db, filter, start, end),
     )?;
 
     let per_request = |v: f64| {
         if totals.requests == 0 { None } else { Some(v / totals.requests as f64) }
     };
-    let attempts = totals.requests + failures;
-    let error_rate = if attempts == 0 { 0.0 } else { failures as f64 / attempts as f64 };
+    let outcomes = totals.requests + failures;
+    let error_rate = if outcomes == 0 { 0.0 } else { failures as f64 / outcomes as f64 };
     let unpriced_models: Vec<String> = by_model
         .iter()
         .filter(|row| !sources.cost_calc.has_price(&row.key) || recorded_unpriced(&row.totals))
@@ -434,6 +629,10 @@ async fn arm_metrics(
         failures,
         error_rate,
         latency,
+        ttft,
+        attempts_tracked: attempt_totals.requests_tracked,
+        attempts: attempt_totals.attempts,
+        retried_requests: attempt_totals.retried_requests,
         unpriced: !unpriced_models.is_empty(),
         unpriced_models,
         by_day,
@@ -491,6 +690,7 @@ pub async fn get_compare_page(
     let internal = |_| DashboardError::Internal;
 
     let mut keys: Vec<String> = Vec::new();
+    let mut experiments: Vec<ExperimentOption> = Vec::new();
     let mut key: Option<String> = None;
     let values: Vec<String> = match dimension {
         "model" => CostRepository::distinct_models_in_ledger(db).await.map_err(internal)?,
@@ -511,10 +711,29 @@ pub async fn get_compare_page(
                 Vec::new()
             }
         }
+        "variant" => {
+            // Every experiment, closed ones included: a closed experiment is
+            // exactly the one whose arms are worth comparing. The key slot
+            // submits the id; the arms are the labels the experiment declares.
+            let all = ExperimentRepository::list(db, ExperimentStatusFilter::All)
+                .await
+                .map_err(internal)?;
+            let chosen = q.key.trim().parse::<i64>().ok();
+            let mut values = Vec::new();
+            for exp in &all {
+                if chosen == Some(exp.id) {
+                    key = Some(exp.id.to_string());
+                    values = exp.variants.keys().cloned().collect();
+                }
+            }
+            experiments = all.iter().map(ExperimentOption::from_experiment).collect();
+            values
+        }
         _ => CostRepository::distinct_recent_correlation_ids(db, FACET_LIMIT)
             .await
             .map_err(internal)?,
     };
+    let caveat_quality = if dimension == "variant" { CAVEAT_QUALITY_VARIANT } else { CAVEAT_QUALITY };
 
     super::dashboard::render(
         "compare.html",
@@ -525,10 +744,31 @@ pub async fn get_compare_page(
             sel_b => q.b,
             sel_window => window,
             keys => keys,
+            experiments => experiments,
             values => values,
-            caveat_quality => CAVEAT_QUALITY,
+            caveat_quality => caveat_quality,
         },
     )
+}
+
+/// One entry of the experiment picker on the page.
+#[derive(Debug, Serialize)]
+struct ExperimentOption {
+    /// The id as the form submits it, so the template compares strings.
+    id: String,
+    /// The name, with closed experiments marked so they can still be picked
+    /// but are not mistaken for live ones.
+    text: String,
+}
+
+impl ExperimentOption {
+    fn from_experiment(exp: &Experiment) -> Self {
+        let text = match exp.status {
+            ExperimentStatus::Active => exp.name.clone(),
+            ExperimentStatus::Closed => format!("{} (closed)", exp.name),
+        };
+        Self { id: exp.id.to_string(), text }
+    }
 }
 
 /// One row of the metric table, pre-formatted so the template only prints.
@@ -540,7 +780,7 @@ struct MetricRow {
     delta: String,
 }
 
-fn fmt_opt<F: Fn(f64) -> String>(v: Option<f64>, f: F) -> String {
+pub(crate) fn fmt_opt<F: Fn(f64) -> String>(v: Option<f64>, f: F) -> String {
     v.map(f).unwrap_or_else(|| "—".to_string())
 }
 
@@ -568,7 +808,7 @@ fn fmt_count(v: f64) -> String {
     format!("{}", v.round() as i64)
 }
 
-fn fmt_ms(v: f64) -> String {
+pub(crate) fn fmt_ms(v: f64) -> String {
     format!("{:.0} ms", v)
 }
 
@@ -621,6 +861,26 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
             a: ms(a.latency.p95_ms),
             b: ms(b.latency.p95_ms),
             delta: fmt_delta(&d.p95_ms, fmt_ms),
+        },
+        // TTFT rows show a dash on rows recorded before it shipped; the
+        // ttft_note on the page says why.
+        MetricRow {
+            label: "Mean TTFT".into(),
+            a: fmt_opt(a.ttft.mean_ms, fmt_ms),
+            b: fmt_opt(b.ttft.mean_ms, fmt_ms),
+            delta: fmt_delta(&c.ttft.as_ref().and_then(|t| t.delta.mean_ms), fmt_ms),
+        },
+        MetricRow {
+            label: "p50 TTFT".into(),
+            a: ms(a.ttft.p50_ms),
+            b: ms(b.ttft.p50_ms),
+            delta: fmt_delta(&c.ttft.as_ref().and_then(|t| t.delta.p50_ms), fmt_ms),
+        },
+        MetricRow {
+            label: "p95 TTFT".into(),
+            a: ms(a.ttft.p95_ms),
+            b: ms(b.ttft.p95_ms),
+            delta: fmt_delta(&c.ttft.as_ref().and_then(|t| t.delta.p95_ms), fmt_ms),
         },
         MetricRow {
             label: "Cache hit rate".into(),
@@ -677,7 +937,38 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
             b: b.failures.to_string(),
             delta: "—".into(),
         },
+        // Attempts count provider calls behind *successful* requests; a dash
+        // means no row in the arm recorded a count (older rows).
+        MetricRow {
+            label: "Attempts".into(),
+            a: fmt_attempts(a),
+            b: fmt_attempts(b),
+            delta: "—".into(),
+        },
+        MetricRow {
+            label: "Retried requests".into(),
+            a: fmt_retried(a),
+            b: fmt_retried(b),
+            delta: "—".into(),
+        },
     ]
+}
+
+/// Total attempts over the rows that tracked them, or a dash when none did.
+fn fmt_attempts(m: &ArmMetrics) -> String {
+    if m.attempts_tracked == 0 {
+        "—".to_string()
+    } else {
+        format!("{} / {} requests", m.attempts, m.attempts_tracked)
+    }
+}
+
+fn fmt_retried(m: &ArmMetrics) -> String {
+    if m.attempts_tracked == 0 {
+        "—".to_string()
+    } else {
+        m.retried_requests.to_string()
+    }
 }
 
 /// Chart payloads. The chart legend shows the raw arm value, which is what
@@ -786,7 +1077,26 @@ mod tests {
         let v = q("run", "ignored", "x", "y", "weekly").validate().unwrap();
         assert_eq!(v.arm_a, ArmFilter::Attribution(AttributionFilter::CorrelationId("x".into())));
         assert_eq!(v.key, None);
+        assert_eq!(v.experiment_id, None);
         assert_eq!(v.window, "weekly");
+        let v = q("variant", " 7 ", "control", "candidate.v2", "all").validate().unwrap();
+        assert_eq!(v.arm_a, ArmFilter::Variant { experiment_id: 7, variant: "control".into() });
+        assert_eq!(v.arm_b, ArmFilter::Variant { experiment_id: 7, variant: "candidate.v2".into() });
+        assert_eq!(v.key.as_deref(), Some("7"));
+        assert_eq!(v.experiment_id, Some(7));
+    }
+
+    #[test]
+    fn validate_variant_checks_the_id_and_the_label_charset_without_a_database() {
+        let err = |query: CompareQuery| query.validate().unwrap_err().to_string();
+        for key in ["", "abc", "0", "-3", "1.5", "99999999999999999999"] {
+            assert!(err(q("variant", key, "x", "y", "all")).starts_with("key"), "key {key:?}");
+        }
+        assert!(err(q("variant", "1", "bad label", "y", "all")).starts_with("a "));
+        assert!(err(q("variant", "1", "x", "b/y", "all")).starts_with("b "));
+        assert!(err(q("variant", "1", &"x".repeat(65), "y", "all")).starts_with("a "));
+        // The label is not echoed before it passes the charset check.
+        assert!(!err(q("variant", "1", "<script>", "y", "all")).contains("<script>"));
     }
 
     #[test]
@@ -799,6 +1109,28 @@ mod tests {
         assert!(err(q("tag", "", "x", "y", "all")).starts_with("key"));
         assert!(err(q("tag", "a b", "x", "y", "all")).contains("tag key"));
         assert!(err(q("model", "", "x", "y", "hourly")).starts_with("window"));
+    }
+
+    #[test]
+    fn stored_content_note_says_whether_content_is_kept_and_for_how_long() {
+        let exp = |retain: bool, days: i64| Experiment {
+            id: 3,
+            name: "exp".into(),
+            variants: Default::default(),
+            allowed_user_ids: vec![],
+            status: ExperimentStatus::Active,
+            feed_learning: false,
+            expires_at: 0,
+            created_at: String::new(),
+            closed_at: None,
+            retain_content: retain,
+            content_retention_days: days,
+        };
+        let note = |retain, days| ComparedExperiment::from_experiment(&exp(retain, days)).stored_content_note;
+        assert!(note(false, 0).contains("does not retain content"), "{}", note(false, 0));
+        assert!(note(true, 0).contains("never purged"), "{}", note(true, 0));
+        assert!(note(true, 30).contains("30 days"), "{}", note(true, 30));
+        assert_eq!(ComparedExperiment::from_experiment(&exp(true, 30)).status, ExperimentStatus::Active);
     }
 
     #[test]

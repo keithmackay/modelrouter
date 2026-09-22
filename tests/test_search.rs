@@ -39,6 +39,26 @@ async fn test_app_with_pricing_and_cache(
     pricing: Vec<PricingEntry>,
     cache: CacheConfig,
 ) -> (TestServer, Arc<dyn DatabaseProvider>) {
+    test_app_full(
+        pricing,
+        cache,
+        SearchRegistry::new_with_mock(common::MockSearchAdapter {
+            results: mock_results(),
+        }),
+        None,
+    )
+    .await
+}
+
+/// Full harness: lets a test choose which search engines the registry can serve
+/// and what `[routing] default_search_engine` says, which is what the
+/// engine-resolution tests below vary.
+async fn test_app_full(
+    pricing: Vec<PricingEntry>,
+    cache: CacheConfig,
+    search_registry: SearchRegistry,
+    default_search_engine: Option<&str>,
+) -> (TestServer, Arc<dyn DatabaseProvider>) {
     let db = common::in_memory_db().await;
     UserRepository::create(
         &db,
@@ -70,6 +90,7 @@ async fn test_app_with_pricing_and_cache(
 
     let mut settings = Settings::default();
     settings.pricing = pricing;
+    settings.routing.default_search_engine = default_search_engine.map(str::to_string);
     let settings = Arc::new(settings);
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
     let router = Arc::new(RequestRouter::new(settings.clone()));
@@ -86,12 +107,11 @@ async fn test_app_with_pricing_and_cache(
             embedding: vec![0.1_f32, 0.2, 0.3],
         },
     ));
-    let search_registry = Arc::new(SearchRegistry::new_with_mock(common::MockSearchAdapter {
-        results: mock_results(),
-    }));
+    let search_registry = Arc::new(search_registry);
 
     let state = AppState {
         settings: settings.clone(),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
         db: db.clone(),
         pool: None,
         router,
@@ -195,6 +215,117 @@ async fn search_unknown_engine_returns_400() {
         .json(&serde_json::json!({ "query": "rust", "engine": "bing" }))
         .await;
     assert_eq!(resp.status_code(), 400);
+}
+
+// ── Engine resolution when the request omits `engine` ────────────────────────
+//
+// These cover the regression that made a Vertex-only host answer every
+// engine-less `/v1/search` with `502 No search adapter configured for engine:
+// tavily`: the route used to hardcode `unwrap_or("tavily")` regardless of what
+// the operator had configured.
+
+fn mock_search_registry(engines: &[&str]) -> SearchRegistry {
+    SearchRegistry::new_with_mock_engines(
+        engines
+            .iter()
+            .map(|e| {
+                let adapter: Arc<dyn modelrouter::providers::search::SearchAdapter> =
+                    Arc::new(common::MockSearchAdapter {
+                        results: mock_results(),
+                    });
+                (*e, adapter)
+            })
+            .collect(),
+    )
+}
+
+async fn search_without_engine(
+    registry: SearchRegistry,
+    default_search_engine: Option<&str>,
+) -> axum_test::TestResponse {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        registry,
+        default_search_engine,
+    )
+    .await;
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust" }))
+        .await
+}
+
+/// The sole available engine serves the request even when it is not Tavily.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_omitted_engine_resolves_to_sole_configured_engine() {
+    let resp = search_without_engine(mock_search_registry(&["vertex"]), None).await;
+    assert_eq!(resp.status_code(), 200);
+}
+
+/// With more than one engine available and no configured default, refuse and
+/// name the options rather than silently substituting one of them.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_omitted_engine_with_multiple_engines_returns_400() {
+    let resp = search_without_engine(mock_search_registry(&["tavily", "vertex"]), None).await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("tavily"), "message was: {message}");
+    assert!(message.contains("vertex"), "message was: {message}");
+}
+
+/// `[routing] default_search_engine` resolves the ambiguity above.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_omitted_engine_uses_configured_default() {
+    let resp =
+        search_without_engine(mock_search_registry(&["tavily", "vertex"]), Some("vertex")).await;
+    assert_eq!(resp.status_code(), 200);
+}
+
+/// An explicit `engine` still wins over the configured default.
+#[cfg(feature = "vertex")]
+#[tokio::test]
+async fn search_explicit_engine_overrides_configured_default() {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        mock_search_registry(&["tavily", "vertex"]),
+        Some("vertex"),
+    )
+    .await;
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "bing" }))
+        .await;
+    // `bing` is unsupported: proof the request's own engine was used, not the
+    // default that would have answered 200.
+    assert_eq!(resp.status_code(), 400);
+}
+
+/// No engines at all is a configuration error the operator can act on, not a
+/// 502 naming an engine they never configured.
+#[tokio::test]
+async fn search_omitted_engine_with_no_engines_returns_400() {
+    let resp = search_without_engine(SearchRegistry::new(HashMap::new()), None).await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no search engine configured"),
+        "message was: {message}"
+    );
 }
 
 #[tokio::test]
@@ -387,4 +518,506 @@ async fn search_is_not_cached_when_the_cache_is_disabled() {
             .unwrap(),
         "MISS"
     );
+}
+
+// ── Search engine fallback chains (issue #42) ────────────────────────────────
+
+/// Build a test app with a custom search registry and fallback chain config.
+async fn test_app_with_chain(
+    registry: SearchRegistry,
+    chains: HashMap<String, Vec<String>>,
+) -> (TestServer, Arc<dyn DatabaseProvider>) {
+    let db = common::in_memory_db().await;
+    UserRepository::create(
+        &db,
+        NewUser {
+            name: "test-user".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let user = UserRepository::find_by_name(&db, "test-user")
+        .await
+        .unwrap()
+        .unwrap();
+    ApiKeyRepository::create_api_key(
+        &db,
+        NewApiKey {
+            user_id: user.id,
+            key_hash: hash_token("test-token"),
+            label: Some("test".to_string()),
+            expires_at: None,
+            project: None,
+            session_window_secs: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut settings = Settings::default();
+    settings.routing.search_fallback_chains = chains;
+    let settings = Arc::new(settings);
+    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    let router = Arc::new(RequestRouter::new(settings.clone()));
+    let cost_calc = Arc::new(CostCalculator::new());
+    let provider_registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
+        response: "hello".to_string(),
+    }));
+    let policy = Arc::new(PolicyEngine::new(db.clone()));
+    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
+    let complexity_router = Arc::new(ComplexityRouter::new(None));
+    let response_cache = Arc::new(ResponseCache::new(&CacheConfig::default()));
+    let embedding_registry = Arc::new(EmbeddingRegistry::new_with_mock(
+        common::MockEmbeddingAdapter {
+            embedding: vec![0.1_f32, 0.2, 0.3],
+        },
+    ));
+    let search_registry = Arc::new(registry);
+
+    let state = AppState {
+        settings: settings.clone(),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
+        db: db.clone(),
+        pool: None,
+        router,
+        cost_calc,
+        provider_registry,
+        policy,
+        fallback,
+        complexity_router,
+        response_cache,
+        embedding_registry,
+        search_registry,
+        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
+            std::collections::HashMap::new(),
+        )),
+        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
+        ip_rate_limiter: Arc::new(
+            modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0),
+        ),
+        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(
+            0, 0,
+        )),
+        session_affinity: Arc::new(
+            modelrouter::router::session_affinity::SessionAffinityMap::new(1800),
+        ),
+        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
+        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        prompt_db: db.clone(),
+        app_metrics: None,
+        callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
+        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+    };
+    (TestServer::new(build_router(state)).unwrap(), db)
+}
+
+#[tokio::test]
+async fn primary_engine_fails_fallback_chain_is_walked() {
+    // Primary "tavily" errors, fallback to "vertex" succeeds.
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "simulated tavily timeout".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::NamedMockSearchAdapter {
+                results: mock_results(),
+                engine_name: "vertex".to_string(),
+            }),
+        ),
+    ]);
+
+    let mut chains = HashMap::new();
+    chains.insert("tavily".to_string(), vec!["vertex".to_string()]);
+
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "tavily" }))
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    // The response metadata must name the serving engine, not the requested one.
+    assert_eq!(body["engine"], "vertex");
+    assert_eq!(body["results"][0]["url"], "https://example.com");
+}
+
+#[tokio::test]
+async fn fallback_chain_exhaustion_surfaces_last_error() {
+    // Both engines fail; the last error is returned.
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "tavily 503 Service Unavailable".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "vertex rate limit exceeded".to_string(),
+            }),
+        ),
+    ]);
+
+    let mut chains = HashMap::new();
+    chains.insert("tavily".to_string(), vec!["vertex".to_string()]);
+
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "tavily" }))
+        .await;
+
+    assert_eq!(resp.status_code(), 502);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap();
+    // The last error in the chain (vertex) should be returned.
+    assert!(
+        message.contains("vertex rate limit exceeded"),
+        "expected last error in message, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn no_chain_configured_behavior_unchanged() {
+    // Without a fallback chain, a single engine failure surfaces immediately.
+    let registry = SearchRegistry::new_with_mock_engines(vec![(
+        "tavily",
+        Arc::new(common::FailingSearchAdapter {
+            error_message: "tavily down".to_string(),
+        }),
+    )]);
+
+    let (server, _db) = test_app_with_chain(registry, HashMap::new()).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "tavily" }))
+        .await;
+
+    assert_eq!(resp.status_code(), 502);
+    let body: serde_json::Value = resp.json();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("tavily down"));
+}
+
+#[tokio::test]
+async fn unconfigured_chain_entry_is_skipped() {
+    // Chain lists "bing" (unconfigured), then "vertex" (configured). "bing" is
+    // skipped; "vertex" serves.
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "tavily down".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::NamedMockSearchAdapter {
+                results: mock_results(),
+                engine_name: "vertex".to_string(),
+            }),
+        ),
+    ]);
+
+    let mut chains = HashMap::new();
+    // "bing" is not registered in the registry above, so it should be skipped.
+    chains.insert("tavily".to_string(), vec!["bing".to_string(), "vertex".to_string()]);
+
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "tavily" }))
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["engine"], "vertex");
+}
+
+#[tokio::test]
+async fn caller_error_does_not_trigger_failover() {
+    // Invalid query (empty) is a caller error (400), not a provider error.
+    // Fallback chains are only walked on provider errors, so this should fail
+    // immediately with 400, not try the next engine.
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::MockSearchAdapter {
+                results: mock_results(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::NamedMockSearchAdapter {
+                results: mock_results(),
+                engine_name: "vertex".to_string(),
+            }),
+        ),
+    ]);
+
+    let mut chains = HashMap::new();
+    chains.insert("tavily".to_string(), vec!["vertex".to_string()]);
+
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "", "engine": "tavily" }))
+        .await;
+
+    // Caller error (empty query) returns 400 immediately without attempting any
+    // engine, so fallback does not happen.
+    assert_eq!(resp.status_code(), 400);
+}
+
+#[tokio::test]
+async fn provider_client_error_surfaces_immediately_no_failover() {
+    // Primary engine returns a client error (400 Bad Request from the provider,
+    // not the modelrouter validation layer). Fallback chain is configured, but
+    // the 4xx error surfaces immediately without trying the next engine.
+    let fallback_was_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                // This error string matches the "returned 400" pattern that
+                // RetryableError::classify uses to identify client errors.
+                error_message: "Tavily returned 400 Bad Request: invalid query parameter 'foo'"
+                    .to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::CallTrackingSearchAdapter {
+                results: mock_results(),
+                engine_name: "vertex".to_string(),
+                was_called: fallback_was_called.clone(),
+            }),
+        ),
+    ]);
+
+    let mut chains = HashMap::new();
+    chains.insert("tavily".to_string(), vec!["vertex".to_string()]);
+
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({ "query": "rust", "engine": "tavily" }))
+        .await;
+
+    // The 400 from the provider surfaces as a 502 (ProviderError), but the key
+    // is that it does NOT fail over to vertex.
+    assert_eq!(resp.status_code(), 502);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("400 Bad Request"),
+        "error must surface the provider's 400: {message}"
+    );
+
+    // The fallback engine must NOT have been called.
+    assert!(
+        !fallback_was_called.load(std::sync::atomic::Ordering::SeqCst),
+        "vertex fallback engine must not be called when the primary returns a client error"
+    );
+}
+
+// ── Search fallback policy re-checks (issue #72) ─────────────────────────────
+
+#[tokio::test]
+async fn search_fallback_denied_by_model_allow_list_fails_request() {
+    use modelrouter::db::models::NewBudgetRule;
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::providers::search::SearchResultItem;
+
+    // Build app with tavily→vertex fallback chain; tavily errors
+    let chains = HashMap::from([("tavily".to_string(), vec!["vertex".to_string()])]);
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "tavily unavailable".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::MockSearchAdapter {
+                results: vec![SearchResultItem {
+                    title: "result".to_string(),
+                    url: "http://example.com".to_string(),
+                    snippet: "snippet".to_string(),
+                    score: None,
+                    published_date: None,
+                }],
+            }),
+        ),
+    ]);
+    let (server, db) = test_app_with_chain(registry, chains).await;
+
+    // Create budget rule that only allows the primary engine
+    let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec!["search/tavily".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Primary fails, fallback is denied by policy → request fails
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "query": "test query",
+            "engine": "tavily"
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        502,
+        "search fallback denied by policy should fail the request"
+    );
+
+    // No cost recorded: primary failed, fallback was denied
+    let ledger = common::wait_for_ledger_rows(&*db, 0).await;
+    assert_eq!(ledger.len(), 0);
+}
+
+#[tokio::test]
+async fn search_fallback_permitted_by_model_allow_list_serves_request() {
+    use modelrouter::db::models::NewBudgetRule;
+    use modelrouter::db::repositories::budgets::BudgetRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+    use modelrouter::providers::search::SearchResultItem;
+
+    // Build app with tavily→vertex fallback chain; tavily errors
+    let chains = HashMap::from([("tavily".to_string(), vec!["vertex".to_string()])]);
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        (
+            "tavily",
+            Arc::new(common::FailingSearchAdapter {
+                error_message: "tavily unavailable".to_string(),
+            }),
+        ),
+        (
+            "vertex",
+            Arc::new(common::MockSearchAdapter {
+                results: vec![SearchResultItem {
+                    title: "result".to_string(),
+                    url: "http://example.com".to_string(),
+                    snippet: "snippet".to_string(),
+                    score: None,
+                    published_date: None,
+                }],
+            }),
+        ),
+    ]);
+    let (server, db) = test_app_with_chain(registry, chains).await;
+
+    // Create budget rule that allows both engines
+    let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user.id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: None,
+            model_allow: vec!["search/tavily".to_string(), "search/vertex".to_string()],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Primary fails, fallback is permitted → fallback serves
+    let resp = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "query": "test query",
+            "engine": "tavily"
+        }))
+        .await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["engine"], "vertex", "fallback engine served the request");
+
+    // Cost recorded under the serving engine
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger[0].provider, "vertex");
 }

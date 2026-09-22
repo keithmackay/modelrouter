@@ -63,6 +63,7 @@ async fn build_server() -> (TestServer, Arc<Settings>, Arc<ResponseCache>) {
         callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
+        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
     (
         TestServer::new(build_router(state)).unwrap(),
@@ -261,4 +262,90 @@ async fn dashboard_page_renders_stats_and_controls() {
     assert!(html.contains("Hit rate"));
     assert!(html.contains("/admin/cache/purge"));
     assert!(html.contains("/admin/cache/policy"));
+}
+
+// ── Additional coverage for issue #80 ────────────────────────────────────────
+
+#[tokio::test]
+async fn purge_by_key_without_key_is_rejected() {
+    let (server, settings, _cache) = build_server().await;
+    let (n, v) = bearer(&jwt(&settings, "superadmin"));
+    let resp = server
+        .post("/admin/api/cache/purge")
+        .add_header(n, v)
+        .json(&json!({ "scope": "key" }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+}
+
+#[tokio::test]
+async fn purge_by_model_with_model() {
+    let (server, settings, _cache) = build_server().await;
+    let (n, v) = bearer(&jwt(&settings, "superadmin"));
+    let resp = server
+        .post("/admin/api/cache/purge")
+        .add_header(n, v)
+        .json(&json!({ "scope": "model", "model": "gpt-4" }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["scope"], "model:gpt-4");
+}
+
+#[tokio::test]
+async fn purge_by_key_with_key() {
+    let (server, settings, _cache) = build_server().await;
+    let (n, v) = bearer(&jwt(&settings, "superadmin"));
+    let resp = server
+        .post("/admin/api/cache/purge")
+        .add_header(n, v)
+        .json(&json!({ "scope": "key", "key": "some-cache-key" }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["scope"], "key:some-cache-key");
+}
+
+// ── Dashboard form handlers (issue #80) ──────────────────────────────────────
+
+#[tokio::test]
+async fn dashboard_purge_form() {
+    let (server, settings, _cache) = build_server().await;
+    let token = jwt(&settings, "superadmin");
+    let resp = server
+        .post("/admin/cache/purge")
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .form(&json!({ "scope": "all" }))
+        .await;
+
+    assert_eq!(resp.status_code(), 303); // Redirect
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(location.contains("/admin/cache"));
+    assert!(location.contains("msg="));
+}
+
+#[tokio::test]
+async fn dashboard_policy_form() {
+    let (server, settings, _cache) = build_server().await;
+    let token = jwt(&settings, "superadmin");
+    let resp = server
+        .post("/admin/cache/policy")
+        .add_header(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("mr_admin_session={}", token)).unwrap(),
+        )
+        .form(&json!({
+            "enabled": "on",
+            "completions_enabled": "on",
+            "completions_max_temperature": "0.5",
+            "completions_ttl_seconds": "3600"
+        }))
+        .await;
+
+    assert_eq!(resp.status_code(), 303); // Redirect
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(location.contains("/admin/cache"));
 }

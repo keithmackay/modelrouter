@@ -16,8 +16,8 @@
 </div>
 <form method="GET" action="/admin/cost" style="display:flex; flex-wrap:wrap; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-end;">
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Window</label>
-        <select name="window" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="cost-window" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Window</label>
+        <select name="window" id="cost-window" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="daily"   {% if window == "daily"   %}selected{% endif %}>Daily</option>
             <option value="weekly"  {% if window == "weekly"  %}selected{% endif %}>Weekly</option>
             <option value="monthly" {% if window == "monthly" %}selected{% endif %}>Monthly</option>
@@ -25,8 +25,8 @@
         </select>
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">User</label>
-        <select name="user" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="cost-user" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">User</label>
+        <select name="user" id="cost-user" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="" {% if not filter_user %}selected{% endif %}>All users</option>
             {% for name in user_names %}
             <option value="{{ name }}" {% if filter_user == name %}selected{% endif %}>{{ name }}</option>
@@ -34,8 +34,8 @@
         </select>
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Group</label>
-        <select name="group" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="cost-group" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Group</label>
+        <select name="group" id="cost-group" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="" {% if not filter_group %}selected{% endif %}>All groups</option>
             {% for name in group_names %}
             <option value="{{ name }}" {% if filter_group == name %}selected{% endif %}>{{ name }}</option>
@@ -43,8 +43,8 @@
         </select>
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Project</label>
-        <select name="project" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="cost-project" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Project</label>
+        <select name="project" id="cost-project" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="" {% if not filter_project %}selected{% endif %}>All projects</option>
             {% for p in projects %}
             <option value="{{ p }}" {% if filter_project == p %}selected{% endif %}>{{ p }}</option>
@@ -52,8 +52,8 @@
         </select>
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Model</label>
-        <select name="model" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="cost-model" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Model</label>
+        <select name="model" id="cost-model" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="" {% if not filter_model %}selected{% endif %}>All models</option>
             {% for m in models %}
             <option value="{{ m }}" {% if filter_model == m %}selected{% endif %}>{{ m }}</option>
@@ -61,8 +61,8 @@
         </select>
     </div>
     <div>
-        <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Key</label>
-        <select name="key_id" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
+        <label for="cost-key-id" style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem;">Key</label>
+        <select name="key_id" id="cost-key-id" style="padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px;">
             <option value="0" {% if filter_key_id == 0 %}selected{% endif %}>All keys</option>
             {% for k in key_options %}
             <option value="{{ k.id }}" {% if filter_key_id == k.id %}selected{% endif %}>{{ k.display }}</option>

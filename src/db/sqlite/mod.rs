@@ -10,6 +10,7 @@ mod sessions;
 mod app_settings;
 mod prompts;
 mod costs;
+mod experiments;
 mod failures;
 mod budgets;
 mod audit;
@@ -17,6 +18,7 @@ mod hooks;
 mod rate_limits;
 mod mcp_servers;
 mod models;
+mod outcomes;
 mod webhook_callbacks;
 
 #[derive(Clone)]

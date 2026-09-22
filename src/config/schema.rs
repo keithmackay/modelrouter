@@ -2,6 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Admin role vocabulary. The complete set of recognized roles for admin users.
+///
+/// Session extractors gate on `role != "superadmin"`, so an unknown role would
+/// silently degrade to viewer. Both OIDC auto-provisioning and bootstrap config
+/// validation check against this list to ensure operators set explicit valid roles.
+pub const ADMIN_ROLE_VOCABULARY: &[&str] = &["superadmin", "viewer"];
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PricingEntry {
     pub model: String,
@@ -213,6 +220,8 @@ pub struct Settings {
     pub oidc: OidcConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -254,7 +263,7 @@ fn default_archive_after_days() -> u32 { 90 }
 fn default_archive_prefix() -> String { "modelrouter/cost-logs".to_string() }
 fn default_archive_region() -> String { "us-east-1".to_string() }
 
-fn default_oidc_role() -> String { "admin".to_string() }
+fn default_oidc_role() -> String { "viewer".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OidcConfig {
@@ -288,6 +297,27 @@ impl Default for OidcConfig {
             allowed_domains: vec![],
             auto_provision_role: default_oidc_role(),
         }
+    }
+}
+
+impl OidcConfig {
+    /// Validate the configured OIDC role against the known vocabulary.
+    ///
+    /// An unknown role would silently degrade to viewer in session extractors
+    /// that gate on `role != "superadmin"`, so this validation rejects startup
+    /// loudly rather than allowing misconfigured SSO admins to believe they hold
+    /// the specified role when they do not.
+    pub fn validate_role(&self) -> anyhow::Result<()> {
+        if !ADMIN_ROLE_VOCABULARY.contains(&self.auto_provision_role.as_str()) {
+            anyhow::bail!(
+                "oidc.auto_provision_role is '{}', which is not a recognized role. \
+                 Valid roles are: {}. Set the role explicitly in config.toml or \
+                 via MODELROUTER_OIDC__AUTO_PROVISION_ROLE. Refusing to start.",
+                self.auto_provision_role,
+                ADMIN_ROLE_VOCABULARY.join(", ")
+            );
+        }
+        Ok(())
     }
 }
 
@@ -364,6 +394,24 @@ pub struct RoutingConfig {
     /// caller believed it was using Opus.
     #[serde(default)]
     pub strict_model_resolution: bool,
+    /// Search engine used when a `/v1/search` request omits `engine`.
+    ///
+    /// Unset means "infer from the configured search providers": if exactly one
+    /// is configured, use it. This exists because the previous behaviour was a
+    /// hardcoded `"tavily"` in `api/routes/search.rs`, which 502s on any host
+    /// that configures a different engine — a caller omitting `engine` got
+    /// `No search adapter configured for engine: tavily` even though a working
+    /// Vertex adapter was configured and reachable. Naming a provider in code
+    /// as the fallback for "caller said nothing" is the same class of mistake
+    /// `strict_model_resolution` exists to prevent for chat models.
+    #[serde(default)]
+    pub default_search_engine: Option<String>,
+    /// Fallback chains for search engines (engine → ordered list of fallback engines).
+    /// Shape-consistent with `fallback_chains` for LLM routing. When a search request
+    /// fails due to provider error (timeout, 5xx, rate-limit), the chain is walked.
+    /// Caller errors (invalid query → 400) never trigger failover.
+    #[serde(default)]
+    pub search_fallback_chains: HashMap<String, Vec<String>>,
 }
 
 impl Default for RoutingConfig {
@@ -377,6 +425,8 @@ impl Default for RoutingConfig {
             load_balancer: HashMap::new(),
             shortcuts: RoutingShortcutsConfig::default(),
             strict_model_resolution: false,
+            default_search_engine: None,
+            search_fallback_chains: HashMap::new(),
         }
     }
 }
@@ -421,6 +471,106 @@ impl Default for HealthConfig {
 fn default_deep_ttl() -> u64 { 60 }
 fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
 fn default_search_probe_engine() -> String { "tavily".to_string() }
+
+/// `[admin]` — admin account management.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub bootstrap: Option<AdminBootstrapConfig>,
+}
+
+/// `[admin.bootstrap]` — idempotent admin account creation at startup (issue #43).
+///
+/// When present, the account is created-if-absent by name at serve time.
+/// Second startup is a no-op: password and role are never overwritten. A
+/// malformed bcrypt hash or invalid role fails startup loudly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdminBootstrapConfig {
+    pub name: String,
+    pub role: String,
+    /// Bcrypt hash. NEVER plaintext.
+    pub password_hash: String,
+}
+
+impl AdminBootstrapConfig {
+    /// Validate role against the known vocabulary and bcrypt hash format.
+    ///
+    /// An unknown role would silently degrade to viewer in session extractors
+    /// that gate on `role != "superadmin"`, so this validation rejects startup
+    /// loudly rather than allowing misconfigured bootstrap accounts to believe
+    /// they hold the specified role when they do not.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !ADMIN_ROLE_VOCABULARY.contains(&self.role.as_str()) {
+            anyhow::bail!(
+                "admin.bootstrap.role is '{}', which is not a recognized role. \
+                 Valid roles are: {}. Set the role explicitly in config.toml or \
+                 via MODELROUTER_ADMIN__BOOTSTRAP__ROLE. Refusing to start.",
+                self.role,
+                ADMIN_ROLE_VOCABULARY.join(", ")
+            );
+        }
+
+        // Validate bcrypt hash format: bcrypt hashes start with $2a$, $2b$, or $2y$
+        // and have a specific structure. We attempt verification with a dummy password
+        // to check if the hash is well-formed — any result (Ok/Err) proves it parses.
+        if !self.password_hash.starts_with("$2") {
+            anyhow::bail!(
+                "admin.bootstrap.password_hash does not look like a bcrypt hash. \
+                 Expected format: $2a$..., $2b$..., or $2y$... \
+                 Use `modelrouter admin hash-password` to generate a valid hash. \
+                 Refusing to start."
+            );
+        }
+
+        // Validate hash is parseable by attempting verification.
+        // Both Ok and Err are acceptable — we just need to ensure it doesn't panic.
+        let _ = bcrypt::verify("_validation_probe_", &self.password_hash)
+            .map_err(|_| anyhow::anyhow!(
+                "admin.bootstrap.password_hash is malformed (bcrypt verification failed). \
+                 Use `modelrouter admin hash-password` to generate a valid hash. \
+                 Refusing to start."
+            ))?;
+
+        Ok(())
+    }
+
+    /// Apply the bootstrap admin account (issue #43).
+    /// Idempotent: create-if-absent by name; second startup is a no-op.
+    /// Invalid role or malformed hash fails loudly.
+    pub async fn apply(
+        &self,
+        db: &dyn crate::api::app::DatabaseProvider,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        use crate::db::repositories::admin_users::AdminUserRepository;
+        match AdminUserRepository::find_by_name(db, &self.name).await? {
+            Some(existing) => {
+                tracing::info!(
+                    name = %existing.name,
+                    role = %existing.role,
+                    "admin bootstrap: account already exists, skipping"
+                );
+            }
+            None => {
+                let admin = AdminUserRepository::create(
+                    db,
+                    crate::db::models::NewAdminUser {
+                        name: self.name.clone(),
+                        password_hash: self.password_hash.clone(),
+                        role: self.role.clone(),
+                    },
+                )
+                .await?;
+                tracing::info!(
+                    name = %admin.name,
+                    role = %admin.role,
+                    "admin bootstrap: created account"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 /// `[storage]` — what the prompt log records (issue #4).
 ///
@@ -532,7 +682,9 @@ pub struct ProviderConfig {
     pub api_base: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
+    /// Azure API version (e.g. "2024-02-01"). Used by the `azure` adapter, and
+    /// by `foundry` to override the api-version it would otherwise pick for the
+    /// endpoint's surface.
     #[serde(default)]
     pub api_version: Option<String>,
     /// AWS region for Bedrock (e.g. "us-east-1"). Used only by the Bedrock adapter.
@@ -558,6 +710,27 @@ pub struct ProviderConfig {
     /// chat region. Falls back to `region` when unset.
     #[serde(default)]
     pub embedding_region: Option<String>,
+    /// Vertex Model-as-a-Service region (Mistral, Llama, DeepSeek, and the
+    /// other Model Garden partners served via the OpenAI-compatible
+    /// `endpoints/openapi/chat/completions` path).
+    ///
+    /// Exactly the embedding_region story again: MaaS models are regional-only
+    /// — `locations/global` answers 404 for them even though Claude and Gemini
+    /// chat models run there. Falls back to `region` when that is itself
+    /// regional; with `region = "global"` and this unset, MaaS dispatch fails
+    /// loudly with a fix-hint. No region name is baked into code (operator
+    /// ruling 2026-08-20: specific regions/publishers are config, not code).
+    #[serde(default)]
+    pub maas_region: Option<String>,
+    /// Vertex publisher catalogs to probe for the available-models endpoint
+    /// (`google`, `anthropic`, `mistralai`, `meta`, `deepseek-ai`, `qwen`,
+    /// `openai`, `ai21`, …). Operations data — which publishers a project can
+    /// reach varies with Model Garden enablement, so the list lives here, not
+    /// in code. Unset/empty = the structural floor (google + anthropic, the
+    /// two with dedicated dispatch arms). Unreachable/refused publishers are
+    /// skipped with a warning, never fatal.
+    #[serde(default)]
+    pub catalog_publishers: Option<Vec<String>>,
     /// Vertex embedding task type (`RETRIEVAL_DOCUMENT`, `RETRIEVAL_QUERY`,
     /// `SEMANTIC_SIMILARITY`, …), sent as each instance's `task_type`.
     ///
@@ -567,14 +740,65 @@ pub struct ProviderConfig {
     /// store and simply retrieve worse. Omitted from the request when unset.
     #[serde(default)]
     pub embedding_task_type: Option<String>,
-    /// Gemini model used to serve `/v1/search` for this provider.
+    /// Model used to serve `/v1/search` for this provider.
     ///
-    /// Web search on Vertex is grounding on a generative model, so unlike Tavily
-    /// the engine has a model to choose. It is not addressed through
-    /// `[routing.model_aliases]` because the search route resolves an ENGINE,
-    /// not a model. Defaults to `gemini-2.5-flash` when unset.
+    /// Search on a grounding provider is a generation call with a search tool
+    /// attached, so unlike Tavily the engine has a model to choose. It is not
+    /// addressed through `[routing.model_aliases]` because the search route
+    /// resolves an ENGINE, not a model. Vertex defaults to `gemini-2.5-flash`;
+    /// `bing_grounding` has no default (the value is a deployment name that
+    /// only the operator's Foundry project knows) and requires this field.
     #[serde(default)]
     pub search_model: Option<String>,
+    /// Azure AI Foundry project endpoint that serves the Responses API, e.g.
+    /// `https://<resource>.services.ai.azure.com/api/projects/<project>`.
+    /// Used only by the `bing_grounding` search adapter. `api_base` is accepted
+    /// as a fallback so the provider table reads like every other one, but the
+    /// explicit name is preferred because "project endpoint" is what the Azure
+    /// portal calls the value being copied.
+    #[serde(default)]
+    pub foundry_project_endpoint: Option<String>,
+    /// Azure AI Foundry inference endpoint, e.g.
+    /// `https://<resource>.services.ai.azure.com` (the `foundry` provider
+    /// appends `/openai/v1`), or the model-inference endpoint
+    /// `https://<resource>.services.ai.azure.com/models`. Used only by the
+    /// `foundry` provider; `api_base` is accepted as a fallback.
+    ///
+    /// Distinct from `foundry_project_endpoint`, which the `bing_grounding`
+    /// SEARCH adapter uses for the Responses API on a project endpoint. Setting
+    /// `project` alongside this one appends `/api/projects/<project>`, which is
+    /// the same project/region split the `[providers.vertex]` block uses.
+    #[serde(default)]
+    pub foundry_endpoint: Option<String>,
+    /// Override the Microsoft Entra scope (audience) requested for this
+    /// provider, e.g. `https://cognitiveservices.azure.com/.default` or
+    /// `https://ai.azure.com/.default`.
+    ///
+    /// The `foundry` provider derives an audience from the endpoint shape —
+    /// project endpoints take `ai.azure.com`, resource endpoints take
+    /// `cognitiveservices.azure.com` per the published OpenAPI documents — but
+    /// Microsoft's own keyless-auth how-to shows `ai.azure.com` for resource
+    /// endpoints too. Where the published spec and the published prose disagree,
+    /// the operator gets the last word. The resolved value is logged at startup
+    /// and named in the 401/403 error hint.
+    #[serde(default)]
+    pub entra_scope: Option<String>,
+    /// Foundry project connection id of the "Grounding with Bing Search" (or
+    /// "Grounding with Bing Custom Search") resource, as shown on the project's
+    /// Connected resources page. Required by the `bing_grounding` adapter: the
+    /// tool call has no meaning without it, and Bing billing is attached to it.
+    #[serde(default)]
+    pub project_connection_id: Option<String>,
+    /// Use "Grounding with Bing Custom Search" (preview) — the domain-restricted
+    /// variant — instead of the general web tool. Changes only the tool type
+    /// emitted in the request (`bing_custom_search_preview`); the connection id
+    /// must then point at a Custom Search resource.
+    #[serde(default)]
+    pub custom_search: bool,
+    /// Bing Custom Search instance (configuration) name. Required by the
+    /// preview tool, ignored by the general one.
+    #[serde(default)]
+    pub custom_search_instance: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -592,8 +816,16 @@ impl Default for ProviderConfig {
             project: None,
             credentials_path: None,
             embedding_region: None,
+            maas_region: None,
+            catalog_publishers: None,
             embedding_task_type: None,
             search_model: None,
+            foundry_project_endpoint: None,
+            foundry_endpoint: None,
+            entra_scope: None,
+            project_connection_id: None,
+            custom_search: false,
+            custom_search_instance: None,
         }
     }
 }

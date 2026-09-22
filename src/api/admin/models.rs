@@ -660,8 +660,23 @@ pub async fn get_provider_rows(
 
 /// TTL cache for the aggregated catalog: provider catalog calls cost quota,
 /// and the mapping UI refetches freely. 15 minutes, bypassed by ?refresh=true.
-static CATALOG_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>> =
-    std::sync::OnceLock::new();
+///
+/// The entry is keyed by the `Arc<Settings>` it was aggregated from (issue #81):
+/// the cache is process-global, so without the key a hit could serve a catalog
+/// built for a *different* settings generation — a stale catalog after a hot
+/// reload in production, or another server's catalog when several coexist in
+/// one process (the integration-test binaries). Holding the `Arc` itself makes
+/// `Arc::ptr_eq` airtight: the allocation cannot be reused while the entry
+/// keeps it alive.
+static CATALOG_CACHE: std::sync::OnceLock<
+    tokio::sync::Mutex<
+        Option<(
+            std::sync::Arc<crate::config::schema::Settings>,
+            std::time::Instant,
+            serde_json::Value,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
 const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(serde::Deserialize)]
@@ -670,30 +685,137 @@ pub struct AvailableModelsQuery {
     pub refresh: bool,
 }
 
+/// Shared catalog cache used by both the models API and alias validation.
+/// Returns the aggregated catalog, using the cache unless `refresh` is true.
+pub(crate) async fn cached_catalog(
+    state: &AppState,
+    refresh: bool,
+) -> serde_json::Value {
+    let settings = state.live_settings.load_full();
+    let cache = CATALOG_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut guard = cache.lock().await;
+    if !refresh {
+        if let Some((for_settings, at, value)) = guard.as_ref() {
+            if std::sync::Arc::ptr_eq(for_settings, &settings) && at.elapsed() < CATALOG_TTL {
+                return value.clone();
+            }
+        }
+    }
+    let providers =
+        crate::providers::catalog_registry::aggregate_catalogs(&settings.providers).await;
+    let value = serde_json::json!({
+        "providers": providers,
+        "ttl_seconds": CATALOG_TTL.as_secs(),
+    });
+    *guard = Some((settings, std::time::Instant::now(), value.clone()));
+    value
+}
+
 /// GET /admin/api/models/available — what each configured provider's catalog
 /// actually offers, per-provider degraded, TTL-cached.
+///
+/// Each model entry is stamped with `priced: bool` (issue: unpriced gateway
+/// models record spend as $0 rather than refusing it — an experiment pinning
+/// a target the catalog lists but `CostCalculator` cannot cost silently
+/// ledgers every call against it as free). Computed fresh per request from
+/// `state.cost_calc`, NOT baked into the TTL-cached catalog value: the catalog
+/// cache is keyed on the `Settings` Arc, and `cost_calc`'s pricing table is
+/// built from that same `Settings`, so a cache hit and a freshly-computed
+/// `priced` flag are always consistent with each other, and pricing changes
+/// (e.g. a hot-reloaded config) are reflected immediately without needing a
+/// separate cache-invalidation path for this field.
 pub async fn get_available_models(
     State(state): State<AppState>,
     _session: AdminSession,
     axum::extract::Query(q): axum::extract::Query<AvailableModelsQuery>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
-    let cache = CATALOG_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
-    let mut guard = cache.lock().await;
-    if !q.refresh {
-        if let Some((at, value)) = guard.as_ref() {
-            if at.elapsed() < CATALOG_TTL {
-                return Ok(axum::Json(value.clone()));
+    let mut value = cached_catalog(&state, q.refresh).await;
+    stamp_pricing(&mut value, &state.cost_calc);
+    Ok(axum::Json(value))
+}
+
+/// Walk the aggregated catalog's `providers.<name>.models[]` and add
+/// `priced: bool` to each entry, using the model's own `provider` field
+/// (stamped by `aggregate_catalogs` for compat-adapter entries) joined with
+/// its `name` — the same `"{provider}/{model}"` shape `gate_target` pins and
+/// prices an experiment overlay target with.
+fn stamp_pricing(value: &mut serde_json::Value, cost_calc: &crate::router::cost::CostCalculator) {
+    let Some(providers) = value.get_mut("providers").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    for provider_entry in providers.values_mut() {
+        let Some(models) = provider_entry.get_mut("models").and_then(|m| m.as_array_mut()) else {
+            continue;
+        };
+        for model in models {
+            let provider = model.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let priced = if provider.is_empty() || name.is_empty() {
+                false
+            } else {
+                cost_calc.has_price(&format!("{provider}/{name}"))
+            };
+            if let Some(obj) = model.as_object_mut() {
+                obj.insert("priced".to_string(), serde_json::Value::Bool(priced));
             }
         }
     }
-    let providers = crate::providers::catalog_registry::aggregate_catalogs(
-        &state.live_settings.load().providers,
-    )
-    .await;
-    let value = serde_json::json!({
-        "providers": providers,
-        "ttl_seconds": CATALOG_TTL.as_secs(),
-    });
-    *guard = Some((std::time::Instant::now(), value.clone()));
-    Ok(axum::Json(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::cost::CostCalculator;
+
+    #[test]
+    fn he_escapes_html_entities() {
+        assert_eq!(he("<script>"), "&lt;script&gt;");
+        assert_eq!(he("foo & bar"), "foo &amp; bar");
+        assert_eq!(he("\"test\""), "&quot;test&quot;");
+        assert_eq!(he("<>&\""), "&lt;&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn stamp_pricing_marks_priced_and_unpriced_models() {
+        let cost_calc = CostCalculator::new();
+        let mut value = serde_json::json!({
+            "providers": {
+                "vertex": {
+                    "supported": true,
+                    "models": [
+                        { "provider": "vertex", "name": "anthropic/claude-haiku-4-5" },
+                        { "provider": "vertex", "name": "anthropic/claude-sonnet-5" }
+                    ]
+                },
+                "azure": { "supported": false }
+            }
+        });
+
+        stamp_pricing(&mut value, &cost_calc);
+
+        let models = value["providers"]["vertex"]["models"].as_array().unwrap();
+        assert_eq!(models[0]["priced"], serde_json::json!(true));
+        // claude-sonnet-5 is not in the built-in table -- exactly the gap
+        // this stamp exists to surface before an experiment create call does.
+        assert_eq!(models[1]["priced"], serde_json::json!(false));
+        // An unsupported provider has no `models` array; must not panic.
+        assert!(value["providers"]["azure"].get("models").is_none());
+    }
+
+    #[test]
+    fn stamp_pricing_treats_a_model_missing_provider_or_name_as_unpriced() {
+        let cost_calc = CostCalculator::new();
+        let mut value = serde_json::json!({
+            "providers": {
+                "custom": {
+                    "supported": true,
+                    "models": [ { "name": "mystery-model" } ]
+                }
+            }
+        });
+
+        stamp_pricing(&mut value, &cost_calc);
+
+        assert_eq!(value["providers"]["custom"]["models"][0]["priced"], serde_json::json!(false));
+    }
 }

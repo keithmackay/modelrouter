@@ -189,8 +189,15 @@ impl RouterProcess {
         if let Some(p) = port_flag {
             cmd.arg("--port").arg(p.to_string());
         }
+        // HOME must point at the fixture's own directory. `init` writes to the
+        // home directory and several defaults resolve under it, so a child that
+        // inherited the developer's real HOME would read and migrate their
+        // actual ~/.modelrouter/router.db — which is how this fixture used to
+        // fail against the state of the machine it ran on rather than against
+        // the config it was handed.
         let child = cmd
             .env("MODELROUTER_CONFIG", &config_path)
+            .env("HOME", dir.path())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
             .spawn()
@@ -256,6 +263,11 @@ impl RouterProcess {
         std::fs::read_to_string(self.dir.path().join("serve.log")).unwrap_or_default()
     }
 
+    /// Process ID. Used by tests that send signals directly (e.g. SIGTERM).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Create a user and an API key through the real CLI, returning the key.
     ///
     /// Shelling out rather than inserting rows keeps the fixture honest: if key
@@ -302,6 +314,33 @@ pub fn extract_key(output: &str) -> Option<String> {
 
 impl Drop for RouterProcess {
     fn drop(&mut self) {
+        // Try SIGTERM first for graceful shutdown, then fall back to SIGKILL.
+        // This matches real operator teardown and exercises the shutdown handler.
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            let pid = self.child.id();
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+
+            // Wait up to 3 seconds for graceful exit.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return, // Exited cleanly.
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            break; // Deadline exceeded, force kill.
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(_) => break, // Process is gone or error; kill is safe.
+                }
+            }
+        }
+
+        // Fallback or deadline exceeded: force kill.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

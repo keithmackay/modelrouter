@@ -24,7 +24,19 @@ async fn audit(
     target: &str,
     after_json: serde_json::Value,
 ) {
-    // after_json is serde_json::Value; convert to String for the Option<String> field.
+    audit_change(db, action, target, None, after_json).await;
+}
+
+/// [`audit`] with a before-image, for writes that change an existing row
+/// (the `experiment` commands share this with the admin commands).
+pub(crate) async fn audit_change(
+    db: &(impl AuditRepository + ?Sized),
+    action: &str,
+    target: &str,
+    before_json: Option<serde_json::Value>,
+    after_json: serde_json::Value,
+) {
+    // The JSON values are stored as text in the Option<String> fields.
     if let Err(e) = AuditRepository::create(
         db,
         NewAuditLogEntry {
@@ -32,7 +44,7 @@ async fn audit(
             actor_name: "cli".to_string(),
             action: action.to_string(),
             target: Some(target.to_string()),
-            before_json: None,
+            before_json: before_json.map(|v| v.to_string()),
             after_json: Some(after_json.to_string()),
         },
     )
@@ -184,6 +196,26 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
             .await;
 
             println!("Disabled admin '{}'.", admin.name);
+        }
+
+        AdminCommands::HashPassword => {
+            let password = rpassword::prompt_password("Password: ")?;
+            let confirm = rpassword::prompt_password("Confirm password: ")?;
+            if password != confirm {
+                anyhow::bail!("passwords do not match");
+            }
+
+            let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
+                .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
+
+            println!("{}", password_hash);
+            println!();
+            println!("Paste this hash into config.toml:");
+            println!();
+            println!("[admin.bootstrap]");
+            println!("name = \"admin\"");
+            println!("role = \"superadmin\"");
+            println!("password_hash = \"{}\"", password_hash);
         }
     }
     Ok(())

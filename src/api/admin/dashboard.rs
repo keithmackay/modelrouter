@@ -112,6 +112,8 @@ impl axum::extract::FromRequestParts<AppState> for SuperDashboardSession {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let session = DashboardSession::from_request_parts(parts, state).await?;
+        // Explicit allow-list: only "superadmin" is permitted, anything else
+        // (including unrecognized roles) is denied rather than degraded (issue #51).
         if session.0.role != "superadmin" {
             return Err(DashboardError::Forbidden);
         }
@@ -352,13 +354,16 @@ fn user_row_html(user: &crate::db::models::User) -> String {
         "\" hx-swap=\"outerHTML\">", toggle_label, "</button>",
     ].concat();
 
-    let email_str = user.email.as_deref().unwrap_or("—");
+    // Name and email are operator-entered but still user-controlled data —
+    // escape them like every other fragment in this file does (issue #75).
+    let name_e = he(&user.name);
+    let email_e = user.email.as_deref().map(he).unwrap_or_else(|| "—".to_string());
 
     [
         "<tr id=\"user-row-", id_s.as_str(), "\">",
         "<td>", id_s.as_str(), "</td>",
-        "<td>", user.name.as_str(), "</td>",
-        "<td>", email_str, "</td>",
+        "<td>", name_e.as_str(), "</td>",
+        "<td>", email_e.as_str(), "</td>",
         "<td>", status_tag, "</td>",
         "<td>", user.created_at.as_str(), "</td>",
         "<td>", toggle_btn.as_str(), "</td>",
@@ -495,6 +500,144 @@ pub async fn post_create_user(
 
     let html = user_row_html(&user);
     Ok(Html(html))
+}
+
+// ── Generate API key for user ─────────────────────────────────────────────────
+
+pub async fn post_generate_user_key(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(user_id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::api_keys::ApiKeyRepository;
+    use crate::db::repositories::users::UserRepository;
+    use crate::api::auth::hash_token;
+
+    // Fetch the user
+    let user = UserRepository::find_by_id(&*state.db, user_id)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("user {} not found", user_id)))?;
+
+    // Generate raw key and hash
+    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = hash_token(&raw_key);
+
+    // Create the API key
+    let created = ApiKeyRepository::create_api_key(&*state.db, crate::db::models::NewApiKey {
+        user_id,
+        key_hash,
+        label: None,
+        expires_at: None,
+        project: None,
+        session_window_secs: None,
+    })
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    // Audit log
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "generate_api_key",
+        Some(format!("user:{}", user_id)),
+        None,
+        Some(format!("key_id:{}", created.id)),
+    )
+    .await;
+
+    // Build the row with the raw key displayed once
+    Ok(Html(user_row_with_key_html(&user, &raw_key)))
+}
+
+/// Build a user row HTML fragment showing the newly generated key with email button.
+fn user_row_with_key_html(user: &crate::db::models::User, raw_key: &str) -> String {
+    let id_s = user.id.to_string();
+    let status_tag = if user.enabled {
+        "<span class=\"tag tag-enabled\">Enabled</span>"
+    } else {
+        "<span class=\"tag tag-disabled\">Disabled</span>"
+    };
+
+    let (toggle_action, toggle_label, toggle_class) = if user.enabled {
+        ("/disable", "Disable", "btn btn-danger")
+    } else {
+        ("/enable", "Enable", "btn btn-success")
+    };
+
+    let toggle_btn = format!(
+        "<button class=\"{}\" hx-post=\"/admin/users/{}{}\
+        \" hx-target=\"#user-row-{}\" hx-swap=\"outerHTML\">{}</button>",
+        toggle_class, id_s, toggle_action, id_s, toggle_label
+    );
+
+    let generate_btn = format!(
+        "<button class=\"btn btn-secondary\" hx-post=\"/admin/users/{}/keys/generate\"\
+        hx-target=\"#user-row-{}\" hx-swap=\"outerHTML\">Generate Key</button>",
+        id_s, id_s
+    );
+
+    let email_str = user.email.as_deref().map(he).unwrap_or_else(|| "—".to_string());
+
+    let raw_e = he(raw_key);
+    let key_display = if let Some(ref email) = user.email {
+        let subject = urlencoding::encode("Your ModelRouter API Key");
+        let body_plain = format!(
+            "Hi {},\n\nYour ModelRouter API key has been generated. \
+            Please keep it safe — it will not be shown again.\n\n\
+            API Key: {}\n\n\
+            To use this key, set the following header in your requests:\n  \
+            Authorization: Bearer {}\n\n\
+            Router URL: http://your-modelrouter-host/v1/chat/completions\n\n\
+            If you have any questions, please contact your administrator.\n",
+            user.name,
+            raw_key,
+            raw_key,
+        );
+        let body_enc = urlencoding::encode(&body_plain);
+        let email_e = he(email);
+        format!(
+            "<br><div style=\"margin-top:0.5rem;padding:0.5rem;background:#f0fff0;border:1px solid #c3e6cb;border-radius:4px;\">\
+            <div style=\"color:#155724;font-weight:bold;margin-bottom:0.3rem;\">✓ Key Generated (shown once only)</div>\
+            <code style=\"display:block;color:green;font-family:monospace;font-size:0.9rem;\
+            padding:0.3rem;background:white;border-radius:3px;margin-bottom:0.5rem;\">{}</code>\
+            <a href=\"mailto:{}?subject={}&body={}\" \
+            class=\"btn btn-secondary\" style=\"text-decoration:none;\">✉ Email Key to User</a>\
+            </div>",
+            raw_e, email_e, subject, body_enc
+        )
+    } else {
+        format!(
+            "<br><div style=\"margin-top:0.5rem;padding:0.5rem;background:#f0fff0;border:1px solid #c3e6cb;border-radius:4px;\">\
+            <div style=\"color:#155724;font-weight:bold;margin-bottom:0.3rem;\">✓ Key Generated (shown once only)</div>\
+            <code style=\"display:block;color:green;font-family:monospace;font-size:0.9rem;\
+            padding:0.3rem;background:white;border-radius:3px;margin-bottom:0.5rem;\">{}</code>\
+            <span style=\"color:#666;font-size:0.85rem;\">No email on file</span>\
+            </div>",
+            raw_e
+        )
+    };
+
+    format!(
+        "<tr id=\"user-row-{}\">\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{} {}{}</td>\
+        </tr>",
+        id_s,
+        id_s,
+        he(&user.name),
+        email_str,
+        status_tag,
+        user.created_at,
+        toggle_btn,
+        generate_btn,
+        key_display,
+    )
 }
 
 // ── Keys page ─────────────────────────────────────────────────────────────────
@@ -1034,6 +1177,12 @@ pub struct PageQuery {
     pub page: Option<u32>,
 }
 
+#[derive(Deserialize)]
+pub struct FailuresQuery {
+    pub page: Option<u32>,
+    pub correlation_id: Option<String>,
+}
+
 pub async fn get_prompts(
     State(state): State<AppState>,
     _session: DashboardSession,
@@ -1142,7 +1291,7 @@ pub async fn post_storage_settings(
 pub async fn get_failures(
     State(state): State<AppState>,
     _session: DashboardSession,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<FailuresQuery>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::repositories::failures::FailureRepository;
 
@@ -1150,10 +1299,18 @@ pub async fn get_failures(
     let per_page: i64 = 50;
     let offset = (page - 1) * per_page;
 
-    let failures = FailureRepository::list(&*state.db, per_page, offset)
-        .await
-        .map_err(|_| DashboardError::Internal)?;
-    let has_next = failures.len() as i64 == per_page;
+    // If a correlation_id is provided, filter to just those failures;
+    // otherwise list the latest batch.
+    let failures = if let Some(ref cid) = q.correlation_id {
+        FailureRepository::find_by_correlation_id(&*state.db, cid)
+            .await
+            .map_err(|_| DashboardError::Internal)?
+    } else {
+        FailureRepository::list(&*state.db, per_page, offset)
+            .await
+            .map_err(|_| DashboardError::Internal)?
+    };
+    let has_next = failures.len() as i64 == per_page && q.correlation_id.is_none();
 
     // Stage counts lead the page: "what is failing, and where" is the question an
     // operator actually arrives with, and it is answerable at a glance.
@@ -1179,6 +1336,7 @@ pub async fn get_failures(
                 error_message => f.error_message,
                 latency_ms => f.latency_ms,
                 project => f.project.unwrap_or_else(|| "-".to_string()),
+                attribution_correlation_id => f.attribution_correlation_id.unwrap_or_else(|| "-".to_string()),
                 created_at => f.created_at,
             }
         })
@@ -1191,6 +1349,7 @@ pub async fn get_failures(
             by_stage => stage_items,
             page => page,
             has_next => has_next,
+            correlation_id => q.correlation_id,
         },
     )
 }
@@ -1224,6 +1383,48 @@ pub async fn get_prompt_detail(
     }
 }
 
+pub async fn get_failure_detail(
+    State(state): State<AppState>,
+    _session: DashboardSession,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::failures::FailureRepository;
+
+    match FailureRepository::find_by_id(&*state.db, id)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+    {
+        Some(f) => {
+            let html = format!(
+                r#"<div style="padding:0.75rem; background:#f9f9f9; border:1px solid #eee; border-radius:4px; margin-top:0.5rem;">
+                    <strong>Endpoint:</strong> {}<br>
+                    <strong>Requested Model:</strong> {}<br>
+                    <strong>Routed Model:</strong> {}<br>
+                    <strong>Provider:</strong> {}<br>
+                    <strong>Stage:</strong> {}<br>
+                    <strong>Status Code:</strong> {}<br>
+                    <strong>Attempts:</strong> {}<br>
+                    <strong>Latency:</strong> {} ms<br>
+                    <strong>Correlation ID:</strong> {}<br>
+                    <strong>Error Message:</strong><pre style="white-space:pre-wrap; font-size:0.8rem; margin-top:0.5rem;">{}</pre>
+                </div>"#,
+                html_escape(&f.endpoint),
+                html_escape(&f.request_model),
+                html_escape(&f.routed_model.unwrap_or_else(|| "-".to_string())),
+                html_escape(&f.provider.unwrap_or_else(|| "-".to_string())),
+                html_escape(&f.stage),
+                f.status_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                f.attempts,
+                f.latency_ms.map(|l| l.to_string()).unwrap_or_else(|| "-".to_string()),
+                html_escape(&f.attribution_correlation_id.unwrap_or_else(|| "-".to_string())),
+                html_escape(&f.error_message),
+            );
+            Ok(Html(html))
+        }
+        None => Ok(Html(format!("<div>Failure {} not found.</div>", id))),
+    }
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1241,6 +1442,100 @@ pub struct CostQuery {
     pub group: Option<String>,
     pub key_id: Option<i64>,
     pub model: Option<String>,
+}
+
+/// Resolve user and group filters to effective user IDs.
+async fn resolve_cost_filters(
+    db: &std::sync::Arc<dyn crate::api::app::DatabaseProvider>,
+    users: &[crate::db::models::User],
+    filter_user: &str,
+    filter_group: &str,
+) -> Result<Option<Vec<i64>>, DashboardError> {
+    use crate::db::repositories::groups::GroupRepository;
+
+    // ── Resolve user filter ─────────────────────────────────────────────────
+    let user_filter_ids: Option<Vec<i64>> = if filter_user.is_empty() {
+        None
+    } else {
+        Some(users.iter().filter(|u| u.name == filter_user).map(|u| u.id).collect())
+    };
+
+    // ── Resolve group filter → active member user_ids ──────────────────────
+    let group_filter_ids: Option<Vec<i64>> = if filter_group.is_empty() {
+        None
+    } else {
+        match GroupRepository::find_group_by_name(&**db, filter_group).await {
+            Ok(Some(g)) => {
+                let members = GroupRepository::list_memberships(&**db, g.id)
+                    .await
+                    .unwrap_or_default();
+                Some(
+                    members
+                        .into_iter()
+                        .filter(|m| m.disabled_at.is_none())
+                        .map(|m| m.user_id)
+                        .collect(),
+                )
+            }
+            _ => Some(vec![]), // unknown group → zero results
+        }
+    };
+
+    // ── Intersect user + group filters ─────────────────────────────────────
+    let effective_user_ids: Option<Vec<i64>> = match (user_filter_ids, group_filter_ids) {
+        (Some(u), Some(g)) => {
+            let set: std::collections::HashSet<i64> = g.into_iter().collect();
+            Some(u.into_iter().filter(|id| set.contains(id)).collect())
+        }
+        (Some(u), None) => Some(u),
+        (None, Some(g)) => Some(g),
+        (None, None) => None,
+    };
+
+    Ok(effective_user_ids)
+}
+
+/// Build user_id → comma-separated group names (active memberships only).
+async fn build_user_groups_map(
+    db: &std::sync::Arc<dyn crate::api::app::DatabaseProvider>,
+    groups: &[crate::db::models::Group],
+) -> std::collections::HashMap<i64, Vec<String>> {
+    use crate::db::repositories::groups::GroupRepository;
+
+    let mut user_groups: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for group in groups {
+        let members = GroupRepository::list_memberships(&**db, group.id)
+            .await
+            .unwrap_or_default();
+        for m in members {
+            if m.disabled_at.is_none() {
+                user_groups.entry(m.user_id).or_default().push(group.name.clone());
+            }
+        }
+    }
+    user_groups
+}
+
+/// Build api_key_id → display string map.
+fn build_key_display_map(
+    all_keys: &[crate::db::models::ApiKey],
+    user_map: &std::collections::HashMap<i64, String>,
+) -> std::collections::HashMap<i64, String> {
+    all_keys
+        .iter()
+        .map(|k| {
+            let uname = user_map.get(&k.user_id).cloned().unwrap_or_default();
+            let proj = k.project.as_deref().unwrap_or("—");
+            let label = k.label.as_deref().unwrap_or("");
+            let display = if label.is_empty() {
+                format!("{} / {}", uname, proj)
+            } else {
+                format!("{} / {} ({})", uname, proj, label)
+            };
+            (k.id, display)
+        })
+        .collect()
 }
 
 pub async fn get_cost(
@@ -1285,81 +1580,15 @@ pub async fn get_cost(
         .await
         .unwrap_or_default();
 
-    // ── Resolve user filter ─────────────────────────────────────────────────
     let filter_user = q.user.as_deref().unwrap_or("").to_string();
-    let user_filter_ids: Option<Vec<i64>> = if filter_user.is_empty() {
-        None
-    } else {
-        Some(users.iter().filter(|u| u.name == filter_user).map(|u| u.id).collect())
-    };
-
-    // ── Resolve group filter → active member user_ids ──────────────────────
     let filter_group = q.group.as_deref().unwrap_or("").to_string();
-    let group_filter_ids: Option<Vec<i64>> = if filter_group.is_empty() {
-        None
-    } else {
-        match GroupRepository::find_group_by_name(&*state.db, &filter_group).await {
-            Ok(Some(g)) => {
-                let members = GroupRepository::list_memberships(&*state.db, g.id)
-                    .await
-                    .unwrap_or_default();
-                Some(
-                    members
-                        .into_iter()
-                        .filter(|m| m.disabled_at.is_none())
-                        .map(|m| m.user_id)
-                        .collect(),
-                )
-            }
-            _ => Some(vec![]), // unknown group → zero results
-        }
-    };
-
-    // ── Intersect user + group filters ─────────────────────────────────────
-    let effective_user_ids: Option<Vec<i64>> = match (user_filter_ids, group_filter_ids) {
-        (Some(u), Some(g)) => {
-            let set: std::collections::HashSet<i64> = g.into_iter().collect();
-            Some(u.into_iter().filter(|id| set.contains(id)).collect())
-        }
-        (Some(u), None) => Some(u),
-        (None, Some(g)) => Some(g),
-        (None, None) => None,
-    };
-
+    let effective_user_ids = resolve_cost_filters(&state.db, &users, &filter_user, &filter_group).await?;
     let filter_project = q.project.as_deref().filter(|s| !s.is_empty());
     let filter_key_id = q.key_id;
     let filter_model = q.model.as_deref().filter(|s| !s.is_empty());
 
-    // ── Build lookup maps ───────────────────────────────────────────────────
-    // user_id → comma-separated group names (active memberships only)
-    let mut user_groups: std::collections::HashMap<i64, Vec<String>> =
-        std::collections::HashMap::new();
-    for group in &groups {
-        let members = GroupRepository::list_memberships(&*state.db, group.id)
-            .await
-            .unwrap_or_default();
-        for m in members {
-            if m.disabled_at.is_none() {
-                user_groups.entry(m.user_id).or_default().push(group.name.clone());
-            }
-        }
-    }
-
-    // api_key_id → display string
-    let key_display: std::collections::HashMap<i64, String> = all_keys
-        .iter()
-        .map(|k| {
-            let uname = user_map.get(&k.user_id).cloned().unwrap_or_default();
-            let proj = k.project.as_deref().unwrap_or("—");
-            let label = k.label.as_deref().unwrap_or("");
-            let display = if label.is_empty() {
-                format!("{} / {}", uname, proj)
-            } else {
-                format!("{} / {} ({})", uname, proj, label)
-            };
-            (k.id, display)
-        })
-        .collect();
+    let user_groups = build_user_groups_map(&state.db, &groups).await;
+    let key_display = build_key_display_map(&all_keys, &user_map);
 
     // ── Query ───────────────────────────────────────────────────────────────
     let raw_rows = CostRepository::cost_rows_grouped(
