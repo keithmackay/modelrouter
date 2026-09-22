@@ -433,5 +433,9 @@ fail_open    = true
 # #llm_probe_model = "balanced"
 # # Model the embedding probe requests.
 # embedding_probe_model = "text-embedding-3-small"
-# # Engine the search probe uses.
-# search_probe_engine = "tavily"
+# # Engine the search probe uses. Unset (the default) infers from
+# # [routing] default_search_engine, then from the sole configured search
+# # provider when there is exactly one -- set this explicitly only when
+# # multiple search engines are configured and the probe should exercise a
+# # specific one regardless of which is the traffic default.
+# #search_probe_engine = "tavily"

@@ -23,7 +23,56 @@ const DEFAULT_COST_PER_QUERY: f64 = 0.005;
 /// unbounded (and unbudgeted) amount of provider work.
 const MAX_RESULTS_LIMIT: u32 = 20;
 
-/// Decide which engine serves a request, in precedence order:
+/// Result of inferring a search engine when nothing named one explicitly.
+/// `Undetermined` carries whatever engines ARE configured (empty means none)
+/// so each caller can render its own reason — a 400 to an API caller and a
+/// health-probe "skipped" reason read very differently even though they hit
+/// the same fork.
+pub(crate) enum InferredSearchEngine {
+    Determined(String),
+    Undetermined { configured: Vec<String> },
+}
+
+/// Infer a search engine from config/registry state alone, in precedence
+/// order:
+///
+/// 1. `[routing] default_search_engine` in config.toml,
+/// 2. the sole configured search provider, when there is exactly one.
+///
+/// Shared by `resolve_engine` below (the `/v1/search` request path, which
+/// tries the request's own `engine` field first) and the `/health/deep`
+/// search probe (issue #2927/#2879's mirror: the probe used to hardcode
+/// `"tavily"` as `search_probe_engine`'s default, so a host configured for
+/// Vertex-only search had a probe that tested an engine not actually on the
+/// live path — reporting a real outage as healthy, or a healthy Vertex path
+/// as down, depending on which engine happened to also be configured). One
+/// function means the request path and the probe can never infer
+/// differently from the same config again.
+///
+/// With two or more engines configured and no explicit default, this reports
+/// `Undetermined` rather than guessing: picking one would reintroduce
+/// exactly the silent-substitution problem `strict_model_resolution` exists
+/// to prevent for chat models, just for search engines instead of models.
+pub(crate) fn infer_search_engine(state: &AppState) -> InferredSearchEngine {
+    if let Some(configured) = state
+        .settings
+        .routing
+        .default_search_engine
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        return InferredSearchEngine::Determined(configured.to_string());
+    }
+
+    let available = state.search_registry.configured_engines();
+    match available.as_slice() {
+        [only] => InferredSearchEngine::Determined(only.clone()),
+        _ => InferredSearchEngine::Undetermined { configured: available },
+    }
+}
+
+/// Decide which engine serves a `/v1/search` request, in precedence order:
 ///
 /// 1. the `engine` field on the request,
 /// 2. `[routing] default_search_engine` in config.toml,
@@ -35,10 +84,6 @@ const MAX_RESULTS_LIMIT: u32 = 20;
 /// reachable adapter sitting unused because the fallback named a provider the
 /// operator had never configured. Callers that DO send `engine` were unaffected,
 /// so the break was invisible until something omitted the field.
-///
-/// With two or more engines configured and no explicit default, refuse rather
-/// than guess: picking one would reintroduce exactly the silent-substitution
-/// problem, and the error names the available engines so the fix is obvious.
 fn resolve_engine(
     state: &AppState,
     requested: Option<&str>,
@@ -47,29 +92,19 @@ fn resolve_engine(
         return Ok(engine.to_string());
     }
 
-    if let Some(configured) = state
-        .settings
-        .routing
-        .default_search_engine
-        .as_deref()
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-    {
-        return Ok(configured.to_string());
-    }
-
-    let available = state.search_registry.configured_engines();
-    match available.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => Err(ApiError::InvalidRequest(format!(
-            "no search engine configured: add a [providers.<engine>] section \
-             (supported by this build: {}) to config.toml",
-            crate::providers::search_registry::supported_engines().join(", ")
-        ))),
-        many => Err(ApiError::InvalidRequest(format!(
+    match infer_search_engine(state) {
+        InferredSearchEngine::Determined(engine) => Ok(engine),
+        InferredSearchEngine::Undetermined { configured } if configured.is_empty() => {
+            Err(ApiError::InvalidRequest(format!(
+                "no search engine configured: add a [providers.<engine>] section \
+                 (supported by this build: {}) to config.toml",
+                crate::providers::search_registry::supported_engines().join(", ")
+            )))
+        }
+        InferredSearchEngine::Undetermined { configured } => Err(ApiError::InvalidRequest(format!(
             "request omitted `engine` and multiple search engines are configured ({}); \
              send `engine` explicitly or set [routing] default_search_engine",
-            many.join(", ")
+            configured.join(", ")
         ))),
     }
 }
