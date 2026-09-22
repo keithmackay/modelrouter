@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::db::models::{NewRequestFailure, RequestFailure};
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::failures::{ExperimentRunFailures, FailureRepository};
-use super::costs::{attribution_predicate, variant_predicate};
+use super::costs::arm_predicate;
 use super::{PostgresDb, now_utc};
 
 const FAILURE_COLUMNS: &str = "id, user_id, api_key_id, endpoint, request_model, routed_model, \
@@ -102,7 +102,9 @@ impl FailureRepository for PostgresDb {
     }
 
     async fn count_for_arm(&self, filter: &ArmFilter, start: &str, end: &str) -> anyhow::Result<i64> {
-        let (predicate, binds) = arm_predicate(filter);
+        // A request that failed before routing has no routed_model, so model
+        // arms fall back to the model the caller asked for.
+        let (predicate, binds) = arm_predicate(filter, "COALESCE(routed_model, request_model)");
         let n = binds.len();
         let sql = format!(
             "SELECT COUNT(*) FROM request_failures \
@@ -156,17 +158,3 @@ impl FailureRepository for PostgresDb {
     }
 }
 
-/// Predicate for a comparison arm against `request_failures`. A request that
-/// failed before routing has no `routed_model`, so model arms fall back to
-/// the model the caller asked for.
-fn arm_predicate(filter: &ArmFilter) -> (String, Vec<String>) {
-    match filter {
-        ArmFilter::Model(m) => (
-            "COALESCE(routed_model, request_model) = $1".to_string(),
-            vec![m.clone()],
-        ),
-        ArmFilter::Provider(p) => ("provider = $1".to_string(), vec![p.clone()]),
-        ArmFilter::Attribution(f) => attribution_predicate(f),
-        ArmFilter::Variant { experiment_id, variant } => variant_predicate(*experiment_id, variant),
-    }
-}

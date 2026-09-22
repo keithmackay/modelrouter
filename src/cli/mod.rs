@@ -2391,6 +2391,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compare_csv_carries_latency_samples_and_unpriced_models() {
+        // CSV has no room for the prose beneath the table, so the honesty
+        // data rides along as ordinary metric rows instead.
+        let sources = seeded_sources().await;
+        let comparison = build_comparison(&sources, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_comparison(&comparison, OutputFormat::Csv, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Latency samples,2,1,-,-"), "{}", text);
+        assert!(text.contains("Unpriced models,m1,m2,-,-"), "{}", text);
+        assert!(!text.contains("Coverage:"), "{}", text);
+    }
+
+    #[tokio::test]
     async fn compare_table_zero_delta_has_no_plus_sign() {
         // A and B are seeded identically, so every delta -- including
         // requests -- is exactly zero. `sign_prefix` only emits `+` for
