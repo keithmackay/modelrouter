@@ -20,9 +20,17 @@ pub const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 /// back to this value. Matches the direct Anthropic adapter's default.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Translate an OpenAI-shaped request to a Vertex Anthropic `:rawPredict` body.
+/// Translate an OpenAI-shaped request to a Vertex Anthropic `:rawPredict` /
+/// `:streamRawPredict` body.
 /// NOTE: `model` is intentionally omitted — it lives in the URL path.
-pub fn translate_request(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
+///
+/// `streaming` must be true for a `:streamRawPredict` call: unlike Gemini
+/// (where streaming is selected by the URL alone), the Anthropic backend
+/// behind `:streamRawPredict` only emits SSE when the body carries
+/// `"stream": true`. Without it the endpoint returns one complete non-SSE
+/// JSON message, every line of which `translate_sse_line` drops — the client
+/// sees a 200 with an empty body.
+pub fn translate_request(req: &NormalizedRequest, streaming: bool) -> serde_json::Value {
     let (system_text, messages) = translate_messages(&req.messages);
 
     let mut body = serde_json::json!({
@@ -30,6 +38,9 @@ pub fn translate_request(req: &NormalizedRequest, stream: bool) -> serde_json::V
         "messages": messages,
         "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
     });
+    if streaming {
+        body["stream"] = serde_json::json!(true);
+    }
     if let Some(system) = system_text {
         body["system"] = serde_json::json!(system);
     }
