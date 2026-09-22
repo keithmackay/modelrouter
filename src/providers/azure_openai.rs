@@ -1,7 +1,7 @@
 use anyhow::Context;
 use futures::TryStreamExt;
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
 
 /// GA stable Azure OpenAI API version at time of writing.
@@ -13,10 +13,12 @@ pub struct AzureOpenAIAdapter {
     api_base: String,
     api_version: String,
     client: reqwest::Client,
+    default_timeout_secs: u64,
+    tier_timeouts: TierTimeoutsConfig,
 }
 
 impl AzureOpenAIAdapter {
-    pub fn new(config: &ProviderConfig) -> Self {
+    pub fn new(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig) -> Self {
         let api_base = config.api_base.clone().unwrap_or_else(|| {
             panic!(
                 "Azure OpenAI adapter requires `api_base` to be set. \
@@ -37,6 +39,8 @@ impl AzureOpenAIAdapter {
             api_base,
             api_version,
             client,
+            default_timeout_secs: config.timeout_secs,
+            tier_timeouts,
         }
     }
 
@@ -111,11 +115,13 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let body = Self::build_body(req);
 
+        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
         let resp = self
             .client
             .post(self.chat_url())
             .header("api-key", &self.api_key)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
             .await
@@ -159,10 +165,12 @@ impl ProviderAdapter for AzureOpenAIAdapter {
         // usage chunk so the streaming ledger records provider-counted tokens.
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
+        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
             .client
             .post(self.chat_url())
             .header("api-key", &self.api_key)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
             .await

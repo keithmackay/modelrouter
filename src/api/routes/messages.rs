@@ -226,7 +226,10 @@ async fn anthropic_messages_inner(
         .trim_end_matches('/')
         .to_string();
     let api_key = anthropic_config.api_key.clone();
-    let timeout_secs = anthropic_config.timeout_secs;
+    // `model` (not `requested_model`) — reflects the alias actually being
+    // dispatched under, in case an experiment/complexity downgrade remapped
+    // it to a different tier. See TierTimeoutsConfig::resolve.
+    let timeout_secs = state.settings.tier_timeouts.resolve(&model, anthropic_config.timeout_secs);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))

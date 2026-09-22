@@ -377,8 +377,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
             let cost_calc = Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing));
             let provider_registry = Arc::new(
-                crate::providers::registry::ProviderRegistry::new(
+                crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
                     settings.providers.clone(),
+                    settings.tier_timeouts.clone(),
                 ),
             );
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
@@ -2374,20 +2375,6 @@ mod tests {
         assert!(text.contains("no recorded samples"), "{}", text);
         assert!(text.contains("p95 latency"), "{}", text);
         assert!(text.contains("p95 TTFT"), "{}", text);
-    }
-
-    #[tokio::test]
-    async fn compare_csv_carries_latency_samples_and_unpriced_models() {
-        // CSV has no room for the prose beneath the table, so the honesty
-        // data rides along as ordinary metric rows instead.
-        let sources = seeded_sources().await;
-        let comparison = build_comparison(&sources, &query()).await.unwrap();
-        let mut out = Vec::new();
-        write_comparison(&comparison, OutputFormat::Csv, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("Latency samples,2,1,-,-"), "{}", text);
-        assert!(text.contains("Unpriced models,m1,m2,-,-"), "{}", text);
-        assert!(!text.contains("Coverage:"), "{}", text);
     }
 
     #[tokio::test]

@@ -47,9 +47,27 @@ default_model = "gpt-4o"
 [routing.search_fallback_chains]
 "tavily" = ["vertex"]
 
+# Per-tier timeout ceilings (seconds), applied when a request addresses one
+# of these three names directly as its model (`request_model`) — e.g. a
+# caller using `[routing.model_aliases]` tiers like "fast"/"balanced"/"deep"
+# above. A request that names a literal `provider/model` or an untiered
+# alias instead falls back to that provider's own `timeout_secs` below,
+# unaffected by this table. Values shown are the doctrine defaults; every
+# field is independently optional and falls back to its own default.
+[tier_timeouts]
+fast     = 120   # 2 minutes
+balanced = 600   # 10 minutes
+deep     = 1800  # 30 minutes
+
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
+# `timeout_secs` below is each provider's FLAT fallback — the ceiling used
+# when a request's `request_model` doesn't match a `[tier_timeouts]` name
+# (see above). It defaults to 1800s (was 60s) so a newly-added provider
+# without an explicit value here is never silently killed before it can
+# answer; set it explicitly for a provider that genuinely needs a shorter
+# per-call bound.
 [providers.openai]
 api_key  = ""          # or set MODELROUTER_PROVIDERS__OPENAI__API_KEY
 # api_base = "https://api.openai.com/v1"

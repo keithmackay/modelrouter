@@ -267,26 +267,6 @@ async fn seed_cache_hit(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i
     .unwrap();
 }
 
-async fn seed_cache_hit(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64, i64)) {
-    CostRepository::create_cache_hit(
-        &**db,
-        NewCostLedgerEntry {
-            user_id: 1,
-            prompt_id: None,
-            model: s.model.to_string(),
-            provider: s.provider.to_string(),
-            project: None,
-            tokens_in: tokens.0,
-            tokens_out: tokens.1,
-            cost_usd: 0.0,
-            api_key_id: None,
-            attribution_correlation_id: Some(s.run.to_string()),
-            attribution_tags: s.tags.to_string(),
-        },
-    )
-    .await
-    .unwrap();
-}
 
 async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: Option<i64>) {
     seed_prompt_measured(db, s, latency_ms, None, None).await

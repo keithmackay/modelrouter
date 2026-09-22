@@ -269,6 +269,7 @@ async fn spawn_ok() -> (String, Arc<Mutex<Capture>>) {
 fn req(model: &str) -> NormalizedRequest {
     NormalizedRequest {
         model: model.to_string(),
+        request_model: model.to_string(),
         messages: vec![json!({"role": "user", "content": "2+2?"})],
         stream: false,
         temperature: Some(0.1),

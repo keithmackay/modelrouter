@@ -35,8 +35,17 @@ pub fn catalog_for(provider_name: &str, config: &ProviderConfig) -> Option<Arc<d
             .map(|a| Arc::new(a) as Arc<dyn ProviderCatalog>),
         #[cfg(not(feature = "foundry"))]
         "foundry" => None,
-        "anthropic" => Some(Arc::new(crate::providers::anthropic::AnthropicAdapter::new(config))),
-        _ => Some(Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(config))),
+        // Catalog listing never dispatches via complete()/stream(), so the
+        // per-tier lookup this adapter also carries is never consulted here
+        // — a default is fine.
+        "anthropic" => Some(Arc::new(crate::providers::anthropic::AnthropicAdapter::new(
+            config,
+            crate::config::schema::TierTimeoutsConfig::default(),
+        ))),
+        _ => Some(Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(
+            config,
+            crate::config::schema::TierTimeoutsConfig::default(),
+        ))),
     }
 }
 

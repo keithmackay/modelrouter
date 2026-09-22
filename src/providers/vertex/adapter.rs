@@ -482,6 +482,7 @@ mod tests {
     fn req(model: &str) -> NormalizedRequest {
         NormalizedRequest {
             model: model.to_string(),
+            request_model: model.to_string(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
             stream: false,
             temperature: Some(0.2),
