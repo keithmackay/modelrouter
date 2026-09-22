@@ -104,6 +104,14 @@ timeout_secs = 120
 # timeout_secs = 30
 # generic_chat = false
 
+# TypeSafe System One typed judgments (POST /v1/systemone). JSON passthrough:
+# callers send the TypeSafe request body; the router adds this key, so callers
+# never hold it. Gated by policy as the pseudo-model "systemone/{model}".
+# [providers.typesafe]
+# api_key  = ""          # or set MODELROUTER_PROVIDERS__TYPESAFE__API_KEY
+# api_base = "https://api.typesafe.ai/v1"
+# timeout_secs = 60
+
 # Grounding with Bing Search on Azure AI Foundry (requires build with
 # `--features bing-grounding`, which is on by default).
 #
@@ -304,6 +312,15 @@ fail_open    = true
 # [[pricing]]
 # model = "search/bing_grounding"
 # input_per_million = 0.035
+# output_per_million = 0.0
+
+#
+# System One is priced per million tokens off the response `usage` block, under
+# the pseudo-model name. Unpriced calls are metered at $0 with a WARN log.
+#
+# [[pricing]]
+# model = "systemone/jev-latest"
+# input_per_million = 0.0
 # output_per_million = 0.0
 
 # ---------------------------------------------------------------------------
