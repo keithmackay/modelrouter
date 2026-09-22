@@ -2,19 +2,28 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::ProviderAdapter;
 
 pub struct ProviderRegistry {
     adapters: DashMap<String, Arc<dyn ProviderAdapter>>,
     configs: HashMap<String, ProviderConfig>,
+    tier_timeouts: TierTimeoutsConfig,
 }
 
 impl ProviderRegistry {
     pub fn new(configs: HashMap<String, ProviderConfig>) -> Self {
+        Self::new_with_tier_timeouts(configs, TierTimeoutsConfig::default())
+    }
+
+    pub fn new_with_tier_timeouts(
+        configs: HashMap<String, ProviderConfig>,
+        tier_timeouts: TierTimeoutsConfig,
+    ) -> Self {
         Self {
             adapters: DashMap::new(),
             configs,
+            tier_timeouts,
         }
     }
 
@@ -56,15 +65,37 @@ impl ProviderRegistry {
                  cargo feature — rebuild with `cargo build --release --features bedrock`"
             );
         }
+        #[cfg(not(feature = "foundry"))]
+        if provider_name == "foundry" {
+            anyhow::bail!(
+                "provider \"foundry\" is configured, but this binary was built without the `foundry` \
+                 cargo feature — rebuild with `cargo build --release --features foundry`"
+            );
+        }
 
         let adapter: Arc<dyn ProviderAdapter> = if provider_name == "anthropic" {
-            Arc::new(crate::providers::anthropic::AnthropicAdapter::new(config))
+            Arc::new(crate::providers::anthropic::AnthropicAdapter::new(
+                config,
+                self.tier_timeouts.clone(),
+            ))
         } else if provider_name == "azure" {
-            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(config))
+            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(
+                config,
+                self.tier_timeouts.clone(),
+            ))
         } else {
             #[cfg(feature = "vertex")]
             if provider_name == "vertex" {
                 let adapter = crate::providers::vertex::VertexAdapter::new(config)?;
+                let entry = self
+                    .adapters
+                    .entry(provider_name.to_string())
+                    .or_insert(Arc::new(adapter));
+                return Ok(entry.clone());
+            }
+            #[cfg(feature = "foundry")]
+            if provider_name == "foundry" {
+                let adapter = crate::providers::foundry::FoundryAdapter::new(config)?;
                 let entry = self
                     .adapters
                     .entry(provider_name.to_string())
@@ -84,7 +115,10 @@ impl ProviderRegistry {
                     .or_insert(Arc::new(bedrock));
                 return Ok(entry.clone());
             }
-            Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(config))
+            Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(
+                config,
+                self.tier_timeouts.clone(),
+            ))
         };
 
         // Use entry API to prevent duplicate creation under concurrency — only first caller wins
@@ -101,6 +135,7 @@ impl ProviderRegistry {
         let registry = Self {
             adapters: DashMap::new(),
             configs: HashMap::new(),
+            tier_timeouts: TierTimeoutsConfig::default(),
         };
         let mock_arc: Arc<dyn ProviderAdapter> = Arc::new(mock);
         registry.adapters.insert("__mock__".to_string(), mock_arc);

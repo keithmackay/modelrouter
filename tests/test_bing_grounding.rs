@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use modelrouter::config::schema::ProviderConfig;
-use modelrouter::providers::bing_grounding::auth::StaticTokenProvider;
+use modelrouter::providers::azure_entra::StaticTokenProvider;
 use modelrouter::providers::bing_grounding::BingGroundingAdapter;
 use modelrouter::providers::search::{SearchAdapter, SearchRequest};
 use modelrouter::providers::search_registry::{is_supported_engine, SearchRegistry};

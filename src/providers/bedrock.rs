@@ -120,6 +120,16 @@ impl BedrockAdapter {
             // Region lives in aws_sdk_bedrockruntime::config::Region (re-exported from aws-types)
             loader = loader.region(Region::new(region.clone()));
         }
+        // Previously unset entirely, so every call ran under the AWS SDK's
+        // own defaults — which the SDK does not name as a stable contract,
+        // and which can differ silently across SDK versions. `config.timeout_secs`
+        // (already read by every other provider adapter) now applies here too,
+        // as an explicit ceiling on both connect and the overall operation.
+        let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+            .connect_timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .operation_timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build();
+        loader = loader.timeout_config(timeout_config);
         let aws_config = loader.load().await;
         let client = aws_sdk_bedrockruntime::Client::new(&aws_config);
         Self { client }
@@ -190,6 +200,7 @@ impl ProviderAdapter for BedrockAdapter {
             // The AWS SDK's converse() resolves only once the whole response
             // is in — there is no header/body split to time, so no TTFT.
             ttft_ms: None,
+            tool_calls: None,
         })
     }
 
@@ -227,14 +238,23 @@ impl ProviderAdapter for BedrockAdapter {
             .stream;
 
         let mut chunks: Vec<anyhow::Result<Bytes>> = Vec::new();
+        // The stream's Metadata event carries what Bedrock actually metered.
+        // Harvest it so the finish chunk reports real token counts and the
+        // streaming ledger doesn't fall back to estimates (issue #84).
+        let mut usage: Option<(u32, u32)> = None;
 
         loop {
             match event_stream.recv().await {
                 Ok(Some(event)) => {
+                    if let aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(m) = &event {
+                        if let Some(u) = m.usage() {
+                            usage = Some((u.input_tokens().max(0) as u32, u.output_tokens().max(0) as u32));
+                        }
+                    }
                     if let Some(chunk) = process_stream_event(event) {
                         chunks.push(Ok(chunk));
                     }
-                    // Non-text events (metadata, message start/stop) are silently skipped.
+                    // Other non-text events (message start/stop) are silently skipped.
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -244,9 +264,23 @@ impl ProviderAdapter for BedrockAdapter {
             }
         }
 
-        // Only emit [DONE] on clean end-of-stream — not after an error event
+        // Only emit the finish chunk and [DONE] on clean end-of-stream — not
+        // after an error event.
         let had_error = chunks.iter().any(|c| c.is_err());
         if !had_error {
+            let mut chunk = serde_json::json!({
+                "id": "chatcmpl-bedrock-stream",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            });
+            if let Some((prompt, completion)) = usage {
+                chunk["usage"] = serde_json::json!({
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt + completion,
+                });
+            }
+            chunks.push(Ok(Bytes::from(format!("data: {}\n\n", chunk))));
             chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
         }
         Ok(Box::pin(stream::iter(chunks)))
@@ -274,4 +308,125 @@ fn process_stream_event(event: aws_sdk_bedrockruntime::types::ConverseStreamOutp
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    //! The SDK-type builders and the stream-event decoder are pure functions
+    //! over AWS SDK types, so they are testable without credentials. What is
+    //! not: `complete` and `stream` issue signed calls through
+    //! `aws_sdk_bedrockruntime::Client`, which this adapter constructs itself
+    //! from the ambient AWS credential chain — there is no endpoint seam to
+    //! point at a local server, so those two remain live-AWS territory.
+
+    use super::*;
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDelta, ContentBlockDeltaEvent, ConverseStreamOutput, MessageStartEvent,
+        ToolUseBlockDelta,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn sdk_messages_drop_system_and_map_roles() {
+        let messages = vec![
+            json!({"role": "system", "content": "be brief"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+            // An unrecognised role is treated as the caller, not dropped —
+            // losing a turn silently would change the conversation.
+            json!({"role": "tool", "content": "42"}),
+        ];
+        let sdk = to_sdk_messages(&messages).unwrap();
+        assert_eq!(sdk.len(), 3, "the system turn is not a Converse message");
+        assert_eq!(sdk[0].role(), &ConversationRole::User);
+        assert_eq!(sdk[1].role(), &ConversationRole::Assistant);
+        assert_eq!(sdk[2].role(), &ConversationRole::User);
+        assert_eq!(sdk[0].content()[0].as_text().unwrap(), "hello");
+    }
+
+    #[test]
+    fn sdk_messages_tolerate_a_missing_or_non_string_content() {
+        let messages = vec![json!({"role": "user"}), json!({"role": "user", "content": 7})];
+        let sdk = to_sdk_messages(&messages).unwrap();
+        assert_eq!(sdk.len(), 2);
+        assert_eq!(sdk[0].content()[0].as_text().unwrap(), "");
+        assert_eq!(sdk[1].content()[0].as_text().unwrap(), "");
+    }
+
+    #[test]
+    fn sdk_system_keeps_only_system_turns() {
+        let messages = vec![
+            json!({"role": "system", "content": "be brief"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "system", "content": "and polite"}),
+        ];
+        let system = to_sdk_system(&messages);
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0].as_text().unwrap(), "be brief");
+        assert_eq!(system[1].as_text().unwrap(), "and polite");
+
+        assert!(
+            to_sdk_system(&[json!({"role": "user", "content": "hello"})]).is_empty(),
+            "no system turns means no system block"
+        );
+    }
+
+    #[test]
+    fn a_text_delta_becomes_one_openai_shaped_sse_frame() {
+        let event = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .delta(ContentBlockDelta::Text("wor".to_string()))
+                .content_block_index(0)
+                .build()
+                .unwrap(),
+        );
+        let bytes = process_stream_event(event).expect("a text delta produces a frame");
+        let frame = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(frame.starts_with("data: "), "{frame}");
+        assert!(frame.ends_with("\n\n"), "{frame}");
+        let payload: serde_json::Value =
+            serde_json::from_str(frame.trim_start_matches("data: ").trim_end()).unwrap();
+        assert_eq!(payload["choices"][0]["delta"]["content"], "wor");
+        assert!(payload["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn non_text_events_produce_no_frame() {
+        // A tool-use delta carries no assistant text.
+        let tool_delta = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .delta(ContentBlockDelta::ToolUse(
+                    ToolUseBlockDelta::builder().input("{}").build().unwrap(),
+                ))
+                .content_block_index(0)
+                .build()
+                .unwrap(),
+        );
+        assert!(process_stream_event(tool_delta).is_none());
+
+        // So does a lifecycle event.
+        let start = ConverseStreamOutput::MessageStart(
+            MessageStartEvent::builder()
+                .role(ConversationRole::Assistant)
+                .build()
+                .unwrap(),
+        );
+        assert!(process_stream_event(start).is_none());
+    }
+
+    #[tokio::test]
+    async fn new_honours_a_configured_region() {
+        // Region from config short-circuits the region chain, so no metadata
+        // lookup happens and construction stays offline.
+        let config = ProviderConfig {
+            region: Some("us-east-1".to_string()),
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let adapter = BedrockAdapter::new(&config).await;
+        assert_eq!(
+            adapter.client.config().region().map(|r| r.as_ref()),
+            Some("us-east-1")
+        );
+    }
 }

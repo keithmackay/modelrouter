@@ -2,6 +2,10 @@ pub mod adapter;
 pub mod catalog;
 pub mod catalog_registry;
 pub mod anthropic;
+/// Microsoft Entra ID token source, shared by every Azure provider that
+/// authenticates without a key. Compiled in when any of them is.
+#[cfg(any(feature = "bing-grounding", feature = "foundry"))]
+pub mod azure_entra;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 #[cfg(feature = "bing-grounding")]
@@ -9,6 +13,8 @@ pub mod bing_grounding;
 pub mod azure_openai;
 pub mod embed_registry;
 pub mod embedding;
+#[cfg(feature = "foundry")]
+pub mod foundry;
 pub mod openai_compat;
 pub mod openai_embed;
 pub mod openai_images;
@@ -38,6 +44,7 @@ const FEATURE_GATED_PROVIDERS: &[(&str, &str, bool)] = &[
         "bing-grounding",
         cfg!(feature = "bing-grounding"),
     ),
+    ("foundry", "foundry", cfg!(feature = "foundry")),
 ];
 
 /// Refuse to start when the config names a provider whose adapter is not in
@@ -122,6 +129,21 @@ mod feature_gate_tests {
         let msg = err.to_string();
         assert!(msg.contains("\"bing_grounding\""), "{msg}");
         assert!(msg.contains("--features bing-grounding"), "{msg}");
+    }
+
+    #[cfg(feature = "foundry")]
+    #[test]
+    fn foundry_passes_when_compiled_in() {
+        assert!(validate_provider_features(&configs(&["foundry"])).is_ok());
+    }
+
+    #[cfg(not(feature = "foundry"))]
+    #[test]
+    fn foundry_fails_when_compiled_out() {
+        let err = validate_provider_features(&configs(&["foundry"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("\"foundry\""), "{msg}");
+        assert!(msg.contains("--features foundry"), "{msg}");
     }
 
     #[cfg(not(feature = "bedrock"))]

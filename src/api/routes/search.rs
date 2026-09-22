@@ -95,6 +95,7 @@ pub async fn search(
 /// Execute search with fallback chain. Returns (result, serving_engine, latency_ms).
 async fn execute_search_with_fallback(
     state: &AppState,
+    user: &crate::db::models::User,
     engine: &str,
     req: &SearchRequest,
 ) -> Result<(crate::providers::search::SearchResponse, String, i64), ApiError> {
@@ -116,6 +117,36 @@ async fn execute_search_with_fallback(
     let mut last_error: Option<anyhow::Error> = None;
 
     for (idx, candidate) in engines_to_try.iter().enumerate() {
+        // Policy re-check for fallback candidates (not the primary, which was
+        // already checked). A denial is not fatal — skip the candidate and try
+        // the next one. The primary was already permitted by the route's check.
+        if idx > 0 {
+            let candidate_pseudo_model = format!("search/{}", candidate);
+            match state.policy.model_permitted_denial(user, &candidate_pseudo_model).await {
+                Ok(None) => {
+                    // Permitted
+                }
+                Ok(Some(reason)) => {
+                    tracing::warn!(
+                        engine = candidate,
+                        user_id = user.id,
+                        reason = reason.as_str(),
+                        "search fallback candidate denied by policy, trying the next one"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Policy engine error — fail closed for this candidate (skip it)
+                    tracing::warn!(
+                        engine = candidate,
+                        error = %e,
+                        "policy check error for search fallback candidate, skipping"
+                    );
+                    continue;
+                }
+            }
+        }
+
         if !crate::providers::search_registry::is_supported_engine(candidate) {
             tracing::debug!(
                 engine = candidate,
@@ -318,7 +349,7 @@ async fn search_inner(
         max_results,
     };
 
-    let (result, serving_engine, latency_ms) = execute_search_with_fallback(&state, &engine, &req).await?;
+    let (result, serving_engine, latency_ms) = execute_search_with_fallback(&state, &user, &engine, &req).await?;
 
     let results_returned = result.results.len() as i64;
 

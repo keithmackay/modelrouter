@@ -9,6 +9,10 @@ use commands::{Cli, Commands, UserCommands, BudgetCommands, KeyCommands, GroupCo
 use crate::report::AuditRow;
 use crate::report::formatter::{print_rows, OutputFormat};
 
+/// Graceful shutdown deadline in seconds. The server drains in-flight requests
+/// until this deadline, then forces exit.
+const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
 // ── Service install/uninstall ─────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -155,6 +159,39 @@ fn config_template_with_generated_secret() -> String {
         crate::config::schema::PLACEHOLDER_JWT_SECRET,
         &secret,
     )
+}
+
+/// Returns a future that completes when SIGTERM or SIGINT is received.
+///
+/// On Unix, listens for both SIGTERM (sent by orchestrators) and SIGINT (Ctrl-C).
+/// On non-Unix, falls back to Ctrl-C only.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("failed to install SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, initiating graceful shutdown");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, initiating graceful shutdown");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+        tracing::info!("received Ctrl-C, initiating graceful shutdown");
+    }
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -340,8 +377,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
             let cost_calc = Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing));
             let provider_registry = Arc::new(
-                crate::providers::registry::ProviderRegistry::new(
+                crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
                     settings.providers.clone(),
+                    settings.tier_timeouts.clone(),
                 ),
             );
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
@@ -584,7 +622,42 @@ pub async fn run(cli: Cli) -> Result<()> {
             tracing::info!("Listening on {}", bind_addr);
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             use std::net::SocketAddr;
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+
+            // Serve with graceful shutdown. Axum drains in-flight connections
+            // when the shutdown signal arrives. The drain deadline must start
+            // at the SIGNAL, not at startup — wrapping the whole serve future
+            // in a timeout would kill a healthy server after 30s of uptime.
+            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+            let serve_future = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                let _ = signal_tx.send(());
+            });
+
+            let drain_deadline = async move {
+                // Pending until the signal fires; only then does the clock start.
+                let _ = signal_rx.await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                ))
+                .await;
+            };
+
+            tokio::select! {
+                result = serve_future => {
+                    result?;
+                    tracing::info!("graceful shutdown complete");
+                }
+                _ = drain_deadline => {
+                    tracing::warn!(
+                        "graceful shutdown exceeded {}s deadline, forcing exit",
+                        GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                    );
+                }
+            }
         }
         Commands::Cache(cache_args) => {
             cache::run(cache_args).await?;

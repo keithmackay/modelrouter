@@ -127,10 +127,13 @@ async fn responses_inner(
 
     let norm_req = NormalizedRequest {
         model: canonical_model.clone(),
+        request_model: model.clone(),
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: false,
         temperature,
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        tools: None,
+        tool_choice: None,
         extra_params: serde_json::Value::Object(Default::default()),
     };
 

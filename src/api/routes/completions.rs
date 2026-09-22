@@ -155,10 +155,12 @@ async fn chat_completions_inner(
     // rest of the request.
     let _concurrency_permit = enforce_policy(&state, &user, &model).await?;
 
-    // Validate that `tools` and `tool_choice` are not present (issue #41).
-    // Check BEFORE session limiter and guardrails so a doomed request doesn't
-    // consume budget or make external calls.
-    validate_no_tools(&body)?;
+    // `tool_choice` without `tools` is malformed on the OpenAI surface; reject
+    // it here, BEFORE session limiter and guardrails, so a doomed request
+    // doesn't consume budget or make external calls. Whether `tools` itself is
+    // accepted depends on the resolved provider/model, so that check happens
+    // after resolution (issue #88).
+    validate_tool_choice_requires_tools(&body)?;
 
     check_session_rate_limit(&state, &body)?;
 
@@ -217,6 +219,26 @@ async fn chat_completions_inner(
         .router
         .check_available(&provider_name, &canonical_model)?;
 
+    // Tools capability gate (issue #88). `tools` used to be rejected outright
+    // (issue #41 era), which broke every OpenAI-compat agentic client whose
+    // backing model natively supports tool calling. Now the request is
+    // rejected only when the RESOLVED adapter cannot forward tools — the only
+    // point where that is knowable, since the caller addresses an alias.
+    // Silently dropping tools instead would be worse than a 400: the model
+    // would answer an agentic request in prose.
+    let has_tools = request_has_tools(&body);
+    if has_tools {
+        let adapter = state
+            .provider_registry
+            .get(&provider_name)
+            .map_err(ApiError::ProviderError)?;
+        if !adapter.supports_tools(&canonical_model) {
+            return Err(ApiError::InvalidRequest(format!(
+                "`tools` is not supported for model '{canonical_model}' on provider '{provider_name}'"
+            )));
+        }
+    }
+
     let span = tracing::Span::current();
     span.record("model", canonical_model.as_str());
     span.record("provider", provider_name.as_str());
@@ -254,7 +276,7 @@ async fn chat_completions_inner(
     }
 
     let norm_req =
-        build_normalized_request(&body, canonical_model.clone(), &state.settings.model_capabilities);
+        build_normalized_request(&body, canonical_model.clone(), &model, &state.settings.model_capabilities);
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -320,10 +342,12 @@ async fn chat_completions_inner(
         attempts,
     } = complete_with_retry_and_fallback(
         &state,
+        &user,
         &body,
         binding.is_some(),
         provider_name.clone(),
         canonical_model.clone(),
+        &model,
     )
     .await?;
 
@@ -493,20 +517,22 @@ async fn enforce_policy(
     }
 }
 
-/// `tools` / `tool_choice` are not supported by this endpoint (issue #41).
-/// Treat null and "none" as absent (both mean: do not use tools).
-fn validate_no_tools(body: &Value) -> Result<(), ApiError> {
-    if let Some(tools) = body["tools"].as_array() {
-        if !tools.is_empty() {
-            return Err(ApiError::InvalidRequest(
-                "`tools` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
-            ));
-        }
+/// Does the request carry a non-empty `tools` array? (issue #88)
+fn request_has_tools(body: &Value) -> bool {
+    body["tools"].as_array().is_some_and(|t| !t.is_empty())
+}
+
+/// A `tool_choice` steering the model toward tools is meaningless — and, on
+/// the OpenAI surface, invalid — without a `tools` array to choose from.
+/// Null and "none" are treated as absent (both mean: do not use tools).
+fn validate_tool_choice_requires_tools(body: &Value) -> Result<(), ApiError> {
+    if request_has_tools(body) {
+        return Ok(());
     }
     if let Some(tc) = body.get("tool_choice") {
         if !tc.is_null() && tc.as_str() != Some("none") {
             return Err(ApiError::InvalidRequest(
-                "`tool_choice` is not supported by this endpoint/model; grounded search belongs on /v1/search".to_string()
+                "`tool_choice` requires a non-empty `tools` array".to_string(),
             ));
         }
     }
@@ -682,32 +708,36 @@ struct ProviderCallOutcome {
 /// recorded against the variant that did not answer.
 async fn complete_with_retry_and_fallback(
     state: &AppState,
+    user: &crate::db::models::User,
     body: &Value,
     bound: bool,
     provider_name: String,
     canonical_model: String,
+    requested_model: &str,
 ) -> Result<ProviderCallOutcome, ApiError> {
     let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model;
     let mut current_provider = provider_name;
-    let next_fallback = |model: &str| {
-        if bound {
-            None
-        } else {
-            next_available_fallback(state, model)
-        }
-    };
     let mut attempts: i64 = 0;
+    // A tools request must never fall back onto an adapter that would drop
+    // the tools (issue #88): the substitute would answer in prose.
+    let require_tools = request_has_tools(body);
     let result = loop {
         if state.circuit_breaker.is_open(&current_provider) {
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
             let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
-            if let Some((next_provider, next_canonical)) = next_fallback(&current_model) {
-                current_model = next_canonical;
-                current_provider = next_provider;
-                continue;
-            } else {
+            if bound {
                 return Err(ApiError::ProviderError(pseudo_err));
+            }
+            match next_available_fallback_with_policy(state, user, &current_model, require_tools).await {
+                Some((next_provider, next_canonical)) => {
+                    current_model = next_canonical;
+                    current_provider = next_provider;
+                    continue;
+                }
+                None => {
+                    return Err(ApiError::ProviderError(pseudo_err));
+                }
             }
         }
         let adapter = state
@@ -722,6 +752,7 @@ async fn complete_with_retry_and_fallback(
                 let req = build_normalized_request(
                     body,
                     current_model.clone(),
+                    requested_model,
                     &state.settings.model_capabilities,
                 );
                 let adapter = adapter.clone();
@@ -747,12 +778,18 @@ async fn complete_with_retry_and_fallback(
                     error = %e,
                     "Provider call failed, checking fallback chain"
                 );
-                if let Some((next_provider, next_canonical)) = next_fallback(&current_model) {
-                    current_model = next_canonical;
-                    current_provider = next_provider;
-                    tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
-                } else {
+                if bound {
                     return Err(ApiError::ProviderError(e));
+                }
+                match next_available_fallback_with_policy(state, user, &current_model, require_tools).await {
+                    Some((next_provider, next_canonical)) => {
+                        current_model = next_canonical;
+                        current_provider = next_provider;
+                        tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
+                    }
+                    None => {
+                        return Err(ApiError::ProviderError(e));
+                    }
                 }
             }
         }
@@ -996,6 +1033,82 @@ struct CacheHitCtx {
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
 /// cost-ledger row with `cache_hit = true`, `cost_usd = 0`, and the avoided cost
 /// in `saved_usd`. Fire-and-forget, matching the live-call logging path.
+/// Next fallback candidate after `current_model` that passes policy model-permission
+/// checks and is not operator-disabled. A candidate denied by policy or disabled by
+/// an administrator is skipped, not fatal — the chain exists to find a working
+/// alternative. Bounded by MAX_FALLBACK_HOPS so a looping chain terminates.
+async fn next_available_fallback_with_policy(
+    state: &AppState,
+    user: &crate::db::models::User,
+    current_model: &str,
+    require_tools: bool,
+) -> Option<(String, String)> {
+    const MAX_FALLBACK_HOPS: usize = 16;
+
+    let mut cursor = current_model.to_string();
+    for _ in 0..MAX_FALLBACK_HOPS {
+        let next_model = state.fallback.next_after(&cursor)?;
+        let (next_provider, next_canonical) = state.router.resolve(&next_model);
+
+        // Check operator availability first
+        if !state.router.is_available(&next_provider, &next_canonical) {
+            tracing::info!(
+                skipped_model = next_model.as_str(),
+                "fallback candidate is disabled by an administrator, trying the next one"
+            );
+            cursor = next_model;
+            continue;
+        }
+
+        // A request carrying tools can only fall back to an adapter that
+        // forwards them (issue #88); anything else would silently drop the
+        // caller's tools mid-conversation.
+        if require_tools {
+            let forwards_tools = state
+                .provider_registry
+                .get(&next_provider)
+                .map(|a| a.supports_tools(&next_canonical))
+                .unwrap_or(false);
+            if !forwards_tools {
+                tracing::info!(
+                    skipped_model = next_model.as_str(),
+                    "fallback candidate does not support tools, trying the next one"
+                );
+                cursor = next_model;
+                continue;
+            }
+        }
+
+        // Check policy model permissions (no rate-limit increment, no budget sum)
+        match state.policy.model_permitted_denial(user, &next_canonical).await {
+            Ok(None) => {
+                // Permitted
+                return Some((next_provider, next_canonical));
+            }
+            Ok(Some(reason)) => {
+                // Policy denies this model for this user — skip it
+                tracing::warn!(
+                    model = next_canonical.as_str(),
+                    user_id = user.id,
+                    reason = reason.as_str(),
+                    "fallback candidate denied by policy, trying the next one"
+                );
+                cursor = next_model;
+            }
+            Err(e) => {
+                // Policy engine error — fail closed for this candidate (skip it)
+                tracing::warn!(
+                    model = next_canonical.as_str(),
+                    error = %e,
+                    "policy check error for fallback candidate, skipping"
+                );
+                cursor = next_model;
+            }
+        }
+    }
+    None
+}
+
 /// Next fallback candidate after `current_model` that an operator has not disabled.
 ///
 /// Operator-disabled entries are *skipped*, not fatal: the chain exists to find a
@@ -1464,6 +1577,7 @@ fn log_streaming_request(
 fn build_normalized_request(
     body: &Value,
     model: String,
+    requested_model: &str,
     capabilities: &[crate::config::schema::ModelCapabilityEntry],
 ) -> crate::providers::adapter::NormalizedRequest {
     // Drop sampling parameters the resolved model rejects. Callers address a
@@ -1484,12 +1598,28 @@ fn build_normalized_request(
         supported
     });
 
+    // Tools ride along only as a pair: a `tool_choice` without tools was
+    // rejected at the door, and forwarding one alone would be invalid at the
+    // provider (issue #88).
+    let tools = body["tools"]
+        .as_array()
+        .filter(|t| !t.is_empty())
+        .cloned();
+    let tool_choice = if tools.is_some() {
+        body.get("tool_choice").filter(|tc| !tc.is_null()).cloned()
+    } else {
+        None
+    };
+
     crate::providers::adapter::NormalizedRequest {
         model,
+        request_model: requested_model.to_string(),
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: body["stream"].as_bool().unwrap_or(false),
         temperature,
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        tools,
+        tool_choice,
         extra_params: serde_json::Value::Object(Default::default()),
     }
 }
@@ -1499,6 +1629,19 @@ fn build_openai_response(
     model: &str,
     result: &crate::providers::adapter::CompletionResult,
 ) -> Value {
+    // OpenAI reports `content: null` (not "") on a pure tool-call turn, and
+    // several client SDKs branch on exactly that (issue #88).
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": if result.content.is_empty() && result.tool_calls.is_some() {
+            Value::Null
+        } else {
+            Value::String(result.content.clone())
+        },
+    });
+    if let Some(tool_calls) = &result.tool_calls {
+        message["tool_calls"] = tool_calls.clone();
+    }
     serde_json::json!({
         "id": request_id,
         "object": "chat.completion",
@@ -1511,10 +1654,7 @@ fn build_openai_response(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": result.content
-            },
+            "message": message,
             "finish_reason": result.finish_reason
         }],
         "usage": {
@@ -1582,6 +1722,7 @@ mod openai_response_tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             ttft_ms: None,
+            tool_calls: None,
         };
         let response = build_openai_response(
             "chatcmpl-mr-test".to_string(),
@@ -1589,6 +1730,88 @@ mod openai_response_tests {
             &result,
         );
         assert_eq!(response["model"], "gpt-4o-2026-01-01");
+        // A plain text turn keeps string content and no tool_calls key.
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
+        assert!(response["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn tool_call_turn_reports_null_content_and_tool_calls(/* issue #88 */) {
+        let result = CompletionResult {
+            content: String::new(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            finish_reason: "tool_calls".to_string(),
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}
+            }])),
+            ..Default::default()
+        };
+        let response =
+            build_openai_response("chatcmpl-mr-test".to_string(), "m", &result);
+        let message = &response["choices"][0]["message"];
+        // OpenAI reports content: null on a pure tool-call turn and SDKs
+        // branch on exactly that.
+        assert!(message["content"].is_null());
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+    }
+}
+
+#[cfg(test)]
+mod tools_request_tests {
+    use super::{build_normalized_request, request_has_tools, validate_tool_choice_requires_tools};
+    use serde_json::json;
+
+    #[test]
+    fn empty_or_absent_tools_do_not_count(/* issue #88 */) {
+        assert!(!request_has_tools(&json!({"messages": []})));
+        assert!(!request_has_tools(&json!({"tools": []})));
+        assert!(request_has_tools(&json!({"tools": [{"type": "function"}]})));
+    }
+
+    #[test]
+    fn tool_choice_without_tools_is_rejected(/* issue #88 */) {
+        let body = json!({"tool_choice": "required"});
+        assert!(validate_tool_choice_requires_tools(&body).is_err());
+        // null and "none" both mean "no tools" and stay accepted.
+        assert!(validate_tool_choice_requires_tools(&json!({"tool_choice": null})).is_ok());
+        assert!(validate_tool_choice_requires_tools(&json!({"tool_choice": "none"})).is_ok());
+        assert!(validate_tool_choice_requires_tools(&json!({})).is_ok());
+        // With tools present any tool_choice shape is the provider's problem.
+        assert!(validate_tool_choice_requires_tools(
+            &json!({"tools": [{"type": "function"}], "tool_choice": "required"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn normalized_request_carries_tools_and_tool_choice(/* issue #88 */) {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "auto",
+        });
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(req.tool_choice, Some(json!("auto")));
+    }
+
+    #[test]
+    fn tool_choice_never_rides_without_tools(/* issue #88 */) {
+        let body = json!({
+            "messages": [],
+            "tool_choice": "none",
+        });
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        assert!(req.tools.is_none());
+        assert!(req.tool_choice.is_none());
+
+        let body = json!({"messages": [], "tools": []});
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        assert!(req.tools.is_none());
     }
 }
 

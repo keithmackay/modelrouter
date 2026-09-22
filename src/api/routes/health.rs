@@ -168,10 +168,13 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
 
     let req = NormalizedRequest {
         model: model.clone(),
+        request_model: requested.clone(),
         messages: vec![json!({"role": "user", "content": "health probe"})],
         stream: false,
         temperature: None,
         max_tokens: Some(1),
+        tools: None,
+        tool_choice: None,
         extra_params: json!({}),
     };
     let started = Instant::now();

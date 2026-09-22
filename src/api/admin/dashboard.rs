@@ -354,13 +354,16 @@ fn user_row_html(user: &crate::db::models::User) -> String {
         "\" hx-swap=\"outerHTML\">", toggle_label, "</button>",
     ].concat();
 
-    let email_str = user.email.as_deref().unwrap_or("—");
+    // Name and email are operator-entered but still user-controlled data —
+    // escape them like every other fragment in this file does (issue #75).
+    let name_e = he(&user.name);
+    let email_e = user.email.as_deref().map(he).unwrap_or_else(|| "—".to_string());
 
     [
         "<tr id=\"user-row-", id_s.as_str(), "\">",
         "<td>", id_s.as_str(), "</td>",
-        "<td>", user.name.as_str(), "</td>",
-        "<td>", email_str, "</td>",
+        "<td>", name_e.as_str(), "</td>",
+        "<td>", email_e.as_str(), "</td>",
         "<td>", status_tag, "</td>",
         "<td>", user.created_at.as_str(), "</td>",
         "<td>", toggle_btn.as_str(), "</td>",
@@ -497,6 +500,144 @@ pub async fn post_create_user(
 
     let html = user_row_html(&user);
     Ok(Html(html))
+}
+
+// ── Generate API key for user ─────────────────────────────────────────────────
+
+pub async fn post_generate_user_key(
+    State(state): State<AppState>,
+    session: SuperDashboardSession,
+    Path(user_id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    use crate::db::repositories::api_keys::ApiKeyRepository;
+    use crate::db::repositories::users::UserRepository;
+    use crate::api::auth::hash_token;
+
+    // Fetch the user
+    let user = UserRepository::find_by_id(&*state.db, user_id)
+        .await
+        .map_err(|_| DashboardError::Internal)?
+        .ok_or_else(|| DashboardError::NotFound(format!("user {} not found", user_id)))?;
+
+    // Generate raw key and hash
+    let raw_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = hash_token(&raw_key);
+
+    // Create the API key
+    let created = ApiKeyRepository::create_api_key(&*state.db, crate::db::models::NewApiKey {
+        user_id,
+        key_hash,
+        label: None,
+        expires_at: None,
+        project: None,
+        session_window_secs: None,
+    })
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    // Audit log
+    audit(
+        &state.db,
+        Some(session.0.sub),
+        &session.0.name,
+        "generate_api_key",
+        Some(format!("user:{}", user_id)),
+        None,
+        Some(format!("key_id:{}", created.id)),
+    )
+    .await;
+
+    // Build the row with the raw key displayed once
+    Ok(Html(user_row_with_key_html(&user, &raw_key)))
+}
+
+/// Build a user row HTML fragment showing the newly generated key with email button.
+fn user_row_with_key_html(user: &crate::db::models::User, raw_key: &str) -> String {
+    let id_s = user.id.to_string();
+    let status_tag = if user.enabled {
+        "<span class=\"tag tag-enabled\">Enabled</span>"
+    } else {
+        "<span class=\"tag tag-disabled\">Disabled</span>"
+    };
+
+    let (toggle_action, toggle_label, toggle_class) = if user.enabled {
+        ("/disable", "Disable", "btn btn-danger")
+    } else {
+        ("/enable", "Enable", "btn btn-success")
+    };
+
+    let toggle_btn = format!(
+        "<button class=\"{}\" hx-post=\"/admin/users/{}{}\
+        \" hx-target=\"#user-row-{}\" hx-swap=\"outerHTML\">{}</button>",
+        toggle_class, id_s, toggle_action, id_s, toggle_label
+    );
+
+    let generate_btn = format!(
+        "<button class=\"btn btn-secondary\" hx-post=\"/admin/users/{}/keys/generate\"\
+        hx-target=\"#user-row-{}\" hx-swap=\"outerHTML\">Generate Key</button>",
+        id_s, id_s
+    );
+
+    let email_str = user.email.as_deref().map(he).unwrap_or_else(|| "—".to_string());
+
+    let raw_e = he(raw_key);
+    let key_display = if let Some(ref email) = user.email {
+        let subject = urlencoding::encode("Your ModelRouter API Key");
+        let body_plain = format!(
+            "Hi {},\n\nYour ModelRouter API key has been generated. \
+            Please keep it safe — it will not be shown again.\n\n\
+            API Key: {}\n\n\
+            To use this key, set the following header in your requests:\n  \
+            Authorization: Bearer {}\n\n\
+            Router URL: http://your-modelrouter-host/v1/chat/completions\n\n\
+            If you have any questions, please contact your administrator.\n",
+            user.name,
+            raw_key,
+            raw_key,
+        );
+        let body_enc = urlencoding::encode(&body_plain);
+        let email_e = he(email);
+        format!(
+            "<br><div style=\"margin-top:0.5rem;padding:0.5rem;background:#f0fff0;border:1px solid #c3e6cb;border-radius:4px;\">\
+            <div style=\"color:#155724;font-weight:bold;margin-bottom:0.3rem;\">✓ Key Generated (shown once only)</div>\
+            <code style=\"display:block;color:green;font-family:monospace;font-size:0.9rem;\
+            padding:0.3rem;background:white;border-radius:3px;margin-bottom:0.5rem;\">{}</code>\
+            <a href=\"mailto:{}?subject={}&body={}\" \
+            class=\"btn btn-secondary\" style=\"text-decoration:none;\">✉ Email Key to User</a>\
+            </div>",
+            raw_e, email_e, subject, body_enc
+        )
+    } else {
+        format!(
+            "<br><div style=\"margin-top:0.5rem;padding:0.5rem;background:#f0fff0;border:1px solid #c3e6cb;border-radius:4px;\">\
+            <div style=\"color:#155724;font-weight:bold;margin-bottom:0.3rem;\">✓ Key Generated (shown once only)</div>\
+            <code style=\"display:block;color:green;font-family:monospace;font-size:0.9rem;\
+            padding:0.3rem;background:white;border-radius:3px;margin-bottom:0.5rem;\">{}</code>\
+            <span style=\"color:#666;font-size:0.85rem;\">No email on file</span>\
+            </div>",
+            raw_e
+        )
+    };
+
+    format!(
+        "<tr id=\"user-row-{}\">\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{}</td>\
+        <td>{} {}{}</td>\
+        </tr>",
+        id_s,
+        id_s,
+        he(&user.name),
+        email_str,
+        status_tag,
+        user.created_at,
+        toggle_btn,
+        generate_btn,
+        key_display,
+    )
 }
 
 // ── Keys page ─────────────────────────────────────────────────────────────────

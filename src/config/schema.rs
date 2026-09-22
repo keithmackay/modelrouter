@@ -145,6 +145,59 @@ fn default_assumed_temperature() -> f64 { 1.0 }
 fn default_search_cache_ttl() -> u64 { 900 }
 fn default_true() -> bool { true }
 
+/// Per-tier timeout ceilings (seconds), keyed by the `request_model` alias a
+/// caller addressed (`fast`/`balanced`/`deep`).
+///
+/// Requests already arrive carrying the tier alias as `request_model`, but
+/// until this existed every provider applied a single flat `timeout_secs`
+/// (from `[providers.<name>]`) regardless of which tier the caller asked
+/// for — a `deep` request queued behind a 60s default died before a
+/// deliberately long-running call had any chance to finish. See
+/// `TierTimeoutsConfig::resolve` for the lookup, and
+/// `default_timeout_secs` below for the flat per-provider fallback used
+/// when `request_model` doesn't name a known tier (a literal
+/// `provider/model` address, or a caller not using the tier system at all).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TierTimeoutsConfig {
+    #[serde(default = "default_tier_timeout_fast")]
+    pub fast: u64,
+    #[serde(default = "default_tier_timeout_balanced")]
+    pub balanced: u64,
+    #[serde(default = "default_tier_timeout_deep")]
+    pub deep: u64,
+}
+
+impl Default for TierTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            fast: default_tier_timeout_fast(),
+            balanced: default_tier_timeout_balanced(),
+            deep: default_tier_timeout_deep(),
+        }
+    }
+}
+
+impl TierTimeoutsConfig {
+    /// Resolve the timeout (seconds) to apply for a request. `request_model`
+    /// is the alias/address the caller used BEFORE resolution — matched
+    /// against the three known tier names. Anything else (a literal
+    /// `provider/model` address, an untiered alias, or a legacy caller not
+    /// using the tier system) falls back to `default_secs` unchanged — the
+    /// provider's own configured `timeout_secs`, exactly today's behavior.
+    pub fn resolve(&self, request_model: &str, default_secs: u64) -> u64 {
+        match request_model {
+            "fast" => self.fast,
+            "balanced" => self.balanced,
+            "deep" => self.deep,
+            _ => default_secs,
+        }
+    }
+}
+
+fn default_tier_timeout_fast() -> u64 { 120 }
+fn default_tier_timeout_balanced() -> u64 { 600 }
+fn default_tier_timeout_deep() -> u64 { 1800 }
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
     #[serde(default = "default_max_retries")]
@@ -187,6 +240,8 @@ pub struct Settings {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub tier_timeouts: TierTimeoutsConfig,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -682,7 +737,9 @@ pub struct ProviderConfig {
     pub api_base: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Azure OpenAI API version (e.g. "2024-02-01"). Used only by the Azure adapter.
+    /// Azure API version (e.g. "2024-02-01"). Used by the `azure` adapter, and
+    /// by `foundry` to override the api-version it would otherwise pick for the
+    /// endpoint's surface.
     #[serde(default)]
     pub api_version: Option<String>,
     /// AWS region for Bedrock (e.g. "us-east-1"). Used only by the Bedrock adapter.
@@ -756,6 +813,31 @@ pub struct ProviderConfig {
     /// portal calls the value being copied.
     #[serde(default)]
     pub foundry_project_endpoint: Option<String>,
+    /// Azure AI Foundry inference endpoint, e.g.
+    /// `https://<resource>.services.ai.azure.com` (the `foundry` provider
+    /// appends `/openai/v1`), or the model-inference endpoint
+    /// `https://<resource>.services.ai.azure.com/models`. Used only by the
+    /// `foundry` provider; `api_base` is accepted as a fallback.
+    ///
+    /// Distinct from `foundry_project_endpoint`, which the `bing_grounding`
+    /// SEARCH adapter uses for the Responses API on a project endpoint. Setting
+    /// `project` alongside this one appends `/api/projects/<project>`, which is
+    /// the same project/region split the `[providers.vertex]` block uses.
+    #[serde(default)]
+    pub foundry_endpoint: Option<String>,
+    /// Override the Microsoft Entra scope (audience) requested for this
+    /// provider, e.g. `https://cognitiveservices.azure.com/.default` or
+    /// `https://ai.azure.com/.default`.
+    ///
+    /// The `foundry` provider derives an audience from the endpoint shape —
+    /// project endpoints take `ai.azure.com`, resource endpoints take
+    /// `cognitiveservices.azure.com` per the published OpenAPI documents — but
+    /// Microsoft's own keyless-auth how-to shows `ai.azure.com` for resource
+    /// endpoints too. Where the published spec and the published prose disagree,
+    /// the operator gets the last word. The resolved value is logged at startup
+    /// and named in the 401/403 error hint.
+    #[serde(default)]
+    pub entra_scope: Option<String>,
     /// Foundry project connection id of the "Grounding with Bing Search" (or
     /// "Grounding with Bing Custom Search") resource, as shown on the project's
     /// Connected resources page. Required by the `bing_grounding` adapter: the
@@ -794,6 +876,8 @@ impl Default for ProviderConfig {
             embedding_task_type: None,
             search_model: None,
             foundry_project_endpoint: None,
+            foundry_endpoint: None,
+            entra_scope: None,
             project_connection_id: None,
             custom_search: false,
             custom_search_instance: None,
@@ -801,7 +885,16 @@ impl Default for ProviderConfig {
     }
 }
 
-fn default_timeout_secs() -> u64 { 60 }
+// Was 60s. That silently killed any newly-configured provider before it had
+// a chance to answer, and — before tier-based timeouts existed — was the
+// ceiling EVERY request ran under regardless of how long its tier expects to
+// take. Raised to the "deep" tier ceiling: a provider that isn't covered by
+// `[tier_timeouts]` (a literal `provider/model` address, or a caller not
+// using the tier system) now gets the most generous bound rather than the
+// least, matching "never silently kill a newly-added provider before this
+// lands." A provider that genuinely needs a *shorter* timeout still sets
+// `timeout_secs` explicitly in `[providers.<name>]`.
+fn default_timeout_secs() -> u64 { 1800 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HooksConfig {
@@ -1088,5 +1181,71 @@ mod policy_rule_tests {
             name = "allow-all"
         "#).unwrap();
         assert_eq!(s.policy_rules.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tier_timeouts_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_matches_known_tier_names() {
+        let t = TierTimeoutsConfig { fast: 120, balanced: 600, deep: 1800 };
+        assert_eq!(t.resolve("fast", 999), 120);
+        assert_eq!(t.resolve("balanced", 999), 600);
+        assert_eq!(t.resolve("deep", 999), 1800);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_provider_default_for_anything_else() {
+        let t = TierTimeoutsConfig::default();
+        // A literal provider/model address.
+        assert_eq!(t.resolve("anthropic/claude-opus-4-5", 45), 45);
+        // An untiered custom alias.
+        assert_eq!(t.resolve("smart", 45), 45);
+        // Empty / unset.
+        assert_eq!(t.resolve("", 45), 45);
+    }
+
+    #[test]
+    fn default_values_match_the_tier_timeout_doctrine_starting_point() {
+        let t = TierTimeoutsConfig::default();
+        assert_eq!(t.fast, 120);
+        assert_eq!(t.balanced, 600);
+        assert_eq!(t.deep, 1800);
+    }
+
+    #[test]
+    fn parses_from_toml_with_partial_overrides() {
+        let s: Settings = toml::from_str(r#"
+            [tier_timeouts]
+            deep = 3600
+        "#).unwrap();
+        // Overridden field takes the configured value...
+        assert_eq!(s.tier_timeouts.deep, 3600);
+        // ...unconfigured fields keep the doctrine defaults.
+        assert_eq!(s.tier_timeouts.fast, 120);
+        assert_eq!(s.tier_timeouts.balanced, 600);
+    }
+
+    #[test]
+    fn settings_default_has_tier_timeouts_populated() {
+        // Regression guard: `Settings::default()` (used by every test helper
+        // across the codebase that doesn't load a config.toml) must not leave
+        // `tier_timeouts` at all-zero — a zero-second reqwest timeout would
+        // fail every request instantly.
+        let s = Settings::default();
+        assert!(s.tier_timeouts.fast > 0);
+        assert!(s.tier_timeouts.balanced > 0);
+        assert!(s.tier_timeouts.deep > 0);
+    }
+
+    #[test]
+    fn raised_provider_default_never_silently_kills_an_unconfigured_provider() {
+        // The whole point of raising this from 60s: a provider added to
+        // config without an explicit `timeout_secs` (or one that falls
+        // through `TierTimeoutsConfig::resolve` because `request_model`
+        // isn't a known tier) must not die on a flat 60s any more.
+        assert_eq!(default_timeout_secs(), 1800);
     }
 }
