@@ -55,12 +55,6 @@ pub fn translate_request(req: &NormalizedRequest, streaming: bool) -> serde_json
             body["tool_choice"] = tc;
         }
     }
-    // `:streamRawPredict` only serves SSE when the body asks for it; without
-    // this flag Vertex answers with one raw JSON object, the SSE translator
-    // finds no `data:` lines, and the client receives an empty 200 (#83).
-    if stream {
-        body["stream"] = serde_json::json!(true);
-    }
     body
 }
 
