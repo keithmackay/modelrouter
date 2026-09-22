@@ -17,6 +17,26 @@ use tokio::sync::RwLock;
 #[async_trait]
 pub trait TokenProvider: Send + Sync {
     async fn token(&self) -> anyhow::Result<String>;
+
+    /// Force a credential rebuild even though `token()` last succeeded.
+    ///
+    /// `token()`'s rebuild path only fires when fetching the token itself
+    /// fails — but issue #2879's actual outage never did that:
+    /// `access_token()` kept returning `Ok` for the whole 8.5 hours,
+    /// because a user ADC grant's *refresh token* had expired underneath an
+    /// access token `google-cloud-auth` still considered current. What
+    /// failed was Vertex's own authorization check on the prediction call —
+    /// a 401 on a token the provider believed was fine. A caller that sees
+    /// exactly that (a downstream 401/UNAUTHENTICATED after a successful
+    /// `token()`) has evidence `token()` doesn't, and needs a way to say "no,
+    /// really, rebuild" — see [`RebuildingProvider::force_rebuild_token`].
+    ///
+    /// Default: no rebuild capability, just re-fetch via `token()` — correct
+    /// for `StaticTokenProvider` and any other source with nothing to
+    /// rebuild.
+    async fn force_rebuild_token(&self) -> anyhow::Result<String> {
+        self.token().await
+    }
 }
 
 /// Test-only token provider that returns a pre-configured token.
@@ -123,6 +143,26 @@ impl<T: AccessTokenSource> RebuildingProvider<T> {
                 self.recover(first_err, generation).await
             }
         }
+    }
+
+    /// Force a rebuild even though the cached credential's own `fetch_token`
+    /// would report success — the caller has independent evidence (a 401
+    /// from the downstream API) that it's wrong anyway. Goes through the
+    /// same `recover` policy (cooldown, generation check, logging) as the
+    /// `token()` failure path, just entered from a different trigger.
+    async fn force_rebuild_token(&self) -> anyhow::Result<String> {
+        let generation = self.state.read().await.generation;
+        tracing::warn!(
+            "vertex: downstream rejected the cached credential (401/UNAUTHENTICATED) even \
+             though the token provider believed it was valid — forcing a rebuild"
+        );
+        self.recover(
+            anyhow::anyhow!(
+                "downstream rejected the cached credential with 401/UNAUTHENTICATED"
+            ),
+            generation,
+        )
+        .await
     }
 
     /// Called after a fetch on the current credential has already failed.
@@ -240,6 +280,98 @@ impl TokenProvider for GoogleCloudAuthProvider {
     async fn token(&self) -> anyhow::Result<String> {
         self.inner.token().await
     }
+
+    async fn force_rebuild_token(&self) -> anyhow::Result<String> {
+        self.inner.force_rebuild_token().await
+    }
+}
+
+/// Send a request built by `build`, and — if Vertex answers with 401 even
+/// though `token_provider` hands out a token successfully — force a
+/// credential rebuild and resend exactly once.
+///
+/// This is the path that actually fired in the 2026-09-22 outage (issue
+/// #2879): `token()` kept returning `Ok` for 8.5 hours while Vertex
+/// rejected every prediction call with `401 ACCESS_TOKEN_TYPE_UNSUPPORTED`,
+/// because the credential material behind an already-cached access token had
+/// gone bad. A rebuild triggered only by `token()` failing never fires in
+/// that scenario — this is the second, independent trigger the fix needs
+/// (see `force_rebuild_token` above).
+///
+/// `build` is called once per attempt (up to two) with the bearer token to
+/// use, so it must be cheap and side-effect-free — it typically just clones a
+/// URL and a JSON body into a `RequestBuilder`.
+pub(crate) async fn send_with_401_retry<F>(
+    token_provider: &Arc<dyn TokenProvider>,
+    send_failed_context: &'static str,
+    mut build: F,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut(String) -> reqwest::RequestBuilder,
+{
+    let token = token_provider.token().await?;
+    let resp = build(token).send().await.context(send_failed_context)?;
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(resp);
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+    tracing::warn!(
+        body = %body,
+        "vertex: request rejected with 401 even though the cached credential looked valid — \
+         forcing a credential rebuild and retrying once"
+    );
+    let fresh_token = token_provider
+        .force_rebuild_token()
+        .await
+        .context("credential rebuild after a 401 from Vertex also failed")?;
+    tracing::info!("vertex: retrying once with a rebuilt credential after a 401");
+    build(fresh_token)
+        .send()
+        .await
+        .with_context(|| format!("{send_failed_context} (retry after credential rebuild)"))
+}
+
+/// Test helper shared across `vertex::adapter`, `vertex::embed` and
+/// `vertex::search`: a `TokenProvider` that hands out one token from
+/// `token()` and a different one from `force_rebuild_token()`, counting
+/// calls to the latter. Used to prove that a 401 from a mock Vertex server
+/// actually drives a forced rebuild and a retry with the new token — not
+/// just that the code compiles against the trait.
+#[cfg(test)]
+pub(crate) struct RecordingTokenProvider {
+    stale_token: String,
+    fresh_token: String,
+    rebuild_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl RecordingTokenProvider {
+    pub(crate) fn new(stale_token: &str, fresh_token: &str) -> Self {
+        Self {
+            stale_token: stale_token.to_string(),
+            fresh_token: fresh_token.to_string(),
+            rebuild_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn rebuild_calls(&self) -> usize {
+        self.rebuild_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl TokenProvider for RecordingTokenProvider {
+    async fn token(&self) -> anyhow::Result<String> {
+        Ok(self.stale_token.clone())
+    }
+
+    async fn force_rebuild_token(&self) -> anyhow::Result<String> {
+        self.rebuild_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.fresh_token.clone())
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +407,25 @@ mod tests {
     impl AccessTokenSource for AlwaysFailsCreds {
         async fn fetch_token(&self) -> anyhow::Result<String> {
             anyhow::bail!("permanently broken credential (simulated)")
+        }
+    }
+
+    /// A fake credential whose `fetch_token` always succeeds, at every
+    /// generation — this is what actually happened in the #2879 outage:
+    /// `google-cloud-auth`'s `access_token()` returned `Ok` for the entire
+    /// 8.5 hours because the user-ADC access token it had cached was still
+    /// individually well-formed. `token()`'s failure-triggered rebuild can
+    /// never fire against a source shaped like this; only
+    /// `force_rebuild_token()` — driven by a downstream 401 — can.
+    #[derive(Clone)]
+    struct AlwaysSucceedsCreds {
+        generation: usize,
+    }
+
+    #[async_trait]
+    impl AccessTokenSource for AlwaysSucceedsCreds {
+        async fn fetch_token(&self) -> anyhow::Result<String> {
+            Ok(format!("token-gen-{}", self.generation))
         }
     }
 
@@ -349,6 +500,70 @@ mod tests {
             build_count.load(Ordering::SeqCst),
             1,
             "a working credential should never be rebuilt"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_rebuild_token_rebuilds_even_though_the_cached_credential_never_fails(
+        /* issue #2879 SPEC UPDATE 2: token() alone never fires here */
+    ) {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let counter = build_count.clone();
+        let provider = RebuildingProvider::new(move || {
+            let generation = counter.fetch_add(1, Ordering::SeqCst);
+            Ok(AlwaysSucceedsCreds { generation })
+        })
+        .unwrap();
+
+        // `token()` alone must never rebuild a credential that fetches fine —
+        // this is exactly the shape of the real outage: access_token() kept
+        // succeeding while Vertex rejected the token downstream.
+        let t1 = provider.token().await.unwrap();
+        assert_eq!(t1, "token-gen-0");
+        assert_eq!(
+            build_count.load(Ordering::SeqCst),
+            1,
+            "token() must not rebuild a credential whose own fetch never fails"
+        );
+
+        // A caller with independent evidence (a 401 from the downstream API)
+        // forces a rebuild anyway, and gets a token from the new generation.
+        let t2 = provider.force_rebuild_token().await.unwrap();
+        assert_eq!(t2, "token-gen-1");
+        assert_eq!(
+            build_count.load(Ordering::SeqCst),
+            2,
+            "force_rebuild_token must rebuild regardless of whether fetch_token would have failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_rebuild_token_is_also_subject_to_the_cooldown() {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let counter = build_count.clone();
+        let provider = RebuildingProvider::new(move || {
+            let generation = counter.fetch_add(1, Ordering::SeqCst);
+            Ok(AlwaysSucceedsCreds { generation })
+        })
+        .unwrap();
+
+        assert!(
+            provider.force_rebuild_token().await.is_ok(),
+            "the first forced rebuild should succeed"
+        );
+        for _ in 0..4 {
+            assert!(
+                provider.force_rebuild_token().await.is_err(),
+                "further forced rebuilds within the cooldown window must be suppressed, \
+                 not silently repeated"
+            );
+        }
+
+        assert_eq!(
+            build_count.load(Ordering::SeqCst),
+            2,
+            "one build at construction plus exactly one forced rebuild — the cooldown applies to \
+             force_rebuild_token exactly as it does to token()'s own rebuild path"
         );
     }
 }
