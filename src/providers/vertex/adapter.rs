@@ -983,7 +983,7 @@ mod tests {
     }
 
     /// A `Router` handler that rejects the stale bearer token with 401 (the
-    /// exact status Vertex answered with for 8.5 hours in issue #2879 —
+    /// exact status Vertex answered with for 8.5 hours in one production outage —
     /// `ACCESS_TOKEN_TYPE_UNSUPPORTED`) and accepts only the rebuilt one.
     fn rejects_stale_token_router(success_body: &'static str) -> Router {
         Router::new().fallback(post(move |headers: axum::http::HeaderMap| async move {
@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_401_on_complete_forces_a_rebuild_and_retries_once(/* issue #2879 */) {
+    async fn a_401_on_complete_forces_a_rebuild_and_retries_once() {
         // `token()` never fails here (it always returns "stale-token", just
         // like `access_token()` kept returning Ok for the whole outage) —
         // only the downstream 401 can trigger recovery.
@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_401_on_stream_forces_a_rebuild_and_retries_once(/* issue #2879 */) {
+    async fn a_401_on_stream_forces_a_rebuild_and_retries_once() {
         let router = rejects_stale_token_router(
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\
              data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n",

@@ -241,7 +241,7 @@ Not implemented. LiteLLM exposes a `/metrics` endpoint in Prometheus format.
 ### 7.3 External Log Destinations (CloudWatch, S3, Datadog, New Relic, Splunk, GCP Logging, Azure Sentinel)
 modelrouter logs to its local database only. LiteLLM can forward logs to a wide range of external destinations.
 
-**Value:** S3 + Athena is the standard pattern for cheap long-term retention and ad-hoc querying of large request logs. Datadog and New Relic are the existing observability platforms in many organisations — native integration eliminates a separate query interface.
+**Value:** S3 plus a serverless SQL query engine is the standard pattern for cheap long-term retention and ad-hoc querying of large request logs. Datadog and New Relic are the existing observability platforms in many organisations — native integration eliminates a separate query interface.
 
 ### 7.4 Cold Storage for Spend Logs (S3 Archival)
 LiteLLM has a cold storage handler that archives old spend log rows to S3 to keep the database size manageable.

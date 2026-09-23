@@ -257,7 +257,7 @@ impl EmbeddingAdapter for VertexEmbeddingAdapter {
 
 #[cfg(test)]
 mod tests {
-    //! Issue #2879's outage log recorded 36 `Embedding provider returned 401
+    //! One production outage's log recorded 36 `Embedding provider returned 401
     //! Unauthorized` lines alongside the chat-completion 401s — the same
     //! defect, a third affected surface. This proves the fix reaches here too.
 
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_401_on_predict_forces_a_rebuild_and_retries_once(/* issue #2879 */) {
+    async fn a_401_on_predict_forces_a_rebuild_and_retries_once() {
         let router = Router::new().fallback(post(|headers: axum::http::HeaderMap| async move {
             let auth = headers
                 .get(axum::http::header::AUTHORIZATION)

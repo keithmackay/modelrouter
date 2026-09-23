@@ -21,7 +21,7 @@ pub trait TokenProvider: Send + Sync {
     /// Force a credential rebuild even though `token()` last succeeded.
     ///
     /// `token()`'s rebuild path only fires when fetching the token itself
-    /// fails — but issue #2879's actual outage never did that:
+    /// fails — but the production outage this fixes never did that:
     /// `access_token()` kept returning `Ok` for the whole 8.5 hours,
     /// because a user ADC grant's *refresh token* had expired underneath an
     /// access token `google-cloud-auth` still considered current. What
@@ -290,8 +290,8 @@ impl TokenProvider for GoogleCloudAuthProvider {
 /// though `token_provider` hands out a token successfully — force a
 /// credential rebuild and resend exactly once.
 ///
-/// This is the path that actually fired in the 2026-09-22 outage (issue
-/// #2879): `token()` kept returning `Ok` for 8.5 hours while Vertex
+/// This is the path that actually fired in one production outage:
+/// `token()` kept returning `Ok` for 8.5 hours while Vertex
 /// rejected every prediction call with `401 ACCESS_TOKEN_TYPE_UNSUPPORTED`,
 /// because the credential material behind an already-cached access token had
 /// gone bad. A rebuild triggered only by `token()` failing never fires in
@@ -411,7 +411,7 @@ mod tests {
     }
 
     /// A fake credential whose `fetch_token` always succeeds, at every
-    /// generation — this is what actually happened in the #2879 outage:
+    /// generation — this is what actually happened in the production outage:
     /// `google-cloud-auth`'s `access_token()` returned `Ok` for the entire
     /// 8.5 hours because the user-ADC access token it had cached was still
     /// individually well-formed. `token()`'s failure-triggered rebuild can
@@ -504,9 +504,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_rebuild_token_rebuilds_even_though_the_cached_credential_never_fails(
-        /* issue #2879 SPEC UPDATE 2: token() alone never fires here */
-    ) {
+    async fn force_rebuild_token_rebuilds_even_though_the_cached_credential_never_fails() {
+        // token() alone never fires here.
         let build_count = Arc::new(AtomicUsize::new(0));
         let counter = build_count.clone();
         let provider = RebuildingProvider::new(move || {

@@ -124,7 +124,7 @@ mod tools_tests {
     }
 
     #[test]
-    fn image_url_parts_reach_vertex_as_anthropic_image_blocks(/* ey-org/athena2#2232 */) {
+    fn image_url_parts_reach_vertex_as_anthropic_image_blocks() {
         // Vertex Anthropic 400s on OpenAI `image_url` parts ("Input tag
         // 'image_url' ... invalid"); they must arrive as native image blocks.
         let req = NormalizedRequest {
