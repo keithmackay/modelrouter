@@ -89,7 +89,7 @@ async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
 
 /// Build a full app with caller-controlled `settings` and `search_registry`,
 /// everything else defaulted/empty — for the search-engine-inference tests
-/// below (issue #2879/#2927), which need to vary `[health]
+/// below, which need to vary `[health]
 /// search_probe_engine`, `[routing] default_search_engine`, and exactly which
 /// search engines are configured independently of each other, none of which
 /// `test_app` above exposes.
@@ -157,7 +157,7 @@ fn mock_search_registry_health(engines: &[&str]) -> SearchRegistry {
     )
 }
 
-// ── GET /health/deep search-engine inference (issue #2879/#2927) ───────────────
+// ── GET /health/deep search-engine inference ──────────────────────────────────
 //
 // Mirrors /v1/search's own precedence (api/routes/search.rs::resolve_engine):
 // explicit config wins, then [routing] default_search_engine, then the sole

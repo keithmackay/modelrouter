@@ -242,7 +242,7 @@ async fn probe_embedding(state: &AppState) -> CapabilityReport {
 ///
 /// `[health] search_probe_engine` wins when set explicitly. Otherwise this
 /// defers to the exact same inference `/v1/search` uses for a caller that
-/// omitted `engine` (issue #2879/#2927) — `[routing] default_search_engine`,
+/// omitted `engine` — `[routing] default_search_engine`,
 /// then the sole configured provider — rather than the previous hardcoded
 /// `"tavily"`, which could report a healthy Vertex-only search path as down
 /// (or, worse, report an unrelated `tavily` entry healthy while the engine

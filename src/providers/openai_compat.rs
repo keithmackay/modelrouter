@@ -423,7 +423,7 @@ mod tier_timeout_tests {
         }
     }
 
-    /// The core claim of #2020's fix: a request addressing a KNOWN tier gets
+    /// The core claim of the tiered-timeout fix: a request addressing a KNOWN tier gets
     /// THAT tier's ceiling, not the provider's flat `timeout_secs` — proven
     /// here by making the tier ceiling shorter than the provider default and
     /// shorter than the server's response delay, so only the tier value
