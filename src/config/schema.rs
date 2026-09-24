@@ -508,8 +508,27 @@ pub struct HealthConfig {
     #[serde(default = "default_embedding_probe_model")]
     pub embedding_probe_model: String,
     /// Engine the search probe uses.
-    #[serde(default = "default_search_probe_engine")]
-    pub search_probe_engine: String,
+    ///
+    /// Unset means "infer from `[routing] default_search_engine`, then from
+    /// the configured search providers": if exactly one is configured, use
+    /// it. This replaced a hardcoded `"tavily"` default (issue #2879/#2927) —
+    /// a host configured for `[providers.vertex]` search only had `/health/deep`
+    /// report "No search adapter configured for engine: tavily" while Vertex
+    /// search worked perfectly, a false alarm on a real signal. Worse, the
+    /// inverse is silent: if a host happens to ALSO have a `tavily` entry
+    /// (even one it never routes real traffic through), the probe reports
+    /// that engine healthy while the engine callers actually use is down —
+    /// the probe answers a question nobody asked. Naming a provider in code
+    /// as the fallback for "operator said nothing" is the same class of
+    /// mistake `default_search_engine`'s doc comment already names for
+    /// `/v1/search`; this field gets the identical inference via
+    /// `api::routes::search::infer_search_engine` rather than its own
+    /// hardcoded guess. When neither source determines a single engine (zero
+    /// or multiple configured, nothing explicit), the probe reports itself
+    /// `skipped` with a reason naming what's configured, rather than probing
+    /// an invented engine and reporting the invention's failure as an outage.
+    #[serde(default)]
+    pub search_probe_engine: Option<String>,
 }
 
 impl Default for HealthConfig {
@@ -518,14 +537,13 @@ impl Default for HealthConfig {
             deep_ttl_seconds: default_deep_ttl(),
             llm_probe_model: None,
             embedding_probe_model: default_embedding_probe_model(),
-            search_probe_engine: default_search_probe_engine(),
+            search_probe_engine: None,
         }
     }
 }
 
 fn default_deep_ttl() -> u64 { 60 }
 fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
-fn default_search_probe_engine() -> String { "tavily".to_string() }
 
 /// `[admin]` — admin account management.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

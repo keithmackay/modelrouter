@@ -19,6 +19,7 @@ use axum::{extract::State, Extension, Json};
 use serde_json::{json, Value};
 
 use crate::api::app::AppState;
+use crate::api::routes::search::{infer_search_engine, InferredSearchEngine};
 use crate::providers::adapter::NormalizedRequest;
 use crate::providers::embedding::EmbeddingRequest;
 use crate::providers::search::SearchRequest;
@@ -237,9 +238,43 @@ async fn probe_embedding(state: &AppState) -> CapabilityReport {
     }
 }
 
-/// One single-result search on the configured probe engine.
+/// One single-result search on the configured (or inferred) probe engine.
+///
+/// `[health] search_probe_engine` wins when set explicitly. Otherwise this
+/// defers to the exact same inference `/v1/search` uses for a caller that
+/// omitted `engine` (issue #2879/#2927) — `[routing] default_search_engine`,
+/// then the sole configured provider — rather than the previous hardcoded
+/// `"tavily"`, which could report a healthy Vertex-only search path as down
+/// (or, worse, report an unrelated `tavily` entry healthy while the engine
+/// real traffic uses is actually broken). When neither source determines a
+/// single engine, this reports `skipped` rather than probing a guess and
+/// reporting the guess's failure as a search outage.
 async fn probe_search(state: &AppState) -> CapabilityReport {
-    let engine = state.settings.health.search_probe_engine.clone();
+    let engine = match state.settings.health.search_probe_engine.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(explicit) => explicit.to_string(),
+        None => match infer_search_engine(state) {
+            InferredSearchEngine::Determined(engine) => engine,
+            InferredSearchEngine::Undetermined { configured } if configured.is_empty() => {
+                return CapabilityReport::skipped(
+                    "search/(undetermined)".to_string(),
+                    "no search engine configured: add a [providers.<engine>] section, or set \
+                     [health] search_probe_engine / [routing] default_search_engine"
+                        .to_string(),
+                );
+            }
+            InferredSearchEngine::Undetermined { configured } => {
+                return CapabilityReport::skipped(
+                    "search/(undetermined)".to_string(),
+                    format!(
+                        "multiple search engines are configured ({}) and none is named as the \
+                         default; set [health] search_probe_engine or [routing] default_search_engine \
+                         to pick which one this probe exercises",
+                        configured.join(", ")
+                    ),
+                );
+            }
+        },
+    };
     let target = format!("search/{}", engine);
 
     let adapter = match state.search_registry.get(&engine) {
