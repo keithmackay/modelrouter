@@ -75,12 +75,12 @@ impl crate::providers::catalog::ProviderCatalog for AnthropicAdapter {
 /// Translate one OpenAI content part to its Anthropic-native block.
 ///
 /// OpenAI `image_url` parts become Anthropic `image` blocks — Anthropic-family
-/// backends reject the OpenAI tag with 400 `Input tag 'image_url' ... invalid`
-/// (ey-org/athena2#2232). A data URL (`data:<media_type>;base64,<data>`)
-/// becomes a `base64` source; any other URL becomes a `url` source. Every
-/// other part — text blocks, already-native image blocks — passes through
-/// verbatim, and an `image_url` part with no usable URL or a malformed data
-/// URL also passes through so the provider's own error names the real problem.
+/// backends reject the OpenAI tag with 400 `Input tag 'image_url' ... invalid`.
+/// A data URL (`data:<media_type>;base64,<data>`) becomes a `base64` source;
+/// any other URL becomes a `url` source. Every other part — text blocks,
+/// already-native image blocks — passes through verbatim, and an `image_url`
+/// part with no usable URL or a malformed data URL also passes through so the
+/// provider's own error names the real problem.
 fn translate_content_block(part: &serde_json::Value) -> serde_json::Value {
     if part["type"] != "image_url" {
         return part.clone();
@@ -803,7 +803,7 @@ mod tests {
 mod image_content_tests {
     // OpenAI `image_url` content parts must translate to Anthropic-native
     // `image` blocks — Anthropic-family backends reject the OpenAI tag with
-    // 400 "Input tag 'image_url' ... invalid" (ey-org/athena2#2232).
+    // 400 "Input tag 'image_url' ... invalid".
     use super::translate_messages;
 
     #[test]
