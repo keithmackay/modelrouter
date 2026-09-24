@@ -1,6 +1,6 @@
 # Critical Design Review: 2026-09-02-intelligent-model-routing-design (Round 1)
 
-**Spec:** `/home/Laird.Popkin/src/modelrouter/docs/superpowers/specs/2026-09-02-intelligent-model-routing-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-02-intelligent-model-routing-design.md`
 **Verified Assumptions section:** MISSING
 
 > ⚠️ This spec lacks a `Verified assumptions` section. Reviewer cannot distinguish verified facts from unverified assumptions; treat findings accordingly.

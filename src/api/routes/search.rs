@@ -41,7 +41,7 @@ pub(crate) enum InferredSearchEngine {
 ///
 /// Shared by `resolve_engine` below (the `/v1/search` request path, which
 /// tries the request's own `engine` field first) and the `/health/deep`
-/// search probe (issue #2927/#2879's mirror: the probe used to hardcode
+/// search probe (where the same defect appeared: the probe used to hardcode
 /// `"tavily"` as `search_probe_engine`'s default, so a host configured for
 /// Vertex-only search had a probe that tested an engine not actually on the
 /// live path — reporting a real outage as healthy, or a healthy Vertex path

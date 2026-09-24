@@ -511,7 +511,7 @@ pub struct HealthConfig {
     ///
     /// Unset means "infer from `[routing] default_search_engine`, then from
     /// the configured search providers": if exactly one is configured, use
-    /// it. This replaced a hardcoded `"tavily"` default (issue #2879/#2927) —
+    /// it. This replaced a hardcoded `"tavily"` default —
     /// a host configured for `[providers.vertex]` search only had `/health/deep`
     /// report "No search adapter configured for engine: tavily" while Vertex
     /// search worked perfectly, a false alarm on a real signal. Worse, the
