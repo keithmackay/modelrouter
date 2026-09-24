@@ -14,3 +14,4 @@ session_stats.md
 /vendor/
 /.cargo/
 coverage/
+/logs/
