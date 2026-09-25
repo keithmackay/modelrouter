@@ -276,7 +276,7 @@ async fn chat_completions_inner(
     }
 
     let norm_req =
-        build_normalized_request(&body, canonical_model.clone(), &state.settings.model_capabilities);
+        build_normalized_request(&body, canonical_model.clone(), &model, &state.settings.model_capabilities);
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -347,6 +347,7 @@ async fn chat_completions_inner(
         binding.is_some(),
         provider_name.clone(),
         canonical_model.clone(),
+        &model,
     )
     .await?;
 
@@ -712,6 +713,7 @@ async fn complete_with_retry_and_fallback(
     bound: bool,
     provider_name: String,
     canonical_model: String,
+    requested_model: &str,
 ) -> Result<ProviderCallOutcome, ApiError> {
     let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model;
@@ -750,6 +752,7 @@ async fn complete_with_retry_and_fallback(
                 let req = build_normalized_request(
                     body,
                     current_model.clone(),
+                    requested_model,
                     &state.settings.model_capabilities,
                 );
                 let adapter = adapter.clone();
@@ -1574,6 +1577,7 @@ fn log_streaming_request(
 fn build_normalized_request(
     body: &Value,
     model: String,
+    requested_model: &str,
     capabilities: &[crate::config::schema::ModelCapabilityEntry],
 ) -> crate::providers::adapter::NormalizedRequest {
     // Drop sampling parameters the resolved model rejects. Callers address a
@@ -1609,6 +1613,7 @@ fn build_normalized_request(
 
     crate::providers::adapter::NormalizedRequest {
         model,
+        request_model: requested_model.to_string(),
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: body["stream"].as_bool().unwrap_or(false),
         temperature,
@@ -1789,7 +1794,7 @@ mod tools_request_tests {
             "tools": [{"type": "function", "function": {"name": "f"}}],
             "tool_choice": "auto",
         });
-        let req = build_normalized_request(&body, "m".to_string(), &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         assert_eq!(req.tool_choice, Some(json!("auto")));
     }
@@ -1800,12 +1805,12 @@ mod tools_request_tests {
             "messages": [],
             "tool_choice": "none",
         });
-        let req = build_normalized_request(&body, "m".to_string(), &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
         assert!(req.tools.is_none());
         assert!(req.tool_choice.is_none());
 
         let body = json!({"messages": [], "tools": []});
-        let req = build_normalized_request(&body, "m".to_string(), &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
         assert!(req.tools.is_none());
     }
 }

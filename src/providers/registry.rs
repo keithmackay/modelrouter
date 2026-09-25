@@ -2,19 +2,28 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::ProviderAdapter;
 
 pub struct ProviderRegistry {
     adapters: DashMap<String, Arc<dyn ProviderAdapter>>,
     configs: HashMap<String, ProviderConfig>,
+    tier_timeouts: TierTimeoutsConfig,
 }
 
 impl ProviderRegistry {
     pub fn new(configs: HashMap<String, ProviderConfig>) -> Self {
+        Self::new_with_tier_timeouts(configs, TierTimeoutsConfig::default())
+    }
+
+    pub fn new_with_tier_timeouts(
+        configs: HashMap<String, ProviderConfig>,
+        tier_timeouts: TierTimeoutsConfig,
+    ) -> Self {
         Self {
             adapters: DashMap::new(),
             configs,
+            tier_timeouts,
         }
     }
 
@@ -65,9 +74,15 @@ impl ProviderRegistry {
         }
 
         let adapter: Arc<dyn ProviderAdapter> = if provider_name == "anthropic" {
-            Arc::new(crate::providers::anthropic::AnthropicAdapter::new(config))
+            Arc::new(crate::providers::anthropic::AnthropicAdapter::new(
+                config,
+                self.tier_timeouts.clone(),
+            ))
         } else if provider_name == "azure" {
-            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(config))
+            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(
+                config,
+                self.tier_timeouts.clone(),
+            ))
         } else {
             #[cfg(feature = "vertex")]
             if provider_name == "vertex" {
@@ -100,7 +115,22 @@ impl ProviderRegistry {
                     .or_insert(Arc::new(bedrock));
                 return Ok(entry.clone());
             }
-            Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(config))
+            // A provider section configured only to back a dedicated route
+            // (e.g. `[providers.typesafe]` for `/v1/systemone`) must not also
+            // become a generic chat provider just by existing in config — see
+            // #97. Routes for those providers look the config up directly via
+            // `state.settings.providers.get(name)`, which is unaffected by
+            // this registry gate.
+            if !config.generic_chat {
+                anyhow::bail!(
+                    "Unknown provider: {} (configured, but not enabled for /v1/chat/completions)",
+                    provider_name
+                );
+            }
+            Arc::new(crate::providers::openai_compat::OpenAICompatAdapter::new(
+                config,
+                self.tier_timeouts.clone(),
+            ))
         };
 
         // Use entry API to prevent duplicate creation under concurrency — only first caller wins
@@ -117,9 +147,55 @@ impl ProviderRegistry {
         let registry = Self {
             adapters: DashMap::new(),
             configs: HashMap::new(),
+            tier_timeouts: TierTimeoutsConfig::default(),
         };
         let mock_arc: Arc<dyn ProviderAdapter> = Arc::new(mock);
         registry.adapters.insert("__mock__".to_string(), mock_arc);
         registry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(generic_chat: bool) -> ProviderConfig {
+        ProviderConfig {
+            api_key: "secret".to_string(),
+            generic_chat,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provider_with_generic_chat_false_is_not_reachable_as_a_chat_provider() {
+        let mut configs = HashMap::new();
+        configs.insert("typesafe".to_string(), config_with(false));
+        let registry = ProviderRegistry::new(configs);
+
+        match registry.get("typesafe") {
+            Ok(_) => panic!("expected an unknown-provider error, got an adapter"),
+            Err(err) => assert!(
+                err.to_string().contains("Unknown provider"),
+                "expected an unknown-provider error, got: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn provider_with_generic_chat_true_falls_back_to_openai_compat() {
+        let mut configs = HashMap::new();
+        configs.insert("custom".to_string(), config_with(true));
+        let registry = ProviderRegistry::new(configs);
+
+        assert!(registry.get("custom").is_ok());
+    }
+
+    #[test]
+    fn generic_chat_defaults_to_true_for_configs_without_it_set() {
+        // Every provider section written before this flag existed (toml/env)
+        // must keep behaving as a generic chat provider.
+        let config: ProviderConfig = toml::from_str("api_key = \"secret\"\n").unwrap();
+        assert!(config.generic_chat);
     }
 }

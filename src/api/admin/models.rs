@@ -713,18 +713,59 @@ pub(crate) async fn cached_catalog(
 
 /// GET /admin/api/models/available — what each configured provider's catalog
 /// actually offers, per-provider degraded, TTL-cached.
+///
+/// Each model entry is stamped with `priced: bool` (issue: unpriced gateway
+/// models record spend as $0 rather than refusing it — an experiment pinning
+/// a target the catalog lists but `CostCalculator` cannot cost silently
+/// ledgers every call against it as free). Computed fresh per request from
+/// `state.cost_calc`, NOT baked into the TTL-cached catalog value: the catalog
+/// cache is keyed on the `Settings` Arc, and `cost_calc`'s pricing table is
+/// built from that same `Settings`, so a cache hit and a freshly-computed
+/// `priced` flag are always consistent with each other, and pricing changes
+/// (e.g. a hot-reloaded config) are reflected immediately without needing a
+/// separate cache-invalidation path for this field.
 pub async fn get_available_models(
     State(state): State<AppState>,
     _session: AdminSession,
     axum::extract::Query(q): axum::extract::Query<AvailableModelsQuery>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
-    let value = cached_catalog(&state, q.refresh).await;
+    let mut value = cached_catalog(&state, q.refresh).await;
+    stamp_pricing(&mut value, &state.cost_calc);
     Ok(axum::Json(value))
+}
+
+/// Walk the aggregated catalog's `providers.<name>.models[]` and add
+/// `priced: bool` to each entry, using the model's own `provider` field
+/// (stamped by `aggregate_catalogs` for compat-adapter entries) joined with
+/// its `name` — the same `"{provider}/{model}"` shape `gate_target` pins and
+/// prices an experiment overlay target with.
+fn stamp_pricing(value: &mut serde_json::Value, cost_calc: &crate::router::cost::CostCalculator) {
+    let Some(providers) = value.get_mut("providers").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    for provider_entry in providers.values_mut() {
+        let Some(models) = provider_entry.get_mut("models").and_then(|m| m.as_array_mut()) else {
+            continue;
+        };
+        for model in models {
+            let provider = model.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let priced = if provider.is_empty() || name.is_empty() {
+                false
+            } else {
+                cost_calc.has_price(&format!("{provider}/{name}"))
+            };
+            if let Some(obj) = model.as_object_mut() {
+                obj.insert("priced".to_string(), serde_json::Value::Bool(priced));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::cost::CostCalculator;
 
     #[test]
     fn he_escapes_html_entities() {
@@ -732,5 +773,49 @@ mod tests {
         assert_eq!(he("foo & bar"), "foo &amp; bar");
         assert_eq!(he("\"test\""), "&quot;test&quot;");
         assert_eq!(he("<>&\""), "&lt;&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn stamp_pricing_marks_priced_and_unpriced_models() {
+        let cost_calc = CostCalculator::new();
+        let mut value = serde_json::json!({
+            "providers": {
+                "vertex": {
+                    "supported": true,
+                    "models": [
+                        { "provider": "vertex", "name": "anthropic/claude-haiku-4-5" },
+                        { "provider": "vertex", "name": "anthropic/claude-sonnet-5" }
+                    ]
+                },
+                "azure": { "supported": false }
+            }
+        });
+
+        stamp_pricing(&mut value, &cost_calc);
+
+        let models = value["providers"]["vertex"]["models"].as_array().unwrap();
+        assert_eq!(models[0]["priced"], serde_json::json!(true));
+        // claude-sonnet-5 is not in the built-in table -- exactly the gap
+        // this stamp exists to surface before an experiment create call does.
+        assert_eq!(models[1]["priced"], serde_json::json!(false));
+        // An unsupported provider has no `models` array; must not panic.
+        assert!(value["providers"]["azure"].get("models").is_none());
+    }
+
+    #[test]
+    fn stamp_pricing_treats_a_model_missing_provider_or_name_as_unpriced() {
+        let cost_calc = CostCalculator::new();
+        let mut value = serde_json::json!({
+            "providers": {
+                "custom": {
+                    "supported": true,
+                    "models": [ { "name": "mystery-model" } ]
+                }
+            }
+        });
+
+        stamp_pricing(&mut value, &cost_calc);
+
+        assert_eq!(value["providers"]["custom"]["models"][0]["priced"], serde_json::json!(false));
     }
 }

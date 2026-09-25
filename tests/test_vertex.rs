@@ -82,6 +82,7 @@ mod gemini_tests {
     fn req(messages: serde_json::Value) -> NormalizedRequest {
         NormalizedRequest {
             model: "gemini-2.5-pro".into(),
+            request_model: "balanced".into(),
             messages: messages.as_array().unwrap().clone(),
             stream: false,
             temperature: Some(0.7),
@@ -237,6 +238,7 @@ mod claude_tests {
     fn req(messages: serde_json::Value) -> NormalizedRequest {
         NormalizedRequest {
             model: "claude-sonnet-4-6@20250514".into(),
+            request_model: "balanced".into(),
             messages: messages.as_array().unwrap().clone(),
             stream: false,
             temperature: Some(0.5),
@@ -273,6 +275,25 @@ mod claude_tests {
         r.max_tokens = None;
         let body = translate_request(&r, false);
         assert!(body["max_tokens"].as_u64().unwrap() > 0, "Anthropic requires max_tokens");
+    }
+
+    /// The `:streamRawPredict` body must carry `"stream": true` — the
+    /// Anthropic backend only emits SSE when the body asks for it. Without
+    /// this flag the endpoint returns one complete non-SSE JSON message,
+    /// `translate_sse_line` drops every line of it, and the client gets a
+    /// 200 with an empty body.
+    #[test]
+    fn translate_request_streaming_sets_stream_true() {
+        let r = req(json!([{"role": "user", "content": "Hi"}]));
+        let body = translate_request(&r, true);
+        assert_eq!(body["stream"], true, "streaming body must carry stream: true");
+    }
+
+    #[test]
+    fn translate_request_non_streaming_omits_stream() {
+        let r = req(json!([{"role": "user", "content": "Hi"}]));
+        let body = translate_request(&r, false);
+        assert!(body.get("stream").is_none(), "non-streaming body must not carry a stream flag");
     }
 
     #[test]

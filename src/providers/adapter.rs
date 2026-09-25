@@ -5,6 +5,14 @@ use bytes::Bytes;
 #[derive(Debug, Clone, Default)]
 pub struct NormalizedRequest {
     pub model: String,
+    /// The tier alias (`fast`/`balanced`/`deep`) or literal address the
+    /// caller/route resolved from BEFORE mapping to `model` (the concrete
+    /// backing model) — used to look up a per-tier timeout override via
+    /// `TierTimeoutsConfig::resolve`. Untiered/concrete requests carry
+    /// whatever string was addressed; `resolve` falls back to the
+    /// provider's own configured `timeout_secs` for anything that isn't a
+    /// known tier name.
+    pub request_model: String,
     pub messages: Vec<serde_json::Value>,
     pub stream: bool,
     pub temperature: Option<f64>,

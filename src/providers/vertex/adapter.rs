@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::config::schema::ProviderConfig;
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
-use crate::providers::vertex::auth::{GoogleCloudAuthProvider, TokenProvider};
+use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::{parse_model_id, Publisher};
 use crate::providers::vertex::{claude, gemini, maas};
 
@@ -102,8 +102,10 @@ pub struct VertexAdapter {
 }
 
 /// Point a Vertex URL at `base` instead of googleapis.com, preserving the path.
-/// `base: None` (always, in production) returns the URL untouched.
-fn rebase(url: String, base: Option<&str>) -> String {
+/// `base: None` (always, in production) returns the URL untouched. `pub(crate)`
+/// so `vertex::embed`'s test-only base-URL override can reuse it instead of
+/// duplicating the splice logic.
+pub(crate) fn rebase(url: String, base: Option<&str>) -> String {
     match base {
         None => url,
         // "https://host/v1/projects/…" → ["https:", "", "host", "v1/projects/…"]
@@ -293,16 +295,11 @@ impl ProviderAdapter for VertexAdapter {
             Publisher::Anthropic => claude::translate_request(req, false),
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
-        let token = self.token_provider.token().await?;
         let dispatched = std::time::Instant::now();
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to send request to Vertex AI")?;
+        let resp = send_with_401_retry(&self.token_provider, "failed to send request to Vertex AI", |token| {
+            self.client.post(&url).bearer_auth(token).json(&body)
+        })
+        .await?;
         // Headers are in, body not yet read: time to first token.
         let ttft_ms = dispatched.elapsed().as_millis() as i64;
         let status = resp.status();
@@ -339,15 +336,12 @@ impl ProviderAdapter for VertexAdapter {
             Publisher::Anthropic => claude::translate_request(req, true),
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
-        let token = self.token_provider.token().await?;
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to send streaming request to Vertex AI")?;
+        let resp = send_with_401_retry(
+            &self.token_provider,
+            "failed to send streaming request to Vertex AI",
+            |token| self.client.post(&url).bearer_auth(token).json(&body),
+        )
+        .await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -460,7 +454,8 @@ mod tests {
     //! is covered only up to its config validation.
 
     use super::*;
-    use crate::providers::vertex::auth::StaticTokenProvider;
+    use crate::providers::vertex::auth::{RecordingTokenProvider, StaticTokenProvider};
+    use axum::response::IntoResponse;
     use axum::{routing::post, Router};
     use futures::StreamExt;
 
@@ -487,6 +482,7 @@ mod tests {
     fn req(model: &str) -> NormalizedRequest {
         NormalizedRequest {
             model: model.to_string(),
+            request_model: model.to_string(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
             stream: false,
             temperature: Some(0.2),
@@ -984,5 +980,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("probe failed"), "{err}");
+    }
+
+    /// A `Router` handler that rejects the stale bearer token with 401 (the
+    /// exact status Vertex answered with for 8.5 hours in one production outage —
+    /// `ACCESS_TOKEN_TYPE_UNSUPPORTED`) and accepts only the rebuilt one.
+    fn rejects_stale_token_router(success_body: &'static str) -> Router {
+        Router::new().fallback(post(move |headers: axum::http::HeaderMap| async move {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if auth == "Bearer stale-token" {
+                (axum::http::StatusCode::UNAUTHORIZED, "ACCESS_TOKEN_TYPE_UNSUPPORTED")
+                    .into_response()
+            } else {
+                success_body.to_string().into_response()
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_401_on_complete_forces_a_rebuild_and_retries_once() {
+        // `token()` never fails here (it always returns "stale-token", just
+        // like `access_token()` kept returning Ok for the whole outage) —
+        // only the downstream 401 can trigger recovery.
+        let router = rejects_stale_token_router(
+            r#"{"content":[{"type":"text","text":"recovered"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let (base, _s) = serve(router).await;
+        let provider = Arc::new(RecordingTokenProvider::new("stale-token", "fresh-token"));
+        let a = VertexAdapter::with_token_provider("proj".into(), "global".into(), provider.clone(), 5)
+            .unwrap()
+            .with_api_base(base);
+
+        let result = a
+            .complete(&req("anthropic/claude-sonnet-4-5"))
+            .await
+            .expect("the retry with a rebuilt credential must succeed");
+        assert_eq!(result.content, "recovered");
+        assert_eq!(provider.rebuild_calls(), 1, "exactly one forced rebuild, not a retry storm");
+    }
+
+    #[tokio::test]
+    async fn a_401_on_stream_forces_a_rebuild_and_retries_once() {
+        let router = rejects_stale_token_router(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n",
+        );
+        let (base, _s) = serve(router).await;
+        let provider = Arc::new(RecordingTokenProvider::new("stale-token", "fresh-token"));
+        let a = VertexAdapter::with_token_provider("proj".into(), "global".into(), provider.clone(), 5)
+            .unwrap()
+            .with_api_base(base);
+
+        let out = collect(
+            a.stream(&req("anthropic/claude-sonnet-4-5"))
+                .await
+                .expect("the retry with a rebuilt credential must succeed"),
+        )
+        .await;
+        assert!(out.contains("\"content\":\"recovered\""), "{out}");
+        assert_eq!(provider.rebuild_calls(), 1, "exactly one forced rebuild, not a retry storm");
+    }
+
+    #[tokio::test]
+    async fn a_non_401_failure_is_not_retried_with_a_rebuild() {
+        // 429 (quota) is not a credential problem — no rebuild should be
+        // attempted, and the original status/body must surface unchanged.
+        let router = Router::new().fallback(post(|| async {
+            (axum::http::StatusCode::TOO_MANY_REQUESTS, "quota exhausted")
+        }));
+        let (base, _s) = serve(router).await;
+        let provider = Arc::new(RecordingTokenProvider::new("stale-token", "fresh-token"));
+        let a = VertexAdapter::with_token_provider("proj".into(), "global".into(), provider.clone(), 5)
+            .unwrap()
+            .with_api_base(base);
+
+        let err = a
+            .complete(&req("google/gemini-2.5-pro"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("429") && err.contains("quota exhausted"), "{err}");
+        assert_eq!(provider.rebuild_calls(), 0, "a non-401 failure must not force a credential rebuild");
     }
 }

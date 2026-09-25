@@ -377,8 +377,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
             let cost_calc = Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing));
             let provider_registry = Arc::new(
-                crate::providers::registry::ProviderRegistry::new(
+                crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
                     settings.providers.clone(),
+                    settings.tier_timeouts.clone(),
                 ),
             );
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(

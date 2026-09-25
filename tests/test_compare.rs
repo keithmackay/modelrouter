@@ -267,6 +267,7 @@ async fn seed_cache_hit(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i
     .unwrap();
 }
 
+
 async fn seed_prompt(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, latency_ms: Option<i64>) {
     seed_prompt_measured(db, s, latency_ms, None, None).await
 }

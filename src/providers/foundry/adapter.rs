@@ -331,6 +331,7 @@ mod tests {
     fn req() -> NormalizedRequest {
         NormalizedRequest {
             model: "Llama-3.3-70B-Instruct".into(),
+            request_model: "Llama-3.3-70B-Instruct".into(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
             stream: false,
             temperature: Some(0.2),

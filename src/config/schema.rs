@@ -145,6 +145,59 @@ fn default_assumed_temperature() -> f64 { 1.0 }
 fn default_search_cache_ttl() -> u64 { 900 }
 fn default_true() -> bool { true }
 
+/// Per-tier timeout ceilings (seconds), keyed by the `request_model` alias a
+/// caller addressed (`fast`/`balanced`/`deep`).
+///
+/// Requests already arrive carrying the tier alias as `request_model`, but
+/// until this existed every provider applied a single flat `timeout_secs`
+/// (from `[providers.<name>]`) regardless of which tier the caller asked
+/// for — a `deep` request queued behind a 60s default died before a
+/// deliberately long-running call had any chance to finish. See
+/// `TierTimeoutsConfig::resolve` for the lookup, and
+/// `default_timeout_secs` below for the flat per-provider fallback used
+/// when `request_model` doesn't name a known tier (a literal
+/// `provider/model` address, or a caller not using the tier system at all).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TierTimeoutsConfig {
+    #[serde(default = "default_tier_timeout_fast")]
+    pub fast: u64,
+    #[serde(default = "default_tier_timeout_balanced")]
+    pub balanced: u64,
+    #[serde(default = "default_tier_timeout_deep")]
+    pub deep: u64,
+}
+
+impl Default for TierTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            fast: default_tier_timeout_fast(),
+            balanced: default_tier_timeout_balanced(),
+            deep: default_tier_timeout_deep(),
+        }
+    }
+}
+
+impl TierTimeoutsConfig {
+    /// Resolve the timeout (seconds) to apply for a request. `request_model`
+    /// is the alias/address the caller used BEFORE resolution — matched
+    /// against the three known tier names. Anything else (a literal
+    /// `provider/model` address, an untiered alias, or a legacy caller not
+    /// using the tier system) falls back to `default_secs` unchanged — the
+    /// provider's own configured `timeout_secs`, exactly today's behavior.
+    pub fn resolve(&self, request_model: &str, default_secs: u64) -> u64 {
+        match request_model {
+            "fast" => self.fast,
+            "balanced" => self.balanced,
+            "deep" => self.deep,
+            _ => default_secs,
+        }
+    }
+}
+
+fn default_tier_timeout_fast() -> u64 { 120 }
+fn default_tier_timeout_balanced() -> u64 { 600 }
+fn default_tier_timeout_deep() -> u64 { 1800 }
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
     #[serde(default = "default_max_retries")]
@@ -187,6 +240,8 @@ pub struct Settings {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub tier_timeouts: TierTimeoutsConfig,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -453,8 +508,27 @@ pub struct HealthConfig {
     #[serde(default = "default_embedding_probe_model")]
     pub embedding_probe_model: String,
     /// Engine the search probe uses.
-    #[serde(default = "default_search_probe_engine")]
-    pub search_probe_engine: String,
+    ///
+    /// Unset means "infer from `[routing] default_search_engine`, then from
+    /// the configured search providers": if exactly one is configured, use
+    /// it. This replaced a hardcoded `"tavily"` default —
+    /// a host configured for `[providers.vertex]` search only had `/health/deep`
+    /// report "No search adapter configured for engine: tavily" while Vertex
+    /// search worked perfectly, a false alarm on a real signal. Worse, the
+    /// inverse is silent: if a host happens to ALSO have a `tavily` entry
+    /// (even one it never routes real traffic through), the probe reports
+    /// that engine healthy while the engine callers actually use is down —
+    /// the probe answers a question nobody asked. Naming a provider in code
+    /// as the fallback for "operator said nothing" is the same class of
+    /// mistake `default_search_engine`'s doc comment already names for
+    /// `/v1/search`; this field gets the identical inference via
+    /// `api::routes::search::infer_search_engine` rather than its own
+    /// hardcoded guess. When neither source determines a single engine (zero
+    /// or multiple configured, nothing explicit), the probe reports itself
+    /// `skipped` with a reason naming what's configured, rather than probing
+    /// an invented engine and reporting the invention's failure as an outage.
+    #[serde(default)]
+    pub search_probe_engine: Option<String>,
 }
 
 impl Default for HealthConfig {
@@ -463,14 +537,13 @@ impl Default for HealthConfig {
             deep_ttl_seconds: default_deep_ttl(),
             llm_probe_model: None,
             embedding_probe_model: default_embedding_probe_model(),
-            search_probe_engine: default_search_probe_engine(),
+            search_probe_engine: None,
         }
     }
 }
 
 fn default_deep_ttl() -> u64 { 60 }
 fn default_embedding_probe_model() -> String { "text-embedding-3-small".to_string() }
-fn default_search_probe_engine() -> String { "tavily".to_string() }
 
 /// `[admin]` — admin account management.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -799,6 +872,21 @@ pub struct ProviderConfig {
     /// preview tool, ignored by the general one.
     #[serde(default)]
     pub custom_search_instance: Option<String>,
+    /// Whether this provider is reachable via `POST /v1/chat/completions` as
+    /// `model = "<provider>/<model>"`. Defaults to true, matching every
+    /// existing chat provider (`anthropic`, `azure`, `vertex`, arbitrary
+    /// OpenAI-compatible sections, ...).
+    ///
+    /// Set to false for a provider section that exists only to back a
+    /// dedicated, single-purpose route (e.g. `[providers.typesafe]` for
+    /// `POST /v1/systemone`). Without this, any provider name added to config
+    /// is implicitly a full generic chat provider via the OpenAI-compat
+    /// fallback in `ProviderRegistry::get`, regardless of why it was
+    /// configured — letting a caller reach the third-party API directly with
+    /// the router's key and bypass that route's own policy gate, pricing, and
+    /// error handling (see #97).
+    #[serde(default = "default_true")]
+    pub generic_chat: bool,
 }
 
 impl Default for ProviderConfig {
@@ -826,11 +914,21 @@ impl Default for ProviderConfig {
             project_connection_id: None,
             custom_search: false,
             custom_search_instance: None,
+            generic_chat: true,
         }
     }
 }
 
-fn default_timeout_secs() -> u64 { 60 }
+// Was 60s. That silently killed any newly-configured provider before it had
+// a chance to answer, and — before tier-based timeouts existed — was the
+// ceiling EVERY request ran under regardless of how long its tier expects to
+// take. Raised to the "deep" tier ceiling: a provider that isn't covered by
+// `[tier_timeouts]` (a literal `provider/model` address, or a caller not
+// using the tier system) now gets the most generous bound rather than the
+// least, matching "never silently kill a newly-added provider before this
+// lands." A provider that genuinely needs a *shorter* timeout still sets
+// `timeout_secs` explicitly in `[providers.<name>]`.
+fn default_timeout_secs() -> u64 { 1800 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HooksConfig {
@@ -1117,5 +1215,71 @@ mod policy_rule_tests {
             name = "allow-all"
         "#).unwrap();
         assert_eq!(s.policy_rules.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tier_timeouts_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_matches_known_tier_names() {
+        let t = TierTimeoutsConfig { fast: 120, balanced: 600, deep: 1800 };
+        assert_eq!(t.resolve("fast", 999), 120);
+        assert_eq!(t.resolve("balanced", 999), 600);
+        assert_eq!(t.resolve("deep", 999), 1800);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_provider_default_for_anything_else() {
+        let t = TierTimeoutsConfig::default();
+        // A literal provider/model address.
+        assert_eq!(t.resolve("anthropic/claude-opus-4-5", 45), 45);
+        // An untiered custom alias.
+        assert_eq!(t.resolve("smart", 45), 45);
+        // Empty / unset.
+        assert_eq!(t.resolve("", 45), 45);
+    }
+
+    #[test]
+    fn default_values_match_the_tier_timeout_doctrine_starting_point() {
+        let t = TierTimeoutsConfig::default();
+        assert_eq!(t.fast, 120);
+        assert_eq!(t.balanced, 600);
+        assert_eq!(t.deep, 1800);
+    }
+
+    #[test]
+    fn parses_from_toml_with_partial_overrides() {
+        let s: Settings = toml::from_str(r#"
+            [tier_timeouts]
+            deep = 3600
+        "#).unwrap();
+        // Overridden field takes the configured value...
+        assert_eq!(s.tier_timeouts.deep, 3600);
+        // ...unconfigured fields keep the doctrine defaults.
+        assert_eq!(s.tier_timeouts.fast, 120);
+        assert_eq!(s.tier_timeouts.balanced, 600);
+    }
+
+    #[test]
+    fn settings_default_has_tier_timeouts_populated() {
+        // Regression guard: `Settings::default()` (used by every test helper
+        // across the codebase that doesn't load a config.toml) must not leave
+        // `tier_timeouts` at all-zero — a zero-second reqwest timeout would
+        // fail every request instantly.
+        let s = Settings::default();
+        assert!(s.tier_timeouts.fast > 0);
+        assert!(s.tier_timeouts.balanced > 0);
+        assert!(s.tier_timeouts.deep > 0);
+    }
+
+    #[test]
+    fn raised_provider_default_never_silently_kills_an_unconfigured_provider() {
+        // The whole point of raising this from 60s: a provider added to
+        // config without an explicit `timeout_secs` (or one that falls
+        // through `TierTimeoutsConfig::resolve` because `request_model`
+        // isn't a known tier) must not die on a flat 60s any more.
+        assert_eq!(default_timeout_secs(), 1800);
     }
 }

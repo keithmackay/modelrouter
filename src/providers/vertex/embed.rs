@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use crate::config::schema::ProviderConfig;
 use crate::providers::embedding::{EmbeddingAdapter, EmbeddingRequest, EmbeddingResult};
-use crate::providers::vertex::adapter::build_predict_url;
-use crate::providers::vertex::auth::{GoogleCloudAuthProvider, TokenProvider};
+use crate::providers::vertex::adapter::{build_predict_url, rebase};
+use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 
 /// Vertex rejects a `:predict` call carrying more than five instances. The
 /// pilot application's client encodes the same limit as `batchSize: 5`. A caller embedding a page of
@@ -138,6 +138,9 @@ pub struct VertexEmbeddingAdapter {
     task_type: Option<String>,
     token_provider: Arc<dyn TokenProvider>,
     client: reqwest::Client,
+    /// Scheme+host override for `:predict` (tests only; None in production).
+    /// Mirrors `VertexAdapter::api_base` — see that type for why it exists.
+    api_base: Option<String>,
 }
 
 impl VertexEmbeddingAdapter {
@@ -160,21 +163,49 @@ impl VertexEmbeddingAdapter {
             task_type: config.embedding_task_type.clone(),
             token_provider,
             client,
+            api_base: None,
         })
     }
 
+    /// Test hook: build with a caller-supplied token provider, bypassing
+    /// Google OAuth. See `VertexAdapter::with_token_provider`.
+    #[cfg(test)]
+    fn with_token_provider(
+        project: String,
+        region: String,
+        token_provider: Arc<dyn TokenProvider>,
+    ) -> Self {
+        Self {
+            project,
+            region,
+            task_type: None,
+            token_provider,
+            client: reqwest::Client::new(),
+            api_base: None,
+        }
+    }
+
+    /// Test hook: point `:predict` at a local mock server.
+    #[cfg(test)]
+    fn with_api_base(mut self, base: String) -> Self {
+        self.api_base = Some(base);
+        self
+    }
+
     async fn predict(&self, body: serde_json::Value, model: &str) -> anyhow::Result<EmbeddingResult> {
-        let url = build_predict_url(&self.project, &self.region, model);
-        let token = self.token_provider.token().await?;
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send embedding request to Vertex AI")?;
+        let url = rebase(build_predict_url(&self.project, &self.region, model), self.api_base.as_deref());
+        let resp = send_with_401_retry(
+            &self.token_provider,
+            "Failed to send embedding request to Vertex AI",
+            |token| {
+                self.client
+                    .post(&url)
+                    .bearer_auth(token)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+            },
+        )
+        .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -221,5 +252,60 @@ impl EmbeddingAdapter for VertexEmbeddingAdapter {
         // silently corrupts every similarity comparison made against it after.
         result.verify_dimensions(req.dimensions)?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! One production outage's log recorded 36 `Embedding provider returned 401
+    //! Unauthorized` lines alongside the chat-completion 401s — the same
+    //! defect, a third affected surface. This proves the fix reaches here too.
+
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::{routing::post, Router};
+    use crate::providers::vertex::auth::RecordingTokenProvider;
+
+    async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn a_401_on_predict_forces_a_rebuild_and_retries_once() {
+        let router = Router::new().fallback(post(|headers: axum::http::HeaderMap| async move {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if auth == "Bearer stale-token" {
+                (axum::http::StatusCode::UNAUTHORIZED, "ACCESS_TOKEN_TYPE_UNSUPPORTED")
+                    .into_response()
+            } else {
+                axum::Json(serde_json::json!({
+                    "predictions": [{"embeddings": {"values": [0.1, 0.2], "statistics": {"token_count": 3}}}]
+                }))
+                .into_response()
+            }
+        }));
+        let (base, _s) = serve(router).await;
+        let provider = Arc::new(RecordingTokenProvider::new("stale-token", "fresh-token"));
+        let adapter = VertexEmbeddingAdapter::with_token_provider(
+            "proj".into(),
+            "us-central1".into(),
+            provider.clone(),
+        )
+        .with_api_base(base);
+
+        let result = adapter
+            .predict(serde_json::json!({"instances": []}), "text-embedding-005")
+            .await
+            .expect("the retry with a rebuilt credential must succeed");
+        assert_eq!(result.embeddings, vec![vec![0.1, 0.2]]);
+        assert_eq!(provider.rebuild_calls(), 1, "exactly one forced rebuild, not a retry storm");
     }
 }

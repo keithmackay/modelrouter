@@ -47,9 +47,27 @@ default_model = "gpt-4o"
 [routing.search_fallback_chains]
 "tavily" = ["vertex"]
 
+# Per-tier timeout ceilings (seconds), applied when a request addresses one
+# of these three names directly as its model (`request_model`) — e.g. a
+# caller using `[routing.model_aliases]` tiers like "fast"/"balanced"/"deep"
+# above. A request that names a literal `provider/model` or an untiered
+# alias instead falls back to that provider's own `timeout_secs` below,
+# unaffected by this table. Values shown are the doctrine defaults; every
+# field is independently optional and falls back to its own default.
+[tier_timeouts]
+fast     = 120   # 2 minutes
+balanced = 600   # 10 minutes
+deep     = 1800  # 30 minutes
+
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
+# `timeout_secs` below is each provider's FLAT fallback — the ceiling used
+# when a request's `request_model` doesn't match a `[tier_timeouts]` name
+# (see above). It defaults to 1800s (was 60s) so a newly-added provider
+# without an explicit value here is never silently killed before it can
+# answer; set it explicitly for a provider that genuinely needs a shorter
+# per-call bound.
 [providers.openai]
 api_key  = ""          # or set MODELROUTER_PROVIDERS__OPENAI__API_KEY
 # api_base = "https://api.openai.com/v1"
@@ -74,10 +92,17 @@ timeout_secs = 120
 # (--features vertex) and `bing_grounding` (--features bing-grounding);
 # additional engines can be added to src/providers/search_registry.rs and
 # configured the same way under [providers.<engine>].
+#
+# `generic_chat` defaults to true, meaning any [providers.x] section is also
+# reachable as a full chat provider via POST /v1/chat/completions with
+# model="x/<anything>". A provider configured only to back a dedicated route
+# like this one should set `generic_chat = false` so it stays reachable
+# solely through that route's own gating (#97).
 # [providers.tavily]
 # api_key  = ""          # or set MODELROUTER_PROVIDERS__TAVILY__API_KEY
 # api_base = "https://api.tavily.com"
 # timeout_secs = 30
+# generic_chat = false
 
 # Grounding with Bing Search on Azure AI Foundry (requires build with
 # `--features bing-grounding`, which is on by default).
@@ -433,5 +458,9 @@ fail_open    = true
 # #llm_probe_model = "balanced"
 # # Model the embedding probe requests.
 # embedding_probe_model = "text-embedding-3-small"
-# # Engine the search probe uses.
-# search_probe_engine = "tavily"
+# # Engine the search probe uses. Unset (the default) infers from
+# # [routing] default_search_engine, then from the sole configured search
+# # provider when there is exactly one -- set this explicitly only when
+# # multiple search engines are configured and the probe should exercise a
+# # specific one regardless of which is the traffic default.
+# #search_probe_engine = "tavily"
