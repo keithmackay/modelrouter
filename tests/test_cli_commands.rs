@@ -1440,7 +1440,9 @@ fn uninstall_service_help() {
 // copies its own stdin into the master, which is what puts our bytes where
 // `/dev/tty` will read them.
 
-/// Quote one argument for the `sh -c` that `script -c` runs.
+/// Quote one argument for the `sh -c` that util-linux `script -c` runs.
+/// Only used on the non-macOS path — see `run_cli_pty`.
+#[cfg(not(target_os = "macos"))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -1455,22 +1457,39 @@ fn run_cli_pty(config: &PathBuf, args: &[&str], stdin_data: &str) -> (bool, Stri
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut cmd_line = sh_quote(BIN);
-    for a in args {
-        cmd_line.push(' ');
-        cmd_line.push_str(&sh_quote(a));
-    }
+    // `script`'s command-invocation syntax differs by implementation:
+    //   - util-linux (Linux): `-c <shell-string>` — one argument, run through
+    //     a shell, so the command and its args must be shell-quoted first.
+    //   - BSD (macOS): `[file [command ...]]` — a real trailing argv with no
+    //     shell involved, and no `-c` flag at all (`man script` on Darwin).
+    // -q: no start/stop banner. -e: exit with the command's status (both
+    // implementations support it), which is what lets these tests assert on
+    // failure. /dev/null: discard the typescript.
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("script");
+        command.args(["-qe", "/dev/null", BIN]).args(args);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let mut cmd_line = sh_quote(BIN);
+        for a in args {
+            cmd_line.push(' ');
+            cmd_line.push_str(&sh_quote(a));
+        }
+        let mut command = std::process::Command::new("script");
+        command.args(["-qec", &cmd_line, "/dev/null"]);
+        command
+    };
 
-    // -q: no start/stop banner. -e: exit with the command's status, which is
-    // what lets these tests assert on failure. /dev/null: discard the typescript.
-    let mut child = std::process::Command::new("script")
-        .args(["-qec", &cmd_line, "/dev/null"])
+    let mut child = command
         .env("MODELROUTER_CONFIG", config)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn util-linux `script` to allocate a pty for the password prompt");
+        .expect("spawn `script` to allocate a pty for the password prompt");
 
     child
         .stdin
@@ -1478,6 +1497,13 @@ fn run_cli_pty(config: &PathBuf, args: &[&str], stdin_data: &str) -> (bool, Stri
         .expect("pty stdin")
         .write_all(stdin_data.as_bytes())
         .expect("write password to pty");
+    // BSD `script` forwards its own stdin to the pty master as it arrives;
+    // closing our pipe immediately after the write can race ahead of that
+    // forwarding and deliver EOF to the child's /dev/tty read before the
+    // typed bytes do (observed directly: `printf ... | script -qe /dev/null
+    // /bin/cat` prints `^D` before the echoed input without this delay).
+    // util-linux `script` doesn't need it, but the delay is harmless there.
+    std::thread::sleep(std::time::Duration::from_millis(200));
     drop(child.stdin.take());
 
     let out = child.wait_with_output().expect("wait for pty child");
@@ -1629,10 +1655,17 @@ fn admin_hash_password_prints_bcrypt_and_config_snippet() {
     assert!(out.contains("[admin.bootstrap]"), "config snippet: {out}");
     assert!(out.contains("role = \"superadmin\""), "{out}");
 
-    // The printed hash must be a usable bcrypt digest of what we typed.
-    let hash = out
+    // The printed hash must be a usable bcrypt digest of what we typed. Look
+    // for the "$2" prefix as a substring rather than requiring it to start a
+    // whitespace-delimited token: BSD `script`'s echo of the pty's closing
+    // EOF (`^D`) can land glued directly onto the following output with no
+    // separating whitespace.
+    let hash_start = out
+        .find("$2")
+        .unwrap_or_else(|| panic!("no bcrypt hash in output: {out}"));
+    let hash = out[hash_start..]
         .split_whitespace()
-        .find(|t| t.starts_with("$2"))
+        .next()
         .map(|t| t.trim_matches('"'))
         .unwrap_or_else(|| panic!("no bcrypt hash in output: {out}"));
     assert!(bcrypt::verify("bootstrap-pw", hash).expect("verify printed hash"));
