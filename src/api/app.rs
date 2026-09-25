@@ -120,7 +120,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         completions::chat_completions, embeddings::embeddings,
         health::{deep_health, health_check, DeepHealthCache},
         images::image_generations, messages::anthropic_messages, models::list_models,
-        prometheus::metrics_handler, responses::responses_handler, search::search,
+        prometheus::metrics_handler, responses::responses_handler, search::search, systemone::systemone,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
         feedback,
     };
@@ -188,6 +188,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/search", post(search))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/feedback", post(feedback::post_feedback))
         // Admin REST API
         .route("/admin/api/login", post(admin_login))

@@ -10,6 +10,7 @@ pub mod messages;
 pub mod models;
 pub mod prometheus;
 pub mod search;
+pub mod systemone;
 
 use crate::{
     api::{app::AppState, error::ApiError},

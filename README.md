@@ -1203,6 +1203,17 @@ curl http://localhost:8080/v1/search \
 curl http://localhost:8080/health
 ```
 
+#### Typed judgments (`POST /v1/systemone`)
+
+JSON passthrough to [TypeSafe System One](https://docs.typesafe.ai/api)
+(Choice / Score / Noul questions over a `state` payload). Callers send the
+TypeSafe request body unchanged with their router API key; the router adds the
+TypeSafe key from `[providers.typesafe]`. The call is gated and priced as the
+pseudo-model `systemone/{model}` (e.g. `systemone/jev-latest`), per million
+tokens off the response `usage` block. Upstream 429/529 (and 422) pass through
+unchanged so clients can back off; an upstream 401/403 means the router's key
+is wrong and is returned as 502 rather than blaming the caller.
+
 #### Web search (`POST /v1/search`)
 
 Proxies web search calls the same way `/v1/chat/completions` proxies LLM calls:
