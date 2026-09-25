@@ -52,21 +52,27 @@ default_model = "gpt-4o"
 # caller using `[routing.model_aliases]` tiers like "fast"/"balanced"/"deep"
 # above. A request that names a literal `provider/model` or an untiered
 # alias instead falls back to that provider's own `timeout_secs` below,
-# unaffected by this table. Values shown are the doctrine defaults; every
-# field is independently optional and falls back to its own default.
+# unaffected by this table. Values shown are the defaults; every field is
+# independently optional and falls back to its own default.
+#
+# These are hours-scale SAFETY CEILINGS, not latency targets: the bound is a
+# total duration that includes a streamed body, so a slow-but-alive stream is
+# cut when it is reached. Keep each value at or above the longest your callers
+# will wait for that tier (including any stream backstop) so the router is
+# never the tightest hop; lowering one discards work that was about to finish.
 [tier_timeouts]
-fast     = 120   # 2 minutes
-balanced = 600   # 10 minutes
-deep     = 1800  # 30 minutes
+fast     = 7200   # 2 hours
+balanced = 14400  # 4 hours
+deep     = 21600  # 6 hours
 
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
 # `timeout_secs` below is each provider's FLAT fallback — the ceiling used
 # when a request's `request_model` doesn't match a `[tier_timeouts]` name
-# (see above). It defaults to 1800s (was 60s) so a newly-added provider
-# without an explicit value here is never silently killed before it can
-# answer; set it explicitly for a provider that genuinely needs a shorter
+# (see above). It defaults to the deep tier ceiling, 21600s (was 60s, then
+# 1800s), so a newly-added provider without an explicit value here is never
+# silently killed before it can answer; set it explicitly for a provider that genuinely needs a shorter
 # per-call bound.
 [providers.openai]
 api_key  = ""          # or set MODELROUTER_PROVIDERS__OPENAI__API_KEY

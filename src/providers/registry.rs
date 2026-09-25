@@ -86,7 +86,8 @@ impl ProviderRegistry {
         } else {
             #[cfg(feature = "vertex")]
             if provider_name == "vertex" {
-                let adapter = crate::providers::vertex::VertexAdapter::new(config)?;
+                let adapter = crate::providers::vertex::VertexAdapter::new(config)?
+                    .with_tier_timeouts(self.tier_timeouts.clone());
                 let entry = self
                     .adapters
                     .entry(provider_name.to_string())
@@ -95,7 +96,8 @@ impl ProviderRegistry {
             }
             #[cfg(feature = "foundry")]
             if provider_name == "foundry" {
-                let adapter = crate::providers::foundry::FoundryAdapter::new(config)?;
+                let adapter = crate::providers::foundry::FoundryAdapter::new(config)?
+                    .with_tier_timeouts(self.tier_timeouts.clone());
                 let entry = self
                     .adapters
                     .entry(provider_name.to_string())

@@ -194,9 +194,25 @@ impl TierTimeoutsConfig {
     }
 }
 
-fn default_tier_timeout_fast() -> u64 { 120 }
-fn default_tier_timeout_balanced() -> u64 { 600 }
-fn default_tier_timeout_deep() -> u64 { 1800 }
+// Hours-scale SAFETY CEILINGS, not latency targets. Were 120s/600s/1800s,
+// which made the router the binding limit on every slow-but-alive call:
+// reqwest's `.timeout()` is a total-duration bound that includes the
+// streamed body, so a healthy stream still producing tokens was cut at
+// 2/10/30 minutes no matter how long the caller was prepared to wait.
+// Timing out a slow call discards work that was about to finish and
+// re-bills it on retry. The router should never be the tightest hop: long
+// reasoning calls routinely run for many minutes, and a client that allows
+// 1h/2h/3h per request with a 2x allowance for streamed bodies waits up to
+// 2h/4h/6h — so that is where these sit. Detecting a dead connection is the
+// caller's job (it sees the stream go silent); a deployment that genuinely
+// wants a tighter bound sets `[tier_timeouts]` explicitly.
+pub(crate) const TIER_TIMEOUT_FAST_SECS: u64 = 2 * 60 * 60; // 2h
+pub(crate) const TIER_TIMEOUT_BALANCED_SECS: u64 = 4 * 60 * 60; // 4h
+pub(crate) const TIER_TIMEOUT_DEEP_SECS: u64 = 6 * 60 * 60; // 6h
+
+fn default_tier_timeout_fast() -> u64 { TIER_TIMEOUT_FAST_SECS }
+fn default_tier_timeout_balanced() -> u64 { TIER_TIMEOUT_BALANCED_SECS }
+fn default_tier_timeout_deep() -> u64 { TIER_TIMEOUT_DEEP_SECS }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
@@ -919,16 +935,16 @@ impl Default for ProviderConfig {
     }
 }
 
-// Was 60s. That silently killed any newly-configured provider before it had
-// a chance to answer, and — before tier-based timeouts existed — was the
-// ceiling EVERY request ran under regardless of how long its tier expects to
-// take. Raised to the "deep" tier ceiling: a provider that isn't covered by
+// Was 60s, then 1800s. 60s silently killed any newly-configured provider
+// before it had a chance to answer, and — before tier-based timeouts existed
+// — was the ceiling EVERY request ran under regardless of how long its tier
+// expects to take. Tracks the "deep" tier ceiling: a provider that isn't covered by
 // `[tier_timeouts]` (a literal `provider/model` address, or a caller not
 // using the tier system) now gets the most generous bound rather than the
 // least, matching "never silently kill a newly-added provider before this
 // lands." A provider that genuinely needs a *shorter* timeout still sets
 // `timeout_secs` explicitly in `[providers.<name>]`.
-fn default_timeout_secs() -> u64 { 1800 }
+fn default_timeout_secs() -> u64 { TIER_TIMEOUT_DEEP_SECS }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HooksConfig {
@@ -1242,11 +1258,15 @@ mod tier_timeouts_tests {
     }
 
     #[test]
-    fn default_values_match_the_tier_timeout_doctrine_starting_point() {
+    fn default_values_are_hours_scale_safety_ceilings() {
+        // The router must never be the binding limit on a slow-but-alive
+        // call: every tier default is hours-scale and covers a downstream
+        // caller's 2x stream backstop over 1h/2h/3h request ceilings.
         let t = TierTimeoutsConfig::default();
-        assert_eq!(t.fast, 120);
-        assert_eq!(t.balanced, 600);
-        assert_eq!(t.deep, 1800);
+        assert_eq!(t.fast, 7200);
+        assert_eq!(t.balanced, 14400);
+        assert_eq!(t.deep, 21600);
+        assert!(t.fast <= t.balanced && t.balanced <= t.deep);
     }
 
     #[test]
@@ -1257,9 +1277,9 @@ mod tier_timeouts_tests {
         "#).unwrap();
         // Overridden field takes the configured value...
         assert_eq!(s.tier_timeouts.deep, 3600);
-        // ...unconfigured fields keep the doctrine defaults.
-        assert_eq!(s.tier_timeouts.fast, 120);
-        assert_eq!(s.tier_timeouts.balanced, 600);
+        // ...unconfigured fields keep the hours-scale defaults.
+        assert_eq!(s.tier_timeouts.fast, 7200);
+        assert_eq!(s.tier_timeouts.balanced, 14400);
     }
 
     #[test]
@@ -1279,7 +1299,9 @@ mod tier_timeouts_tests {
         // The whole point of raising this from 60s: a provider added to
         // config without an explicit `timeout_secs` (or one that falls
         // through `TierTimeoutsConfig::resolve` because `request_model`
-        // isn't a known tier) must not die on a flat 60s any more.
-        assert_eq!(default_timeout_secs(), 1800);
+        // isn't a known tier) must not die on a flat 60s any more — it gets
+        // the most generous (deep) tier ceiling.
+        assert_eq!(default_timeout_secs(), 21600);
+        assert_eq!(default_timeout_secs(), TierTimeoutsConfig::default().deep);
     }
 }

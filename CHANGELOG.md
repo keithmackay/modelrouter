@@ -5,6 +5,11 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-09-21
+
+**Fixes**
+- Slow LLM calls are no longer cut by the router. `[tier_timeouts]` defaults rise from 120s/600s/1800s to 2h/4h/6h (`fast`/`balanced`/`deep`), and the flat per-provider `timeout_secs` default from 1800s to 21600s. These are total-duration bounds that include a streamed body, so the old values killed healthy streams at 2, 10 or 30 minutes. The Vertex and Azure AI Foundry adapters now honour `[tier_timeouts]` per request instead of only their flat `timeout_secs`. A deployment that set `[tier_timeouts]` explicitly keeps its values.
+
 ### Week of 2026-08-31
 
 **Features**
