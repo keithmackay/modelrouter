@@ -104,6 +104,13 @@ async fn systemone_inner(
     tracing::Span::current().record("user_id", user.id);
 
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    // The body is otherwise forwarded to TypeSafe verbatim; the attribution
+    // extension field is router-internal bookkeeping (already captured above)
+    // and must not leak to the third-party upstream.
+    let mut body = body;
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove(crate::api::attribution::BODY_FIELD);
+    }
 
     let model = body["model"]
         .as_str()
@@ -119,17 +126,28 @@ async fn systemone_inner(
     tracing::Span::current().record("model", model.as_str());
 
     let pseudo_model = format!("systemone/{}", model);
-    match state
+    let _concurrency_permit = match state
         .policy
         .check(&user, &pseudo_model)
         .await
         .map_err(|_| ApiError::Internal)?
     {
-        PolicyDecision::Allow { .. } => {}
+        PolicyDecision::Allow { max_concurrent } => match max_concurrent {
+            Some(max) => match state.concurrency.try_acquire(user.id, max) {
+                Some(permit) => Some(permit),
+                None => {
+                    return Err(ApiError::PolicyDenied {
+                        reason: "concurrent request limit exceeded".to_string(),
+                        status: 429,
+                    });
+                }
+            },
+            None => None,
+        },
         PolicyDecision::Deny { reason, status, .. } => {
             return Err(ApiError::PolicyDenied { reason, status });
         }
-    }
+    };
 
     let provider = state.settings.providers.get(PROVIDER_NAME).ok_or_else(|| {
         ApiError::ProviderError(anyhow::anyhow!(

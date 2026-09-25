@@ -12,6 +12,8 @@ use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
 use modelrouter::config::schema::{
     CacheConfig, PolicyConditionConfig, PolicyRuleConfig, PricingEntry, ProviderConfig, Settings,
 };
+use modelrouter::db::models::NewBudgetRule;
+use modelrouter::db::repositories::budgets::BudgetRepository;
 use modelrouter::providers::{
     embed_registry::EmbeddingRegistry, registry::ProviderRegistry, search_registry::SearchRegistry,
 };
@@ -79,11 +81,17 @@ struct Opts {
     api_key: &'static str,
     pricing: Vec<PricingEntry>,
     policy_rules: Vec<PolicyRuleConfig>,
+    concurrency: Arc<modelrouter::router::concurrency::ConcurrencyLimiter>,
 }
 
 async fn test_app(opts: Opts) -> (TestServer, Arc<dyn DatabaseProvider>) {
+    let (server, db, _user_id) = test_app_with_user_id(opts).await;
+    (server, db)
+}
+
+async fn test_app_with_user_id(opts: Opts) -> (TestServer, Arc<dyn DatabaseProvider>, i64) {
     let db = common::in_memory_db().await;
-    common::create_user(&db, "test-user", "test-token").await;
+    let user_id = common::create_user(&db, "test-user", "test-token").await;
 
     let mut settings = Settings::default();
     settings.pricing = opts.pricing;
@@ -125,7 +133,7 @@ async fn test_app(opts: Opts) -> (TestServer, Arc<dyn DatabaseProvider>) {
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             HashMap::new(),
         )),
-        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        concurrency: opts.concurrency.clone(),
         circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
         ip_rate_limiter: Arc::new(
             modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0),
@@ -142,7 +150,7 @@ async fn test_app(opts: Opts) -> (TestServer, Arc<dyn DatabaseProvider>) {
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
-    (TestServer::new(build_router(state)).unwrap(), db)
+    (TestServer::new(build_router(state)).unwrap(), db, user_id)
 }
 
 fn opts(api_base: Option<String>) -> Opts {
@@ -151,6 +159,7 @@ fn opts(api_base: Option<String>) -> Opts {
         api_key: TYPESAFE_KEY,
         pricing: vec![],
         policy_rules: vec![],
+        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
     }
 }
 
@@ -288,5 +297,92 @@ async fn policy_gates_the_systemone_pseudo_model() {
     let (server, _) = test_app(o).await;
     let resp = call(&server, &request_body()).await;
     assert_eq!(resp.status_code(), 403);
+    assert!(up.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attribution_extension_field_is_recorded_but_not_forwarded_upstream() {
+    let (base, up) = start_upstream(200, choice_answer()).await;
+    let mut o = opts(Some(base));
+    o.pricing = vec![PricingEntry {
+        model: "systemone/jev-latest".to_string(),
+        input_per_million: 2.0,
+        output_per_million: 10.0,
+        cache_read_per_million: None,
+        cache_write_per_million: None,
+    }];
+    let (server, db) = test_app(o).await;
+
+    let mut body = request_body();
+    body["attribution"] = json!({ "correlation_id": "eng-4711-run-3", "tags": { "phase": "research" } });
+    let resp = call(&server, &body).await;
+    assert_eq!(resp.status_code(), 200);
+
+    // The upstream never sees the attribution field, and nothing else about
+    // the body changed.
+    let seen = up.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, request_body());
+    assert!(seen[0].1.get("attribution").is_none());
+
+    // It IS captured in the router's own ledger.
+    let rows = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(rows[0].attribution_correlation_id.as_deref(), Some("eng-4711-run-3"));
+}
+
+#[tokio::test]
+async fn unpriced_model_is_metered_at_zero_cost() {
+    let (base, up) = start_upstream(200, choice_answer()).await;
+    // No [[pricing]] entry for systemone/jev-latest.
+    let (server, db) = test_app(opts(Some(base))).await;
+
+    let resp = call(&server, &request_body()).await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(up.seen.lock().unwrap().len(), 1);
+
+    let rows = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(rows[0].model, "systemone/jev-latest");
+    assert_eq!(rows[0].tokens_in, 1000);
+    assert_eq!(rows[0].tokens_out, 10);
+    assert_eq!(rows[0].cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn policy_concurrency_limit_is_enforced() {
+    let (base, up) = start_upstream(200, choice_answer()).await;
+    let concurrency = Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new());
+    let mut o = opts(Some(base));
+    o.concurrency = concurrency.clone();
+    let (server, db, user_id) = test_app_with_user_id(o).await;
+
+    BudgetRepository::create(
+        &*db,
+        NewBudgetRule {
+            user_id: Some(user_id),
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            project: None,
+            window: "monthly".to_string(),
+            limit_usd: None,
+            limit_tokens: None,
+            rate_rpm: None,
+            max_concurrent: Some(1),
+            model_allow: vec![],
+            model_deny: vec![],
+            window_start: None,
+            window_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Hold the user's one permit on the exact ConcurrencyLimiter instance the
+    // route itself uses (same pattern as tests/test_images.rs), so the route
+    // must see it as exhausted without any real concurrent HTTP traffic.
+    let _held_permit = concurrency.try_acquire(user_id, 1).expect("first acquire should succeed");
+
+    let resp = call(&server, &request_body()).await;
+    assert_eq!(resp.status_code().as_u16(), 429);
     assert!(up.seen.lock().unwrap().is_empty());
 }

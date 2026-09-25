@@ -107,10 +107,14 @@ timeout_secs = 120
 # TypeSafe System One typed judgments (POST /v1/systemone). JSON passthrough:
 # callers send the TypeSafe request body; the router adds this key, so callers
 # never hold it. Gated by policy as the pseudo-model "systemone/{model}".
+# generic_chat = false keeps this provider reachable only through
+# /v1/systemone's own gating, not as a generic /v1/chat/completions backend
+# (see #97).
 # [providers.typesafe]
 # api_key  = ""          # or set MODELROUTER_PROVIDERS__TYPESAFE__API_KEY
 # api_base = "https://api.typesafe.ai/v1"
 # timeout_secs = 60
+# generic_chat = false
 
 # Grounding with Bing Search on Azure AI Foundry (requires build with
 # `--features bing-grounding`, which is on by default).
