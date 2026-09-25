@@ -17,7 +17,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use modelrouter::config::schema::ProviderConfig;
+use modelrouter::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use modelrouter::providers::adapter::{NormalizedRequest, ProviderAdapter};
 use modelrouter::providers::azure_entra::StaticTokenProvider;
 use modelrouter::providers::catalog::ProviderCatalog;
@@ -777,4 +777,69 @@ fn provider_config_default_matches_an_empty_table_for_the_new_fields() {
     assert_eq!(from_default.entra_scope, from_toml.entra_scope);
     assert!(from_default.foundry_endpoint.is_none());
     assert!(from_default.entra_scope.is_none());
+}
+
+// ── 7. tier timeouts ────────────────────────────────────────────────────────
+
+/// A Foundry chat endpoint that answers after `delay`.
+async fn spawn_slow_chat(delay: std::time::Duration) -> String {
+    spawn(Router::new().route(
+        "/openai/v1/chat/completions",
+        post(move || async move {
+            tokio::time::sleep(delay).await;
+            Json(chat_payload())
+        }),
+    ))
+    .await
+}
+
+fn tiered_req(request_model: &str) -> NormalizedRequest {
+    NormalizedRequest {
+        request_model: request_model.to_string(),
+        ..req(DEPLOYMENT)
+    }
+}
+
+/// Foundry used to apply only its flat `timeout_secs`. A `[tier_timeouts]`
+/// ceiling tighter than both the provider default and the server's delay can
+/// only fire if the tier is honoured per request.
+#[tokio::test]
+async fn a_known_tier_is_bounded_by_its_own_ceiling_not_the_flat_timeout() {
+    let base = spawn_slow_chat(std::time::Duration::from_millis(300)).await;
+    let adapter = static_adapter(&config(&base)).with_tier_timeouts(TierTimeoutsConfig {
+        fast: 0,
+        balanced: 30,
+        deep: 30,
+    });
+    let err = adapter.complete(&tiered_req("fast")).await.unwrap_err();
+    assert!(
+        format!("{err:#}").to_lowercase().contains("time"),
+        "expected a timeout, got: {err:#}"
+    );
+}
+
+/// The slow-call direction: a tier's generous ceiling outlasts a shorter flat
+/// `timeout_secs`, so a slow tiered call is never cut by the fallback. And the
+/// registry's serving path wires the configured table in.
+#[tokio::test]
+async fn the_registry_applies_tier_timeouts_that_outlast_the_flat_timeout() {
+    let base = spawn_slow_chat(std::time::Duration::from_millis(300)).await;
+    let mut cfg = config(&base);
+    cfg.api_key = "k".into();
+    cfg.timeout_secs = 0;
+    let mut configs = HashMap::new();
+    configs.insert("foundry".to_string(), cfg);
+    let registry = ProviderRegistry::new_with_tier_timeouts(configs, TierTimeoutsConfig::default());
+    let adapter = registry.get("foundry").unwrap();
+
+    let result = adapter.complete(&tiered_req("deep")).await.unwrap();
+    assert_eq!(result.content, "four");
+
+    // Untiered: the zero flat timeout applies, proving the lengthening above
+    // came from the tier table and not from some other generous bound.
+    let err = adapter.complete(&req(DEPLOYMENT)).await.unwrap_err();
+    assert!(
+        format!("{err:#}").to_lowercase().contains("time"),
+        "expected the flat timeout to apply, got: {err:#}"
+    );
 }
