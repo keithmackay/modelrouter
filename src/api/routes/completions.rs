@@ -4,6 +4,7 @@ use axum::{extract::State, response::{IntoResponse, Response}, Json};
 use serde_json::Value;
 use tracing::Instrument;
 
+use super::router_meta::{CallCost, RouterMeta, TimingMeta, TokenMeta};
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     config::schema::StorageConfig,
@@ -60,6 +61,8 @@ async fn chat_completions_inner(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
+    // Request receipt: `x_router.timing.total_ms` is measured from here.
+    let received = Instant::now();
     let x_no_log = should_skip_logging(&headers);
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
@@ -262,6 +265,8 @@ async fn chat_completions_inner(
             &state,
             key,
             &model,
+            &requested_model,
+            received,
             &canonical_model,
             &provider_name,
             &user,
@@ -301,6 +306,7 @@ async fn chat_completions_inner(
                 ApiError::ProviderError(e)
             })?;
         state.circuit_breaker.record_success(&provider_name);
+        let settings = completion_settings(adapter.effective_settings(&norm_req), &norm_req, &body);
 
         let messages_json = serde_json::to_string(
             &body["messages"].as_array().cloned().unwrap_or_default(),
@@ -317,6 +323,10 @@ async fn chat_completions_inner(
                 api_key_id: user.api_key_id,
                 user_project: attribution.project_or(user.api_key_project.clone()),
                 user_name: user.name.clone(),
+                request_id: request_id.clone(),
+                received,
+                requested_model: requested_model.clone(),
+                settings,
                 model: logged_model.clone(),
                 canonical_model: canonical_model.clone(),
                 provider: provider_name.clone(),
@@ -340,6 +350,9 @@ async fn chat_completions_inner(
         provider: current_provider,
         model: current_model,
         attempts,
+        fallbacks,
+        provider_ms,
+        settings,
     } = complete_with_retry_and_fallback(
         &state,
         &user,
@@ -428,7 +441,26 @@ async fn chat_completions_inner(
             .await;
     }
 
-    let mut response = Json(build_openai_response(request_id, &current_model, &result)).into_response();
+    // Every figure below is the one handed to `spawn_completion_logging`
+    // above, so what the caller reads is what the ledger holds.
+    let meta = RouterMeta {
+        requested_model,
+        model: current_model,
+        provider: current_provider,
+        settings,
+        tokens: Some(completion_tokens(&result)),
+        results: None,
+        cost: CallCost::spent(cost),
+        timing: TimingMeta {
+            total_ms: received.elapsed().as_millis() as i64,
+            latency_ms,
+            provider_ms: Some(provider_ms),
+            ttft_ms: result.ttft_ms,
+            attempts: attempts.max(1),
+            fallbacks,
+        },
+    };
+    let mut response = Json(build_openai_response(request_id, &result, &meta)).into_response();
     response
         .headers_mut()
         .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
@@ -640,6 +672,8 @@ async fn try_serve_cached_completion(
     state: &AppState,
     key: &str,
     request_model: &str,
+    caller_model: &str,
+    received: Instant,
     canonical_model: &str,
     provider_name: &str,
     user: &crate::db::models::User,
@@ -681,8 +715,39 @@ async fn try_serve_cached_completion(
         &cached,
     );
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
-    let mut response =
-        Json(build_openai_response(request_id, canonical_model, &cached)).into_response();
+    // No provider was called; the settings are those the cached answer's
+    // request resolved to (the cache key covers the request parameters).
+    let norm_req = build_normalized_request(
+        body,
+        canonical_model.to_string(),
+        request_model,
+        &state.settings.model_capabilities,
+    );
+    let settings = match state.provider_registry.get(provider_name) {
+        Ok(adapter) => completion_settings(adapter.effective_settings(&norm_req), &norm_req, body),
+        Err(_) => Value::Null,
+    };
+    // The ledger row for a hit is `cost_usd = 0` with the avoided cost in
+    // `saved_usd` (`create_cache_hit`), latency 0, no TTFT, no attempts; the
+    // response reports exactly that.
+    let meta = RouterMeta {
+        requested_model: caller_model.to_string(),
+        model: canonical_model.to_string(),
+        provider: provider_name.to_string(),
+        settings,
+        tokens: Some(completion_tokens(&cached)),
+        results: None,
+        cost: CallCost::cache_hit(avoided_cost),
+        timing: TimingMeta {
+            total_ms: received.elapsed().as_millis() as i64,
+            latency_ms: 0,
+            provider_ms: None,
+            ttft_ms: None,
+            attempts: 0,
+            fallbacks: 0,
+        },
+    };
+    let mut response = Json(build_openai_response(request_id, &cached, &meta)).into_response();
     response
         .headers_mut()
         .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("HIT"));
@@ -700,6 +765,12 @@ struct ProviderCallOutcome {
     /// failover hops that reached a provider all count; a circuit-breaker skip
     /// does not (no provider was called). 1 = first-try success.
     attempts: i64,
+    /// Hops along the fallback chain to a different model.
+    fallbacks: i64,
+    /// Duration of the provider call that produced `result`.
+    provider_ms: i64,
+    /// `x_router.settings` for the answering dispatch.
+    settings: Value,
 }
 
 /// Call the provider with backoff retries, walking the fallback chain on
@@ -719,10 +790,11 @@ async fn complete_with_retry_and_fallback(
     let mut current_model = canonical_model;
     let mut current_provider = provider_name;
     let mut attempts: i64 = 0;
+    let mut fallbacks: i64 = 0;
     // A tools request must never fall back onto an adapter that would drop
     // the tools (issue #88): the substitute would answer in prose.
     let require_tools = request_has_tools(body);
-    let result = loop {
+    let (result, provider_ms, settings) = loop {
         if state.circuit_breaker.is_open(&current_provider) {
             tracing::warn!(provider = current_provider.as_str(), "circuit breaker open, skipping provider");
             let pseudo_err = anyhow::anyhow!("circuit breaker open for {}", current_provider);
@@ -733,6 +805,7 @@ async fn complete_with_retry_and_fallback(
                 Some((next_provider, next_canonical)) => {
                     current_model = next_canonical;
                     current_provider = next_provider;
+                    fallbacks += 1;
                     continue;
                 }
                 None => {
@@ -764,9 +837,16 @@ async fn complete_with_retry_and_fallback(
         )
         .await;
         match call_result {
-            Ok(r) => {
+            Ok((r, provider_ms)) => {
                 state.circuit_breaker.record_success(&current_provider);
-                break r;
+                let req = build_normalized_request(
+                    body,
+                    current_model.clone(),
+                    requested_model,
+                    &state.settings.model_capabilities,
+                );
+                let settings = completion_settings(adapter.effective_settings(&req), &req, body);
+                break (r, provider_ms, settings);
             }
             Err(e) => {
                 state
@@ -785,6 +865,7 @@ async fn complete_with_retry_and_fallback(
                     Some((next_provider, next_canonical)) => {
                         current_model = next_canonical;
                         current_provider = next_provider;
+                        fallbacks += 1;
                         tracing::info!(fallback_model = current_model.as_str(), "Retrying with fallback");
                     }
                     None => {
@@ -799,17 +880,21 @@ async fn complete_with_retry_and_fallback(
         provider: current_provider,
         model: current_model,
         attempts,
+        fallbacks,
+        provider_ms,
+        settings,
     })
 }
 
 /// One provider's retry loop: call, classify the error, back off and retry
-/// while the policy allows. Each call made increments `attempts`.
+/// while the policy allows. Each call made increments `attempts`. Returns the
+/// result with the successful call's own duration in ms.
 async fn call_with_backoff<F, Fut>(
     retry_policy: &crate::router::retry::RetryPolicy,
     attempts: &mut i64,
     provider: &str,
     mut call: F,
-) -> anyhow::Result<crate::providers::adapter::CompletionResult>
+) -> anyhow::Result<(crate::providers::adapter::CompletionResult, i64)>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<crate::providers::adapter::CompletionResult>>,
@@ -817,8 +902,10 @@ where
     let mut retry_attempt = 0u32;
     loop {
         *attempts += 1;
+        // Timed per call: the successful call's duration is `provider_ms`.
+        let called = Instant::now();
         match call().await {
-            Ok(r) => return Ok(r),
+            Ok(r) => return Ok((r, called.elapsed().as_millis() as i64)),
             Err(e) => {
                 let err_str = e.to_string();
                 let retryable = crate::router::retry::RetryableError::classify(&err_str);
@@ -1226,6 +1313,14 @@ fn record_cache_hit(
 #[derive(Clone)]
 struct StreamLogCtx {
     state: AppState,
+    /// Id stamped on the cost chunk the router appends to the stream.
+    request_id: String,
+    /// Request receipt, for `x_router.timing.total_ms`.
+    received: Instant,
+    /// The model name the caller sent (`x_router.requested_model`).
+    requested_model: String,
+    /// `x_router.settings` for the dispatch.
+    settings: Value,
     user_id: i64,
     api_key_id: Option<i64>,
     user_project: Option<String>,
@@ -1254,6 +1349,8 @@ pub struct ReportedUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
+    /// `completion_tokens_details.reasoning_tokens`, when reported.
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// What one SSE chunk contributed to a stream's accounting.
@@ -1308,6 +1405,9 @@ pub fn parse_sse_chunk(chunk: &[u8]) -> SseChunkInfo {
                 cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or(0) as u32,
+                reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .map(|n| n as u32),
             });
         }
     }
@@ -1335,6 +1435,7 @@ struct StreamSettlement {
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_read_tokens: u32,
+    reasoning_tokens: Option<u32>,
     /// True when the provider never reported usage and the counts above are
     /// the character-count estimate.
     tokens_estimated: bool,
@@ -1356,39 +1457,67 @@ struct StreamLogger {
 
 impl StreamLogger {
     fn observe(&mut self, chunk_result: anyhow::Result<bytes::Bytes>) -> anyhow::Result<bytes::Bytes> {
-        match &chunk_result {
-            Ok(chunk) => {
-                if self.acc.ttft_ms.is_none() {
-                    self.acc.ttft_ms = Some(self.ctx.start.elapsed().as_millis() as i64);
-                }
-                let info = parse_sse_chunk(chunk);
-                self.acc.content.push_str(&info.text);
-                if info.usage.is_some() {
-                    self.acc.usage = info.usage;
-                }
-                if info.finish_reason.is_some() {
-                    self.acc.finish_reason = info.finish_reason;
-                }
-                if info.done {
-                    self.record(None);
-                }
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                self.record(Some(e.to_string()));
+                return Err(e);
             }
-            Err(e) => self.record(Some(e.to_string())),
+        };
+        if self.acc.ttft_ms.is_none() {
+            self.acc.ttft_ms = Some(self.ctx.start.elapsed().as_millis() as i64);
         }
-        chunk_result
+        let info = parse_sse_chunk(&chunk);
+        self.acc.content.push_str(&info.text);
+        if info.usage.is_some() {
+            self.acc.usage = info.usage;
+        }
+        if info.finish_reason.is_some() {
+            self.acc.finish_reason = info.finish_reason;
+        }
+        if !info.done || self.acc.recorded {
+            return Ok(chunk);
+        }
+        // Terminal chunk: settle once, tell the caller what it cost in a final
+        // usage chunk ahead of `[DONE]`, and write that same settlement to the
+        // ledger — one value, so the two can never disagree.
+        self.acc.recorded = true;
+        let settlement = self.settle(self.finish_reason(None));
+        let event = cost_chunk_event(&self.ctx.request_id, &stream_meta(&self.ctx, &settlement));
+        let chunk = insert_before_done(&chunk, &event);
+        self.spawn_ledger_write(settlement, None);
+        Ok(chunk)
+    }
+
+    fn finish_reason(&self, provider_error: Option<&String>) -> String {
+        match provider_error {
+            Some(_) => "error".to_string(),
+            None => self
+                .acc
+                .finish_reason
+                .clone()
+                .unwrap_or_else(|| "stop".to_string()),
+        }
     }
 
     /// Provider-reported usage when the stream carried it; otherwise the
     /// character-count estimate, flagged as such.
     fn settle(&self, finish_reason: String) -> StreamSettlement {
         let content = self.acc.content.clone();
-        let (prompt_tokens, completion_tokens, cache_read_tokens, tokens_estimated) =
+        let (prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens, tokens_estimated) =
             match self.acc.usage {
-                Some(u) => (u.prompt_tokens, u.completion_tokens, u.cached_tokens, false),
+                Some(u) => (
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    u.cached_tokens,
+                    u.reasoning_tokens,
+                    false,
+                ),
                 None => (
                     (self.ctx.messages_json.chars().count() / 4) as u32,
                     (content.chars().count() / 4) as u32,
                     0,
+                    None,
                     true,
                 ),
             };
@@ -1407,6 +1536,7 @@ impl StreamLogger {
             prompt_tokens,
             completion_tokens,
             cache_read_tokens,
+            reasoning_tokens,
             tokens_estimated,
             cost,
             latency_ms: self.ctx.start.elapsed().as_millis() as i64,
@@ -1422,16 +1552,11 @@ impl StreamLogger {
             return;
         }
         self.acc.recorded = true;
+        let settlement = self.settle(self.finish_reason(provider_error.as_ref()));
+        self.spawn_ledger_write(settlement, provider_error);
+    }
 
-        let finish_reason = match &provider_error {
-            Some(_) => "error".to_string(),
-            None => self
-                .acc
-                .finish_reason
-                .clone()
-                .unwrap_or_else(|| "stop".to_string()),
-        };
-        let settlement = self.settle(finish_reason);
+    fn spawn_ledger_write(&self, settlement: StreamSettlement, provider_error: Option<String>) {
         let ctx = self.ctx.clone();
 
         // `Drop` runs wherever the body is released; without a runtime there
@@ -1574,6 +1699,80 @@ fn log_streaming_request(
     stream.map(move |chunk_result| logger.observe(chunk_result))
 }
 
+/// `x_router` for a settled stream — the settlement's figures, which are the
+/// ones `write_stream_ledger` records. The streaming path has one dispatch
+/// and no retry or fallback loop.
+fn stream_meta(ctx: &StreamLogCtx, s: &StreamSettlement) -> RouterMeta {
+    RouterMeta {
+        requested_model: ctx.requested_model.clone(),
+        model: ctx.canonical_model.clone(),
+        provider: ctx.provider.clone(),
+        settings: ctx.settings.clone(),
+        tokens: Some(TokenMeta {
+            cache_read: s.cache_read_tokens,
+            reasoning: s.reasoning_tokens,
+            estimated: s.tokens_estimated,
+            ..TokenMeta::new(s.prompt_tokens, s.completion_tokens)
+        }),
+        results: None,
+        cost: CallCost::spent(s.cost),
+        timing: TimingMeta {
+            total_ms: ctx.received.elapsed().as_millis() as i64,
+            latency_ms: s.latency_ms,
+            provider_ms: Some(s.latency_ms),
+            ttft_ms: s.ttft_ms,
+            attempts: 1,
+            fallbacks: 0,
+        },
+    }
+}
+
+/// The SSE event carrying a stream's settled cost: an OpenAI-shaped usage
+/// chunk (`choices: []`, as OpenAI's own `include_usage` chunk) whose `usage`
+/// adds `cost_usd` — the ledger row's value — and `tokens_estimated` when the
+/// provider never reported usage, plus the full `x_router` object.
+fn cost_chunk_event(request_id: &str, meta: &RouterMeta) -> String {
+    let mut chunk = serde_json::json!({
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": meta.model,
+        "choices": [],
+        "usage": openai_usage(&meta.tokens.unwrap_or_default(), meta.cost),
+    });
+    meta.attach(&mut chunk);
+    format!("data: {chunk}\n\n")
+}
+
+/// Splice `event` into an SSE chunk immediately before its `data: [DONE]`
+/// line, so the cost is the last thing a client reads before the stream ends.
+/// A chunk without a recognisable `[DONE]` line gets the event appended.
+fn insert_before_done(chunk: &[u8], event: &str) -> bytes::Bytes {
+    let Ok(text) = std::str::from_utf8(chunk) else {
+        let mut out = chunk.to_vec();
+        out.extend_from_slice(event.as_bytes());
+        return bytes::Bytes::from(out);
+    };
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let is_done = line
+            .strip_prefix("data: ")
+            .is_some_and(|data| data.trim() == "[DONE]");
+        if is_done {
+            let mut out = String::with_capacity(text.len() + event.len());
+            out.push_str(&text[..offset]);
+            out.push_str(event);
+            out.push_str(&text[offset..]);
+            return bytes::Bytes::from(out);
+        }
+        offset += line.len();
+    }
+    let mut out = String::with_capacity(text.len() + event.len());
+    out.push_str(text);
+    out.push_str(event);
+    bytes::Bytes::from(out)
+}
+
 fn build_normalized_request(
     body: &Value,
     model: String,
@@ -1624,10 +1823,12 @@ fn build_normalized_request(
     }
 }
 
+/// Build the non-streamed chat-completion body: OpenAI's shape, with the
+/// router's figures in `usage` (see [`openai_usage`]) and in `x_router`.
 fn build_openai_response(
     request_id: String,
-    model: &str,
     result: &crate::providers::adapter::CompletionResult,
+    meta: &RouterMeta,
 ) -> Value {
     // OpenAI reports `content: null` (not "") on a pure tool-call turn, and
     // several client SDKs branch on exactly that (issue #88).
@@ -1642,7 +1843,8 @@ fn build_openai_response(
     if let Some(tool_calls) = &result.tool_calls {
         message["tool_calls"] = tool_calls.clone();
     }
-    serde_json::json!({
+    let usage = openai_usage(&meta.tokens.unwrap_or_default(), meta.cost);
+    let mut body = serde_json::json!({
         "id": request_id,
         "object": "chat.completion",
         // The concrete backing model this request actually dispatched to —
@@ -1651,17 +1853,75 @@ fn build_openai_response(
         // request; omitting it left OpenAI-compatible clients unable to
         // learn the resolved model at all, and the `ai` SDK fell back to
         // the requested id, corrupting the caller's cost attribution.
-        "model": model,
+        "model": meta.model,
         "choices": [{
             "index": 0,
             "message": message,
             "finish_reason": result.finish_reason
         }],
-        "usage": {
-            "prompt_tokens": result.prompt_tokens,
-            "completion_tokens": result.completion_tokens,
-            "total_tokens": result.prompt_tokens + result.completion_tokens
-        }
+        "usage": usage
+    });
+    meta.attach(&mut body);
+    body
+}
+
+/// An OpenAI-shaped `usage` object carrying the router's figures: the token
+/// counts (with OpenAI's `prompt_tokens_details.cached_tokens` and
+/// `completion_tokens_details.reasoning_tokens` where known), the router
+/// extension `tokens_estimated` when the counts are an estimate, and the
+/// ledger cost (`cost_usd`, plus `cache_hit`/`saved_usd` on a hit).
+fn openai_usage(tokens: &TokenMeta, cost: CallCost) -> Value {
+    let mut usage = serde_json::json!({
+        "prompt_tokens": tokens.prompt,
+        "completion_tokens": tokens.completion,
+        "total_tokens": tokens.total,
+    });
+    if tokens.cache_read > 0 {
+        usage["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": tokens.cache_read });
+    }
+    if let Some(reasoning) = tokens.reasoning {
+        usage["completion_tokens_details"] = serde_json::json!({ "reasoning_tokens": reasoning });
+    }
+    if tokens.estimated {
+        usage["tokens_estimated"] = Value::Bool(true);
+    }
+    cost.write_into(&mut usage);
+    usage
+}
+
+/// Token accounting of a (non-streamed or cached) completion result — the
+/// counts its ledger and prompt rows record.
+fn completion_tokens(result: &crate::providers::adapter::CompletionResult) -> TokenMeta {
+    TokenMeta {
+        cache_read: result.cache_read_tokens,
+        cache_write: result.cache_write_tokens,
+        reasoning: result.reasoning_tokens,
+        ..TokenMeta::new(result.prompt_tokens, result.completion_tokens)
+    }
+}
+
+/// `x_router.settings` for a chat completion: what the adapter sends the
+/// provider (`temperature`, `max_tokens` incl. adapter defaults,
+/// `timeout_secs`), plus the router-resolved request shape (`stream`, tool
+/// count, `tool_choice`) and `dropped` — caller parameters the router
+/// deliberately did not forward (e.g. `temperature` to a model that rejects it).
+fn completion_settings(
+    effective: crate::providers::adapter::EffectiveSettings,
+    req: &crate::providers::adapter::NormalizedRequest,
+    body: &Value,
+) -> Value {
+    let mut dropped = Vec::new();
+    if body["temperature"].is_number() && req.temperature.is_none() {
+        dropped.push("temperature");
+    }
+    serde_json::json!({
+        "temperature": effective.temperature,
+        "max_tokens": effective.max_tokens,
+        "timeout_secs": effective.timeout_secs,
+        "stream": req.stream,
+        "tools": req.tools.as_ref().map(Vec::len),
+        "tool_choice": req.tool_choice,
+        "dropped": dropped,
     })
 }
 
@@ -1705,8 +1965,28 @@ pub fn should_skip_logging(headers: &axum::http::HeaderMap) -> bool {
 
 #[cfg(test)]
 mod openai_response_tests {
-    use super::build_openai_response;
-    use crate::providers::adapter::CompletionResult;
+    use super::{
+        build_openai_response, completion_settings, completion_tokens, openai_usage, CallCost,
+        RouterMeta, TimingMeta, TokenMeta,
+    };
+    use crate::providers::adapter::{CompletionResult, EffectiveSettings, NormalizedRequest};
+
+    fn meta(model: &str, result: &CompletionResult, cost: CallCost) -> RouterMeta {
+        RouterMeta {
+            requested_model: "balanced".to_string(),
+            model: model.to_string(),
+            provider: "p".to_string(),
+            settings: serde_json::json!({}),
+            tokens: Some(completion_tokens(result)),
+            results: None,
+            cost,
+            timing: TimingMeta::default(),
+        }
+    }
+
+    fn respond(model: &str, result: &CompletionResult, cost: CallCost) -> serde_json::Value {
+        build_openai_response("chatcmpl-mr-test".to_string(), result, &meta(model, result, cost))
+    }
 
     #[test]
     fn includes_the_resolved_backing_model() {
@@ -1719,17 +1999,11 @@ mod openai_response_tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             finish_reason: "stop".to_string(),
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            ttft_ms: None,
-            tool_calls: None,
+            ..Default::default()
         };
-        let response = build_openai_response(
-            "chatcmpl-mr-test".to_string(),
-            "gpt-4o-2026-01-01",
-            &result,
-        );
+        let response = respond("gpt-4o-2026-01-01", &result, CallCost::spent(0.25));
         assert_eq!(response["model"], "gpt-4o-2026-01-01");
+        assert_eq!(response["x_router"]["model"], "gpt-4o-2026-01-01");
         // A plain text turn keeps string content and no tool_calls key.
         assert_eq!(response["choices"][0]["message"]["content"], "hello");
         assert!(response["choices"][0]["message"].get("tool_calls").is_none());
@@ -1749,14 +2023,119 @@ mod openai_response_tests {
             }])),
             ..Default::default()
         };
-        let response =
-            build_openai_response("chatcmpl-mr-test".to_string(), "m", &result);
+        let response = respond("m", &result, CallCost::spent(0.0));
         let message = &response["choices"][0]["message"];
         // OpenAI reports content: null on a pure tool-call turn and SDKs
         // branch on exactly that.
         assert!(message["content"].is_null());
         assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    fn plain_result() -> CompletionResult {
+        CompletionResult {
+            content: "hi".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reports_the_call_cost_in_usage() {
+        let response = respond("m", &plain_result(), CallCost::spent(0.0123));
+        assert_eq!(response["usage"]["cost_usd"].as_f64(), Some(0.0123));
+        assert_eq!(response["usage"]["total_tokens"], 15);
+        // A live call carries no cache fields.
+        assert!(response["usage"].get("cache_hit").is_none());
+        assert!(response["usage"].get("saved_usd").is_none());
+        assert_eq!(response["x_router"]["cost"]["cost_usd"].as_f64(), Some(0.0123));
+        assert_eq!(response["x_router"]["tokens"]["prompt"], 10);
+    }
+
+    #[test]
+    fn a_cache_hit_reports_zero_cost_and_the_saving() {
+        let response = respond("m", &plain_result(), CallCost::cache_hit(0.5));
+        assert_eq!(response["usage"]["cost_usd"].as_f64(), Some(0.0));
+        assert_eq!(response["usage"]["cache_hit"], true);
+        assert_eq!(response["usage"]["saved_usd"].as_f64(), Some(0.5));
+        assert_eq!(response["x_router"]["cost"]["cache_hit"], true);
+    }
+
+    #[test]
+    fn usage_carries_cached_reasoning_and_estimate_details() {
+        let tokens = TokenMeta {
+            cache_read: 4,
+            reasoning: Some(3),
+            estimated: true,
+            ..TokenMeta::new(10, 5)
+        };
+        let usage = openai_usage(&tokens, CallCost::spent(1.0));
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 3);
+        assert_eq!(usage["tokens_estimated"], true);
+        // Absent figures stay absent rather than reading as a zero.
+        let bare = openai_usage(&TokenMeta::new(1, 1), CallCost::spent(0.0));
+        assert!(bare.get("prompt_tokens_details").is_none());
+        assert!(bare.get("completion_tokens_details").is_none());
+        assert!(bare.get("tokens_estimated").is_none());
+    }
+
+    #[test]
+    fn completion_tokens_mirror_the_result() {
+        let result = CompletionResult {
+            prompt_tokens: 7,
+            completion_tokens: 2,
+            cache_read_tokens: 3,
+            cache_write_tokens: 1,
+            reasoning_tokens: Some(2),
+            ..Default::default()
+        };
+        let t = completion_tokens(&result);
+        assert_eq!((t.prompt, t.completion, t.total), (7, 2, 9));
+        assert_eq!((t.cache_read, t.cache_write, t.reasoning), (3, 1, Some(2)));
+        assert!(!t.estimated);
+    }
+
+    fn norm_req(temperature: Option<f64>) -> NormalizedRequest {
+        NormalizedRequest {
+            model: "m".into(),
+            request_model: "balanced".into(),
+            messages: vec![],
+            stream: false,
+            temperature,
+            max_tokens: None,
+            tools: Some(vec![serde_json::json!({}), serde_json::json!({})]),
+            tool_choice: Some(serde_json::json!("auto")),
+            extra_params: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn settings_report_what_the_adapter_sends() {
+        let effective = EffectiveSettings {
+            temperature: Some(0.3),
+            max_tokens: Some(4096),
+            timeout_secs: Some(600),
+        };
+        let body = serde_json::json!({"temperature": 0.3});
+        let s = completion_settings(effective, &norm_req(Some(0.3)), &body);
+        assert_eq!(s["temperature"].as_f64(), Some(0.3));
+        assert_eq!(s["max_tokens"], 4096, "adapter default, not the caller's null");
+        assert_eq!(s["timeout_secs"], 600);
+        assert_eq!(s["stream"], false);
+        assert_eq!(s["tools"], 2);
+        assert_eq!(s["tool_choice"], "auto");
+        assert_eq!(s["dropped"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn settings_name_a_temperature_the_router_dropped() {
+        let body = serde_json::json!({"temperature": 0.7});
+        let s = completion_settings(EffectiveSettings::default(), &norm_req(None), &body);
+        assert!(s["temperature"].is_null());
+        assert_eq!(s["dropped"], serde_json::json!(["temperature"]));
     }
 }
 
@@ -1833,7 +2212,7 @@ mod sse_chunk_tests {
         assert_eq!(info.finish_reason.as_deref(), Some("stop"));
         assert_eq!(
             info.usage,
-            Some(ReportedUsage { prompt_tokens: 12, completion_tokens: 2, cached_tokens: 4 })
+            Some(ReportedUsage { prompt_tokens: 12, completion_tokens: 2, cached_tokens: 4, reasoning_tokens: None })
         );
         assert!(info.done);
     }
@@ -1905,5 +2284,93 @@ mod no_log_tests {
         let mut h = HeaderMap::new();
         h.insert("x-no-log", "TRUE".parse().unwrap());
         assert!(should_skip_logging(&h));
+    }
+}
+
+#[cfg(test)]
+mod stream_cost_chunk_tests {
+    use super::{cost_chunk_event, insert_before_done, parse_sse_chunk, CallCost, RouterMeta, TimingMeta, TokenMeta};
+
+    fn meta(estimated: bool) -> RouterMeta {
+        RouterMeta {
+            requested_model: "balanced".into(),
+            model: "big-model".into(),
+            provider: "p".into(),
+            settings: serde_json::json!({"stream": true}),
+            tokens: Some(TokenMeta {
+                estimated,
+                ..TokenMeta::new(40, 6)
+            }),
+            results: None,
+            cost: CallCost::spent(0.046),
+            timing: TimingMeta {
+                attempts: 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn event_json(event: &str) -> serde_json::Value {
+        let data = event.strip_prefix("data: ").unwrap().trim_end();
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn cost_chunk_is_an_openai_usage_chunk_with_the_settled_cost() {
+        let event = cost_chunk_event("chatcmpl-mr-x", &meta(false));
+        assert!(event.ends_with("\n\n"));
+        let json = event_json(&event);
+        assert_eq!(json["id"], "chatcmpl-mr-x");
+        assert_eq!(json["object"], "chat.completion.chunk");
+        assert_eq!(json["model"], "big-model");
+        assert_eq!(json["choices"].as_array().map(Vec::len), Some(0));
+        assert_eq!(json["usage"]["prompt_tokens"], 40);
+        assert_eq!(json["usage"]["completion_tokens"], 6);
+        assert_eq!(json["usage"]["cost_usd"].as_f64(), Some(0.046));
+        assert!(json["usage"].get("tokens_estimated").is_none());
+        assert_eq!(json["x_router"]["cost"]["cost_usd"].as_f64(), Some(0.046));
+        assert_eq!(json["x_router"]["timing"]["attempts"], 1);
+        // The router's own accounting reads it back as usage, unchanged.
+        let info = parse_sse_chunk(event.as_bytes());
+        assert_eq!(info.usage.map(|u| u.prompt_tokens), Some(40));
+    }
+
+    #[test]
+    fn estimated_usage_is_flagged_in_the_cost_chunk() {
+        let json = event_json(&cost_chunk_event("id", &meta(true)));
+        assert_eq!(json["usage"]["tokens_estimated"], true);
+        assert_eq!(json["x_router"]["tokens"]["estimated"], true);
+    }
+
+    #[test]
+    fn reasoning_tokens_are_read_from_a_stream_usage_chunk() {
+        let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":9,\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\n";
+        let usage = parse_sse_chunk(chunk).usage.expect("usage");
+        assert_eq!(usage.reasoning_tokens, Some(5));
+    }
+
+    #[test]
+    fn event_is_spliced_in_immediately_before_done() {
+        let chunk = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
+        let out = insert_before_done(chunk, "data: {\"cost\":1}\n\n");
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "data: {\"a\":1}\n\ndata: {\"cost\":1}\n\ndata: [DONE]\n\n"
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_is_only_done_gets_the_event_first() {
+        let out = insert_before_done(b"data: [DONE]\n\n", "data: {}\n\n");
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "data: {}\n\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn a_chunk_without_a_done_line_gets_the_event_appended() {
+        let out = insert_before_done(b"data: {}\n\n", "data: {\"cost\":1}\n\n");
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "data: {}\n\ndata: {\"cost\":1}\n\n"
+        );
     }
 }

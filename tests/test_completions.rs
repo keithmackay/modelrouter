@@ -596,6 +596,148 @@ mod accounting {
         assert_eq!(prompts[0].finish_reason.as_deref(), Some("stop"));
     }
 
+    /// The `usage` object of the router's cost chunk: the last `data:` event
+    /// before `[DONE]`.
+    fn cost_chunk_usage(body: &str) -> serde_json::Value {
+        let events: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        assert_eq!(events.last().copied(), Some("[DONE]"), "stream must still end with [DONE]");
+        let cost_event: serde_json::Value =
+            serde_json::from_str(events[events.len() - 2]).expect("cost chunk is JSON");
+        assert_eq!(cost_event["object"], "chat.completion.chunk");
+        cost_event["usage"].clone()
+    }
+
+    /// The `x_router` object of the router's cost chunk.
+    fn cost_chunk_meta(body: &str) -> serde_json::Value {
+        let events: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        let cost_event: serde_json::Value =
+            serde_json::from_str(events[events.len() - 2]).expect("cost chunk is JSON");
+        cost_event["x_router"].clone()
+    }
+
+    #[tokio::test]
+    async fn non_stream_response_reports_exactly_the_ledger_cost() {
+        let (server, db) = build_app(ScriptedAdapter::failing_first(0), HashMap::new(), false).await;
+
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&request_body(false))
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["model"], "big-model", "the routed model is returned");
+
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        let returned = body["usage"]["cost_usd"].as_f64().expect("usage.cost_usd present");
+        assert_eq!(returned, ledger[0].cost_usd, "response cost must be the ledger value");
+        assert!(close_to(returned, 0.15));
+
+        let meta = &body["x_router"];
+        assert_eq!(meta["requested_model"], "primary/big-model");
+        assert_eq!(meta["model"], ledger[0].model.as_str());
+        assert_eq!(meta["provider"], ledger[0].provider.as_str());
+        assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+        assert_eq!(meta["cost"]["cache_hit"], false);
+        assert_eq!(meta["tokens"]["prompt"].as_i64(), Some(ledger[0].tokens_in));
+        assert_eq!(meta["tokens"]["completion"].as_i64(), Some(ledger[0].tokens_out));
+        assert_eq!(meta["tokens"]["estimated"], false);
+        assert_eq!(meta["timing"]["attempts"], 1);
+        assert_eq!(meta["timing"]["fallbacks"], 0);
+        assert!(meta["timing"]["total_ms"].as_i64().unwrap() >= meta["timing"]["latency_ms"].as_i64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn fallback_response_reports_the_fallback_ledger_cost() {
+        let chains = HashMap::from([(
+            "big-model".to_string(),
+            vec!["backup/mini-model".to_string()],
+        )]);
+        let (server, db) = build_app(ScriptedAdapter::failing_first(1), chains, false).await;
+
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&request_body(false))
+            .await;
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["model"], "mini-model");
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        assert_eq!(body["usage"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+        assert!(close_to(ledger[0].cost_usd, 0.015));
+
+        let meta = &body["x_router"];
+        assert_eq!(meta["model"], ledger[0].model.as_str(), "the fallback model is named");
+        assert_eq!(meta["provider"], ledger[0].provider.as_str());
+        assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+        assert_eq!(meta["timing"]["attempts"], 2, "the failed primary call counts");
+        assert_eq!(meta["timing"]["fallbacks"], 1);
+    }
+
+    #[tokio::test]
+    async fn streamed_response_ends_with_exactly_the_ledger_cost() {
+        let chunks = vec![
+            Chunk::Data(delta("Hello")),
+            Chunk::Data(sse(json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}))),
+            Chunk::Data(format!(
+                "{}data: [DONE]\n\n",
+                sse(json!({"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":6,"total_tokens":46}}))
+            )),
+        ];
+        let (server, db) = build_app(ScriptedAdapter::streaming(chunks), HashMap::new(), false).await;
+
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&request_body(true))
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let text = resp.text();
+        let usage = cost_chunk_usage(&text);
+
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        let returned = usage["cost_usd"].as_f64().expect("usage.cost_usd present");
+        assert_eq!(returned, ledger[0].cost_usd, "stream cost must be the ledger value");
+        assert!(close_to(returned, 0.046));
+        assert_eq!(usage["prompt_tokens"], 40);
+        assert_eq!(usage["completion_tokens"], 6);
+        assert!(usage.get("tokens_estimated").is_none());
+        let meta = cost_chunk_meta(&text);
+        assert_eq!(meta["model"], ledger[0].model.as_str());
+        assert_eq!(meta["provider"], ledger[0].provider.as_str());
+        assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+        assert_eq!(meta["tokens"]["prompt"].as_i64(), Some(ledger[0].tokens_in));
+        assert_eq!(meta["tokens"]["completion"].as_i64(), Some(ledger[0].tokens_out));
+        assert_eq!(meta["timing"]["attempts"], 1);
+        // The provider's own chunks still pass through untouched.
+        assert!(text.contains("Hello"));
+    }
+
+    #[tokio::test]
+    async fn streamed_estimate_is_returned_with_its_flag() {
+        let chunks = vec![Chunk::Data(format!("{}data: [DONE]\n\n", delta("Hello world!")))];
+        let (server, db) = build_app(ScriptedAdapter::streaming(chunks), HashMap::new(), false).await;
+
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&request_body(true))
+            .await;
+        let usage = cost_chunk_usage(&resp.text());
+
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        assert!(ledger[0].tokens_estimated);
+        assert_eq!(usage["tokens_estimated"], true);
+        assert_eq!(usage["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+        assert_eq!(usage["completion_tokens"].as_i64(), Some(ledger[0].tokens_out));
+    }
+
     #[tokio::test]
     async fn anthropic_stream_usage_reaches_the_ledger() {
         // Anthropic-shaped events run through the real translator, the way the

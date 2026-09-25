@@ -17,8 +17,9 @@ use crate::providers::anthropic::{
 pub const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 
 /// Anthropic requires `max_tokens`; when the caller doesn't supply one, fall
-/// back to this value. Matches the direct Anthropic adapter's default.
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// back to the direct Anthropic adapter's default (one constant, so the value
+/// sent and the value reported in `x_router.settings` cannot drift).
+pub(crate) use crate::providers::anthropic::DEFAULT_MAX_TOKENS;
 
 /// Translate an OpenAI-shaped request to a Vertex Anthropic `:rawPredict` /
 /// `:streamRawPredict` body.
@@ -67,6 +68,7 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
+        reasoning_tokens: None,
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
         finish_reason: map_stop_reason(v["stop_reason"].as_str().unwrap_or("end_turn")),

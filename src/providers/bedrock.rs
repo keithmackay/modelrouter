@@ -21,7 +21,9 @@ use bytes::Bytes;
 use futures::stream;
 
 use crate::config::schema::ProviderConfig;
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
 
 // ── Translation helpers (pub so unit tests can import them) ─────────────────
 
@@ -109,6 +111,8 @@ fn to_sdk_system(messages: &[serde_json::Value]) -> Vec<SystemContentBlock> {
 
 pub struct BedrockAdapter {
     client: aws_sdk_bedrockruntime::Client,
+    /// The SDK operation timeout, reported in `x_router.settings`.
+    timeout_secs: u64,
 }
 
 impl BedrockAdapter {
@@ -132,12 +136,24 @@ impl BedrockAdapter {
         loader = loader.timeout_config(timeout_config);
         let aws_config = loader.load().await;
         let client = aws_sdk_bedrockruntime::Client::new(&aws_config);
-        Self { client }
+        Self {
+            client,
+            timeout_secs: config.timeout_secs,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl ProviderAdapter for BedrockAdapter {
+    /// Settings forwarded as normalized; the timeout is the configured ceiling.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            timeout_secs: Some(self.timeout_secs),
+        }
+    }
+
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let sdk_messages = to_sdk_messages(&req.messages)?;
         let sdk_system = to_sdk_system(&req.messages);
@@ -197,6 +213,7 @@ impl ProviderAdapter for BedrockAdapter {
             finish_reason,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reasoning_tokens: None,
             // The AWS SDK's converse() resolves only once the whole response
             // is in — there is no header/body split to time, so no TTFT.
             ttft_ms: None,
