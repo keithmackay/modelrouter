@@ -47,7 +47,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures::TryStreamExt;
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
 use crate::providers::azure_entra::TokenProvider;
 use crate::providers::foundry::auth::FoundryAuth;
@@ -58,6 +58,12 @@ pub struct FoundryAdapter {
     endpoint: FoundryEndpoint,
     auth: FoundryAuth,
     client: reqwest::Client,
+    /// This provider's configured flat timeout — the fallback `tier_timeouts`
+    /// resolves to for a request that doesn't address a known tier.
+    default_timeout_secs: u64,
+    /// Per-tier ceilings from `[tier_timeouts]`, applied per request like the
+    /// other chat adapters (previously ignored: one flat client timeout).
+    tier_timeouts: TierTimeoutsConfig,
 }
 
 impl FoundryAdapter {
@@ -99,7 +105,25 @@ impl FoundryAdapter {
             endpoint,
             auth,
             client,
+            default_timeout_secs: config.timeout_secs,
+            tier_timeouts: TierTimeoutsConfig::default(),
         })
+    }
+
+    /// Apply the configured `[tier_timeouts]` table. The serving path
+    /// (`ProviderRegistry`) always calls this; without it the adapter uses
+    /// the built-in tier defaults.
+    pub fn with_tier_timeouts(mut self, tier_timeouts: TierTimeoutsConfig) -> Self {
+        self.tier_timeouts = tier_timeouts;
+        self
+    }
+
+    /// Per-request ceiling: the addressed tier's value, or this provider's
+    /// flat `timeout_secs` for anything else.
+    fn request_timeout(&self, req: &NormalizedRequest) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs),
+        )
     }
 
     pub fn endpoint(&self) -> &FoundryEndpoint {
@@ -236,7 +260,7 @@ impl ProviderAdapter for FoundryAdapter {
 
         let request = self
             .auth
-            .apply(self.client.post(&url).json(&body))
+            .apply(self.client.post(&url).timeout(self.request_timeout(req)).json(&body))
             .await
             .context("failed to attach credentials to the Azure AI Foundry request")?;
 
@@ -291,7 +315,7 @@ impl ProviderAdapter for FoundryAdapter {
 
         let request = self
             .auth
-            .apply(self.client.post(&url).json(&body))
+            .apply(self.client.post(&url).timeout(self.request_timeout(req)).json(&body))
             .await
             .context("failed to attach credentials to the Azure AI Foundry request")?;
 

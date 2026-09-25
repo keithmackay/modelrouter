@@ -7,7 +7,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
 use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::{parse_model_id, Publisher};
@@ -90,6 +90,14 @@ pub struct VertexAdapter {
     catalog_publishers: Vec<String>,
     token_provider: Arc<dyn TokenProvider>,
     client: reqwest::Client,
+    /// This provider's configured flat timeout — the fallback `tier_timeouts`
+    /// resolves to for a request that doesn't address a known tier.
+    default_timeout_secs: u64,
+    /// Per-tier ceilings from `[tier_timeouts]`, applied per request exactly
+    /// as the other chat adapters do. Before this the Vertex adapter used only
+    /// the flat `timeout_secs` baked into its client, so every Vertex call ran
+    /// under one bound whatever tier the caller addressed.
+    tier_timeouts: TierTimeoutsConfig,
     /// Scheme+host override for the publisher-models catalog (tests only;
     /// None in production — the host derives from `region`). See catalog.rs.
     catalog_base: Option<String>,
@@ -145,6 +153,8 @@ impl VertexAdapter {
             catalog_publishers: config.catalog_publishers.clone().unwrap_or_default(),
             token_provider,
             client,
+            default_timeout_secs: config.timeout_secs,
+            tier_timeouts: TierTimeoutsConfig::default(),
             catalog_base: None,
             api_base: None,
         })
@@ -170,9 +180,27 @@ impl VertexAdapter {
             catalog_publishers: Vec::new(),
             token_provider,
             client,
+            default_timeout_secs: timeout_secs,
+            tier_timeouts: TierTimeoutsConfig::default(),
             catalog_base: None,
             api_base: None,
         })
+    }
+
+    /// Apply the configured `[tier_timeouts]` table. The serving path
+    /// (`ProviderRegistry`) always calls this; without it the adapter uses
+    /// the built-in tier defaults.
+    pub fn with_tier_timeouts(mut self, tier_timeouts: TierTimeoutsConfig) -> Self {
+        self.tier_timeouts = tier_timeouts;
+        self
+    }
+
+    /// Per-request ceiling for a generative call: the addressed tier's value,
+    /// or this provider's flat `timeout_secs` for anything else.
+    fn request_timeout(&self, req: &NormalizedRequest) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs),
+        )
     }
 
     /// Test hook: point catalog discovery at a local mock server.
@@ -295,9 +323,10 @@ impl ProviderAdapter for VertexAdapter {
             Publisher::Anthropic => claude::translate_request(req, false),
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
+        let timeout = self.request_timeout(req);
         let dispatched = std::time::Instant::now();
         let resp = send_with_401_retry(&self.token_provider, "failed to send request to Vertex AI", |token| {
-            self.client.post(&url).bearer_auth(token).json(&body)
+            self.client.post(&url).bearer_auth(token).timeout(timeout).json(&body)
         })
         .await?;
         // Headers are in, body not yet read: time to first token.
@@ -336,10 +365,11 @@ impl ProviderAdapter for VertexAdapter {
             Publisher::Anthropic => claude::translate_request(req, true),
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
+        let timeout = self.request_timeout(req);
         let resp = send_with_401_retry(
             &self.token_provider,
             "failed to send streaming request to Vertex AI",
-            |token| self.client.post(&url).bearer_auth(token).json(&body),
+            |token| self.client.post(&url).bearer_auth(token).timeout(timeout).json(&body),
         )
         .await?;
         let status = resp.status();
@@ -538,6 +568,79 @@ mod tests {
         // `global` serves no MaaS models, so no MaaS region is implied.
         let global = adapter("http://127.0.0.1:9", "global");
         assert_eq!(global.maas_region(), None);
+    }
+
+    /// A Gemini-shaped server that answers after `delay`, for the tier
+    /// timeout tests below.
+    async fn serve_slow_gemini(delay: std::time::Duration) -> (String, tokio::task::JoinHandle<()>) {
+        serve(Router::new().fallback(post(move || async move {
+            tokio::time::sleep(delay).await;
+            axum::Json(serde_json::json!({
+                "candidates": [{"content": {"parts": [{"text": "pong"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+            }))
+        })))
+        .await
+    }
+
+    fn adapter_with_timeouts(base: &str, flat_secs: u64, tiers: TierTimeoutsConfig) -> VertexAdapter {
+        VertexAdapter::with_token_provider(
+            "proj".into(),
+            "global".into(),
+            Arc::new(StaticTokenProvider::new("tok".into())),
+            flat_secs,
+        )
+        .unwrap()
+        .with_api_base(base.to_string())
+        .with_tier_timeouts(tiers)
+    }
+
+    fn tiered_req(request_model: &str) -> NormalizedRequest {
+        NormalizedRequest { request_model: request_model.into(), ..req("google/gemini-2.5-pro") }
+    }
+
+    fn is_timeout(err: &anyhow::Error) -> bool {
+        err.chain().any(|e| {
+            e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+        })
+    }
+
+    /// Vertex used to apply only its flat `timeout_secs`, ignoring the tier
+    /// the caller addressed. A tier ceiling tighter than both the provider
+    /// default and the server's delay can only fire if the tier is honoured —
+    /// on `complete` and `stream` alike.
+    #[tokio::test]
+    async fn a_known_tier_is_bounded_by_its_own_ceiling_not_the_flat_timeout() {
+        let (base, _s) = serve_slow_gemini(std::time::Duration::from_millis(300)).await;
+        let a = adapter_with_timeouts(&base, 30, TierTimeoutsConfig { fast: 0, balanced: 30, deep: 30 });
+        let err = a.complete(&tiered_req("fast")).await.unwrap_err();
+        assert!(is_timeout(&err), "expected a timeout, got: {err:#}");
+        let err = a.stream(&tiered_req("fast")).await.err().unwrap();
+        assert!(is_timeout(&err), "expected a timeout, got: {err:#}");
+    }
+
+    /// The direction that matters for slow calls: a tier's generous ceiling
+    /// LENGTHENS the bound past the provider's flat `timeout_secs` (the
+    /// per-request value overrides the client's), so a slow tiered call is
+    /// not cut by the flat fallback.
+    #[tokio::test]
+    async fn a_known_tier_ceiling_outlasts_a_shorter_flat_timeout() {
+        let (base, _s) = serve_slow_gemini(std::time::Duration::from_millis(300)).await;
+        let a = adapter_with_timeouts(&base, 0, TierTimeoutsConfig::default());
+        let result = a.complete(&tiered_req("deep")).await.unwrap();
+        assert_eq!(result.content, "pong");
+        let body = collect(a.stream(&tiered_req("deep")).await.unwrap()).await;
+        assert!(!body.is_empty(), "the slow stream should complete, not be cut");
+    }
+
+    /// An address that is not a tier keeps the provider's own flat bound,
+    /// however generous the tier table is.
+    #[tokio::test]
+    async fn an_untiered_request_model_uses_the_flat_timeout() {
+        let (base, _s) = serve_slow_gemini(std::time::Duration::from_millis(300)).await;
+        let a = adapter_with_timeouts(&base, 0, TierTimeoutsConfig::default());
+        let err = a.complete(&tiered_req("vertex/google/gemini-2.5-pro")).await.unwrap_err();
+        assert!(is_timeout(&err), "expected the flat timeout to apply, got: {err:#}");
     }
 
     #[tokio::test]
