@@ -872,6 +872,21 @@ pub struct ProviderConfig {
     /// preview tool, ignored by the general one.
     #[serde(default)]
     pub custom_search_instance: Option<String>,
+    /// Whether this provider is reachable via `POST /v1/chat/completions` as
+    /// `model = "<provider>/<model>"`. Defaults to true, matching every
+    /// existing chat provider (`anthropic`, `azure`, `vertex`, arbitrary
+    /// OpenAI-compatible sections, ...).
+    ///
+    /// Set to false for a provider section that exists only to back a
+    /// dedicated, single-purpose route (e.g. `[providers.typesafe]` for
+    /// `POST /v1/systemone`). Without this, any provider name added to config
+    /// is implicitly a full generic chat provider via the OpenAI-compat
+    /// fallback in `ProviderRegistry::get`, regardless of why it was
+    /// configured — letting a caller reach the third-party API directly with
+    /// the router's key and bypass that route's own policy gate, pricing, and
+    /// error handling (see #97).
+    #[serde(default = "default_true")]
+    pub generic_chat: bool,
 }
 
 impl Default for ProviderConfig {
@@ -899,6 +914,7 @@ impl Default for ProviderConfig {
             project_connection_id: None,
             custom_search: false,
             custom_search_instance: None,
+            generic_chat: true,
         }
     }
 }

@@ -92,10 +92,17 @@ timeout_secs = 120
 # (--features vertex) and `bing_grounding` (--features bing-grounding);
 # additional engines can be added to src/providers/search_registry.rs and
 # configured the same way under [providers.<engine>].
+#
+# `generic_chat` defaults to true, meaning any [providers.x] section is also
+# reachable as a full chat provider via POST /v1/chat/completions with
+# model="x/<anything>". A provider configured only to back a dedicated route
+# like this one should set `generic_chat = false` so it stays reachable
+# solely through that route's own gating (#97).
 # [providers.tavily]
 # api_key  = ""          # or set MODELROUTER_PROVIDERS__TAVILY__API_KEY
 # api_base = "https://api.tavily.com"
 # timeout_secs = 30
+# generic_chat = false
 
 # Grounding with Bing Search on Azure AI Foundry (requires build with
 # `--features bing-grounding`, which is on by default).
