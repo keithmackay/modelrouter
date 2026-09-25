@@ -8,7 +8,9 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::config::schema::ProviderConfig;
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
 use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::{parse_model_id, Publisher};
 use crate::providers::vertex::{claude, gemini, maas};
@@ -90,6 +92,8 @@ pub struct VertexAdapter {
     catalog_publishers: Vec<String>,
     token_provider: Arc<dyn TokenProvider>,
     client: reqwest::Client,
+    /// The client's timeout ceiling, reported in `x_router.settings`.
+    timeout_secs: u64,
     /// Scheme+host override for the publisher-models catalog (tests only;
     /// None in production — the host derives from `region`). See catalog.rs.
     catalog_base: Option<String>,
@@ -145,6 +149,7 @@ impl VertexAdapter {
             catalog_publishers: config.catalog_publishers.clone().unwrap_or_default(),
             token_provider,
             client,
+            timeout_secs: config.timeout_secs,
             catalog_base: None,
             api_base: None,
         })
@@ -170,6 +175,7 @@ impl VertexAdapter {
             catalog_publishers: Vec::new(),
             token_provider,
             client,
+            timeout_secs,
             catalog_base: None,
             api_base: None,
         })
@@ -277,6 +283,22 @@ impl ProviderAdapter for VertexAdapter {
             parse_model_id(model),
             Ok((Publisher::Anthropic | Publisher::Maas, _))
         )
+    }
+
+    /// Claude-on-Vertex always sends `max_tokens` (the caller's or the
+    /// Anthropic default); Gemini and MaaS forward it only when given.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        let max_tokens = match parse_model_id(&req.model) {
+            Ok((Publisher::Anthropic, _)) => {
+                Some(req.max_tokens.unwrap_or(claude::DEFAULT_MAX_TOKENS))
+            }
+            _ => req.max_tokens,
+        };
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens,
+            timeout_secs: Some(self.timeout_secs),
+        }
     }
 
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {

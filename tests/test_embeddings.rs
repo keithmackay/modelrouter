@@ -23,6 +23,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 async fn test_app() -> TestServer {
+    test_app_with_db().await.0
+}
+
+async fn test_app_with_db() -> (TestServer, Arc<dyn DatabaseProvider>) {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
@@ -90,7 +94,7 @@ async fn test_app() -> TestServer {
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
-    TestServer::new(build_router(state)).unwrap()
+    (TestServer::new(build_router(state)).unwrap(), db)
 }
 
 #[tokio::test]
@@ -250,4 +254,40 @@ async fn embeddings_unknown_encoding_format_is_refused() {
         }))
         .await;
     assert_eq!(resp.status_code(), 400);
+}
+
+/// The response carries the router's price for the call,
+/// and it is exactly the value on the cost-ledger row — not a second estimate.
+#[tokio::test]
+async fn embeddings_response_reports_exactly_the_ledger_cost() {
+    let (server, db) = test_app_with_db().await;
+    let resp = server
+        .post("/v1/embeddings")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": ["hello world, this is forty characters.."]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    let returned = body["usage"]["cost_usd"]
+        .as_f64()
+        .expect("usage.cost_usd present");
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(returned, ledger[0].cost_usd, "response cost must be the ledger value");
+    assert_eq!(body["model"], ledger[0].model.as_str(), "response names the ledger model");
+    // A priced model yields a non-zero figure: the field is a real price,
+    // not a placeholder zero.
+    assert!(returned > 0.0, "cost was {returned}");
+
+    let meta = &body["x_router"];
+    assert_eq!(meta["model"], ledger[0].model.as_str());
+    assert_eq!(meta["provider"], ledger[0].provider.as_str());
+    assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+    assert_eq!(meta["tokens"]["prompt"].as_i64(), Some(ledger[0].tokens_in));
 }

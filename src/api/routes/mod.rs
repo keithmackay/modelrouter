@@ -3,6 +3,7 @@ pub mod completions;
 pub mod mcp;
 pub mod images;
 pub mod responses;
+pub mod router_meta;
 pub mod embeddings;
 pub mod feedback;
 pub mod health;

@@ -1255,12 +1255,78 @@ Response:
       "published_date": null
     }
   ],
-  "usage": { "results": 1, "cost_usd": 0.005 }
+  "model": "search/tavily",
+  "usage": { "results": 1, "cost_usd": 0.005 },
+  "x_router": { "...": "see below" }
 }
 ```
 
-Out of scope for this endpoint: result caching, re-ranking, and fetching full
-page content (only the engine's own snippet is returned).
+Out of scope for this endpoint: re-ranking and fetching full page content
+(only the engine's own snippet is returned).
+
+#### Per-call cost and routing metadata in responses
+
+Every priced response carries the router's own account of the call, so a
+client can record the authoritative cost, the model that actually answered,
+the settings sent, the token counts and the timing **verbatim** instead of
+re-pricing calls against a private price list that drifts from the router's
+`[[pricing]]` table. Every figure is the value the router wrote to its
+`cost_ledger` (and `prompts`) row for the same request.
+
+Covered endpoints: `/v1/chat/completions` (non-streamed, and the terminal
+chunk of a stream), `/v1/embeddings`, `/v1/search`. Not yet covered:
+`/v1/messages`, `/v1/responses`, images, audio.
+
+Two additive fields; the OpenAI shape is otherwise unchanged:
+
+- `usage.cost_usd` — USD charged for this call (the ledger row's
+  `cost_usd`), after retries and fallback. On a response-cache hit it is
+  `0`, with `usage.cache_hit: true` and `usage.saved_usd` carrying the
+  avoided cost. `usage.tokens_estimated: true` appears when the provider
+  reported no usage and the counts (and so the cost) are the router's
+  estimate.
+- `x_router` — the full per-call record:
+
+```json
+{
+  "requested_model": "balanced",
+  "model": "claude-sonnet-4-5",
+  "provider": "vertex",
+  "settings": {
+    "temperature": 0.2, "max_tokens": 8192, "timeout_secs": 600,
+    "stream": false, "tools": null, "tool_choice": null, "dropped": []
+  },
+  "tokens": {
+    "prompt": 1200, "completion": 350, "total": 1550,
+    "cache_read": 0, "cache_write": 0, "reasoning": null, "estimated": false
+  },
+  "cost": { "cost_usd": 0.00885, "cache_hit": false },
+  "timing": {
+    "total_ms": 4210, "latency_ms": 4180, "provider_ms": 4170,
+    "ttft_ms": 900, "attempts": 1, "fallbacks": 0
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `requested_model` | The model name or alias the caller sent. |
+| `model`, `provider` | What answered after alias resolution and fallback (the ledger row's `model`/`provider`). The top-level `model` field names the same model. |
+| `settings` | Values actually sent to the provider after router resolution and adapter defaults. `dropped` lists caller parameters the router deliberately did not forward (e.g. `temperature` to a model that rejects it). Search reports `max_results`. |
+| `tokens` | Chat/embeddings only. `prompt` includes provider-cache reads; `reasoning` is `null` when the provider gave no figure; `estimated` mirrors the ledger's `tokens_estimated`. |
+| `results` | Search only: results returned. |
+| `cost` | `cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
+| `timing` | `total_ms` from request receipt; `latency_ms` dispatch to completion including retries and fallback hops (0 on a hit); `provider_ms` for the answering provider call; `ttft_ms` for streams (first byte); `attempts` provider calls made; `fallbacks` hops to another model. |
+
+**Streams.** The router splices one extra `chat.completion.chunk` with
+`"choices": []`, a `usage` object (including `cost_usd`) and `x_router`
+immediately before `data: [DONE]`. Its figures come from the same settlement
+that writes the ledger row. Clients that ignore chunks without choices are
+unaffected. A stream that is abandoned before completion never receives it.
+
+A client that finds neither `usage.cost_usd` nor `x_router` on a response is
+talking to a router build that predates this contract, and should treat the
+call as unpriced rather than estimate it.
 
 #### Request cost attribution
 
