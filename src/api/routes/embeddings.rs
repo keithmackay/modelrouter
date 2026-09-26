@@ -8,6 +8,8 @@ use axum::{
 use serde_json::Value;
 use tracing::Instrument;
 
+use super::router_meta::{CallCost, RouterMeta, TimingMeta, TokenMeta};
+
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     db::models::{NewCostLedgerEntry, NewPrompt},
@@ -62,6 +64,8 @@ async fn embeddings_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    // Request receipt: `x_router.timing.total_ms` is measured from here.
+    let received = Instant::now();
     let user = user.0;
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let attr_correlation = attribution.correlation_id.clone();
@@ -179,7 +183,10 @@ async fn embeddings_inner(
     span.record("user_id", user.id);
 
     let start = Instant::now();
-    let (provider_name, canonical_model, result) = {
+    // Provider calls made and the successful call's duration, for `x_router`.
+    let mut attempts: i64 = 0;
+    let mut provider_ms: i64 = 0;
+    let (provider_name, canonical_model, result, hops) = {
         let (mut current_provider, mut current_model) = state.router.resolve(&model);
         // Bounded: `next_after` follows configured chains, and a chain that points
         // back at itself (a→b, b→a) would otherwise spin forever, burning provider
@@ -200,14 +207,18 @@ async fn embeddings_inner(
                         input: input.clone(),
                         dimensions,
                     };
-                    adapter.embed(&req).await
+                    attempts += 1;
+                    let called = Instant::now();
+                    let r = adapter.embed(&req).await;
+                    provider_ms = called.elapsed().as_millis() as i64;
+                    r
                 }
                 Err(e) => Err(e),
                 },
             };
 
             match attempt {
-                Ok(r) => break (current_provider, current_model, r),
+                Ok(r) => break (current_provider, current_model, r, hops),
                 Err(e) => {
                     tracing::warn!(
                         model = current_model.as_str(),
@@ -312,7 +323,7 @@ async fn embeddings_inner(
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             ttft_ms: None,
-            attempts: None,
+            attempts: Some(attempts),
             tags: "[]".to_string(),
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
@@ -400,14 +411,40 @@ async fn embeddings_inner(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({
+    // Every figure is the one written to the ledger/prompt rows above:
+    // callers record the router's price rather than keeping their own copy.
+    let meta = RouterMeta {
+        requested_model,
+        model: canonical_model.clone(),
+        provider: provider_name,
+        settings: serde_json::json!({
+            "dimensions": dimensions,
+            "encoding_format": encoding_format,
+            "inputs": input.len(),
+        }),
+        tokens: Some(TokenMeta::new(result.prompt_tokens, 0)),
+        results: None,
+        cost: CallCost::spent(cost),
+        timing: TimingMeta {
+            total_ms: received.elapsed().as_millis() as i64,
+            latency_ms,
+            provider_ms: Some(provider_ms),
+            ttft_ms: None,
+            attempts,
+            fallbacks: hops as i64,
+        },
+    };
+    let mut usage = serde_json::json!({
+        "prompt_tokens": result.prompt_tokens,
+        "total_tokens": result.prompt_tokens,
+    });
+    meta.cost.write_into(&mut usage);
+    let mut response = serde_json::json!({
         "object": "list",
         "data": data,
         "model": canonical_model,
-        "usage": {
-            "prompt_tokens": result.prompt_tokens,
-            "total_tokens": result.prompt_tokens,
-        }
-    }))
-    .into_response())
+        "usage": usage,
+    });
+    meta.attach(&mut response);
+    Ok(Json(response).into_response())
 }

@@ -56,6 +56,9 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0)
             as u32,
         cache_write_tokens: 0,
+        reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .map(|n| n as u32),
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
         tool_calls: choice["message"]["tool_calls"]

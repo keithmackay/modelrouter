@@ -2,7 +2,9 @@ use anyhow::Context;
 use futures::TryStreamExt;
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
 
 /// GA stable Azure OpenAI API version at time of writing.
 /// Operators should pin `api_version` in config for production deployments.
@@ -102,6 +104,14 @@ struct AzureUsage {
     completion_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: AzurePromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: AzureCompletionTokensDetails,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AzureCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -153,6 +163,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
+            reasoning_tokens: parsed.usage.completion_tokens_details.reasoning_tokens,
             ttft_ms: Some(ttft_ms),
             tool_calls: choice.message.tool_calls.filter(|tc| !tc.is_null()),
         })
@@ -192,5 +203,18 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     /// Azure serves the OpenAI wire shape: `tools` pass through verbatim (issue #88).
     fn supports_tools(&self, _model: &str) -> bool {
         true
+    }
+
+    /// Temperature and `max_tokens` are forwarded as normalized; the timeout
+    /// is the tier-resolved ceiling this adapter applies to the call.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            timeout_secs: Some(
+                self.tier_timeouts
+                    .resolve(&req.request_model, self.default_timeout_secs),
+            ),
+        }
     }
 }

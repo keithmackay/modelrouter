@@ -39,6 +39,12 @@ pub struct CompletionResult {
     pub cache_read_tokens: u32,
     /// Tokens written to the provider's prompt cache on this request (billed at a premium rate).
     pub cache_write_tokens: u32,
+    /// Reasoning/thinking tokens the provider reported (OpenAI
+    /// `completion_tokens_details.reasoning_tokens`, Gemini
+    /// `thoughtsTokenCount`). `None` when the provider did not report a
+    /// figure — distinct from a reported zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
     /// Time to first token: elapsed time of the provider HTTP send (headers
     /// received, body not yet read). `None` where the client gives no
     /// header/body split (e.g. AWS SDK) — and meaningless on a result replayed
@@ -75,4 +81,29 @@ pub trait ProviderAdapter: Send + Sync {
     fn supports_tools(&self, _model: &str) -> bool {
         false
     }
+
+    /// The settings this adapter actually sends the provider for `req`, after
+    /// router resolution AND the adapter's own defaults (e.g. the Anthropic
+    /// `max_tokens` floor) — reported back to the caller in the response's
+    /// `x_router.settings` so it sees what ran, not just what it asked for.
+    /// The default reports the normalized request as-is with no known timeout;
+    /// adapters that fill in defaults or resolve a timeout override it.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            timeout_secs: None,
+        }
+    }
+}
+
+/// Provider-facing settings for one dispatch (see
+/// [`ProviderAdapter::effective_settings`]). `None` means the setting was not
+/// sent and the provider's own default applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct EffectiveSettings {
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    /// HTTP timeout ceiling applied to the provider call, in seconds.
+    pub timeout_secs: Option<u64>,
 }
