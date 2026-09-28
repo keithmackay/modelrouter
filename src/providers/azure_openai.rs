@@ -2,14 +2,20 @@ use anyhow::Context;
 use futures::TryStreamExt;
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
+use crate::providers::azure_credentials::AzureAuth;
+use crate::providers::azure_entra::COGNITIVE_SERVICES_SCOPE;
 
 /// GA stable Azure OpenAI API version at time of writing.
 /// Operators should pin `api_version` in config for production deployments.
 const DEFAULT_API_VERSION: &str = "2024-02-01";
 
 pub struct AzureOpenAIAdapter {
-    api_key: String,
+    /// The `api-key` header by default; a Microsoft Entra bearer token when
+    /// `credential_source` is set under `[providers.azure]`.
+    auth: AzureAuth,
     api_base: String,
     api_version: String,
     client: reqwest::Client,
@@ -18,7 +24,41 @@ pub struct AzureOpenAIAdapter {
 }
 
 impl AzureOpenAIAdapter {
+    /// Infallible constructor kept for existing callers; panics where
+    /// [`Self::try_new`] would return an error.
     pub fn new(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig) -> Self {
+        Self::try_new(config, tier_timeouts).unwrap_or_else(|e| panic!("{e:#}"))
+    }
+
+    /// Build from config. Key auth (`api-key` header) unless
+    /// `credential_source` selects an Entra credential, in which case the
+    /// audience is `entra_scope` or the Azure OpenAI default,
+    /// `https://cognitiveservices.azure.com/.default`.
+    pub fn try_new(
+        config: &ProviderConfig,
+        tier_timeouts: TierTimeoutsConfig,
+    ) -> anyhow::Result<Self> {
+        let scope = config
+            .entra_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(COGNITIVE_SERVICES_SCOPE);
+        let auth = AzureAuth::key_by_default(
+            "azure",
+            config,
+            scope,
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+        )?;
+        Ok(Self::with_auth(config, tier_timeouts, auth))
+    }
+
+    /// Build with a caller-chosen auth mode (tests).
+    pub fn with_auth(
+        config: &ProviderConfig,
+        tier_timeouts: TierTimeoutsConfig,
+        auth: AzureAuth,
+    ) -> Self {
         let api_base = config.api_base.clone().unwrap_or_else(|| {
             panic!(
                 "Azure OpenAI adapter requires `api_base` to be set. \
@@ -35,7 +75,7 @@ impl AzureOpenAIAdapter {
             .build()
             .expect("Failed to build reqwest client");
         Self {
-            api_key: config.api_key.clone(),
+            auth,
             api_base,
             api_version,
             client,
@@ -102,6 +142,14 @@ struct AzureUsage {
     completion_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: AzurePromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: AzureCompletionTokensDetails,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AzureCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -112,15 +160,20 @@ struct AzurePromptTokensDetails {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for AzureOpenAIAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.auth.credential_report()
+    }
+
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let body = Self::build_body(req);
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
+        let resp = self.client.post(self.chat_url());
         let resp = self
-            .client
-            .post(self.chat_url())
-            .header("api-key", &self.api_key)
+            .auth
+            .apply(resp)
+            .await?
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
@@ -153,6 +206,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
             cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
             cache_write_tokens: 0,
+            reasoning_tokens: parsed.usage.completion_tokens_details.reasoning_tokens,
             ttft_ms: Some(ttft_ms),
             tool_calls: choice.message.tool_calls.filter(|tc| !tc.is_null()),
         })
@@ -165,11 +219,14 @@ impl ProviderAdapter for AzureOpenAIAdapter {
         // usage chunk so the streaming ledger records provider-counted tokens.
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
-        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
+        let timeout_secs = self
+            .tier_timeouts
+            .resolve(&req.request_model, self.default_timeout_secs);
+        let resp = self.client.post(self.chat_url());
         let resp = self
-            .client
-            .post(self.chat_url())
-            .header("api-key", &self.api_key)
+            .auth
+            .apply(resp)
+            .await?
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
@@ -192,5 +249,18 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     /// Azure serves the OpenAI wire shape: `tools` pass through verbatim (issue #88).
     fn supports_tools(&self, _model: &str) -> bool {
         true
+    }
+
+    /// Temperature and `max_tokens` are forwarded as normalized; the timeout
+    /// is the tier-resolved ceiling this adapter applies to the call.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            timeout_secs: Some(
+                self.tier_timeouts
+                    .resolve(&req.request_model, self.default_timeout_secs),
+            ),
+        }
     }
 }

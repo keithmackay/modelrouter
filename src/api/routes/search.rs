@@ -8,6 +8,7 @@ use axum::{
 use serde_json::Value;
 use tracing::Instrument;
 
+use super::router_meta::{CallCost, RouterMeta, TimingMeta};
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     db::models::{NewCostLedgerEntry, NewPrompt},
@@ -128,12 +129,23 @@ pub async fn search(
 }
 
 /// Execute search with fallback chain. Returns (result, serving_engine, latency_ms).
+/// What the fallback walk settled on.
+struct SearchOutcome {
+    response: crate::providers::search::SearchResponse,
+    /// The engine that answered.
+    engine: String,
+    /// Duration of the answering engine's call.
+    latency_ms: i64,
+    /// Engine calls made (skipped/unconfigured candidates excluded).
+    attempts: i64,
+}
+
 async fn execute_search_with_fallback(
     state: &AppState,
     user: &crate::db::models::User,
     engine: &str,
     req: &SearchRequest,
-) -> Result<(crate::providers::search::SearchResponse, String, i64), ApiError> {
+) -> Result<SearchOutcome, ApiError> {
     let chain = state
         .settings
         .routing
@@ -150,6 +162,7 @@ async fn execute_search_with_fallback(
     engines_to_try.retain(|e| seen.insert(e.clone()));
 
     let mut last_error: Option<anyhow::Error> = None;
+    let mut attempts: i64 = 0;
 
     for (idx, candidate) in engines_to_try.iter().enumerate() {
         // Policy re-check for fallback candidates (not the primary, which was
@@ -203,10 +216,15 @@ async fn execute_search_with_fallback(
         };
 
         let start = Instant::now();
+        attempts += 1;
         match adapter.search(req).await {
-            Ok(res) => {
-                let latency_ms = start.elapsed().as_millis() as i64;
-                return Ok((res, candidate.clone(), latency_ms));
+            Ok(response) => {
+                return Ok(SearchOutcome {
+                    response,
+                    engine: candidate.clone(),
+                    latency_ms: start.elapsed().as_millis() as i64,
+                    attempts,
+                });
             }
             Err(e) => {
                 // Classify the error: client errors (4xx except 429) surface
@@ -261,6 +279,8 @@ async fn search_inner(
 ) -> Result<Response, ApiError> {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
+    // Request receipt: `x_router.timing.total_ms` is measured from here.
+    let received = Instant::now();
     crate::api::routes::reject_experiment_header("/v1/search", &headers)?;
     let user = user.0;
     tracing::Span::current().record("user_id", user.id);
@@ -335,7 +355,8 @@ async fn search_inner(
     if let Some(ref key) = cache_key {
         if let Some(payload) = state.response_cache.get_search(key, &requested_pseudo_model).await {
             // Cache hit: the cached payload already names the serving engine.
-            let cached_engine = payload["engine"].as_str().unwrap_or(&engine);
+            let cached_engine = payload["engine"].as_str().unwrap_or(&engine).to_string();
+            let cached_engine = cached_engine.as_str();
             let cached_pseudo_model = format!("search/{}", cached_engine);
             tracing::info!(engine = cached_engine, "search cache hit");
             let results_returned = payload["results"].as_array().map(|r| r.len()).unwrap_or(0) as i64;
@@ -359,12 +380,23 @@ async fn search_inner(
                 &attribution,
             );
             let mut body = payload;
-            body["usage"] = serde_json::json!({
-                "results": results_returned,
-                "cost_usd": 0.0,
-                "cache_hit": true,
-                "saved_usd": cost,
-            });
+            // The ledger's model for this row: the serving engine's pseudo-model.
+            body["model"] = Value::String(cached_pseudo_model.clone());
+            let meta = RouterMeta {
+                requested_model: requested_pseudo_model.clone(),
+                model: cached_pseudo_model.clone(),
+                provider: cached_engine.to_string(),
+                settings: search_settings(max_results),
+                tokens: None,
+                results: Some(results_returned),
+                cost: CallCost::cache_hit(cost),
+                timing: TimingMeta {
+                    total_ms: received.elapsed().as_millis() as i64,
+                    ..TimingMeta::default()
+                },
+            };
+            body["usage"] = search_usage(results_returned, meta.cost);
+            meta.attach(&mut body);
             let mut response = Json(body).into_response();
             response.headers_mut().insert(
                 crate::api::routes::completions::CACHE_HEADER,
@@ -384,7 +416,12 @@ async fn search_inner(
         max_results,
     };
 
-    let (result, serving_engine, latency_ms) = execute_search_with_fallback(&state, &user, &engine, &req).await?;
+    let SearchOutcome {
+        response: result,
+        engine: serving_engine,
+        latency_ms,
+        attempts,
+    } = execute_search_with_fallback(&state, &user, &engine, &req).await?;
 
     let results_returned = result.results.len() as i64;
 
@@ -451,7 +488,7 @@ async fn search_inner(
             cost_usd: cost,
             latency_ms: Some(latency_ms),
             ttft_ms: None,
-            attempts: None,
+            attempts: Some(attempts),
             tags: "[]".to_string(),
             project: user_project.clone(),
             attribution_correlation_id: attr_correlation.clone(),
@@ -493,15 +530,34 @@ async fn search_inner(
         }
     });
 
+    let meta = RouterMeta {
+        requested_model: requested_pseudo_model,
+        model: serving_pseudo_model.clone(),
+        provider: serving_engine.clone(),
+        settings: search_settings(max_results),
+        tokens: None,
+        results: Some(results_returned),
+        cost: CallCost::spent(cost),
+        timing: TimingMeta {
+            total_ms: received.elapsed().as_millis() as i64,
+            latency_ms,
+            provider_ms: Some(latency_ms),
+            ttft_ms: None,
+            attempts,
+            fallbacks: i64::from(serving_engine != engine),
+        },
+    };
     let payload = serde_json::json!({
         "engine": serving_engine,
+        // What the ledger row records as the model: the serving engine's
+        // pseudo-model, so a caller can attribute the cost to what served it.
+        "model": serving_pseudo_model,
         "results": result.results,
-        "usage": {
-            "results": results_returned,
-            "cost_usd": cost,
-        }
+        "usage": search_usage(results_returned, meta.cost),
     });
 
+    // Cached without `x_router`: that describes this call, and a hit
+    // replaces it with its own.
     if let Some(key) = cache_key {
         state
             .response_cache
@@ -509,12 +565,26 @@ async fn search_inner(
             .await;
     }
 
+    let mut payload = payload;
+    meta.attach(&mut payload);
     let mut response = Json(payload).into_response();
     response.headers_mut().insert(
         crate::api::routes::completions::CACHE_HEADER,
         axum::http::HeaderValue::from_static("MISS"),
     );
     Ok(response)
+}
+
+/// The search `usage` object: results returned plus the ledger cost fields.
+fn search_usage(results_returned: i64, cost: CallCost) -> Value {
+    let mut usage = serde_json::json!({ "results": results_returned });
+    cost.write_into(&mut usage);
+    usage
+}
+
+/// `x_router.settings` for a search: the options the engine was called with.
+fn search_settings(max_results: Option<u32>) -> Value {
+    serde_json::json!({ "max_results": max_results })
 }
 
 /// Meter a search cache hit: one usage row with `cache_hit = true`, zero cost,
@@ -536,7 +606,9 @@ fn record_search_cache_hit(
         prompt_id: None,
         model: pseudo_model.to_string(),
         provider: engine.to_string(),
-        project: user.api_key_project.clone(),
+        // Same project resolution as the live-call row, so a hit is
+        // attributed to the caller's declared project, not only the key's.
+        project: attribution.project_or(user.api_key_project.clone()),
         tokens_in: results_returned,
         tokens_out: 0,
         // Interpreted as the avoided cost by `create_cache_hit`.

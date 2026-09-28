@@ -151,3 +151,112 @@ async fn openai_compat_stream_body_always_requests_usage() {
     assert_eq!(body["stream"], true, "{body}");
     assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
 }
+
+/// With `credential_source` set, the `azure` provider sends a Microsoft Entra
+/// bearer token and no `api-key` header; without it, key auth is unchanged.
+#[tokio::test]
+async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
+    use modelrouter::providers::adapter::{NormalizedRequest, ProviderAdapter};
+    use modelrouter::providers::azure_credentials::AzureAuth;
+    use modelrouter::providers::azure_entra::StaticTokenProvider;
+    use std::sync::{Arc, Mutex};
+
+    /// (Authorization, api-key) per request.
+    type Seen = Vec<(Option<String>, Option<String>)>;
+    let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_handler = seen.clone();
+    let router = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+        let seen = seen_handler.clone();
+        async move {
+            let get = |k: &str| {
+                headers
+                    .get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            seen.lock()
+                .unwrap()
+                .push((get("authorization"), get("api-key")));
+            axum::Json(serde_json::json!({
+                "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!(
+        "http://{}/openai/deployments/d",
+        listener.local_addr().unwrap()
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let req = NormalizedRequest {
+        model: "d".into(),
+        request_model: "azure/d".into(),
+        messages: vec![serde_json::json!({"role": "user", "content": "x"})],
+        stream: false,
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        extra_params: serde_json::json!({}),
+    };
+    let config = ProviderConfig {
+        api_base: Some(base.clone()),
+        timeout_secs: 10,
+        ..Default::default()
+    };
+    let tiers = modelrouter::config::schema::TierTimeoutsConfig::default();
+
+    let entra = AzureOpenAIAdapter::with_auth(
+        &config,
+        tiers.clone(),
+        AzureAuth::Entra(Arc::new(StaticTokenProvider::new("entra-token"))),
+    );
+    entra.complete(&req).await.unwrap();
+
+    let keyed = AzureOpenAIAdapter::new(
+        &ProviderConfig {
+            api_key: "the-key".into(),
+            ..config.clone()
+        },
+        tiers,
+    );
+    keyed.complete(&req).await.unwrap();
+    assert!(keyed.credential_report().is_none());
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0], (Some("Bearer entra-token".to_string()), None));
+    assert_eq!(seen[1], (None, Some("the-key".to_string())));
+}
+
+/// `credential_source` on `[providers.azure]` builds an Entra credential and
+/// reports it; an invalid combination is an error, not a panic.
+#[test]
+fn azure_credential_source_selects_entra() {
+    use modelrouter::providers::adapter::ProviderAdapter;
+    let config = ProviderConfig {
+        api_base: Some("https://example.invalid/openai/deployments/d".into()),
+        credential_source: Some("workload-identity".into()),
+        azure_tenant_id: Some("t".into()),
+        azure_client_id: Some("c".into()),
+        azure_federated_token_file: Some("/var/run/secrets/token".into()),
+        ..Default::default()
+    };
+    let tiers = modelrouter::config::schema::TierTimeoutsConfig::default();
+    let adapter = AzureOpenAIAdapter::try_new(&config, tiers.clone()).unwrap();
+    let report = adapter.credential_report().unwrap();
+    assert_eq!(report.provider, "azure");
+    assert_eq!(report.source, "workload-identity");
+    assert_eq!(report.kind, "azure-workload-identity");
+
+    let contradictory = ProviderConfig {
+        api_key: "k".into(),
+        ..config
+    };
+    let err = AzureOpenAIAdapter::try_new(&contradictory, tiers)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("contradictory"), "{err}");
+}

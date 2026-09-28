@@ -194,9 +194,8 @@ impl VertexSearchAdapter {
         let region = config.region.clone().ok_or_else(|| {
             anyhow::anyhow!("Vertex search needs `region` under [providers.vertex]")
         })?;
-        let token_provider = Arc::new(GoogleCloudAuthProvider::new(
-            config.credentials_path.as_deref(),
-        )?) as Arc<dyn TokenProvider>;
+        let token_provider =
+            Arc::new(GoogleCloudAuthProvider::from_config(config)?) as Arc<dyn TokenProvider>;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
@@ -240,6 +239,10 @@ impl VertexSearchAdapter {
 
 #[async_trait::async_trait]
 impl SearchAdapter for VertexSearchAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.token_provider.credential_report()
+    }
+
     async fn search(&self, req: &SearchRequest) -> anyhow::Result<SearchResponse> {
         let url = build_endpoint_url(
             &self.project,

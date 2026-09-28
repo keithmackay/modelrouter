@@ -48,7 +48,9 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
 use crate::providers::azure_entra::TokenProvider;
 use crate::providers::foundry::auth::FoundryAuth;
 use crate::providers::foundry::endpoint::FoundryEndpoint;
@@ -69,7 +71,12 @@ pub struct FoundryAdapter {
 impl FoundryAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        let auth = FoundryAuth::from_config(config, endpoint.scope())?;
+        let auth = FoundryAuth::entra_by_default(
+            "foundry",
+            config,
+            endpoint.scope(),
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+        )?;
         Self::build(endpoint, auth, config)
     }
 
@@ -216,6 +223,14 @@ struct FoundryUsage {
     completion_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: FoundryPromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: FoundryCompletionTokensDetails,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct FoundryCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -240,6 +255,7 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
         cache_read_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
         cache_write_tokens: 0,
+        reasoning_tokens: parsed.usage.completion_tokens_details.reasoning_tokens,
         ttft_ms: None,
         tool_calls: None,
     })
@@ -247,6 +263,19 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
 
 #[async_trait::async_trait]
 impl ProviderAdapter for FoundryAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.auth.credential_report()
+    }
+
+    /// Settings forwarded as normalized; the timeout is the configured ceiling.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            timeout_secs: Some(self.request_timeout(req).as_secs()),
+        }
+    }
+
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, false);

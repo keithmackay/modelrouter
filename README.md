@@ -617,6 +617,29 @@ are operations data and live here, never in code**):
 | `maas_region` | MaaS partners are regional-only; `global` 404s for them | falls back to `region`; MaaS dispatch fails with a fix-hint if that is `global` |
 | `catalog_publishers` | Publisher catalogs probed for `GET /admin/api/models/available` | `["google", "anthropic"]` |
 | `credentials_path` | Service-account key file; omit to use ADC (metadata server on GCE — no key material on disk) | ADC |
+| `credential_source` | `"adc"` or `"metadata"` (see below). Contradicts `credentials_path` — setting both is a config-load error | `"adc"` |
+
+**Vertex credentials.** Which Google credential the provider uses:
+
+| `credential_source` | `credentials_path` | Credential |
+|---|---|---|
+| unset / `"adc"` | unset | Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud user file (`~/.config/gcloud/application_default_credentials.json`), then the metadata server |
+| `"metadata"` | unset | The GCE/GKE/Cloud Run metadata server's attached service account **only** — the gcloud user file and `GOOGLE_APPLICATION_CREDENTIALS` are ignored |
+| unset | set | That service-account key file |
+| `"adc"` / `"metadata"` | set | Rejected at config load (contradictory) |
+
+ADC checks the gcloud user file *before* the metadata server, so on a VM meant to run as its
+attached service account a single `gcloud auth application-default login` silently moves the
+proxy onto a personal credential — and Google's reauthentication policy can later refuse to
+refresh it (`invalid_grant` / `invalid_rapt`). Set `credential_source = "metadata"` on such
+hosts. Under `"adc"`, when a refresh fails that way and the metadata server answers, the
+provider switches to the metadata server for the rest of the process and logs a
+`CREDENTIAL FALLBACK` warning.
+
+When no fallback is available the failure is **permanent**, not transient — see
+[Credential health and `credential_expired`](#credential-health-and-credential_expired),
+which applies to every provider with a managed credential.
+
 
 **The catalog lists only what the project can actually call.** The public publisher
 catalog enumerates what *exists*; Model Garden partner (MaaS) models additionally gate on
@@ -666,11 +689,12 @@ documented as deprecated in favour of the OpenAI-compatible one, which is why a 
 picks the latter. Discovery always reads the `/openai/v1/models` listing on the same
 resource, because the Model Inference surface has no listing operation at all.
 
-**Authentication is Microsoft Entra, from the environment, never from config** — the same
-credential chain the `bing_grounding` engine uses, sharing the same code:
-`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` for an app registration,
-otherwise managed identity via IMDS. Setting `api_key` switches to resource-key auth
-(`api-key` header) — supported, but it puts a secret on disk.
+**Authentication is Microsoft Entra ID** — the same credential sources the `azure` and
+`bing_grounding` providers use, sharing the same code; see
+[Azure credentials](#azure-credentials). With no `credential_source`, Foundry reads the
+environment (`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` for an app
+registration, otherwise managed identity). Setting `api_key` with no `credential_source`
+switches to resource-key auth (`api-key` header) — supported, but it puts a secret on disk.
 
 The **audience** is derived per endpoint: `https://cognitiveservices.azure.com/.default`
 for a resource endpoint (what the published OpenAPI documents declare),
@@ -678,6 +702,178 @@ for a resource endpoint (what the published OpenAPI documents declare),
 shows `ai.azure.com` for resource endpoints too, so where spec and prose disagree
 `entra_scope` is the override. The resolved value is logged at startup and named in any
 401/403 response, so the fix is visible without a doc hunt.
+
+### Azure credentials
+
+> **Status: implemented from Microsoft's documentation; not yet exercised against a live
+> Azure endpoint.** Every source below is covered by fake-server tests of the documented
+> request and response shapes. Run the [live-test checklist](#azure-live-test-checklist)
+> before relying on a source in production, and report anything that differs.
+
+`credential_source` selects a Microsoft Entra ID credential for the three Azure-facing
+providers: `[providers.azure]`, `[providers.foundry]` and `[providers.bing_grounding]`. The
+same key on `[providers.vertex]` takes the Google values above; any other value, or the key on
+any other provider, is a config-load error that names the providers which accept it.
+
+| `credential_source` | Credential | `kind` in health |
+|---|---|---|
+| `"managed-identity"` | The platform's managed identity. App Service / Container Apps / Functions style when `IDENTITY_ENDPOINT` and `IDENTITY_HEADER` are set (`api-version=2019-08-01`, `X-IDENTITY-HEADER`); otherwise the VM/AKS instance metadata service at `169.254.169.254` (`api-version=2018-02-01`, `Metadata: true`). `azure_client_id` selects a user-assigned identity | `azure-managed-identity` |
+| `"workload-identity"` | Federated token file (AKS workload identity, other OIDC federation) exchanged at the tenant's token endpoint as a `client_credentials` grant with a `jwt-bearer` client assertion. The file is re-read on every exchange, because the platform rotates it | `azure-workload-identity` |
+| `"client-secret"` | App registration client secret, `client_credentials` grant | `azure-client-secret` |
+| `"cli"` | `az account get-access-token --resource <audience>` — a developer's personal login | `azure-cli` |
+| `"default"` | The first source that resolves, in this order: client secret (tenant + client id + secret all set) → workload identity (federated token file set) → App Service managed identity → instance metadata service (a 2s probe) → Azure CLI | `azure-default-<resolved>`, e.g. `azure-default-managed-identity` |
+| unset | `azure`: resource key (`api_key`), as before. `foundry` / `bing_grounding`: key auth when `api_key` is set, otherwise the environment — client secret if the `AZURE_*` trio is set, else managed identity | `azure-client-secret` / `azure-managed-identity` |
+
+Setting both `api_key` and `credential_source` is rejected as contradictory. For `azure`,
+the audience is `entra_scope`, defaulting to `https://cognitiveservices.azure.com/.default`.
+
+| Key | Environment fallback | Used by |
+|---|---|---|
+| `azure_tenant_id` | `AZURE_TENANT_ID` | `client-secret`, `workload-identity`, `cli` (`--tenant`) |
+| `azure_client_id` | `AZURE_CLIENT_ID` | `client-secret`, `workload-identity`, `managed-identity` (user-assigned) |
+| `azure_client_secret` | `AZURE_CLIENT_SECRET` | `client-secret` |
+| `azure_federated_token_file` | `AZURE_FEDERATED_TOKEN_FILE` | `workload-identity` |
+| `entra_scope` | — | audience override |
+
+A config value wins over its environment variable. `AZURE_AUTHORITY_HOST` overrides
+`https://login.microsoftonline.com` (sovereign clouds); `AZURE_POD_IDENTITY_AUTHORITY_HOST`
+overrides the metadata-service host. A secret-bearing key is only accepted next to a
+`credential_source` that reads it, and a missing required setting fails the first token
+request with an error naming each missing key.
+
+**Token lifetime.** `expires_in` (seconds) and `expires_on` (epoch seconds, as a number or
+a string; the CLI's local-time `expiresOn` too) are both honoured. Tokens are refreshed
+early, five minutes before expiry or at half their lifetime, whichever is sooner. A response
+that states no lifetime is cached for five minutes.
+
+**Which failures are permanent.** A token-endpoint answer is classified as needing
+reauthentication, and so becomes `credential_expired`, when it carries OAuth2 error
+`invalid_grant` or `interaction_required`, or one of these AADSTS codes: `50173` (grant
+revoked by a password change), `70043` / `700082` (refresh token expired by sign-in
+frequency or inactivity), `50076` / `50079` / `50078` (MFA or re-enrolment required),
+`700024` (client assertion outside its validity window: the federated token went stale),
+`7000222` / `7000215` (client secret expired or invalid). A CLI failure that asks for
+`az login` or carries an AADSTS reauth code is classified the same way. Everything else,
+including 5xx, 429 and network failures, stays transient and goes through normal retry and
+circuit-breaker handling.
+
+**Fallback.** Under `"default"`, when the chain resolved to the Azure CLI and that login
+dies, the router probes the managed-identity endpoint once. If it answers, the provider
+switches to it for the rest of the process and logs `CREDENTIAL FALLBACK`. No other Azure
+source has a fallback: an explicit choice is honoured, not second-guessed.
+
+#### Azure live-test checklist
+
+For each source: add the snippet, start the router on a host where that source exists, and
+send the proving request. Every source passes when **(a)** the request succeeds and **(b)**
+`GET /health/deep` lists the provider under `credentials` with the expected `kind` and
+`status`. Replace `<resource>`/`<deployment>` with your own; values in angle brackets are
+placeholders.
+
+The proving request is a chat completion through the configured provider:
+
+```bash
+curl -s localhost:8090/v1/chat/completions -H "Authorization: Bearer $ROUTER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"foundry/<deployment>","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
+curl -s localhost:8090/health/deep | jq '.credentials'
+```
+
+1. **Managed identity (VM / AKS instance metadata)** — expect `azure-managed-identity`, `ok`.
+   The identity needs the *Cognitive Services User* role (or equivalent) on the resource.
+   ```toml
+   [providers.foundry]
+   foundry_endpoint = "https://<resource>.services.ai.azure.com"
+   credential_source = "managed-identity"
+   # azure_client_id = "<user-assigned identity client id>"
+   ```
+2. **Managed identity (App Service / Container Apps)** — the same snippet, on a host where
+   `IDENTITY_ENDPOINT` and `IDENTITY_HEADER` are set. Expect `azure-managed-identity`, `ok`.
+3. **Workload identity (AKS)** — expect `azure-workload-identity`, `ok`. The pod needs the
+   workload-identity label; the webhook injects `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+   `AZURE_FEDERATED_TOKEN_FILE`.
+   ```toml
+   [providers.foundry]
+   foundry_endpoint = "https://<resource>.services.ai.azure.com"
+   credential_source = "workload-identity"
+   ```
+   Also run for longer than the projected token's lifetime (about an hour) to prove that the
+   file is re-read.
+4. **Client secret** — expect `azure-client-secret`, `warn`. Put the secret in
+   `AZURE_CLIENT_SECRET` rather than the file where you can.
+   ```toml
+   [providers.azure]
+   api_base = "https://<resource>.openai.azure.com/openai/deployments/<deployment>"
+   credential_source = "client-secret"
+   azure_tenant_id = "<tenant id>"
+   azure_client_id = "<app client id>"
+   ```
+   Also prove the error path: set a wrong secret and expect HTTP 401,
+   `error.code = "credential_expired"` (AADSTS7000215). Prove this one with
+   `"model":"azure/<model>"` in the chat request.
+5. **Azure CLI** — expect `azure-cli`, `warn`, after `az login` as the user running the router.
+   ```toml
+   [providers.foundry]
+   foundry_endpoint = "https://<resource>.services.ai.azure.com"
+   credential_source = "cli"
+   ```
+   Also prove the error path: run `az logout` and restart, then expect HTTP 401
+   `credential_expired` whose `remediation` names managed identity.
+6. **Default chain** — `credential_source = "default"` on each of the hosts above. Expect
+   `azure-default-<source>` naming the source that host provides. On a VM with a managed
+   identity *and* an `az login`, with no `AZURE_*` variables set, expect
+   `azure-default-managed-identity` (the metadata service comes before the CLI).
+7. **Bing grounding** — repeat source 1 or 3 on `[providers.bing_grounding]`, then prove it
+   with a search: `curl -s localhost:8090/v1/search -H "Authorization: Bearer $ROUTER_KEY"
+   -H 'Content-Type: application/json' -d '{"engine":"bing_grounding","query":"ping"}'`.
+
+### Credential health and `credential_expired`
+
+Every provider with a managed credential (`vertex`, `azure`, `foundry`, `bing_grounding`)
+shares one policy, implemented once in the core `CredentialChain`.
+
+**A dead credential is permanent, not transient.** When a token refresh fails with a
+reauthentication-class error and no fallback answers, the request fails with HTTP **401**:
+
+```json
+{"error": {"code": "credential_expired", "type": "credential_expired",
+  "message": "...", "provider": "foundry", "credential_kind": "azure-cli",
+  "reason": "the Azure CLI login can no longer be refreshed without interactive sign-in",
+  "remediation": "Run az login, or set credential_source = \"managed-identity\" under [providers.foundry] ..."}}
+```
+
+It is not retried and does not count toward the circuit breaker. Retrying cannot repair a
+credential, and an open breaker would hide the actionable error behind a "circuit breaker
+open" that invites retries. The dead state is cached for 60 seconds, so a burst of requests
+does not hammer the token endpoint. After that the chain probes again: a repaired login
+recovers without a restart. Fallback probes, where a source has one, are spaced the same way.
+
+**Verdicts.** `GET /health/deep` reports each credential without ever including the credential
+itself: under `capabilities.<llm|embedding|search>.credential` for the probed adapter, and in a
+top-level `credentials` array listing **every** configured provider with a managed credential.
+Each entry has:
+
+| Field | Meaning |
+|---|---|
+| `status` | `ok` (a workload identity that renews itself), `warn` (works now, but will expire or is a secret at rest), `expired` (dead; requests are failing with `credential_expired`), `unknown` (not resolved yet, or a type the router does not classify) |
+| `reason` | Why, in one line |
+| `remediation` | What to change; empty when `ok` |
+| `source` | The configured `credential_source` (`environment` when unset) |
+| `kind` | The credential actually in use |
+| `fallback_active` | `true` once a fallback has taken over |
+
+`credentials` entries also carry `provider` and `capability`. A provider on key auth is not
+listed: there is no credential lifecycle to report.
+
+| Kind | Status |
+|---|---|
+| `metadata`, `explicit-file`, `adc-service-account` | `ok` |
+| `adc-user` (a `gcloud auth application-default login` file) | `warn` |
+| `adc-other` | `unknown` |
+| `azure-managed-identity`, `azure-workload-identity` | `ok` |
+| `azure-client-secret`, `azure-cli` | `warn` |
+| `azure-default-unresolved` (no request yet) | `unknown` |
+| any kind whose refresh has failed permanently | `expired` |
 
 **Build note:** default cargo features include every provider (`vertex`, `bedrock`, `foundry`, …).
 An unconfigured provider costs nothing at runtime, while a binary missing a compiled
@@ -1255,12 +1451,78 @@ Response:
       "published_date": null
     }
   ],
-  "usage": { "results": 1, "cost_usd": 0.005 }
+  "model": "search/tavily",
+  "usage": { "results": 1, "cost_usd": 0.005 },
+  "x_router": { "...": "see below" }
 }
 ```
 
-Out of scope for this endpoint: result caching, re-ranking, and fetching full
-page content (only the engine's own snippet is returned).
+Out of scope for this endpoint: re-ranking and fetching full page content
+(only the engine's own snippet is returned).
+
+#### Per-call cost and routing metadata in responses
+
+Every priced response carries the router's own account of the call, so a
+client can record the authoritative cost, the model that actually answered,
+the settings sent, the token counts and the timing **verbatim** instead of
+re-pricing calls against a private price list that drifts from the router's
+`[[pricing]]` table. Every figure is the value the router wrote to its
+`cost_ledger` (and `prompts`) row for the same request.
+
+Covered endpoints: `/v1/chat/completions` (non-streamed, and the terminal
+chunk of a stream), `/v1/embeddings`, `/v1/search`. Not yet covered:
+`/v1/messages`, `/v1/responses`, images, audio.
+
+Two additive fields; the OpenAI shape is otherwise unchanged:
+
+- `usage.cost_usd` — USD charged for this call (the ledger row's
+  `cost_usd`), after retries and fallback. On a response-cache hit it is
+  `0`, with `usage.cache_hit: true` and `usage.saved_usd` carrying the
+  avoided cost. `usage.tokens_estimated: true` appears when the provider
+  reported no usage and the counts (and so the cost) are the router's
+  estimate.
+- `x_router` — the full per-call record:
+
+```json
+{
+  "requested_model": "balanced",
+  "model": "claude-sonnet-4-5",
+  "provider": "vertex",
+  "settings": {
+    "temperature": 0.2, "max_tokens": 8192, "timeout_secs": 600,
+    "stream": false, "tools": null, "tool_choice": null, "dropped": []
+  },
+  "tokens": {
+    "prompt": 1200, "completion": 350, "total": 1550,
+    "cache_read": 0, "cache_write": 0, "reasoning": null, "estimated": false
+  },
+  "cost": { "cost_usd": 0.00885, "cache_hit": false },
+  "timing": {
+    "total_ms": 4210, "latency_ms": 4180, "provider_ms": 4170,
+    "ttft_ms": 900, "attempts": 1, "fallbacks": 0
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `requested_model` | The model name or alias the caller sent. |
+| `model`, `provider` | What answered after alias resolution and fallback (the ledger row's `model`/`provider`). The top-level `model` field names the same model. |
+| `settings` | Values actually sent to the provider after router resolution and adapter defaults. `dropped` lists caller parameters the router deliberately did not forward (e.g. `temperature` to a model that rejects it). Search reports `max_results`. |
+| `tokens` | Chat/embeddings only. `prompt` includes provider-cache reads; `reasoning` is `null` when the provider gave no figure; `estimated` mirrors the ledger's `tokens_estimated`. |
+| `results` | Search only: results returned. |
+| `cost` | `cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
+| `timing` | `total_ms` from request receipt; `latency_ms` dispatch to completion including retries and fallback hops (0 on a hit); `provider_ms` for the answering provider call; `ttft_ms` for streams (first byte); `attempts` provider calls made; `fallbacks` hops to another model. |
+
+**Streams.** The router splices one extra `chat.completion.chunk` with
+`"choices": []`, a `usage` object (including `cost_usd`) and `x_router`
+immediately before `data: [DONE]`. Its figures come from the same settlement
+that writes the ledger row. Clients that ignore chunks without choices are
+unaffected. A stream that is abandoned before completion never receives it.
+
+A client that finds neither `usage.cost_usd` nor `x_router` on a response is
+talking to a router build that predates this contract, and should treat the
+call as unpriced rather than estimate it.
 
 #### Request cost attribution
 

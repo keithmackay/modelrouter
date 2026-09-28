@@ -3,7 +3,12 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
+
+/// Anthropic requires `max_tokens`; sent when the caller supplies none.
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 pub struct AnthropicAdapter {
     api_key: String,
@@ -395,7 +400,7 @@ impl ProviderAdapter for AnthropicAdapter {
             body["max_tokens"] = serde_json::json!(max);
         } else {
             // Anthropic requires max_tokens
-            body["max_tokens"] = serde_json::json!(4096);
+            body["max_tokens"] = serde_json::json!(DEFAULT_MAX_TOKENS);
         }
         apply_tools(&mut body, req);
 
@@ -435,6 +440,7 @@ impl ProviderAdapter for AnthropicAdapter {
             ),
             cache_read_tokens: parsed.usage.cache_read_input_tokens,
             cache_write_tokens: parsed.usage.cache_creation_input_tokens,
+            reasoning_tokens: None,
             ttft_ms: Some(ttft_ms),
             tool_calls: tool_calls_from_content(&parsed.content),
         })
@@ -458,7 +464,7 @@ impl ProviderAdapter for AnthropicAdapter {
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
         } else {
-            body["max_tokens"] = serde_json::json!(4096);
+            body["max_tokens"] = serde_json::json!(DEFAULT_MAX_TOKENS);
         }
         apply_tools(&mut body, req);
 
@@ -507,6 +513,19 @@ impl ProviderAdapter for AnthropicAdapter {
     /// shape both ways (issue #88).
     fn supports_tools(&self, _model: &str) -> bool {
         true
+    }
+
+    /// `max_tokens` is always sent (Anthropic requires it): the caller's value
+    /// or [`DEFAULT_MAX_TOKENS`]. The timeout is the tier-resolved ceiling.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens: Some(req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+            timeout_secs: Some(
+                self.tier_timeouts
+                    .resolve(&req.request_model, self.default_timeout_secs),
+            ),
+        }
     }
 }
 

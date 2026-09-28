@@ -133,12 +133,12 @@ timeout_secs = 120
 # not 30 — this behaves like a completion, not like a search API. The router
 # warns at startup if you set it below 300.
 #
-# Authentication is Microsoft Entra, from the ENVIRONMENT, never from this file:
-#   * AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET (app registration), or
-#   * managed identity via IMDS (nothing to set; the default when the trio is absent).
-# Grant the identity the "Azure AI User" role on the Foundry project. Setting
-# `api_key` here switches to resource-key auth — supported, but it puts a secret
-# on disk; Entra is the intended mode.
+# Authentication is Microsoft Entra ID, chosen by `credential_source` (the same
+# values as [providers.foundry] below; README "Azure credentials"). Unset reads
+# the environment: AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET, else
+# managed identity. Grant the identity the "Azure AI User" role on the Foundry
+# project. Setting `api_key` (with no credential_source) switches to
+# resource-key auth — supported, but it puts a secret on disk.
 #
 # LEGAL: results from this engine are governed by Microsoft's Grounding with
 # Bing Search Use and Display Requirements
@@ -158,15 +158,34 @@ timeout_secs = 120
 # api_version              = ""          # omit: the /openai/v1/ surface is version-less
 # custom_search            = false       # true = Bing Custom Search (preview), domain-restricted
 # custom_search_instance   = ""          # required when custom_search = true
+# credential_source        = "managed-identity"  # optional; see [providers.foundry]
 
 # GCP Vertex AI (requires build with `--features vertex`).
 # Supports Gemini (publisher "google") and Claude-on-Vertex (publisher "anthropic").
 # Authentication uses Application Default Credentials by default; point
 # `credentials_path` at a service-account JSON to override.
+#
+# credential_source selects the credential when credentials_path is unset:
+#   "adc"      (default) GOOGLE_APPLICATION_CREDENTIALS, then the gcloud user
+#              file (~/.config/gcloud/application_default_credentials.json),
+#              then the metadata server. If that credential later needs
+#              interactive reauthentication (invalid_grant / invalid_rapt) and
+#              the metadata server answers, the provider switches to it for
+#              the rest of the process with a CREDENTIAL FALLBACK warning.
+#   "metadata" The GCE/GKE/Cloud Run metadata server's attached service
+#              account ONLY; the gcloud user file and
+#              GOOGLE_APPLICATION_CREDENTIALS are ignored. Use this on a VM
+#              meant to run as its service account, so a stray
+#              `gcloud auth application-default login` cannot take over.
+# Setting credential_source together with credentials_path is rejected at
+# config load. A credential that cannot be refreshed without a human fails
+# requests with HTTP 401 `credential_expired` (not retried, not counted
+# toward the circuit breaker).
 # [providers.vertex]
-# project          = "my-gcp-project"
-# region           = "us-east5"               # region must host the models you plan to call
-# credentials_path = "/secrets/sa.json"       # omit to use ADC (gcloud / metadata server)
+# project           = "my-gcp-project"
+# region            = "us-east5"              # region must host the models you plan to call
+# credentials_path  = "/secrets/sa.json"      # omit to use credential_source
+# credential_source = "metadata"              # "adc" (default) or "metadata"; not with credentials_path
 # timeout_secs     = 120
 #
 # Example aliases — Claude-on-Vertex models require versioned IDs (@YYYYMMDD).
@@ -198,12 +217,26 @@ timeout_secs = 120
 # The Model Inference API is documented as deprecated in favour of the
 # OpenAI-compatible one, which is why a bare host resolves to the latter.
 #
-# Authentication is Microsoft Entra, from the ENVIRONMENT, never from this file:
-#   * AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET (app registration), or
-#   * managed identity via IMDS (nothing to set; the default when the trio is absent).
-# Grant the identity the "Azure AI User" role (or equivalent) on the resource.
-# Setting `api_key` here switches to resource-key auth — supported, but it puts
-# a secret on disk; Entra is the intended mode.
+# Authentication is Microsoft Entra ID, chosen by `credential_source`
+# (implemented from Microsoft's documentation; not yet exercised against a live
+# Azure endpoint — see the README's live-test checklist):
+#   "managed-identity"  App Service / Container Apps (IDENTITY_ENDPOINT +
+#                       IDENTITY_HEADER) or the VM/AKS metadata service;
+#                       azure_client_id selects a user-assigned identity
+#   "workload-identity" federated token file (AKS workload identity / OIDC)
+#                       exchanged for an Entra token; needs tenant + client id
+#   "client-secret"     app registration secret; needs tenant + client id + secret
+#   "cli"               `az account get-access-token` (a personal login)
+#   "default"           client secret -> workload identity -> managed identity
+#                       -> CLI, first that resolves; a dead CLI login falls
+#                       back to managed identity
+#   unset               the environment: AZURE_TENANT_ID + AZURE_CLIENT_ID +
+#                       AZURE_CLIENT_SECRET, else managed identity
+# Each azure_* key falls back to its AZURE_* environment variable. A credential
+# needing interactive sign-in fails requests with HTTP 401 `credential_expired`
+# (not retried, not counted toward the circuit breaker). Grant the identity the
+# "Azure AI User" role (or equivalent) on the resource. Setting `api_key` (with
+# no credential_source) switches to resource-key auth — it puts a secret on disk.
 #
 # [providers.foundry]
 # foundry_endpoint = "https://<resource>.services.ai.azure.com"
@@ -211,6 +244,11 @@ timeout_secs = 120
 # entra_scope      = ""       # optional audience override; see below
 # api_version      = ""       # optional; overrides the per-surface default
 # timeout_secs     = 120
+# credential_source          = "managed-identity"  # see above
+# azure_tenant_id            = ""   # or AZURE_TENANT_ID
+# azure_client_id            = ""   # or AZURE_CLIENT_ID
+# azure_client_secret        = ""   # or AZURE_CLIENT_SECRET (prefer the env var)
+# azure_federated_token_file = ""   # or AZURE_FEDERATED_TOKEN_FILE
 #
 # `entra_scope`: the audience is derived from the endpoint — project endpoints
 # take https://ai.azure.com/.default, resource endpoints take
@@ -224,6 +262,16 @@ timeout_secs = 120
 # [routing.model_aliases]
 # "llama-70b"  = "foundry/Llama-3.3-70B-Instruct"
 # "phi-4"      = "foundry/Phi-4"
+
+# Azure OpenAI (one provider entry per deployment). Key auth (`api_key`) is the
+# default; set `credential_source` (same values as [providers.foundry]) to send
+# an Entra bearer token instead. Setting both is rejected.
+# [providers.azure]
+# api_base          = "https://<resource>.openai.azure.com/openai/deployments/<deployment>"
+# api_version       = "2024-10-21"
+# api_key           = ""                   # key auth, or:
+# credential_source = "managed-identity"   # Entra auth; not with api_key
+# entra_scope       = ""                   # default https://cognitiveservices.azure.com/.default
 
 # ---------------------------------------------------------------------------
 # Authentication

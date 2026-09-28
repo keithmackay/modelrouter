@@ -91,6 +91,7 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         finish_reason: map_finish_reason(finish).to_string(),
         cache_read_tokens: cache_read,
         cache_write_tokens: 0,
+        reasoning_tokens: usage["thoughtsTokenCount"].as_u64().map(|n| n as u32),
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
         tool_calls: None,

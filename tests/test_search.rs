@@ -374,6 +374,8 @@ async fn search_writes_cost_ledger_row_with_configured_pricing() {
     assert_eq!(resp.status_code(), 200);
     let body: serde_json::Value = resp.json();
     assert_eq!(body["usage"]["cost_usd"], 0.25);
+    // The model the ledger row is recorded under.
+    assert_eq!(body["model"], "search/tavily");
 
     // Cost recording happens on a spawned task; poll briefly for it to land.
     let user = UserRepository::find_by_name(&*db, "test-user")
@@ -394,6 +396,15 @@ async fn search_writes_cost_ledger_row_with_configured_pricing() {
         (total - 0.25).abs() < 0.000001,
         "expected cost ledger sum 0.25, got {total}"
     );
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(body["usage"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+    assert_eq!(body["model"], ledger[0].model.as_str());
+    let meta = &body["x_router"];
+    assert_eq!(meta["model"], ledger[0].model.as_str());
+    assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(ledger[0].cost_usd));
+    assert_eq!(meta["cost"]["cache_hit"], false);
+    assert!(meta.get("tokens").is_none(), "search reports results, not tokens");
+    assert_eq!(meta["results"].as_i64(), Some(ledger[0].tokens_in));
 }
 
 // ── Response cache ────────────────────────────────────────────────────────────
@@ -447,6 +458,11 @@ async fn repeated_search_is_served_from_cache_at_zero_cost() {
     assert_eq!(body["usage"]["cache_hit"], true);
     assert_eq!(body["usage"]["saved_usd"], 0.25);
     assert_eq!(body["results"][0]["url"], "https://example.com");
+    assert_eq!(body["model"], "search/tavily", "a hit names the engine that served it");
+    assert_eq!(body["x_router"]["cost"]["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(body["x_router"]["cost"]["cache_hit"], true);
+    assert_eq!(body["x_router"]["cost"]["saved_usd"].as_f64(), Some(0.25));
+    assert_eq!(body["x_router"]["timing"]["attempts"], 0);
 
     // The hit is metered: two usage rows, one of them a cache hit, and total
     // spend is unchanged from the single live call.

@@ -507,8 +507,12 @@ async fn cache_hit_is_metered_with_zero_cost() {
         "messages": [{"role": "user", "content": "meter me"}],
         "temperature": 0.0
     });
-    assert_eq!(post_completion(&server, &body).await.status_code(), 200);
-    assert_eq!(post_completion(&server, &body).await.status_code(), 200);
+    let first = post_completion(&server, &body).await;
+    assert_eq!(first.status_code(), 200);
+    let second = post_completion(&server, &body).await;
+    assert_eq!(second.status_code(), 200);
+    let miss: serde_json::Value = first.json();
+    let hit_body: serde_json::Value = second.json();
 
     // Cost recording is fire-and-forget; give the spawned tasks a moment.
     let since = "1970-01-01T00:00:00Z";
@@ -531,6 +535,24 @@ async fn cache_hit_is_metered_with_zero_cost() {
     let hit = entries.iter().find(|e| e.cache_hit).expect("a cache_hit row");
     assert_eq!(hit.cost_usd, 0.0, "a cache hit must never be counted as spend");
     assert!(hit.saved_usd >= 0.0);
+
+    // The responses report exactly what the ledger recorded for each call.
+    // Tolerance only for serde_json's non-round-trip float parsing in the test.
+    let close = |v: &serde_json::Value, want: f64| (v.as_f64().unwrap() - want).abs() < 1e-15;
+    let live = entries.iter().find(|e| !e.cache_hit).expect("a live row");
+    assert!(close(&miss["usage"]["cost_usd"], live.cost_usd));
+    assert!(miss["usage"].get("cache_hit").is_none());
+    assert_eq!(miss["x_router"]["cost"]["cache_hit"], false);
+    assert_eq!(hit_body["usage"]["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(hit_body["usage"]["cache_hit"], true);
+    assert!(close(&hit_body["usage"]["saved_usd"], hit.saved_usd));
+    let meta = &hit_body["x_router"];
+    assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(meta["cost"]["cache_hit"], true);
+    assert!(close(&meta["cost"]["saved_usd"], hit.saved_usd));
+    assert_eq!(meta["model"], hit.model.as_str(), "a hit names the model that produced it");
+    assert_eq!(meta["timing"]["attempts"], 0, "no provider call on a hit");
+    assert!(meta["timing"]["provider_ms"].is_null());
 }
 
 #[tokio::test]

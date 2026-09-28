@@ -8,7 +8,9 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
-use crate::providers::adapter::{CompletionResult, NormalizedRequest, ProviderAdapter, SseStream};
+use crate::providers::adapter::{
+    CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
+};
 use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::{parse_model_id, Publisher};
 use crate::providers::vertex::{claude, gemini, maas};
@@ -135,9 +137,8 @@ impl VertexAdapter {
             .region
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Vertex provider requires `region` in config"))?;
-        let token_provider = Arc::new(
-            GoogleCloudAuthProvider::new(config.credentials_path.as_deref())?,
-        ) as Arc<dyn TokenProvider>;
+        let token_provider =
+            Arc::new(GoogleCloudAuthProvider::from_config(config)?) as Arc<dyn TokenProvider>;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
@@ -295,6 +296,10 @@ impl VertexAdapter {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for VertexAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.token_provider.credential_report()
+    }
+
     /// Tool forwarding is per-publisher (issue #88): Claude bodies translate
     /// through the shared Anthropic layer and MaaS is OpenAI-shaped
     /// passthrough. Gemini's `functionDeclarations` dialect is not yet
@@ -305,6 +310,22 @@ impl ProviderAdapter for VertexAdapter {
             parse_model_id(model),
             Ok((Publisher::Anthropic | Publisher::Maas, _))
         )
+    }
+
+    /// Claude-on-Vertex always sends `max_tokens` (the caller's or the
+    /// Anthropic default); Gemini and MaaS forward it only when given.
+    fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        let max_tokens = match parse_model_id(&req.model) {
+            Ok((Publisher::Anthropic, _)) => {
+                Some(req.max_tokens.unwrap_or(claude::DEFAULT_MAX_TOKENS))
+            }
+            _ => req.max_tokens,
+        };
+        EffectiveSettings {
+            temperature: req.temperature,
+            max_tokens,
+            timeout_secs: Some(self.request_timeout(req).as_secs()),
+        }
     }
 
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
