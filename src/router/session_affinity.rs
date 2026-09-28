@@ -63,6 +63,11 @@ impl SessionAffinityMap {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// True when no live sessions are tracked (same approximation as [`Self::len`]).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Evict all expired entries. Call periodically from a background task.
     pub fn evict_expired(&self) {
         let now = now_secs();
@@ -188,5 +193,14 @@ mod tests {
         map.evict_expired();
         assert!(map.get("old").is_none());
         assert!(map.get("new").is_some());
+    }
+
+    #[test]
+    fn is_empty_tracks_len() {
+        let map = SessionAffinityMap::new(1800);
+        assert!(map.is_empty());
+        map.set("sess1", "anthropic", "claude-haiku-4-5");
+        assert!(!map.is_empty());
+        assert_eq!(map.len(), 1);
     }
 }

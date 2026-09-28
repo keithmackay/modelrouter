@@ -729,17 +729,12 @@ pub struct RoutingShortcutsConfig {
     pub cheapest: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LbStrategy {
+    #[default]
     RoundRobin,
     Weighted,
-}
-
-impl Default for LbStrategy {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

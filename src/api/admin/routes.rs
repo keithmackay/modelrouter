@@ -518,7 +518,6 @@ pub async fn reset_user_spend(
     _session: SuperAdminSession,
     Path(user_id): Path<i64>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
-    use crate::db::repositories::users::UserRepository;
     state.db.reset_spend(user_id).await.map_err(|_| ApiError::Internal)?;
     Ok(axum::Json(serde_json::json!({ "user_id": user_id, "reset": true })))
 }

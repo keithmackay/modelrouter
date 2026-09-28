@@ -12,8 +12,6 @@ pub async fn list_models(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    use crate::db::repositories::models::ModelRepository;
-
     crate::api::routes::reject_experiment_header("/v1/models", &headers)?;
     let availability = state.router.availability();
 

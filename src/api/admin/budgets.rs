@@ -499,23 +499,27 @@ async fn scope_for_rule_id(state: &AppState, id: i64) -> Result<BudgetScope, Das
         .map_err(|_| DashboardError::Internal)?;
     let rule = all.iter().find(|r| r.id == id)
         .ok_or_else(|| DashboardError::NotFound("budget rule not found".to_string()))?;
-    let scope = if rule.user_id.is_some() {
-        BudgetScope::User(rule.user_id.unwrap())
-    } else if rule.group_name.is_some() {
-        BudgetScope::Group(rule.group_name.clone().unwrap())
-    } else if rule.project.is_some() {
-        BudgetScope::Project(rule.project.clone().unwrap())
+    scope_of_rule(rule)
+}
+
+/// The admin-UI scope a stored rule belongs to (user > group > project > global).
+fn scope_of_rule(rule: &BudgetRule) -> Result<BudgetScope, DashboardError> {
+    if let Some(user_id) = rule.user_id {
+        Ok(BudgetScope::User(user_id))
+    } else if let Some(group) = &rule.group_name {
+        Ok(BudgetScope::Group(group.clone()))
+    } else if let Some(project) = &rule.project {
+        Ok(BudgetScope::Project(project.clone()))
     } else if rule.api_key_id.is_some() {
         // api_key_id-scoped rules are not managed by this UI (created via CLI).
         // Return an error so the handler surfaces a clear message rather than
         // silently re-rendering the Global card.
-        return Err(DashboardError::NotFound(
+        Err(DashboardError::NotFound(
             "api_key-scoped budget rules cannot be edited via the admin UI — use the CLI".to_string()
-        ));
+        ))
     } else {
-        BudgetScope::Global
-    };
-    Ok(scope)
+        Ok(BudgetScope::Global)
+    }
 }
 
 async fn render_scope_card(state: &AppState, scope: &BudgetScope) -> Result<Html<String>, DashboardError> {
@@ -557,4 +561,70 @@ async fn render_scope_card(state: &AppState, scope: &BudgetScope) -> Result<Html
     };
 
     Ok(Html(budget_card_html(&card_id, &title, &rules, &scope_fields)))
+}
+
+#[cfg(test)]
+mod scope_of_rule_tests {
+    use super::*;
+
+    fn rule() -> BudgetRule {
+        BudgetRule {
+            id: 1,
+            user_id: None,
+            group_name: None,
+            api_key_id: None,
+            tag: None,
+            window: "monthly".into(),
+            limit_usd: None,
+            limit_tokens: None,
+            model_allow: String::new(),
+            model_deny: String::new(),
+            rate_rpm: None,
+            max_concurrent: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            project: None,
+            window_start: None,
+            window_end: None,
+        }
+    }
+
+    #[test]
+    fn user_wins_over_group_and_project() {
+        let r = BudgetRule {
+            user_id: Some(7),
+            group_name: Some("g".into()),
+            project: Some("p".into()),
+            ..rule()
+        };
+        assert!(matches!(scope_of_rule(&r), Ok(BudgetScope::User(7))));
+    }
+
+    #[test]
+    fn group_then_project() {
+        let r = BudgetRule {
+            group_name: Some("g".into()),
+            project: Some("p".into()),
+            ..rule()
+        };
+        assert!(matches!(scope_of_rule(&r), Ok(BudgetScope::Group(g)) if g == "g"));
+        let r = BudgetRule {
+            project: Some("p".into()),
+            ..rule()
+        };
+        assert!(matches!(scope_of_rule(&r), Ok(BudgetScope::Project(p)) if p == "p"));
+    }
+
+    #[test]
+    fn api_key_scope_is_rejected_and_empty_is_global() {
+        let r = BudgetRule {
+            api_key_id: Some(3),
+            ..rule()
+        };
+        assert!(matches!(
+            scope_of_rule(&r),
+            Err(DashboardError::NotFound(_))
+        ));
+        assert!(matches!(scope_of_rule(&rule()), Ok(BudgetScope::Global)));
+    }
 }

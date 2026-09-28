@@ -1,6 +1,7 @@
 use axum::{extract::State, response::IntoResponse};
 use crate::api::app::AppState;
 
+#[cfg_attr(not(feature = "prometheus"), allow(unused_variables))]
 pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     #[cfg(feature = "prometheus")]
     {

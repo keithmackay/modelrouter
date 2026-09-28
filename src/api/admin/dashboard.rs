@@ -271,7 +271,6 @@ pub async fn get_overview(
     let mut spend_today = 0f64;
     let mut spend_week = 0f64;
     let mut spend_month = 0f64;
-    let mut request_count = 0i64;
 
     for user in &users {
         spend_today += CostRepository::sum_for_user_since(&*state.db, user.id, &since_today)
@@ -287,7 +286,7 @@ pub async fn get_overview(
 
     // Total request count from prompts (using PromptRepository)
     use crate::db::repositories::prompts::PromptRepository;
-    request_count = PromptRepository::count(&*state.prompt_db)
+    let request_count = PromptRepository::count(&*state.prompt_db)
         .await
         .unwrap_or(0);
 
@@ -644,7 +643,6 @@ fn user_row_with_key_html(user: &crate::db::models::User, raw_key: &str) -> Stri
 
 struct KeyView {
     id: i64,
-    user_id: i64,
     user_name: String,
     user_email: Option<String>,
     project: Option<String>,
@@ -812,7 +810,6 @@ fn key_sub_row_html(view: &KeyView, group_id: &str, display: &str) -> String {
 fn to_key_view(k: &crate::db::models::ApiKey, user_name: String, user_email: Option<String>) -> KeyView {
     KeyView {
         id: k.id,
-        user_id: k.user_id,
         user_name,
         user_email,
         project: k.project.clone(),
@@ -831,7 +828,7 @@ async fn render_group(
     project: Option<&str>,
     expanded: bool,
 ) -> Result<String, DashboardError> {
-    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    use crate::db::repositories::users::UserRepository;
     let group_keys = db.list_keys_for_group(user_id, project)
         .await.map_err(|_| DashboardError::Internal)?;
     if group_keys.is_empty() {
@@ -862,7 +859,7 @@ pub async fn get_keys(
     State(state): State<AppState>,
     session: DashboardSession,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+    use crate::db::repositories::users::UserRepository;
     use std::collections::HashMap;
 
     let keys = state.db.list_all_api_keys()
@@ -1092,8 +1089,6 @@ pub async fn post_disable_key(
     session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::api_keys::ApiKeyRepository;
-
     // Look up key to get user_id + project before disabling
     let all = state.db.list_all_api_keys().await.map_err(|_| DashboardError::Internal)?;
     let key = all.iter().find(|k| k.id == id)
@@ -1116,7 +1111,6 @@ pub async fn post_rotate_key(
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
     use crate::db::models::NewApiKey;
-    use crate::db::repositories::api_keys::ApiKeyRepository;
     use crate::api::auth::hash_token;
 
     // Look up key to get user_id, project, label

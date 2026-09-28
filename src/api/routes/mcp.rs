@@ -8,7 +8,7 @@ use crate::providers::embedding::EmbeddingRequest;
 
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser},
-    db::{models::NewMcpServer, repositories::mcp_servers::McpServerRepository},
+    db::models::NewMcpServer,
 };
 
 #[derive(Deserialize)]

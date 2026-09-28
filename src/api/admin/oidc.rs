@@ -14,6 +14,12 @@ pub struct OidcStateStore {
     map: DashMap<String, PendingOidcState>,
 }
 
+impl Default for OidcStateStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OidcStateStore {
     pub fn new() -> Self {
         Self { map: DashMap::new() }
@@ -53,9 +59,9 @@ pub fn generate_pkce_pair() -> (String, String) {
     use sha2::{Digest, Sha256};
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let hash = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
     (verifier, challenge)
 }
 
@@ -63,7 +69,7 @@ pub fn generate_pkce_pair() -> (String, String) {
 pub fn verify_pkce_challenge(verifier: &str, challenge: &str) -> bool {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(verifier.as_bytes());
-    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash);
+    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
     expected == challenge
 }
 
@@ -72,7 +78,7 @@ pub fn generate_state() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 // ── Email allowlist check ─────────────────────────────────────────────────────

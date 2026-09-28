@@ -295,7 +295,7 @@ async fn search_inner(
     }
 
     let max_results = match body.get("max_results").and_then(|v| v.as_u64()) {
-        Some(n) if n == 0 => {
+        Some(0) => {
             return Err(ApiError::InvalidRequest(
                 "max_results must be at least 1".to_string(),
             ))
