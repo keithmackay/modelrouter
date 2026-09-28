@@ -406,6 +406,23 @@ fail_open    = true
 # [[model_capabilities]]
 # model = "claude-opus-6"
 # supports_temperature = false
+#
+# Reasoning controls. An OpenAI-style `reasoning_effort` on a request is
+# translated for Anthropic-dialect backends (direct and Vertex) using three
+# per-model facts, each overridable here:
+#   thinks_by_default    — the model reasons when the request says nothing
+#   can_disable_thinking — the model accepts `thinking: {type: "disabled"}`
+#   supports_effort      — the model accepts `output_config.effort`
+# `reasoning_effort: "none"` disables thinking where the model allows it and
+# falls back to the lowest effort where it does not; `minimal`/`low`/`medium`/
+# `high`/`xhigh`/`max` set the effort on models that accept one. Unlisted
+# models get no thinking or effort fields (the provider default applies).
+#
+# [[model_capabilities]]
+# model = "claude-sonnet-6"
+# thinks_by_default = true
+# can_disable_thinking = true
+# supports_effort = true
 
 # ---------------------------------------------------------------------------
 # Declarative Policy Rules

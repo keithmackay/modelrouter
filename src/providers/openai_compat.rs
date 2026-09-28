@@ -208,6 +208,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
     /// is the tier-resolved ceiling this adapter applies to the call.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: Some(
@@ -443,6 +444,7 @@ mod tier_timeout_tests {
             max_tokens: None,
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: serde_json::Value::Null,
         }
     }

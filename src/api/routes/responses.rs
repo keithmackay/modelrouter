@@ -134,6 +134,15 @@ async fn responses_inner(
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
         tools: None,
         tool_choice: None,
+        // The Responses API nests the level as `reasoning.effort`; accept the
+        // chat-completions spelling too.
+        reasoning: crate::router::model_capabilities::resolve_reasoning(
+            &canonical_model,
+            body["reasoning"]["effort"]
+                .as_str()
+                .or_else(|| body["reasoning_effort"].as_str()),
+            &state.settings.model_capabilities,
+        ),
         extra_params: serde_json::Value::Object(Default::default()),
     };
 

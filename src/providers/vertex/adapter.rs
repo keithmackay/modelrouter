@@ -315,13 +315,16 @@ impl ProviderAdapter for VertexAdapter {
     /// Claude-on-Vertex always sends `max_tokens` (the caller's or the
     /// Anthropic default); Gemini and MaaS forward it only when given.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
-        let max_tokens = match parse_model_id(&req.model) {
-            Ok((Publisher::Anthropic, _)) => {
-                Some(req.max_tokens.unwrap_or(claude::DEFAULT_MAX_TOKENS))
-            }
-            _ => req.max_tokens,
+        // Only the Claude translation forwards reasoning controls.
+        let (max_tokens, reasoning) = match parse_model_id(&req.model) {
+            Ok((Publisher::Anthropic, _)) => (
+                Some(req.max_tokens.unwrap_or(claude::DEFAULT_MAX_TOKENS)),
+                req.reasoning,
+            ),
+            _ => (req.max_tokens, None),
         };
         EffectiveSettings {
+            reasoning,
             temperature: req.temperature,
             max_tokens,
             timeout_secs: Some(self.request_timeout(req).as_secs()),
@@ -540,6 +543,7 @@ mod tests {
             max_tokens: Some(16),
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: serde_json::Value::Null,
         }
     }
