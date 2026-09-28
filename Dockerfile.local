@@ -1,0 +1,12 @@
+# Fast local build — copies pre-built binary from target/release/
+# Run `cargo build --release --features otel` first, then:
+#   docker compose -f docker-compose.otel.yml -f docker-compose.otel.local.yml up -d --build
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY bin/modelrouter /modelrouter
+
+ENTRYPOINT ["/modelrouter"]
+CMD ["serve"]
