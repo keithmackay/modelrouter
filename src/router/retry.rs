@@ -9,10 +9,26 @@ pub enum RetryableError {
     /// unsupported parameter, an unknown model. Distinguished from
     /// [`Self::NotRetryable`] because it says nothing about provider health.
     ClientError(u16),
+    /// A provider credential that cannot be refreshed without a human (see
+    /// [`crate::providers::credential_error::CredentialExpired`]). Never
+    /// retried, and not evidence the provider is unhealthy.
+    CredentialExpired,
     NotRetryable,
 }
 
 impl RetryableError {
+    /// Classify a provider error, recognising typed errors before falling back
+    /// to [`Self::classify`] on its message. Prefer this over `classify` when
+    /// the `anyhow::Error` is at hand: `to_string()` shows only the outermost
+    /// context, so a typed cause under a `.context(..)` is invisible to string
+    /// matching.
+    pub fn classify_error(err: &anyhow::Error) -> Self {
+        if crate::providers::credential_error::find_credential_expired(err).is_some() {
+            return Self::CredentialExpired;
+        }
+        Self::classify(&err.to_string())
+    }
+
     pub fn classify(err_str: &str) -> Self {
         // Known limitation: providers embed status codes in error strings.
         // A future phase should add typed ProviderError variants.
@@ -39,8 +55,12 @@ impl RetryableError {
     /// deny every other model behind that provider — observed in production
     /// when a `temperature` a Claude 5 model no longer accepts took down the
     /// entire Vertex provider, including models that would have answered.
+    ///
+    /// Nor is an expired credential: the provider is fine, our credential for
+    /// it is not, and opening the breaker would replace an actionable
+    /// `credential_expired` with a "circuit breaker open" that invites retries.
     pub fn counts_toward_circuit_breaker(&self) -> bool {
-        !matches!(self, Self::ClientError(_))
+        !matches!(self, Self::ClientError(_) | Self::CredentialExpired)
     }
 }
 
@@ -167,6 +187,44 @@ mod tests {
                 other => panic!("{err} classified as {other:?}"),
             }
         }
+    }
+
+    fn credential_expired() -> anyhow::Error {
+        anyhow::Error::new(crate::providers::credential_error::CredentialExpired {
+            provider: "vertex".into(),
+            credential_kind: "adc-user".into(),
+            hint: "Reauthenticate.".into(),
+            // Deliberately contains a 5xx-looking number: the typed check must
+            // win over string matching.
+            detail: "token endpoint said 500 invalid_grant".into(),
+        })
+    }
+
+    #[test]
+    fn credential_expired_is_recognised_through_context() {
+        use anyhow::Context;
+        let err = Err::<(), _>(credential_expired())
+            .context("failed to fetch token")
+            .unwrap_err();
+        let classified = RetryableError::classify_error(&err);
+        assert!(matches!(classified, RetryableError::CredentialExpired));
+        assert!(!classified.counts_toward_circuit_breaker());
+    }
+
+    #[test]
+    fn credential_expired_is_never_retried() {
+        let policy = RetryPolicy::new(3, 10, 100);
+        let classified = RetryableError::classify_error(&credential_expired());
+        assert!(!policy.should_retry(0, &classified));
+    }
+
+    #[test]
+    fn classify_error_falls_back_to_the_message() {
+        let err = anyhow::anyhow!("Vertex AI returned 503 Service Unavailable");
+        assert!(matches!(
+            RetryableError::classify_error(&err),
+            RetryableError::ServerError(_)
+        ));
     }
 
     /// 429 is a 4xx but is a real health signal, and must keep its own

@@ -157,10 +157,28 @@ timeout_secs = 120
 # Supports Gemini (publisher "google") and Claude-on-Vertex (publisher "anthropic").
 # Authentication uses Application Default Credentials by default; point
 # `credentials_path` at a service-account JSON to override.
+#
+# credential_source selects the credential when credentials_path is unset:
+#   "adc"      (default) GOOGLE_APPLICATION_CREDENTIALS, then the gcloud user
+#              file (~/.config/gcloud/application_default_credentials.json),
+#              then the metadata server. If that credential later needs
+#              interactive reauthentication (invalid_grant / invalid_rapt) and
+#              the metadata server answers, the provider switches to it for
+#              the rest of the process with a CREDENTIAL FALLBACK warning.
+#   "metadata" The GCE/GKE/Cloud Run metadata server's attached service
+#              account ONLY; the gcloud user file and
+#              GOOGLE_APPLICATION_CREDENTIALS are ignored. Use this on a VM
+#              meant to run as its service account, so a stray
+#              `gcloud auth application-default login` cannot take over.
+# Setting credential_source together with credentials_path is rejected at
+# config load. A credential that cannot be refreshed without a human fails
+# requests with HTTP 401 `credential_expired` (not retried, not counted
+# toward the circuit breaker).
 # [providers.vertex]
-# project          = "my-gcp-project"
-# region           = "us-east5"               # region must host the models you plan to call
-# credentials_path = "/secrets/sa.json"       # omit to use ADC (gcloud / metadata server)
+# project           = "my-gcp-project"
+# region            = "us-east5"              # region must host the models you plan to call
+# credentials_path  = "/secrets/sa.json"      # omit to use credential_source
+# credential_source = "metadata"              # "adc" (default) or "metadata"; not with credentials_path
 # timeout_secs     = 120
 #
 # Example aliases — Claude-on-Vertex models require versioned IDs (@YYYYMMDD).

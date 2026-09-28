@@ -116,25 +116,36 @@ struct CapabilityReport {
     target: String,
     latency_ms: i64,
     error: Option<String>,
+    /// The adapter's `credential_report()`, when it has one. Present on
+    /// failure too — that is when "which credential?" matters most.
+    credential: Option<Value>,
 }
 
 impl CapabilityReport {
     fn ok(target: String, latency_ms: i64) -> Self {
-        Self { status: "ok", target, latency_ms, error: None }
+        Self { status: "ok", target, latency_ms, error: None, credential: None }
     }
     fn failed(target: String, latency_ms: i64, error: String) -> Self {
-        Self { status: "failed", target, latency_ms, error: Some(error) }
+        Self { status: "failed", target, latency_ms, error: Some(error), credential: None }
     }
     fn skipped(target: String, reason: String) -> Self {
-        Self { status: "skipped", target, latency_ms: 0, error: Some(reason) }
+        Self { status: "skipped", target, latency_ms: 0, error: Some(reason), credential: None }
+    }
+    fn with_credential(mut self, credential: Option<Value>) -> Self {
+        self.credential = credential;
+        self
     }
     fn to_json(&self) -> Value {
-        json!({
+        let mut body = json!({
             "status": self.status,
             "target": self.target,
             "latency_ms": self.latency_ms,
             "error": self.error,
-        })
+        });
+        if let Some(credential) = &self.credential {
+            body["credential"] = credential.clone();
+        }
+        body
     }
 }
 
@@ -179,7 +190,7 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
         extra_params: json!({}),
     };
     let started = Instant::now();
-    match adapter.complete(&req).await {
+    let report = match adapter.complete(&req).await {
         Ok(result) => {
             let latency = started.elapsed().as_millis() as i64;
             let cost = state
@@ -196,7 +207,9 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
             CapabilityReport::ok(target, latency)
         }
         Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
-    }
+    };
+    // Read after the call: a fallback taken during it changes the answer.
+    report.with_credential(adapter.credential_report())
 }
 
 /// One short embedding through the embedding registry.

@@ -39,7 +39,17 @@ impl IntoResponse for ApiError {
                 "forbidden",
             ),
             ApiError::ProviderError(e) => {
-                (StatusCode::BAD_GATEWAY, e.to_string(), "provider_error")
+                // A credential that needs a human is not a gateway fault: 401
+                // with a stable code tells the caller "stop retrying, go fix
+                // auth" instead of the 502 that invites a retry loop.
+                match crate::providers::credential_error::find_credential_expired(e) {
+                    Some(expired) => (
+                        StatusCode::UNAUTHORIZED,
+                        expired.to_string(),
+                        crate::providers::credential_error::CREDENTIAL_EXPIRED_CODE,
+                    ),
+                    None => (StatusCode::BAD_GATEWAY, e.to_string(), "provider_error"),
+                }
             }
             ApiError::InvalidRequest(msg) => {
                 (StatusCode::BAD_REQUEST, msg.clone(), "invalid_request")
@@ -88,5 +98,44 @@ impl From<crate::router::experiments::BindError> for ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         ApiError::ProviderError(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::credential_error::CredentialExpired;
+    use anyhow::Context;
+
+    async fn status_and_body(err: ApiError) -> (StatusCode, serde_json::Value) {
+        let resp = err.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn credential_expired_maps_to_401_with_a_stable_code() {
+        let inner: anyhow::Result<()> = Err(anyhow::Error::new(CredentialExpired {
+            provider: "vertex".into(),
+            credential_kind: "adc-user".into(),
+            hint: "Reauthenticate: gcloud auth application-default login.".into(),
+            detail: "invalid_grant".into(),
+        }));
+        let err = inner.context("failed to send request").unwrap_err();
+        let (status, body) = status_and_body(ApiError::ProviderError(err)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "credential_expired");
+        assert_eq!(body["error"]["type"], "credential_expired");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("gcloud auth application-default login"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn other_provider_errors_stay_502() {
+        let err = anyhow::anyhow!("Vertex AI returned 503 Service Unavailable");
+        let (status, body) = status_and_body(ApiError::ProviderError(err)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "provider_error");
     }
 }

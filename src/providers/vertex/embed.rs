@@ -150,9 +150,7 @@ impl VertexEmbeddingAdapter {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Vertex embeddings need `project` under [providers.vertex]"))?;
         let region = resolve_embedding_region(config)?;
-        let token_provider = Arc::new(GoogleCloudAuthProvider::new(
-            config.credentials_path.as_deref(),
-        )?);
+        let token_provider = Arc::new(GoogleCloudAuthProvider::from_config(config)?);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()

@@ -142,6 +142,12 @@ fn status_for(err: &ApiError) -> i64 {
         ApiError::Unauthorized => 401,
         ApiError::Forbidden => 403,
         ApiError::Disabled(_) => 403,
+        // Must agree with `ApiError::into_response`, which answers 401 here.
+        ApiError::ProviderError(e)
+            if crate::providers::credential_error::find_credential_expired(e).is_some() =>
+        {
+            401
+        }
         ApiError::ProviderError(_) => 502,
         ApiError::InvalidRequest(_) => 400,
         ApiError::PolicyDenied { status, .. } => *status as i64,
@@ -211,6 +217,20 @@ mod tests {
     #[test]
     fn a_genuine_upstream_error_stays_a_provider_failure() {
         let err = ApiError::ProviderError(anyhow::anyhow!("upstream returned 500"));
+        assert_eq!(stage_for(&err), FailureStage::Provider);
+    }
+
+    #[test]
+    fn expired_credential_is_logged_with_the_401_the_caller_saw() {
+        let err = ApiError::ProviderError(anyhow::Error::new(
+            crate::providers::credential_error::CredentialExpired {
+                provider: "vertex".into(),
+                credential_kind: "adc-user".into(),
+                hint: "Reauthenticate.".into(),
+                detail: "invalid_grant".into(),
+            },
+        ));
+        assert_eq!(status_for(&err), 401);
         assert_eq!(stage_for(&err), FailureStage::Provider);
     }
 

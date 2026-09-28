@@ -173,6 +173,8 @@ environment:
 
 Alternatively, set `GOOGLE_APPLICATION_CREDENTIALS=/secrets/vertex-sa.json` and leave `credentials_path` unset — `google-cloud-auth` will pick it up via ADC.
 
+On a GCE VM (or GKE / Cloud Run) that should authenticate as its attached service account, set `credential_source = "metadata"` under `[providers.vertex]` instead of relying on ADC. ADC checks the gcloud user file before the metadata server, so one `gcloud auth application-default login` on the host would otherwise move the proxy onto a personal credential that Google may later refuse to refresh. See the Vertex credentials table in the README for the full precedence rules and the `credential_expired` (HTTP 401) error.
+
 **4. Test:**
 
 ```bash

@@ -770,9 +770,16 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub project: Option<String>,
     /// Path to GCP service-account JSON. If None, uses Application Default Credentials.
-    /// Used only by the Vertex adapter.
+    /// Used only by the Vertex adapter. Mutually exclusive with an explicit
+    /// `credential_source` — see [`ProviderConfig::gcp_credential`].
     #[serde(default)]
     pub credentials_path: Option<String>,
+    /// Where the Vertex adapter gets its Google credential: `"adc"` (the
+    /// default) or `"metadata"`. See [`GcpCredentialSource`] for the meaning
+    /// of each, and [`ProviderConfig::gcp_credential`] for how it combines with
+    /// `credentials_path`. Used only by the Vertex adapter.
+    #[serde(default)]
+    pub credential_source: Option<GcpCredentialSource>,
     /// Region for the embedding endpoint, when it differs from `region`.
     ///
     /// Vertex serves `text-embedding-*` regionally only — `locations/global`
@@ -903,6 +910,7 @@ impl Default for ProviderConfig {
             region: None,
             project: None,
             credentials_path: None,
+            credential_source: None,
             embedding_region: None,
             maas_region: None,
             catalog_publishers: None,
@@ -916,6 +924,93 @@ impl Default for ProviderConfig {
             custom_search_instance: None,
             generic_chat: true,
         }
+    }
+}
+
+/// `credential_source` values for `[providers.vertex]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GcpCredentialSource {
+    /// Application Default Credentials, resolved in Google's order:
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud user file
+    /// (`~/.config/gcloud/application_default_credentials.json`), then the
+    /// GCE/GKE/Cloud Run metadata server. If the resolved credential later
+    /// needs interactive reauthentication and the metadata server is
+    /// reachable, the adapter falls back to the metadata server for the rest
+    /// of the process, with a WARN.
+    Adc,
+    /// The metadata server's attached service account ONLY. The gcloud user
+    /// file and `GOOGLE_APPLICATION_CREDENTIALS` are ignored, so a stray
+    /// `gcloud auth application-default login` on the host cannot move the
+    /// proxy onto a personal credential.
+    Metadata,
+}
+
+/// The credential a Vertex provider will actually use, after
+/// [`ProviderConfig::gcp_credential`] has applied the precedence rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedGcpCredential {
+    Adc,
+    Metadata,
+    /// Service-account JSON at this path (`credentials_path`).
+    ServiceAccountFile(String),
+}
+
+impl ProviderConfig {
+    /// Resolve `credential_source` and `credentials_path` into one choice.
+    ///
+    /// | `credential_source` | `credentials_path` | result |
+    /// |---|---|---|
+    /// | unset | unset | ADC |
+    /// | unset | set | that service-account file |
+    /// | `"adc"` | unset | ADC |
+    /// | `"metadata"` | unset | metadata server only |
+    /// | `"adc"` or `"metadata"` | set | error: contradictory |
+    ///
+    /// A path next to an explicit source is rejected rather than ranked:
+    /// either reading silently ignores something the operator wrote down.
+    pub fn gcp_credential(&self) -> anyhow::Result<ResolvedGcpCredential> {
+        match (self.credential_source, self.credentials_path.as_deref()) {
+            (None, None) | (Some(GcpCredentialSource::Adc), None) => Ok(ResolvedGcpCredential::Adc),
+            (Some(GcpCredentialSource::Metadata), None) => Ok(ResolvedGcpCredential::Metadata),
+            (None, Some(path)) => Ok(ResolvedGcpCredential::ServiceAccountFile(path.to_string())),
+            (Some(source), Some(path)) => anyhow::bail!(
+                "credential_source = \"{}\" and credentials_path = \"{path}\" are contradictory: \
+                 credentials_path selects an explicit service-account file, credential_source \
+                 selects {}. Remove one of them.",
+                match source {
+                    GcpCredentialSource::Adc => "adc",
+                    GcpCredentialSource::Metadata => "metadata",
+                },
+                match source {
+                    GcpCredentialSource::Adc => "Application Default Credentials",
+                    GcpCredentialSource::Metadata => "the metadata server",
+                },
+            ),
+        }
+    }
+}
+
+impl Settings {
+    /// Reject provider credential settings that cannot mean what they say.
+    /// Called by the config loaders, so a contradictory config fails at load
+    /// rather than on the first request that lazily builds the adapter.
+    pub fn validate_provider_credentials(&self) -> anyhow::Result<()> {
+        let mut names: Vec<&String> = self.providers.keys().collect();
+        names.sort();
+        for name in names {
+            let config = &self.providers[name];
+            if name == "vertex" {
+                config
+                    .gcp_credential()
+                    .map_err(|e| anyhow::anyhow!("[providers.{name}]: {e}"))?;
+            } else if config.credential_source.is_some() {
+                anyhow::bail!(
+                    "[providers.{name}]: credential_source is only supported for [providers.vertex]"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

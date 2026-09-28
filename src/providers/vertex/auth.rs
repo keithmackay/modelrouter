@@ -7,6 +7,10 @@
 //! file's refresh token) after construction — see [`RebuildingProvider`] for
 //! why that matters and what we do about it.
 
+use super::credentials::{
+    detect_adc_kind, CredentialChain, CredentialKind, CredentialReport, FallbackFactory,
+};
+use crate::config::schema::{ProviderConfig, ResolvedGcpCredential};
 use anyhow::Context;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -36,6 +40,12 @@ pub trait TokenProvider: Send + Sync {
     /// rebuild.
     async fn force_rebuild_token(&self) -> anyhow::Result<String> {
         self.token().await
+    }
+
+    /// Which credential is serving requests, for deep health. `None` for
+    /// sources with nothing meaningful to report (test fakes).
+    fn credential_report(&self) -> Option<CredentialReport> {
+        None
     }
 }
 
@@ -217,15 +227,24 @@ impl<T: AccessTokenSource> RebuildingProvider<T> {
     }
 }
 
+#[async_trait]
+impl<T: AccessTokenSource> TokenProvider for RebuildingProvider<T> {
+    async fn token(&self) -> anyhow::Result<String> {
+        RebuildingProvider::token(self).await
+    }
+
+    async fn force_rebuild_token(&self) -> anyhow::Result<String> {
+        RebuildingProvider::force_rebuild_token(self).await
+    }
+}
+
 /// Production token provider backed by `google-cloud-auth 1.9`.
 ///
-/// If `credentials_path` is None, uses Application Default Credentials
-/// (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`
-/// env var, or the GCE/GKE/Cloud Run metadata server — whichever is
-/// resolvable first).
-///
-/// If `credentials_path` is Some, the file is read as a service-account JSON
-/// and passed to the service-account builder directly.
+/// The credential comes from [`ProviderConfig::gcp_credential`]:
+/// - ADC (default): `GOOGLE_APPLICATION_CREDENTIALS`, the gcloud user file,
+///   or the GCE/GKE/Cloud Run metadata server — whichever resolves first.
+/// - `credential_source = "metadata"`: the metadata server only.
+/// - `credentials_path`: that service-account JSON.
 ///
 /// Tokens are cached and auto-refreshed by `google-cloud-auth`, but the
 /// underlying credential material (the ADC file's contents, a service
@@ -234,44 +253,84 @@ impl<T: AccessTokenSource> RebuildingProvider<T> {
 /// the file / re-resolving ADC — and retries once, so a credential refreshed
 /// on disk after this process started takes effect without a restart. See
 /// [`RebuildingProvider`] for the rebuild/cooldown policy.
+///
+/// On top of that, [`CredentialChain`] separates failures a human must fix
+/// (reauth required) from transient ones, and under ADC falls back to the
+/// metadata server when it can — see [`super::credentials`].
 pub struct GoogleCloudAuthProvider {
-    inner: RebuildingProvider<google_cloud_auth::credentials::AccessTokenCredentials>,
+    inner: CredentialChain,
 }
 
 impl GoogleCloudAuthProvider {
-    pub fn new(credentials_path: Option<&str>) -> anyhow::Result<Self> {
-        let credentials_path = credentials_path.map(str::to_string);
-        let inner = RebuildingProvider::new(move || {
-            Self::build_credentials(credentials_path.as_deref())
-        })?;
-        Ok(Self { inner })
+    pub fn from_config(config: &ProviderConfig) -> anyhow::Result<Self> {
+        let source = config.gcp_credential()?;
+        let (primary, fallback): (Arc<dyn TokenProvider>, Option<FallbackFactory>) = match &source {
+            ResolvedGcpCredential::Adc => (
+                Arc::new(RebuildingProvider::new(Self::build_adc)?),
+                Some(Arc::new(|| {
+                    Ok(Arc::new(RebuildingProvider::new(Self::build_metadata)?)
+                        as Arc<dyn TokenProvider>)
+                })),
+            ),
+            ResolvedGcpCredential::Metadata => {
+                (Arc::new(RebuildingProvider::new(Self::build_metadata)?), None)
+            }
+            ResolvedGcpCredential::ServiceAccountFile(path) => {
+                let path = path.clone();
+                (
+                    Arc::new(RebuildingProvider::new(move || Self::build_service_account(&path))?),
+                    None,
+                )
+            }
+        };
+        let kind: Box<dyn Fn() -> CredentialKind + Send + Sync> = match &source {
+            ResolvedGcpCredential::Adc => Box::new(detect_adc_kind),
+            ResolvedGcpCredential::Metadata => Box::new(|| CredentialKind::Metadata),
+            ResolvedGcpCredential::ServiceAccountFile(_) => Box::new(|| CredentialKind::ExplicitFile),
+        };
+        tracing::info!(
+            credential_source = ?source,
+            credential_kind = kind().as_str(),
+            "vertex: credential source resolved"
+        );
+        Ok(Self {
+            inner: CredentialChain::new("vertex", source, primary, kind, fallback),
+        })
     }
 
-    fn build_credentials(
-        credentials_path: Option<&str>,
+    fn build_service_account(
+        path: &str,
     ) -> anyhow::Result<google_cloud_auth::credentials::AccessTokenCredentials> {
-        match credentials_path {
-            Some(path) => {
-                let raw = std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read {path}"))?;
-                let json: serde_json::Value = serde_json::from_str(&raw)
-                    .with_context(|| format!("{path} is not valid JSON"))?;
-                google_cloud_auth::credentials::service_account::Builder::new(json)
-                    .with_access_specifier(
-                        google_cloud_auth::credentials::service_account::AccessSpecifier::from_scopes(
-                            [CLOUD_PLATFORM_SCOPE],
-                        ),
-                    )
-                    .build_access_token_credentials()
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))
-                    .context("failed to build service-account credentials")
-            }
-            None => google_cloud_auth::credentials::Builder::default()
-                .with_scopes([CLOUD_PLATFORM_SCOPE])
-                .build_access_token_credentials()
-                .map_err(|e| anyhow::Error::msg(e.to_string()))
-                .context("failed to build ADC credentials"),
-        }
+        let raw = std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("{path} is not valid JSON"))?;
+        google_cloud_auth::credentials::service_account::Builder::new(json)
+            .with_access_specifier(
+                google_cloud_auth::credentials::service_account::AccessSpecifier::from_scopes([
+                    CLOUD_PLATFORM_SCOPE,
+                ]),
+            )
+            .build_access_token_credentials()
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+            .context("failed to build service-account credentials")
+    }
+
+    fn build_adc() -> anyhow::Result<google_cloud_auth::credentials::AccessTokenCredentials> {
+        google_cloud_auth::credentials::Builder::default()
+            .with_scopes([CLOUD_PLATFORM_SCOPE])
+            .build_access_token_credentials()
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+            .context("failed to build ADC credentials")
+    }
+
+    /// Metadata-server credentials, bypassing the ADC file search entirely.
+    /// Honours `GCE_METADATA_HOST` like the rest of Google's tooling.
+    fn build_metadata() -> anyhow::Result<google_cloud_auth::credentials::AccessTokenCredentials> {
+        google_cloud_auth::credentials::mds::Builder::default()
+            .with_scopes([CLOUD_PLATFORM_SCOPE])
+            .build_access_token_credentials()
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+            .context("failed to build metadata-server credentials")
     }
 }
 
@@ -283,6 +342,10 @@ impl TokenProvider for GoogleCloudAuthProvider {
 
     async fn force_rebuild_token(&self) -> anyhow::Result<String> {
         self.inner.force_rebuild_token().await
+    }
+
+    fn credential_report(&self) -> Option<CredentialReport> {
+        self.inner.credential_report()
     }
 }
 

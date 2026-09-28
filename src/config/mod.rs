@@ -11,6 +11,7 @@ pub fn load_from_path(path: &str) -> Result<Settings> {
         .add_source(File::with_name(path).required(false))
         .build()?
         .try_deserialize::<Settings>()?;
+    settings.validate_provider_credentials()?;
     Ok(settings)
 }
 
@@ -33,6 +34,7 @@ pub fn load(path: Option<PathBuf>) -> Result<Settings> {
         )
         .build()?
         .try_deserialize::<Settings>()?;
+    settings.validate_provider_credentials()?;
 
     Ok(settings)
 }

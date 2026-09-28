@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod catalog;
 pub mod catalog_registry;
+pub mod credential_error;
 pub mod anthropic;
 /// Microsoft Entra ID token source, shared by every Azure provider that
 /// authenticates without a key. Compiled in when any of them is.

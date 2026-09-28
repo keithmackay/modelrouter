@@ -95,6 +95,14 @@ pub trait ProviderAdapter: Send + Sync {
             timeout_secs: None,
         }
     }
+
+    /// Which credential this adapter is authenticating with, for
+    /// `GET /health/deep` — the credential's type and source, never the
+    /// credential itself. `None` (the default) for adapters with nothing
+    /// beyond a static key to report.
+    fn credential_report(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// Provider-facing settings for one dispatch (see

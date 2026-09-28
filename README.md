@@ -617,6 +617,34 @@ are operations data and live here, never in code**):
 | `maas_region` | MaaS partners are regional-only; `global` 404s for them | falls back to `region`; MaaS dispatch fails with a fix-hint if that is `global` |
 | `catalog_publishers` | Publisher catalogs probed for `GET /admin/api/models/available` | `["google", "anthropic"]` |
 | `credentials_path` | Service-account key file; omit to use ADC (metadata server on GCE — no key material on disk) | ADC |
+| `credential_source` | `"adc"` or `"metadata"` (see below). Contradicts `credentials_path` — setting both is a config-load error | `"adc"` |
+
+**Vertex credentials.** Which Google credential the provider uses:
+
+| `credential_source` | `credentials_path` | Credential |
+|---|---|---|
+| unset / `"adc"` | unset | Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud user file (`~/.config/gcloud/application_default_credentials.json`), then the metadata server |
+| `"metadata"` | unset | The GCE/GKE/Cloud Run metadata server's attached service account **only** — the gcloud user file and `GOOGLE_APPLICATION_CREDENTIALS` are ignored |
+| unset | set | That service-account key file |
+| `"adc"` / `"metadata"` | set | Rejected at config load (contradictory) |
+
+ADC checks the gcloud user file *before* the metadata server, so on a VM meant to run as its
+attached service account a single `gcloud auth application-default login` silently moves the
+proxy onto a personal credential — and Google's reauthentication policy can later refuse to
+refresh it (`invalid_grant` / `invalid_rapt`). Set `credential_source = "metadata"` on such
+hosts. Under `"adc"`, when a refresh fails that way and the metadata server answers, the
+provider switches to the metadata server for the rest of the process and logs a
+`CREDENTIAL FALLBACK` warning.
+
+When no fallback is available the failure is **permanent**, not transient: the request fails
+with HTTP **401** and `error.code = "credential_expired"`, whose message says how to fix it
+(`gcloud auth application-default login`, or `credential_source = "metadata"`). It is not
+retried and does not count toward the provider circuit breaker — retrying cannot repair a
+credential, and an open breaker would hide the actionable error behind a "circuit breaker
+open" that invites retries. Transient token-endpoint failures (network, 5xx) behave as before.
+`GET /health/deep` reports the credential in use under `capabilities.llm.credential`
+(`source`, `kind` = `adc-user` / `adc-service-account` / `adc-other` / `metadata` /
+`explicit-file`, and `fallback_active`) — never the credential itself.
 
 **The catalog lists only what the project can actually call.** The public publisher
 catalog enumerates what *exists*; Model Garden partner (MaaS) models additionally gate on
