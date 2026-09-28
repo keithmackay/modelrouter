@@ -24,4 +24,12 @@ pub struct SearchResponse {
 #[async_trait]
 pub trait SearchAdapter: Send + Sync {
     async fn search(&self, req: &SearchRequest) -> anyhow::Result<SearchResponse>;
+
+    /// The credential this adapter authenticates with, for `GET /health/deep`
+    /// — its type, source and the router's verdict, never the credential
+    /// itself. `None` (the default) for adapters with nothing beyond a static
+    /// key to report.
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        None
+    }
 }

@@ -27,9 +27,7 @@ fn provider_config_default_matches_serde_defaults() {
 }
 
 mod credential_source_config {
-    use modelrouter::config::schema::{
-        GcpCredentialSource, ProviderConfig, ResolvedGcpCredential, Settings,
-    };
+    use modelrouter::config::schema::{ProviderConfig, ResolvedGcpCredential, Settings};
 
     fn vertex(toml_body: &str) -> ProviderConfig {
         toml::from_str(toml_body).unwrap()
@@ -39,18 +37,24 @@ mod credential_source_config {
     fn parses_both_values() {
         assert_eq!(
             vertex(r#"credential_source = "adc""#).credential_source,
-            Some(GcpCredentialSource::Adc)
+            Some("adc".to_string())
         );
         assert_eq!(
             vertex(r#"credential_source = "metadata""#).credential_source,
-            Some(GcpCredentialSource::Metadata)
+            Some("metadata".to_string())
         );
     }
 
+    /// The key is generic in shape (any provider may declare values), so an
+    /// unknown value is rejected by per-provider validation, naming the values
+    /// that provider accepts.
     #[test]
-    fn unknown_value_is_a_parse_error() {
-        let err = toml::from_str::<ProviderConfig>(r#"credential_source = "gcloud""#).unwrap_err();
-        assert!(err.to_string().contains("gcloud"), "{err}");
+    fn unknown_value_is_a_validation_error() {
+        let msg = vertex(r#"credential_source = "gcloud""#).gcp_credential().unwrap_err().to_string();
+        assert!(msg.contains("gcloud") && msg.contains("adc") && msg.contains("metadata"), "{msg}");
+        let s = settings("[providers.vertex]\ncredential_source = \"gcloud\"\n");
+        let msg = s.validate_provider_credentials().unwrap_err().to_string();
+        assert!(msg.starts_with("[providers.vertex]") && msg.contains("gcloud"), "{msg}");
     }
 
     #[test]
@@ -99,7 +103,8 @@ mod credential_source_config {
     fn credential_source_on_another_provider_is_rejected() {
         let s = settings("[providers.openai]\ncredential_source = \"metadata\"\n");
         let msg = s.validate_provider_credentials().unwrap_err().to_string();
-        assert!(msg.contains("only supported for [providers.vertex]"), "{msg}");
+        assert!(msg.contains("not supported by this provider"), "{msg}");
+        assert!(msg.contains("[providers.vertex]") && msg.contains("[providers.azure]"), "{msg}");
     }
 
     #[test]
@@ -110,9 +115,40 @@ mod credential_source_config {
             "[providers.vertex]\ncredential_source = \"metadata\"\n",
             "[providers.vertex]\ncredentials_path = \"/x.json\"\n",
             "[providers.openai]\napi_key = \"k\"\n",
+            "[providers.azure]\napi_key = \"k\"\n",
+            "[providers.azure]\ncredential_source = \"managed-identity\"\nazure_client_id = \"u\"\n",
+            "[providers.foundry]\ncredential_source = \"workload-identity\"\n",
+            "[providers.bing_grounding]\ncredential_source = \"default\"\n",
         ] {
             settings(body).validate_provider_credentials().unwrap();
         }
+    }
+
+    #[test]
+    fn azure_values_are_validated_per_provider() {
+        // A GCP value on an Azure provider, and vice versa.
+        let msg = settings("[providers.foundry]\ncredential_source = \"metadata\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.starts_with("[providers.foundry]") && msg.contains("managed-identity"), "{msg}");
+        let msg = settings("[providers.vertex]\ncredential_source = \"cli\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.starts_with("[providers.vertex]"), "{msg}");
+        // Key auth and an Entra source together cannot both be meant.
+        let msg = settings("[providers.azure]\napi_key = \"k\"\ncredential_source = \"cli\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("contradictory"), "{msg}");
+        // Azure-only keys belong on Azure providers.
+        let msg = settings("[providers.vertex]\nazure_tenant_id = \"t\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("azure_tenant_id"), "{msg}");
     }
 
     #[test]

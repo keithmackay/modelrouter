@@ -173,7 +173,8 @@ mod tests {
         anyhow::Error::new(CredentialExpired {
             provider: "vertex".into(),
             credential_kind: "adc-user".into(),
-            hint: "Reauthenticate.".into(),
+            reason: "the login has expired".into(),
+            remediation: "Reauthenticate.".into(),
             detail: "invalid_grant".into(),
         })
     }

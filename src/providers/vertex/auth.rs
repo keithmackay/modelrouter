@@ -7,8 +7,9 @@
 //! file's refresh token) after construction — see [`RebuildingProvider`] for
 //! why that matters and what we do about it.
 
-use super::credentials::{
-    detect_adc_kind, CredentialChain, CredentialKind, CredentialReport, FallbackFactory,
+use super::credentials::{detect_adc_kind, CredentialKind, GcpSource};
+use crate::providers::credentials::{
+    CredentialChain, CredentialReport, CredentialSource, FallbackFactory,
 };
 use crate::config::schema::{ProviderConfig, ResolvedGcpCredential};
 use anyhow::Context;
@@ -263,39 +264,43 @@ pub struct GoogleCloudAuthProvider {
 
 impl GoogleCloudAuthProvider {
     pub fn from_config(config: &ProviderConfig) -> anyhow::Result<Self> {
+        Self::from_config_named("vertex", config)
+    }
+
+    pub fn from_config_named(provider: &str, config: &ProviderConfig) -> anyhow::Result<Self> {
         let source = config.gcp_credential()?;
-        let (primary, fallback): (Arc<dyn TokenProvider>, Option<FallbackFactory>) = match &source {
-            ResolvedGcpCredential::Adc => (
-                Arc::new(RebuildingProvider::new(Self::build_adc)?),
-                Some(Arc::new(|| {
-                    Ok(Arc::new(RebuildingProvider::new(Self::build_metadata)?)
-                        as Arc<dyn TokenProvider>)
-                })),
-            ),
-            ResolvedGcpCredential::Metadata => {
-                (Arc::new(RebuildingProvider::new(Self::build_metadata)?), None)
-            }
+        let primary: Arc<dyn TokenProvider> = match &source {
+            ResolvedGcpCredential::Adc => Arc::new(RebuildingProvider::new(Self::build_adc)?),
+            ResolvedGcpCredential::Metadata => Arc::new(RebuildingProvider::new(Self::build_metadata)?),
             ResolvedGcpCredential::ServiceAccountFile(path) => {
                 let path = path.clone();
-                (
-                    Arc::new(RebuildingProvider::new(move || Self::build_service_account(&path))?),
-                    None,
-                )
+                Arc::new(RebuildingProvider::new(move || Self::build_service_account(&path))?)
             }
         };
-        let kind: Box<dyn Fn() -> CredentialKind + Send + Sync> = match &source {
-            ResolvedGcpCredential::Adc => Box::new(detect_adc_kind),
-            ResolvedGcpCredential::Metadata => Box::new(|| CredentialKind::Metadata),
-            ResolvedGcpCredential::ServiceAccountFile(_) => Box::new(|| CredentialKind::ExplicitFile),
+        let fallback: Option<FallbackFactory> = match &source {
+            ResolvedGcpCredential::Adc => {
+                let provider = provider.to_string();
+                Some(Arc::new(move || {
+                    let mds = Arc::new(RebuildingProvider::new(Self::build_metadata)?);
+                    Ok(Arc::new(GcpSource::metadata(provider.clone(), mds)) as Arc<dyn CredentialSource>)
+                }))
+            }
+            _ => None,
+        };
+        let kind: fn() -> CredentialKind = match &source {
+            ResolvedGcpCredential::Adc => detect_adc_kind,
+            ResolvedGcpCredential::Metadata => || CredentialKind::Metadata,
+            ResolvedGcpCredential::ServiceAccountFile(_) => || CredentialKind::ExplicitFile,
         };
         tracing::info!(
+            provider,
             credential_source = ?source,
             credential_kind = kind().as_str(),
             "vertex: credential source resolved"
         );
-        Ok(Self {
-            inner: CredentialChain::new("vertex", source, primary, kind, fallback),
-        })
+        let label = GcpSource::configured_label(&source);
+        let gcp = GcpSource::new(provider, source, primary, kind, fallback);
+        Ok(Self { inner: CredentialChain::new(provider, label, Arc::new(gcp)) })
     }
 
     fn build_service_account(
@@ -341,11 +346,11 @@ impl TokenProvider for GoogleCloudAuthProvider {
     }
 
     async fn force_rebuild_token(&self) -> anyhow::Result<String> {
-        self.inner.force_rebuild_token().await
+        self.inner.force_refresh().await
     }
 
     fn credential_report(&self) -> Option<CredentialReport> {
-        self.inner.credential_report()
+        Some(self.inner.report())
     }
 }
 

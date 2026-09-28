@@ -273,8 +273,8 @@ impl VertexAdapter {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for VertexAdapter {
-    fn credential_report(&self) -> Option<serde_json::Value> {
-        self.token_provider.credential_report().map(|r| r.to_json())
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.token_provider.credential_report()
     }
 
     /// Tool forwarding is per-publisher (issue #88): Claude bodies translate

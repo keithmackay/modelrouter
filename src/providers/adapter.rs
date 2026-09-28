@@ -96,11 +96,11 @@ pub trait ProviderAdapter: Send + Sync {
         }
     }
 
-    /// Which credential this adapter is authenticating with, for
-    /// `GET /health/deep` — the credential's type and source, never the
-    /// credential itself. `None` (the default) for adapters with nothing
-    /// beyond a static key to report.
-    fn credential_report(&self) -> Option<serde_json::Value> {
+    /// The credential this adapter authenticates with, for `GET /health/deep`
+    /// — its type, source and the router's verdict, never the credential
+    /// itself. `None` (the default) for adapters with nothing beyond a static
+    /// key to report.
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
         None
     }
 }

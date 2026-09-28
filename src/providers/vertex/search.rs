@@ -238,6 +238,10 @@ impl VertexSearchAdapter {
 
 #[async_trait::async_trait]
 impl SearchAdapter for VertexSearchAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.token_provider.credential_report()
+    }
+
     async fn search(&self, req: &SearchRequest) -> anyhow::Result<SearchResponse> {
         let url = build_endpoint_url(
             &self.project,

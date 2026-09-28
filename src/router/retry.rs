@@ -193,7 +193,8 @@ mod tests {
         anyhow::Error::new(crate::providers::credential_error::CredentialExpired {
             provider: "vertex".into(),
             credential_kind: "adc-user".into(),
-            hint: "Reauthenticate.".into(),
+            reason: "the login has expired".into(),
+            remediation: "Reauthenticate.".into(),
             // Deliberately contains a 5xx-looking number: the typed check must
             // win over string matching.
             detail: "token endpoint said 500 invalid_grant".into(),

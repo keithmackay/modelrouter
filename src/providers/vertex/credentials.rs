@@ -1,6 +1,8 @@
-//! Credential-source policy for the Vertex provider: which Google credential
-//! is active, whether a token failure is permanent, and when to fall back to
-//! the metadata server.
+//! Google credentials as a [`CredentialSource`]: which Google credential is
+//! active, whether a token failure is permanent, what health should say about
+//! it, and when to fall back to the metadata server. The shared failure policy
+//! (typed `credential_expired`, dead-credential cache, spaced fallback probes,
+//! health report) lives in `providers::credentials`.
 //!
 //! Why this layer exists. Application Default Credentials checks the gcloud
 //! user file (`~/.config/gcloud/application_default_credentials.json`) BEFORE
@@ -14,7 +16,8 @@
 //! counted toward the circuit breaker, so callers saw a transient-looking
 //! "circuit breaker open" and retried for hours.
 //!
-//! [`CredentialChain`] turns that into one of two outcomes:
+//! [`GcpSource`], run through the provider-neutral `CredentialChain`, turns
+//! that into one of two outcomes:
 //! - under `credential_source = "adc"`, a reachable metadata server takes over
 //!   for the rest of the process, with a loud WARN naming the switch;
 //! - otherwise a [`CredentialExpired`] error, which the retry loop and circuit
@@ -29,10 +32,11 @@
 
 use super::auth::TokenProvider;
 use crate::config::schema::ResolvedGcpCredential;
-use crate::providers::credential_error::CredentialExpired;
+use crate::providers::credentials::{
+    CredentialSource, CredentialStatus, CredentialVerdict, FallbackFactory,
+};
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 /// Which credential is actually serving requests. Reported by deep health;
 /// names the credential type only, never any credential material.
@@ -61,6 +65,31 @@ impl CredentialKind {
             Self::AdcOther => "adc-other",
             Self::Metadata => "metadata",
             Self::ExplicitFile => "explicit-file",
+        }
+    }
+
+    /// The router's judgment of this credential type while it works.
+    pub fn verdict(self, provider: &str) -> CredentialVerdict {
+        match self {
+            Self::AdcUser => CredentialVerdict::new(
+                CredentialStatus::Warn,
+                "personal login; expires under the identity provider's reauthentication policy",
+                format!(
+                    "set credential_source = \"metadata\" under [providers.{provider}] to use the \
+                     instance's attached service account"
+                ),
+            ),
+            Self::AdcServiceAccount => {
+                CredentialVerdict::ok("service-account key found through Application Default Credentials")
+            }
+            Self::AdcOther => CredentialVerdict::new(
+                CredentialStatus::Unknown,
+                "Application Default Credentials file of a type the router does not classify \
+                 (workload identity federation, impersonation, ...)",
+                "",
+            ),
+            Self::Metadata => CredentialVerdict::ok("the instance's attached service account"),
+            Self::ExplicitFile => CredentialVerdict::ok("service-account key named by credentials_path"),
         }
     }
 }
@@ -132,295 +161,114 @@ pub(crate) fn classify_token_error(err: &anyhow::Error) -> TokenFailure {
     }
 }
 
-/// Builds the metadata-server token source used as the reauth fallback.
-pub(crate) type FallbackFactory =
-    Arc<dyn Fn() -> anyhow::Result<Arc<dyn TokenProvider>> + Send + Sync>;
-
-/// How long a fallback probe may take before we decide the metadata server is
-/// not there. Off GCE `metadata.google.internal` usually fails DNS at once,
-/// but a black-holed route would otherwise hang the request.
-pub(crate) const FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Minimum spacing between fallback probes, and how long a permanent failure
-/// is answered from memory before the configured credential is tried again.
-/// The latter keeps a broken credential from sending one refresh request to
-/// Google per incoming call, while still noticing a re-login within a minute.
-pub(crate) const RECHECK_INTERVAL: Duration = Duration::from_secs(60);
-
-#[derive(Default)]
-struct ChainState {
-    /// Set once the metadata server has taken over; never unset.
-    active_fallback: Option<Arc<dyn TokenProvider>>,
-    last_probe: Option<Instant>,
-    /// The last permanent failure and when it was seen.
-    expired: Option<(Instant, CredentialExpired)>,
-}
-
-/// See the module docs.
-pub(crate) struct CredentialChain {
+/// A Google credential as seen by the provider-neutral chain.
+///
+/// `primary` is the rebuilding `google-cloud-auth` source for the configured
+/// credential; `fallback` (kept only under ADC — an explicit `"metadata"` or
+/// service-account source means the operator chose that credential, and
+/// silently swapping it would defeat the choice) builds the metadata-server
+/// source.
+pub(crate) struct GcpSource {
     provider: String,
-    source: ResolvedGcpCredential,
+    configured: ResolvedGcpCredential,
     primary: Arc<dyn TokenProvider>,
-    primary_kind: Box<dyn Fn() -> CredentialKind + Send + Sync>,
+    kind: Box<dyn Fn() -> CredentialKind + Send + Sync>,
     fallback: Option<FallbackFactory>,
-    probe_timeout: Duration,
-    recheck_interval: Duration,
-    state: Mutex<ChainState>,
-    /// Serialises fallback probes so a burst of failing requests makes one
-    /// metadata-server call, not one each.
-    probe_lock: tokio::sync::Mutex<()>,
 }
 
-impl CredentialChain {
-    /// `fallback` is honoured only under ADC — an explicit `"metadata"` or
-    /// service-account source means the operator chose that credential, and
-    /// silently swapping it would defeat the choice.
+impl GcpSource {
     pub(crate) fn new(
         provider: impl Into<String>,
-        source: ResolvedGcpCredential,
+        configured: ResolvedGcpCredential,
         primary: Arc<dyn TokenProvider>,
-        primary_kind: impl Fn() -> CredentialKind + Send + Sync + 'static,
+        kind: impl Fn() -> CredentialKind + Send + Sync + 'static,
         fallback: Option<FallbackFactory>,
     ) -> Self {
-        let fallback = match source {
+        let fallback = match configured {
             ResolvedGcpCredential::Adc => fallback,
             _ => None,
         };
-        Self {
-            provider: provider.into(),
-            source,
-            primary,
-            primary_kind: Box::new(primary_kind),
-            fallback,
-            probe_timeout: FALLBACK_PROBE_TIMEOUT,
-            recheck_interval: RECHECK_INTERVAL,
-            state: Mutex::new(ChainState::default()),
-            probe_lock: tokio::sync::Mutex::new(()),
-        }
+        Self { provider: provider.into(), configured, primary, kind: Box::new(kind), fallback }
     }
 
-    #[cfg(test)]
-    fn with_timings(mut self, probe_timeout: Duration, recheck_interval: Duration) -> Self {
-        self.probe_timeout = probe_timeout;
-        self.recheck_interval = recheck_interval;
-        self
+    /// The metadata-server source: what `configured = Metadata` uses and what
+    /// ADC falls back to.
+    pub(crate) fn metadata(provider: impl Into<String>, primary: Arc<dyn TokenProvider>) -> Self {
+        Self::new(provider, ResolvedGcpCredential::Metadata, primary, || CredentialKind::Metadata, None)
     }
 
-    /// The credential serving requests right now.
-    pub(crate) fn active_kind(&self) -> CredentialKind {
-        if self.fallback_active() {
-            return CredentialKind::Metadata;
-        }
-        (self.primary_kind)()
-    }
-
-    pub(crate) fn fallback_active(&self) -> bool {
-        self.state.lock().unwrap().active_fallback.is_some()
-    }
-
-    fn active_fallback(&self) -> Option<Arc<dyn TokenProvider>> {
-        self.state.lock().unwrap().active_fallback.clone()
-    }
-
-    async fn fetch(&self, force: bool) -> anyhow::Result<String> {
-        if let Some(fallback) = self.active_fallback() {
-            let result = if force {
-                fallback.force_rebuild_token().await
-            } else {
-                fallback.token().await
-            };
-            return result.map_err(|e| self.escalate(e, CredentialKind::Metadata));
-        }
-
-        if let Some(expired) = self.recent_expiry() {
-            return Err(anyhow::Error::new(expired));
-        }
-
-        let result = if force {
-            self.primary.force_rebuild_token().await
-        } else {
-            self.primary.token().await
-        };
-        let err = match result {
-            Ok(token) => {
-                self.state.lock().unwrap().expired = None;
-                return Ok(token);
-            }
-            Err(err) => err,
-        };
-        if classify_token_error(&err) == TokenFailure::Transient {
-            return Err(err);
-        }
-        if let Some(token) = self.try_fallback(&err).await {
-            return Ok(token);
-        }
-        let expired = self.expired_error(&err, (self.primary_kind)());
-        tracing::error!(
-            provider = self.provider.as_str(),
-            credential = expired.credential_kind.as_str(),
-            error = %format!("{err:#}"),
-            "credential needs reauthentication and no fallback is available; failing requests \
-             with credential_expired (not retried, not counted toward the circuit breaker)"
-        );
-        self.state.lock().unwrap().expired = Some((Instant::now(), expired.clone()));
-        Err(anyhow::Error::new(expired))
-    }
-
-    fn recent_expiry(&self) -> Option<CredentialExpired> {
-        let state = self.state.lock().unwrap();
-        match &state.expired {
-            Some((at, expired)) if at.elapsed() < self.recheck_interval => Some(expired.clone()),
-            _ => None,
-        }
-    }
-
-    fn escalate(&self, err: anyhow::Error, kind: CredentialKind) -> anyhow::Error {
-        match classify_token_error(&err) {
-            TokenFailure::Transient => err,
-            TokenFailure::NeedsReauth => anyhow::Error::new(self.expired_error(&err, kind)),
-        }
-    }
-
-    fn expired_error(&self, err: &anyhow::Error, kind: CredentialKind) -> CredentialExpired {
-        if let Some(existing) = crate::providers::credential_error::find_credential_expired(err) {
-            return existing.clone();
-        }
-        let hint = match (kind, &self.source) {
-            (CredentialKind::Metadata, _) => format!(
-                "Check the service account attached to this instance and that it may call \
-                 {} (IAM role and access scopes).",
-                self.provider
-            ),
-            (_, ResolvedGcpCredential::ServiceAccountFile(_)) => {
-                "Replace or re-enable the service-account key named by credentials_path."
-                    .to_string()
-            }
-            _ => format!(
-                "Reauthenticate: gcloud auth application-default login, or set \
-                 credential_source = \"metadata\" under [providers.{}] to use the instance's \
-                 attached service account.",
-                self.provider
-            ),
-        };
-        CredentialExpired {
-            provider: self.provider.clone(),
-            credential_kind: kind.as_str().to_string(),
-            hint,
-            detail: format!("{err:#}"),
-        }
-    }
-
-    /// Try to switch to the metadata server after a reauth failure. Returns a
-    /// token from it on success; `None` when there is no fallback, it was
-    /// probed too recently, or it is unreachable.
-    async fn try_fallback(&self, cause: &anyhow::Error) -> Option<String> {
-        let factory = self.fallback.as_ref()?;
-        let _probe = self.probe_lock.lock().await;
-
-        // Another request switched over while we waited for the probe lock.
-        if let Some(fallback) = self.active_fallback() {
-            return fallback.token().await.ok();
-        }
-        {
-            let mut state = self.state.lock().unwrap();
-            if let Some(last) = state.last_probe {
-                if last.elapsed() < self.recheck_interval {
-                    return None;
-                }
-            }
-            state.last_probe = Some(Instant::now());
-        }
-
-        let probe = async {
-            let provider = factory()?;
-            let token = provider.token().await?;
-            Ok::<_, anyhow::Error>((provider, token))
-        };
-        match tokio::time::timeout(self.probe_timeout, probe).await {
-            Ok(Ok((provider, token))) => {
-                tracing::warn!(
-                    provider = self.provider.as_str(),
-                    from = (self.primary_kind)().as_str(),
-                    to = CredentialKind::Metadata.as_str(),
-                    cause = %format!("{cause:#}"),
-                    "CREDENTIAL FALLBACK: the Application Default Credential needs interactive \
-                     reauthentication; switching to the metadata server's attached service \
-                     account for the rest of this process. Set credential_source = \"metadata\" \
-                     to make this explicit, or reauthenticate and restart to go back."
-                );
-                let mut state = self.state.lock().unwrap();
-                state.active_fallback = Some(provider);
-                state.expired = None;
-                Some(token)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    provider = self.provider.as_str(),
-                    error = %format!("{e:#}"),
-                    "metadata-server fallback is not available"
-                );
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    provider = self.provider.as_str(),
-                    timeout_secs = self.probe_timeout.as_secs(),
-                    "metadata-server fallback did not answer in time"
-                );
-                None
-            }
+    /// The configured source as health reports it.
+    pub(crate) fn configured_label(configured: &ResolvedGcpCredential) -> &'static str {
+        match configured {
+            ResolvedGcpCredential::Adc => "adc",
+            ResolvedGcpCredential::Metadata => "metadata",
+            ResolvedGcpCredential::ServiceAccountFile(_) => "explicit-file",
         }
     }
 }
 
 #[async_trait]
-impl TokenProvider for CredentialChain {
+impl CredentialSource for GcpSource {
     async fn token(&self) -> anyhow::Result<String> {
-        self.fetch(false).await
+        self.primary.token().await
     }
 
-    async fn force_rebuild_token(&self) -> anyhow::Result<String> {
-        self.fetch(true).await
+    async fn force_refresh(&self) -> anyhow::Result<String> {
+        self.primary.force_rebuild_token().await
     }
 
-    fn credential_report(&self) -> Option<CredentialReport> {
-        Some(CredentialReport {
-            source: match self.source {
-                ResolvedGcpCredential::Adc => "adc",
-                ResolvedGcpCredential::Metadata => "metadata",
-                ResolvedGcpCredential::ServiceAccountFile(_) => "explicit-file",
-            },
-            kind: self.active_kind(),
-            fallback_active: self.fallback_active(),
-        })
+    fn kind(&self) -> String {
+        (self.kind)().as_str().to_string()
     }
-}
 
-/// What deep health reports about a provider's credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CredentialReport {
-    /// The configured source (`adc`, `metadata`, `explicit-file`).
-    pub source: &'static str,
-    /// The credential actually in use.
-    pub kind: CredentialKind,
-    /// Whether the metadata-server reauth fallback has taken over.
-    pub fallback_active: bool,
-}
+    fn is_reauth_required(&self, err: &anyhow::Error) -> bool {
+        classify_token_error(err) == TokenFailure::NeedsReauth
+    }
 
-impl CredentialReport {
-    pub fn to_json(self) -> serde_json::Value {
-        serde_json::json!({
-            "source": self.source,
-            "kind": self.kind.as_str(),
-            "fallback_active": self.fallback_active,
-        })
+    fn verdict(&self) -> CredentialVerdict {
+        (self.kind)().verdict(&self.provider)
+    }
+
+    fn expired_guidance(&self) -> (String, String) {
+        match ((self.kind)(), &self.configured) {
+            (CredentialKind::Metadata, _) => (
+                "the instance's attached service account was refused".to_string(),
+                format!(
+                    "Check the service account attached to this instance and that it may call \
+                     {} (IAM role and access scopes).",
+                    self.provider
+                ),
+            ),
+            (_, ResolvedGcpCredential::ServiceAccountFile(_)) => (
+                "the service-account key was refused".to_string(),
+                "Replace or re-enable the service-account key named by credentials_path.".to_string(),
+            ),
+            _ => (
+                "the Application Default Credential can no longer be refreshed without \
+                 interactive reauthentication"
+                    .to_string(),
+                format!(
+                    "Reauthenticate: gcloud auth application-default login, or set \
+                     credential_source = \"metadata\" under [providers.{}] to use the instance's \
+                     attached service account.",
+                    self.provider
+                ),
+            ),
+        }
+    }
+
+    fn fallback(&self) -> Option<FallbackFactory> {
+        self.fallback.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::credential_error::find_credential_expired;
+    use crate::providers::credentials::CredentialChain;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     const REAUTH_BODY: &str = r#"failed to refresh user access token, body=<{"error":"invalid_grant","error_description":"reauth related error (invalid_rapt)","error_subtype":"invalid_rapt"}>"#;
 
@@ -450,10 +298,10 @@ mod tests {
         }
     }
 
-    fn factory_for(provider: Arc<Scripted>, builds: Arc<AtomicUsize>) -> FallbackFactory {
+    fn metadata_factory(provider: Arc<Scripted>, builds: Arc<AtomicUsize>) -> FallbackFactory {
         Arc::new(move || {
             builds.fetch_add(1, Ordering::SeqCst);
-            Ok(provider.clone() as Arc<dyn TokenProvider>)
+            Ok(Arc::new(GcpSource::metadata("vertex", provider.clone())) as Arc<dyn CredentialSource>)
         })
     }
 
@@ -463,7 +311,9 @@ mod tests {
         kind: CredentialKind,
         fallback: Option<FallbackFactory>,
     ) -> CredentialChain {
-        CredentialChain::new("vertex", source, primary, move || kind, fallback)
+        let label = GcpSource::configured_label(&source);
+        let gcp = GcpSource::new("vertex", source, primary, move || kind, fallback);
+        CredentialChain::new("vertex", label, Arc::new(gcp))
             .with_timings(Duration::from_secs(1), Duration::ZERO)
     }
 
@@ -525,18 +375,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn every_kind_maps_to_a_verdict() {
+        use CredentialStatus::*;
+        for (kind, status) in [
+            (CredentialKind::AdcUser, Warn),
+            (CredentialKind::AdcServiceAccount, Ok),
+            (CredentialKind::AdcOther, Unknown),
+            (CredentialKind::Metadata, Ok),
+            (CredentialKind::ExplicitFile, Ok),
+        ] {
+            let v = kind.verdict("vertex");
+            assert_eq!(v.status, status, "{kind:?}");
+            assert!(!v.reason.is_empty(), "{kind:?}");
+        }
+        let user = CredentialKind::AdcUser.verdict("vertex");
+        assert!(user.reason.contains("personal login"), "{}", user.reason);
+        assert!(user.remediation.contains("credential_source = \"metadata\""), "{}", user.remediation);
+    }
+
     #[tokio::test]
-    async fn healthy_primary_is_used_and_fallback_never_built() {
+    async fn healthy_adc_user_is_used_reported_warn_and_fallback_never_built() {
         let builds = Arc::new(AtomicUsize::new(0));
         let c = chain(
             ResolvedGcpCredential::Adc,
             Scripted::ok("user-token"),
             CredentialKind::AdcUser,
-            Some(factory_for(Scripted::ok("mds-token"), builds.clone())),
+            Some(metadata_factory(Scripted::ok("mds-token"), builds.clone())),
         );
         assert_eq!(c.token().await.unwrap(), "user-token");
         assert_eq!(builds.load(Ordering::SeqCst), 0);
-        assert_eq!(c.active_kind(), CredentialKind::AdcUser);
+        let json = c.report().to_json();
+        assert_eq!(json["kind"], "adc-user");
+        assert_eq!(json["status"], "warn");
+        assert_eq!(json["source"], "adc");
     }
 
     #[tokio::test]
@@ -548,22 +420,20 @@ mod tests {
             ResolvedGcpCredential::Adc,
             primary.clone(),
             CredentialKind::AdcUser,
-            Some(factory_for(mds.clone(), builds.clone())),
+            Some(metadata_factory(mds.clone(), builds.clone())),
         );
 
         assert_eq!(c.token().await.unwrap(), "mds-token");
-        assert_eq!(c.active_kind(), CredentialKind::Metadata);
         assert!(c.fallback_active());
-
-        // Later calls go straight to the metadata server.
         assert_eq!(c.token().await.unwrap(), "mds-token");
-        assert_eq!(c.force_rebuild_token().await.unwrap(), "mds-token");
+        assert_eq!(c.force_refresh().await.unwrap(), "mds-token");
         assert_eq!(primary.calls(), 1, "primary must not be asked again after the switch");
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        let report = c.credential_report().unwrap();
-        assert_eq!(report.to_json()["kind"], "metadata");
-        assert_eq!(report.to_json()["source"], "adc");
-        assert_eq!(report.to_json()["fallback_active"], true);
+        let json = c.report().to_json();
+        assert_eq!(json["kind"], "metadata");
+        assert_eq!(json["source"], "adc");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["fallback_active"], true);
     }
 
     #[tokio::test]
@@ -572,41 +442,20 @@ mod tests {
             ResolvedGcpCredential::Adc,
             Scripted::err(REAUTH_BODY),
             CredentialKind::AdcUser,
-            Some(factory_for(
+            Some(metadata_factory(
                 Scripted::err("dns error: metadata.google.internal"),
                 Arc::new(AtomicUsize::new(0)),
             )),
         );
         let err = c.token().await.unwrap_err();
-        let expired = crate::providers::credential_error::find_credential_expired(&err)
-            .expect("must be the typed permanent error");
+        let expired = find_credential_expired(&err).expect("must be the typed permanent error");
         assert_eq!(expired.credential_kind, "adc-user");
-        assert!(expired.hint.contains("gcloud auth application-default login"), "{}", expired.hint);
-        assert!(expired.hint.contains("credential_source = \"metadata\""), "{}", expired.hint);
+        assert!(expired.remediation.contains("gcloud auth application-default login"), "{}", expired.remediation);
+        assert!(expired.remediation.contains("credential_source = \"metadata\""), "{}", expired.remediation);
+        assert!(expired.reason.contains("reauthentication"), "{}", expired.reason);
         assert!(expired.detail.contains("invalid_rapt"), "{}", expired.detail);
         assert!(!c.fallback_active());
-    }
-
-    #[tokio::test]
-    async fn a_hanging_metadata_server_does_not_hang_the_request() {
-        struct Hangs;
-        #[async_trait]
-        impl TokenProvider for Hangs {
-            async fn token(&self) -> anyhow::Result<String> {
-                std::future::pending().await
-            }
-        }
-        let factory: FallbackFactory = Arc::new(|| Ok(Arc::new(Hangs) as Arc<dyn TokenProvider>));
-        let c = CredentialChain::new(
-            "vertex",
-            ResolvedGcpCredential::Adc,
-            Scripted::err(REAUTH_BODY),
-            || CredentialKind::AdcUser,
-            Some(factory),
-        )
-        .with_timings(Duration::from_millis(20), Duration::ZERO);
-        let err = c.token().await.unwrap_err();
-        assert!(crate::providers::credential_error::find_credential_expired(&err).is_some());
+        assert_eq!(c.report().to_json()["status"], "expired");
     }
 
     #[tokio::test]
@@ -616,10 +465,10 @@ mod tests {
             ResolvedGcpCredential::Adc,
             Scripted::err("error sending request: connection reset"),
             CredentialKind::AdcUser,
-            Some(factory_for(Scripted::ok("mds-token"), builds.clone())),
+            Some(metadata_factory(Scripted::ok("mds-token"), builds.clone())),
         );
         let err = c.token().await.unwrap_err();
-        assert!(crate::providers::credential_error::find_credential_expired(&err).is_none());
+        assert!(find_credential_expired(&err).is_none());
         assert!(err.to_string().contains("connection reset"));
         assert_eq!(builds.load(Ordering::SeqCst), 0, "a transient error must not trigger fallback");
     }
@@ -639,49 +488,13 @@ mod tests {
                 source,
                 Scripted::err(REAUTH_BODY),
                 kind,
-                Some(factory_for(Scripted::ok("mds-token"), builds.clone())),
+                Some(metadata_factory(Scripted::ok("mds-token"), builds.clone())),
             );
             let err = c.token().await.unwrap_err();
-            let expired = crate::providers::credential_error::find_credential_expired(&err).unwrap();
+            let expired = find_credential_expired(&err).unwrap();
             assert_eq!(expired.credential_kind, kind.as_str());
-            assert!(expired.hint.contains(hint), "{}", expired.hint);
+            assert!(expired.remediation.contains(hint), "{}", expired.remediation);
             assert_eq!(builds.load(Ordering::SeqCst), 0);
         }
-    }
-
-    #[tokio::test]
-    async fn a_permanent_failure_is_answered_from_memory_within_the_recheck_interval() {
-        let primary = Scripted::err(REAUTH_BODY);
-        let c = CredentialChain::new(
-            "vertex",
-            ResolvedGcpCredential::Adc,
-            primary.clone(),
-            || CredentialKind::AdcUser,
-            None,
-        )
-        .with_timings(Duration::from_secs(1), Duration::from_secs(3600));
-        for _ in 0..5 {
-            let err = c.token().await.unwrap_err();
-            assert!(crate::providers::credential_error::find_credential_expired(&err).is_some());
-        }
-        assert_eq!(primary.calls(), 1, "a known-dead credential must not be refreshed per request");
-    }
-
-    #[tokio::test]
-    async fn fallback_probes_are_spaced_by_the_recheck_interval() {
-        let builds = Arc::new(AtomicUsize::new(0));
-        let c = CredentialChain::new(
-            "vertex",
-            ResolvedGcpCredential::Adc,
-            Scripted::err(REAUTH_BODY),
-            || CredentialKind::AdcUser,
-            Some(factory_for(Scripted::err("no metadata server"), builds.clone())),
-        )
-        // The second call lands inside the interval: it must neither probe
-        // the metadata server again nor refresh the dead credential.
-        .with_timings(Duration::from_secs(1), Duration::from_secs(3600));
-        c.token().await.unwrap_err();
-        c.force_rebuild_token().await.unwrap_err();
-        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 }

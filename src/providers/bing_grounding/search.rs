@@ -47,7 +47,8 @@ use anyhow::Context;
 use std::sync::Arc;
 
 use crate::config::schema::ProviderConfig;
-use crate::providers::azure_entra::{EntraTokenProvider, TokenProvider, FOUNDRY_PROJECT_SCOPE};
+use crate::providers::azure_credentials::AzureAuth as FoundryAuth;
+use crate::providers::azure_entra::{TokenProvider, FOUNDRY_PROJECT_SCOPE};
 use crate::providers::search::{SearchAdapter, SearchRequest, SearchResponse, SearchResultItem};
 
 /// Path of the GA ("v1") Responses surface on a Foundry project endpoint.
@@ -88,14 +89,6 @@ const EXTRACTION_INSTRUCTION: &str = "Search the web and report what you find fo
 Use only information retrieved from the web tool, never prior knowledge, and cite every source. \
 For each relevant source, state in one or two sentences what it says about the query.\n\nQuery: ";
 
-/// How the request authenticates to the Foundry data plane.
-enum FoundryAuth {
-    /// Intended mode: no secret on disk.
-    Entra(Arc<dyn TokenProvider>),
-    /// Explicit opt-in, selected by setting a non-empty `api_key`.
-    ApiKey(String),
-}
-
 pub struct BingGroundingAdapter {
     endpoint: String,
     api_version: Option<String>,
@@ -109,31 +102,16 @@ pub struct BingGroundingAdapter {
 
 impl BingGroundingAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
-        let auth = if config.api_key.trim().is_empty() {
-            // A Foundry PROJECT endpoint (`/api/projects/<project>`), whose
-            // documented audience is `https://ai.azure.com/.default` — not the
-            // `cognitiveservices` audience the resource-level inference
-            // endpoints take. See `providers::azure_entra` for both constants.
-            let provider = EntraTokenProvider::from_env(
-                FOUNDRY_PROJECT_SCOPE,
-                std::time::Duration::from_secs(
-                    config.timeout_secs.min(RECOMMENDED_TIMEOUT_SECS),
-                ),
-            )?;
-            tracing::debug!(
-                credential_source = provider.source_label(),
-                scope = provider.scope(),
-                "bing_grounding: authenticating with Entra"
-            );
-            FoundryAuth::Entra(Arc::new(provider) as Arc<dyn TokenProvider>)
-        } else {
-            tracing::info!(
-                "bing_grounding: `api_key` is set, so key auth is used instead of Entra. \
-                 Entra (managed identity or an app registration in the environment) is the \
-                 intended mode — a key in config.toml is a secret at rest."
-            );
-            FoundryAuth::ApiKey(config.api_key.trim().to_string())
-        };
+        // A Foundry PROJECT endpoint (`/api/projects/<project>`), whose
+        // documented audience is `https://ai.azure.com/.default` — not the
+        // `cognitiveservices` audience the resource-level inference endpoints
+        // take. See `providers::azure_entra` for both constants.
+        let auth = FoundryAuth::entra_by_default(
+            "bing_grounding",
+            config,
+            FOUNDRY_PROJECT_SCOPE,
+            std::time::Duration::from_secs(config.timeout_secs.clamp(1, RECOMMENDED_TIMEOUT_SECS)),
+        )?;
         Self::build(config, auth)
     }
 
@@ -410,6 +388,10 @@ pub fn parse_responses_payload(
 
 #[async_trait::async_trait]
 impl SearchAdapter for BingGroundingAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.auth.credential_report()
+    }
+
     async fn search(&self, req: &SearchRequest) -> anyhow::Result<SearchResponse> {
         let url = self.responses_url();
         let body = self.build_body(req);
@@ -427,14 +409,8 @@ impl SearchAdapter for BingGroundingAdapter {
             .client
             .post(&url)
             .header("Content-Type", "application/json");
-        request = match &self.auth {
-            FoundryAuth::Entra(provider) => {
-                let token = provider.token().await?;
-                request.bearer_auth(token)
-            }
-            // Foundry accepts a resource key in `api-key` on the same surface.
-            FoundryAuth::ApiKey(key) => request.header("api-key", key),
-        };
+        // Foundry accepts a resource key in `api-key` on the same surface.
+        request = self.auth.apply(request).await?;
 
         let started = std::time::Instant::now();
         let resp = request.json(&body).send().await.with_context(|| {

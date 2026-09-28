@@ -2,6 +2,8 @@ use anyhow::Context;
 use futures::TryStreamExt;
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
+use crate::providers::azure_credentials::AzureAuth;
+use crate::providers::azure_entra::COGNITIVE_SERVICES_SCOPE;
 use crate::providers::adapter::{
     CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
 };
@@ -11,7 +13,9 @@ use crate::providers::adapter::{
 const DEFAULT_API_VERSION: &str = "2024-02-01";
 
 pub struct AzureOpenAIAdapter {
-    api_key: String,
+    /// The `api-key` header by default; a Microsoft Entra bearer token when
+    /// `credential_source` is set under `[providers.azure]`.
+    auth: AzureAuth,
     api_base: String,
     api_version: String,
     client: reqwest::Client,
@@ -20,7 +24,34 @@ pub struct AzureOpenAIAdapter {
 }
 
 impl AzureOpenAIAdapter {
+    /// Infallible constructor kept for existing callers; panics where
+    /// [`Self::try_new`] would return an error.
     pub fn new(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig) -> Self {
+        Self::try_new(config, tier_timeouts).unwrap_or_else(|e| panic!("{e:#}"))
+    }
+
+    /// Build from config. Key auth (`api-key` header) unless
+    /// `credential_source` selects an Entra credential, in which case the
+    /// audience is `entra_scope` or the Azure OpenAI default,
+    /// `https://cognitiveservices.azure.com/.default`.
+    pub fn try_new(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig) -> anyhow::Result<Self> {
+        let scope = config
+            .entra_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(COGNITIVE_SERVICES_SCOPE);
+        let auth = AzureAuth::key_by_default(
+            "azure",
+            config,
+            scope,
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+        )?;
+        Ok(Self::with_auth(config, tier_timeouts, auth))
+    }
+
+    /// Build with a caller-chosen auth mode (tests).
+    pub fn with_auth(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig, auth: AzureAuth) -> Self {
         let api_base = config.api_base.clone().unwrap_or_else(|| {
             panic!(
                 "Azure OpenAI adapter requires `api_base` to be set. \
@@ -37,7 +68,7 @@ impl AzureOpenAIAdapter {
             .build()
             .expect("Failed to build reqwest client");
         Self {
-            api_key: config.api_key.clone(),
+            auth,
             api_base,
             api_version,
             client,
@@ -122,6 +153,10 @@ struct AzurePromptTokensDetails {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for AzureOpenAIAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.auth.credential_report()
+    }
+
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         let body = Self::build_body(req);
 
@@ -129,8 +164,11 @@ impl ProviderAdapter for AzureOpenAIAdapter {
         let dispatched = std::time::Instant::now();
         let resp = self
             .client
-            .post(self.chat_url())
-            .header("api-key", &self.api_key)
+            .post(self.chat_url());
+        let resp = self
+            .auth
+            .apply(resp)
+            .await?
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
@@ -179,8 +217,11 @@ impl ProviderAdapter for AzureOpenAIAdapter {
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
             .client
-            .post(self.chat_url())
-            .header("api-key", &self.api_key)
+            .post(self.chat_url());
+        let resp = self
+            .auth
+            .apply(resp)
+            .await?
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()

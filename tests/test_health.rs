@@ -2,7 +2,7 @@ mod common;
 
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
-use modelrouter::config::schema::{CacheConfig, Settings};
+use modelrouter::config::schema::{CacheConfig, ProviderConfig, Settings};
 use modelrouter::providers::{
     embed_registry::EmbeddingRegistry, registry::ProviderRegistry, search::SearchResultItem,
     search_registry::SearchRegistry,
@@ -94,6 +94,15 @@ async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
 /// search engines are configured independently of each other, none of which
 /// `test_app` above exposes.
 async fn test_app_with(settings: Settings, search_registry: SearchRegistry) -> TestServer {
+    test_app_with_registries(settings, search_registry, ProviderRegistry::new(HashMap::new())).await
+}
+
+/// As `test_app_with`, with a caller-supplied provider registry.
+async fn test_app_with_registries(
+    settings: Settings,
+    search_registry: SearchRegistry,
+    provider_registry: ProviderRegistry,
+) -> TestServer {
     let db = common::in_memory_db().await;
     let settings = Arc::new(settings);
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
@@ -105,7 +114,7 @@ async fn test_app_with(settings: Settings, search_registry: SearchRegistry) -> T
         pool: None,
         router: Arc::new(RequestRouter::new(settings.clone())),
         cost_calc: Arc::new(CostCalculator::new()),
-        provider_registry: Arc::new(ProviderRegistry::new(HashMap::new())),
+        provider_registry: Arc::new(provider_registry),
         policy: Arc::new(PolicyEngine::new(db.clone())),
         fallback: Arc::new(FallbackChain::new(HashMap::new())),
         complexity_router: Arc::new(ComplexityRouter::new(None)),
@@ -337,4 +346,50 @@ async fn deep_health_second_call_within_ttl_is_served_cached() {
     let second: serde_json::Value = server.get("/health/deep").await.json();
     assert_eq!(second["cached"], true, "default TTL is 60s — no re-probe");
     assert_eq!(second["checked_at"], first["checked_at"], "same probe run");
+}
+
+// ── GET /health/deep credential inventory ────────────────────────────────────
+
+/// Every configured provider that holds a managed credential is listed with
+/// its provider-neutral verdict, whether or not a probe exercised it. The
+/// listing reads cached state only: nothing here reaches a token endpoint.
+#[tokio::test]
+async fn deep_health_lists_every_configured_credential() {
+    let mut settings = Settings::default();
+    settings.providers.insert(
+        "azure".to_string(),
+        ProviderConfig {
+            api_base: Some("https://example.invalid/openai/deployments/d".to_string()),
+            credential_source: Some("managed-identity".to_string()),
+            ..Default::default()
+        },
+    );
+    // Key auth holds no managed credential, so it is not listed.
+    settings.providers.insert(
+        "openai".to_string(),
+        ProviderConfig { api_key: "k".to_string(), ..Default::default() },
+    );
+    let registry = ProviderRegistry::new(settings.providers.clone());
+    let server =
+        test_app_with_registries(settings, mock_search_registry_health(&["tavily"]), registry).await;
+
+    let body: serde_json::Value = server.get("/health/deep").await.json();
+    let rows = body["credentials"].as_array().expect("credentials list");
+    assert_eq!(rows.len(), 1, "{body:#}");
+    let row = &rows[0];
+    assert_eq!(row["provider"], "azure");
+    assert_eq!(row["capability"], "llm");
+    assert_eq!(row["status"], "ok");
+    assert_eq!(row["source"], "managed-identity");
+    assert_eq!(row["kind"], "azure-managed-identity");
+    assert_eq!(row["fallback_active"], false);
+    assert!(row["reason"].as_str().is_some_and(|r| !r.is_empty()), "{row}");
+    assert!(row.get("remediation").is_some(), "{row}");
+}
+
+#[tokio::test]
+async fn deep_health_credentials_is_empty_without_managed_credentials() {
+    let server = test_app(CacheConfig::default(), true).await;
+    let body: serde_json::Value = server.get("/health/deep").await.json();
+    assert_eq!(body["credentials"], serde_json::json!([]), "{body:#}");
 }

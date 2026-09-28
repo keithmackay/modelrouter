@@ -67,7 +67,12 @@ pub struct FoundryAdapter {
 impl FoundryAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        let auth = FoundryAuth::from_config(config, endpoint.scope())?;
+        let auth = FoundryAuth::entra_by_default(
+            "foundry",
+            config,
+            endpoint.scope(),
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+        )?;
         Self::build(endpoint, auth, config)
     }
 
@@ -237,6 +242,10 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
 
 #[async_trait::async_trait]
 impl ProviderAdapter for FoundryAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.auth.credential_report()
+    }
+
     /// Settings forwarded as normalized; the timeout is the configured ceiling.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {

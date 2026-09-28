@@ -23,7 +23,7 @@ pub const CREDENTIAL_EXPIRED_CODE: &str = "credential_expired";
 #[derive(Debug, Clone, thiserror::Error)]
 #[error(
     "{code}: the {provider} credential ({credential_kind}) can no longer be refreshed and needs \
-     human action. {hint} Upstream said: {detail}",
+     human action: {reason}. {remediation} Upstream said: {detail}",
     code = CREDENTIAL_EXPIRED_CODE
 )]
 pub struct CredentialExpired {
@@ -31,8 +31,12 @@ pub struct CredentialExpired {
     pub provider: String,
     /// Which credential failed, e.g. `adc-user` (never the credential itself).
     pub credential_kind: String,
-    /// What the operator should do about it.
-    pub hint: String,
+    /// Short, provider-neutral statement of what is wrong. Carried in the 401
+    /// body so a caller can show it without knowing anything about the
+    /// provider behind the router.
+    pub reason: String,
+    /// What an operator should do about it.
+    pub remediation: String,
     /// The identity provider's own error text (error code and description;
     /// never token material).
     pub detail: String,
@@ -54,7 +58,8 @@ mod tests {
         CredentialExpired {
             provider: "vertex".into(),
             credential_kind: "adc-user".into(),
-            hint: "Reauthenticate.".into(),
+            reason: "the login has expired".into(),
+            remediation: "Reauthenticate.".into(),
             detail: "invalid_grant".into(),
         }
     }

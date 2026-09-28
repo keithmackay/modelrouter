@@ -207,14 +207,18 @@ Which data plane you get is decided by the path you configure:
 
 The Model Inference API is documented as deprecated in favour of the OpenAI-compatible one, so a bare host resolves to the latter. Set `api_version` only to override the per-surface default.
 
-**2. Set up authentication.** Credentials come from the environment, never from `config.toml` — the same chain the Bing grounding adapter uses, sharing the same code. In order:
+**2. Set up authentication.** Pick a Microsoft Entra credential with `credential_source` in the provider table — the same sources the Bing grounding adapter and `[providers.azure]` use, sharing the same code. Full table, config keys and a live-test checklist: README, *Azure credentials* (implemented from Microsoft's documentation; not yet exercised against a live Azure endpoint).
 
-1. **App registration** — `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` present in the environment. The router requests a token from `{AZURE_AUTHORITY_HOST}/{tenant}/oauth2/v2.0/token`.
-2. **Managed identity** — the fallback when the trio is absent. IMDS at `http://169.254.169.254/metadata/identity/oauth2/token`. Set `AZURE_CLIENT_ID` alone for a user-assigned identity.
+- `"managed-identity"` — App Service / Container Apps (`IDENTITY_ENDPOINT` + `IDENTITY_HEADER`) or the VM/AKS metadata service. `azure_client_id` selects a user-assigned identity.
+- `"workload-identity"` — AKS workload identity: the federated token file (`AZURE_FEDERATED_TOKEN_FILE`) exchanged for an Entra token.
+- `"client-secret"` — an app registration secret (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`).
+- `"cli"` — your own `az login`; convenient on a laptop, reported as `warn` by `/health/deep`.
+- `"default"` — the first of those that resolves (client secret → workload identity → managed identity → CLI).
+- unset — the environment: the client-secret trio when all three variables are set, otherwise managed identity.
 
-Grant the identity the **Azure AI User** role (or equivalent) on the resource. Tokens are cached in-process and refreshed five minutes before expiry.
+Grant the identity the **Azure AI User** role (or equivalent) on the resource. Tokens are cached in-process and refreshed early (five minutes before expiry, or at half their lifetime for short-lived tokens).
 
-The **audience** is derived from the endpoint: a resource endpoint gets `https://cognitiveservices.azure.com/.default` (what the published OpenAPI documents declare), a project endpoint gets `https://ai.azure.com/.default`. Microsoft's own keyless-auth how-to shows `ai.azure.com` for resource endpoints as well, so where the spec and the prose disagree, `entra_scope` in the provider table overrides the derived value. The resolved scope is logged at startup alongside `credential_source`, and named in any 401/403 — start there when troubleshooting.
+The **audience** is derived from the endpoint: a resource endpoint gets `https://cognitiveservices.azure.com/.default` (what the published OpenAPI documents declare), a project endpoint gets `https://ai.azure.com/.default`. Microsoft's own keyless-auth how-to shows `ai.azure.com` for resource endpoints as well, so where the spec and the prose disagree, `entra_scope` in the provider table overrides the derived value. The resolved scope is logged at startup alongside `credential_source` and `credential_kind`, and named in any 401/403 — start there when troubleshooting.
 
 Setting `api_key` in the provider table switches to resource-key auth (`api-key` header) instead. It works, but it puts a secret on disk; Entra is the intended mode.
 
@@ -259,12 +263,9 @@ The adapter is compiled in by default; `cargo build --release --features bing-gr
 
 **1. Provision and connect the resource.** In the Azure portal, create a *Grounding with Bing Search* resource in the same resource group as your Foundry project, then add it to the project as a connection. Copy the **project endpoint** and the **connection id** from the project's overview and Connected resources pages. You also need the name of a **model deployment** in that project for the tool to run on — note that `gpt-4o-mini (2024-07-18)` and the `gpt-5` family are documented as unsupported by this tool.
 
-**2. Set up authentication.** Credentials come from the environment, never from `config.toml`, mirroring the Vertex ADC pattern. The adapter picks, in order:
+**2. Set up authentication.** `credential_source` in the provider table picks the Microsoft Entra credential — the same values as the Foundry provider above (`managed-identity`, `workload-identity`, `client-secret`, `cli`, `default`). Unset reads the environment: `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` when all three are set, otherwise managed identity (IMDS, resource `https://ai.azure.com`). The token audience is `https://ai.azure.com/.default`.
 
-1. **App registration** — `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` present in the environment. The router requests a token from `{AZURE_AUTHORITY_HOST}/{tenant}/oauth2/v2.0/token` for scope `https://ai.azure.com/.default`.
-2. **Managed identity** — the fallback when the trio is absent. IMDS at `http://169.254.169.254/metadata/identity/oauth2/token`, resource `https://ai.azure.com`. Set `AZURE_CLIENT_ID` alone for a user-assigned identity.
-
-Grant the identity the **Azure AI User** role on the Foundry project. Tokens are cached in-process and refreshed five minutes before expiry. The chosen credential source is logged at startup (`credential_source=client_credentials|managed_identity`), and acquisition failures log the endpoint and the AADSTS body — start there when troubleshooting.
+Grant the identity the **Azure AI User** role on the Foundry project. The chosen source is logged at startup (`azure: Entra credential configured`, with `credential_source` and `credential_kind`), and `GET /health/deep` lists it under `credentials` with a status and remediation. A credential that needs interactive sign-in fails with HTTP 401 `credential_expired`, whose `remediation` says what to change. Other token failures log the endpoint and the AADSTS body — start there when troubleshooting.
 
 Setting `api_key` in the provider table switches to resource-key auth (`api-key` header) instead. It works, but it puts a secret on disk; Entra is the intended mode.
 

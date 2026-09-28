@@ -221,6 +221,10 @@ impl VertexEmbeddingAdapter {
 
 #[async_trait::async_trait]
 impl EmbeddingAdapter for VertexEmbeddingAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.token_provider.credential_report()
+    }
+
     async fn embed(&self, req: &EmbeddingRequest) -> anyhow::Result<EmbeddingResult> {
         // Strip any publisher prefix the router carried through
         // ("google/text-embedding-005"); the publisher is already in the URL.

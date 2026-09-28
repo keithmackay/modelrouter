@@ -27,6 +27,28 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // A credential that needs a human is not a gateway fault: 401 with a
+        // stable code tells the caller "stop retrying, go fix auth" instead of
+        // the 502 that invites a retry loop. The body carries the router's own
+        // provider-neutral reason and remediation, so a caller can act on it
+        // without knowing which provider or platform is behind the router.
+        if let ApiError::ProviderError(e) = &self {
+            if let Some(expired) = crate::providers::credential_error::find_credential_expired(e) {
+                let code = crate::providers::credential_error::CREDENTIAL_EXPIRED_CODE;
+                let body = json!({
+                    "error": {
+                        "message": expired.to_string(),
+                        "type": code,
+                        "code": code,
+                        "provider": expired.provider,
+                        "credential_kind": expired.credential_kind,
+                        "reason": expired.reason,
+                        "remediation": expired.remediation,
+                    }
+                });
+                return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+            }
+        }
         let (status, message, code) = match &self {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -39,17 +61,7 @@ impl IntoResponse for ApiError {
                 "forbidden",
             ),
             ApiError::ProviderError(e) => {
-                // A credential that needs a human is not a gateway fault: 401
-                // with a stable code tells the caller "stop retrying, go fix
-                // auth" instead of the 502 that invites a retry loop.
-                match crate::providers::credential_error::find_credential_expired(e) {
-                    Some(expired) => (
-                        StatusCode::UNAUTHORIZED,
-                        expired.to_string(),
-                        crate::providers::credential_error::CREDENTIAL_EXPIRED_CODE,
-                    ),
-                    None => (StatusCode::BAD_GATEWAY, e.to_string(), "provider_error"),
-                }
+                (StatusCode::BAD_GATEWAY, e.to_string(), "provider_error")
             }
             ApiError::InvalidRequest(msg) => {
                 (StatusCode::BAD_REQUEST, msg.clone(), "invalid_request")
@@ -119,7 +131,8 @@ mod tests {
         let inner: anyhow::Result<()> = Err(anyhow::Error::new(CredentialExpired {
             provider: "vertex".into(),
             credential_kind: "adc-user".into(),
-            hint: "Reauthenticate: gcloud auth application-default login.".into(),
+            reason: "the login has expired".into(),
+            remediation: "Reauthenticate: gcloud auth application-default login.".into(),
             detail: "invalid_grant".into(),
         }));
         let err = inner.context("failed to send request").unwrap_err();
@@ -127,6 +140,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "credential_expired");
         assert_eq!(body["error"]["type"], "credential_expired");
+        assert_eq!(body["error"]["provider"], "vertex");
+        assert_eq!(body["error"]["credential_kind"], "adc-user");
+        assert_eq!(body["error"]["reason"], "the login has expired");
+        assert_eq!(
+            body["error"]["remediation"],
+            "Reauthenticate: gcloud auth application-default login."
+        );
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("gcloud auth application-default login"), "{msg}");
     }

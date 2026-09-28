@@ -37,6 +37,9 @@ const AZURE_ENV_KEYS: &[&str] = &[
     "AZURE_CLIENT_SECRET",
     "AZURE_AUTHORITY_HOST",
     "AZURE_POD_IDENTITY_AUTHORITY_HOST",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "IDENTITY_ENDPOINT",
+    "IDENTITY_HEADER",
 ];
 
 fn clear_azure_env() {
@@ -537,6 +540,43 @@ async fn entra_client_credentials_request_the_cognitiveservices_audience() {
         capture.lock().unwrap().authorization[0].as_deref(),
         Some("Bearer mock-entra-token")
     );
+}
+
+/// `credential_source = "workload-identity"` with the identifiers in config:
+/// the federated token is exchanged at the tenant's token endpoint, and the
+/// adapter reports the credential for `/health/deep`.
+#[tokio::test]
+#[serial]
+async fn configured_workload_identity_exchanges_the_federated_token() {
+    clear_azure_env();
+    let (login_base, forms) = spawn_login().await;
+    let (base, capture) = spawn_ok().await;
+    std::env::set_var("AZURE_AUTHORITY_HOST", &login_base);
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("token");
+    std::fs::write(&token_file, "federated-jwt").unwrap();
+
+    let mut c = config(&base);
+    c.credential_source = Some("workload-identity".into());
+    c.azure_tenant_id = Some("tenant-wi".into());
+    c.azure_client_id = Some("client-wi".into());
+    c.azure_federated_token_file = Some(token_file.to_string_lossy().to_string());
+    let adapter = FoundryAdapter::new(&c).unwrap();
+    adapter.complete(&req(DEPLOYMENT)).await.unwrap();
+    clear_azure_env();
+
+    let forms = forms.lock().unwrap();
+    assert_eq!(forms.len(), 1);
+    assert!(forms[0].contains("client_assertion=federated-jwt"), "{}", forms[0]);
+    assert!(forms[0].contains("client_id=client-wi"), "{}", forms[0]);
+    assert_eq!(
+        capture.lock().unwrap().authorization[0].as_deref(),
+        Some("Bearer mock-entra-token")
+    );
+    let report = adapter.credential_report().unwrap();
+    assert_eq!(report.provider, "foundry");
+    assert_eq!(report.kind, "azure-workload-identity");
+    assert_eq!(report.verdict.status.as_str(), "ok");
 }
 
 /// No client secret in the environment → managed identity via IMDS, with the
