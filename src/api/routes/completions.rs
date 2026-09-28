@@ -1193,33 +1193,6 @@ async fn next_available_fallback_with_policy(
     None
 }
 
-/// Next fallback candidate after `current_model` that an operator has not disabled.
-///
-/// Operator-disabled entries are *skipped*, not fatal: the chain exists to find a
-/// working alternative, and a disable means "do not use this one". Bounded by the
-/// chain length so a chain that loops back on itself terminates.
-fn next_available_fallback(
-    state: &AppState,
-    current_model: &str,
-) -> Option<(String, String)> {
-    const MAX_FALLBACK_HOPS: usize = 16;
-
-    let mut cursor = current_model.to_string();
-    for _ in 0..MAX_FALLBACK_HOPS {
-        let next_model = state.fallback.next_after(&cursor)?;
-        let (next_provider, next_canonical) = state.router.resolve(&next_model);
-        if state.router.is_available(&next_provider, &next_canonical) {
-            return Some((next_provider, next_canonical));
-        }
-        tracing::info!(
-            skipped_model = next_model.as_str(),
-            "fallback candidate is disabled by an administrator, trying the next one"
-        );
-        cursor = next_model;
-    }
-    None
-}
-
 fn record_cache_hit(
     state: &AppState,
     ctx: CacheHitCtx,

@@ -416,10 +416,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             let oidc_state = Arc::new(crate::api::admin::oidc::OidcStateStore::new());
 
             // Load DB webhooks before moving `db` into AppState
-            let db_webhooks: Vec<crate::db::repositories::webhook_callbacks::WebhookCallback> = {
-                use crate::db::repositories::webhook_callbacks::WebhookCallbackRepository;
-                db.list_enabled_webhooks().await.unwrap_or_default()
-            };
+            let db_webhooks: Vec<crate::db::repositories::webhook_callbacks::WebhookCallback> =
+                db.list_enabled_webhooks().await.unwrap_or_default();
 
             // Experiment registry (spec §7a): load once before serving so the
             // first request can bind; the tick below keeps it fresh.
@@ -506,7 +504,6 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             // Seed DB model aliases and failover chains into live router/fallback
             {
-                use crate::db::repositories::models::ModelRepository;
                 let db_aliases =
                     crate::api::admin::aliases::build_db_alias_map(&state.db).await;
                 if !db_aliases.is_empty() {
@@ -1427,7 +1424,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     });
 
                     let fmt_ts = |s: &str| if s.len() >= 19 { s[..19].replace('T', " ") } else { s.to_string() };
-                    println!("{:>4}  {:16}  {:16}  {:16}  {:8}  {:19}  {}", "ID", "User", "Project", "Label", "Status", "Created", "Disabled");
+                    println!("{:>4}  {:16}  {:16}  {:16}  {:8}  {:19}  Disabled", "ID", "User", "Project", "Label", "Status", "Created");
                     for k in filtered {
                         println!("{:>4}  {:16}  {:16}  {:16}  {:8}  {:19}  {}",
                             k.id,
@@ -1436,7 +1433,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             k.label.as_deref().unwrap_or("—"),
                             if k.enabled { "enabled" } else { "disabled" },
                             fmt_ts(&k.created_at),
-                            k.disabled_at.as_deref().map(|s| fmt_ts(s)).unwrap_or_else(|| "—".to_string()),
+                            k.disabled_at.as_deref().map(&fmt_ts).unwrap_or_else(|| "—".to_string()),
                         );
                     }
                 }
@@ -1509,7 +1506,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         println!("No providers configured.");
                         return Ok(());
                     }
-                    println!("{:20}  {}", "PROVIDER", "STATUS");
+                    println!("{:20}  STATUS", "PROVIDER");
                     println!("{}", "─".repeat(72));
                     for name in names {
                         let row = states.iter().find(|s| s.provider == name);
@@ -1588,7 +1585,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else if effective.is_empty() {
                         println!("No aliases defined.");
                     } else {
-                        println!("{:24}  {:40}  {}", "ALIAS", "TARGET", "SOURCE");
+                        println!("{:24}  {:40}  SOURCE", "ALIAS", "TARGET");
                         println!("{}", "─".repeat(78));
                         for (alias, (target, source)) in &effective {
                             println!("{:24}  {:40}  {}", alias, target, source);
@@ -1651,8 +1648,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                         println!("No models registered.");
                         return Ok(());
                     }
-                    println!("{:>4}  {:16}  {:36}  {:16}  {}",
-                        "ID", "Provider", "Name", "Alias", "Status");
+                    println!("{:>4}  {:16}  {:36}  {:16}  Status",
+                        "ID", "Provider", "Name", "Alias");
                     println!("{}", "─".repeat(96));
                     for m in models {
                         let status = if m.enabled {
@@ -1748,7 +1745,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let base = provider.api_base
                     .as_deref()
                     .or_else(|| default_bases.get(name.as_str()).copied())
-                    .unwrap_or_else(|| "https://localhost");
+                    .unwrap_or("https://localhost");
 
                 // Build a client that does NOT follow redirects so we get the TLS
                 // handshake result directly, and with a short connect timeout.
@@ -1814,8 +1811,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             match webhook_args.command {
                 WebhookCommands::List => {
                     let rows = db.list_webhooks().await?;
-                    println!("{:>4}  {:20}  {:8}  {:50}  {}",
-                        "ID", "Name", "Status", "URL", "Events");
+                    println!("{:>4}  {:20}  {:8}  {:50}  Events",
+                        "ID", "Name", "Status", "URL");
                     for w in rows {
                         println!("{:>4}  {:20}  {:8}  {:50}  {}",
                             w.id,

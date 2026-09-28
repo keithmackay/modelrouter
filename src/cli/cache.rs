@@ -82,15 +82,7 @@ pub async fn run(args: CacheArgs) -> Result<()> {
             print_stats(&stats);
         }
         CacheCommands::Purge { all, model, key } => {
-            let body = if let Some(model) = model {
-                json!({ "scope": "model", "model": model })
-            } else if let Some(key) = key {
-                json!({ "scope": "key", "key": key })
-            } else if all {
-                json!({ "scope": "all" })
-            } else {
-                json!({ "scope": "all" })
-            };
+            let body = build_purge_body(all, model, key);
             let res = send(
                 &client,
                 reqwest::Method::POST,
@@ -234,9 +226,52 @@ fn print_stats(stats: &serde_json::Value) {
     }
 }
 
+/// Request body for `POST /admin/api/cache/purge`.
+///
+/// `--model` wins over `--key`; with neither, the purge covers everything,
+/// whether or not `--all` was passed (the documented default).
+fn build_purge_body(_all: bool, model: Option<String>, key: Option<String>) -> serde_json::Value {
+    if let Some(model) = model {
+        json!({ "scope": "model", "model": model })
+    } else if let Some(key) = key {
+        json!({ "scope": "key", "key": key })
+    } else {
+        json!({ "scope": "all" })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_policy_update;
+    use super::{build_policy_update, build_purge_body};
+    use serde_json::json;
+
+    #[test]
+    fn purge_defaults_to_all_with_or_without_flag() {
+        assert_eq!(
+            build_purge_body(false, None, None),
+            json!({ "scope": "all" })
+        );
+        assert_eq!(
+            build_purge_body(true, None, None),
+            json!({ "scope": "all" })
+        );
+    }
+
+    #[test]
+    fn purge_by_model_takes_precedence() {
+        assert_eq!(
+            build_purge_body(true, Some("m".into()), Some("k".into())),
+            json!({ "scope": "model", "model": "m" })
+        );
+    }
+
+    #[test]
+    fn purge_by_key() {
+        assert_eq!(
+            build_purge_body(false, None, Some("k".into())),
+            json!({ "scope": "key", "key": "k" })
+        );
+    }
 
     #[test]
     fn update_only_includes_supplied_flags() {

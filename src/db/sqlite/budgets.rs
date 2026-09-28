@@ -166,10 +166,10 @@ impl BudgetRepository for SqliteDb {
     async fn update(&self, id: i64, changes: &UpdateBudgetRule) -> anyhow::Result<BudgetRule> {
         let now = now_utc();
         let model_allow = changes.model_allow.as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()?;
         let model_deny = changes.model_deny.as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()?;
 
         let result = sqlx::query(

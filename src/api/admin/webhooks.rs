@@ -8,11 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::dashboard::{DashboardError, DashboardSession, SuperDashboardSession, render};
 use crate::api::app::AppState;
-use crate::db::repositories::webhook_callbacks::{NewWebhookCallback, WebhookCallback, WebhookCallbackRepository};
-
-fn he(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
+use crate::db::repositories::webhook_callbacks::{NewWebhookCallback, WebhookCallback};
 
 // ── REST API types ─────────────────────────────────────────────────────────────
 

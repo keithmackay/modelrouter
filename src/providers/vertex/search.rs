@@ -146,7 +146,7 @@ pub fn parse_grounded_response(
             .iter()
             .copied()
             .fold(None::<f64>, |acc, c| Some(acc.map_or(c, |a: f64| a.max(c))))
-            .unwrap_or_else(|| 1.0 - i as f64 * RANK_SCORE_DECAY);
+            .unwrap_or(1.0 - i as f64 * RANK_SCORE_DECAY);
 
         items.push(SearchResultItem {
             title: title.to_string(),

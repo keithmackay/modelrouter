@@ -376,7 +376,7 @@ pub async fn hook_latency_stats(pool: &sqlx::SqlitePool) -> Result<Vec<HookStats
             return 0;
         }
         // Use nearest-rank method: ceil(p/100 * n) - 1, clamped to [0, n-1]
-        let idx = ((pct * n + 99) / 100).saturating_sub(1).min(n - 1);
+        let idx = (pct * n).div_ceil(100).saturating_sub(1).min(n - 1);
         sorted[idx]
     }
 
@@ -475,7 +475,7 @@ pub async fn fetch_usage_rows(
     };
 
     // Build JOIN and WHERE clause
-    let (joins, mut where_parts, bind_values) = match scope {
+    let (joins, where_parts, bind_values) = match scope {
         UsageScope::Global => (
             "JOIN users u ON cl.user_id = u.id".to_string(),
             vec![],

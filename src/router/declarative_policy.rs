@@ -29,7 +29,7 @@ pub fn find_matching_rule<'a>(
     model: &str,
 ) -> Option<&'a PolicyRuleConfig> {
     let mut sorted: Vec<&PolicyRuleConfig> = rules.iter().collect();
-    sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
     sorted.into_iter().find(|r| condition_matches(&r.condition, user, model))
 }
 

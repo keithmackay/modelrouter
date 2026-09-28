@@ -35,8 +35,6 @@ pub async fn get_models(
     State(state): State<AppState>,
     _session: SuperDashboardSession,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
-
     let models = state.db.list_models().await.map_err(|_| DashboardError::Internal)?;
     let all_failovers = state.db.list_all_failovers().await.map_err(|_| DashboardError::Internal)?;
 
@@ -113,7 +111,6 @@ pub async fn post_create_model(
     session: SuperDashboardSession,
     Form(form): Form<CreateModelForm>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
     use crate::db::models::NewModel;
 
     let provider = form.provider.trim().to_string();
@@ -191,8 +188,6 @@ async fn set_model_from_dashboard(
     enabled: bool,
     reason: Option<String>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
-
     let before = state.db.get_model(id).await.map_err(|_| DashboardError::Internal)?
         .ok_or_else(|| DashboardError::NotFound(format!("model {id}")))?;
 
@@ -224,8 +219,6 @@ pub async fn post_delete_model(
     session: SuperDashboardSession,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
-
     state.db.delete_model(id).await.map_err(|_| DashboardError::Internal)?;
     refresh_router_aliases(&state).await;
 
@@ -241,10 +234,8 @@ pub async fn post_set_failovers(
     Path(primary): Path<String>,
     Form(form): Form<SetFailoverForm>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
-
     let fallbacks: Vec<String> = form.fallbacks
-        .split(|c| c == ',' || c == '\n')
+        .split([',', '\n'])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -328,8 +319,6 @@ fn model_row_html(m: &crate::db::models::Model) -> String {
 
 /// Reload DB failover chains into the live FallbackChain.
 async fn refresh_router_failovers(state: &AppState) {
-    use crate::db::repositories::models::ModelRepository;
-
     if let Ok(rows) = state.db.list_all_failovers().await {
         let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         for r in rows {
@@ -372,8 +361,6 @@ pub async fn list_models_api(
     State(state): State<AppState>,
     _session: AdminSession,
 ) -> Result<impl IntoResponse, ApiError> {
-    use crate::db::repositories::models::ModelRepository;
-
     let models = state.db.list_models().await.map_err(|_| ApiError::Internal)?;
     Ok(axum::Json(serde_json::json!({ "models": models })))
 }
@@ -385,8 +372,6 @@ pub async fn set_model_enabled_api(
     Path(id): Path<i64>,
     axum::Json(body): axum::Json<SetEnabledRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    use crate::db::repositories::models::ModelRepository;
-
     let before = state
         .db
         .get_model(id)
@@ -440,8 +425,6 @@ pub async fn set_provider_enabled_api(
     Path(provider): Path<String>,
     axum::Json(body): axum::Json<SetEnabledRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    use crate::db::repositories::models::ModelRepository;
-
     // Only providers this router actually knows about can be toggled, so a typo
     // cannot create a phantom "disabled" entry that silently does nothing.
     if !state.settings.providers.contains_key(&provider) {
@@ -484,8 +467,6 @@ pub async fn set_provider_enabled_api(
 
 /// Configured providers joined with any persisted disable state.
 async fn provider_views(state: &AppState) -> anyhow::Result<Vec<serde_json::Value>> {
-    use crate::db::repositories::models::ModelRepository;
-
     let states = state.db.list_provider_states().await?;
     let mut names: Vec<String> = state.settings.providers.keys().cloned().collect();
     for s in &states {
@@ -536,8 +517,6 @@ async fn set_provider_from_dashboard(
     enabled: bool,
     reason: Option<String>,
 ) -> Result<Html<String>, DashboardError> {
-    use crate::db::repositories::models::ModelRepository;
-
     if !state.settings.providers.contains_key(&provider) {
         return Err(DashboardError::NotFound(format!("provider {provider}")));
     }
@@ -668,15 +647,14 @@ pub async fn get_provider_rows(
 /// one process (the integration-test binaries). Holding the `Arc` itself makes
 /// `Arc::ptr_eq` airtight: the allocation cannot be reused while the entry
 /// keeps it alive.
-static CATALOG_CACHE: std::sync::OnceLock<
-    tokio::sync::Mutex<
-        Option<(
-            std::sync::Arc<crate::config::schema::Settings>,
-            std::time::Instant,
-            serde_json::Value,
-        )>,
-    >,
-> = std::sync::OnceLock::new();
+type CatalogCacheEntry = (
+    std::sync::Arc<crate::config::schema::Settings>,
+    std::time::Instant,
+    serde_json::Value,
+);
+
+static CATALOG_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<CatalogCacheEntry>>> =
+    std::sync::OnceLock::new();
 const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(serde::Deserialize)]

@@ -237,6 +237,7 @@ impl VertexAdapter {
     pub(crate) fn maas_region(&self) -> Option<&str> {
         self.maas_region.as_deref()
     }
+    #[cfg(test)]
     pub(crate) fn project(&self) -> &str {
         &self.project
     }

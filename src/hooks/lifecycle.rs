@@ -17,6 +17,7 @@ pub fn fire(hook: &LifecycleHookConfig, payload: serde_json::Value) -> tokio::ta
                 run_subprocess(&hook.exec, &payload),
             )
             .await;
+            #[cfg_attr(not(feature = "otel"), allow(unused_variables))]
             let duration_ms = hook_start.elapsed().as_millis() as i64;
 
             #[cfg(feature = "otel")]

@@ -6,7 +6,7 @@
 
 use axum::{
     extract::{Query, State},
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, Redirect},
     Form, Json,
 };
 use serde::Deserialize;
