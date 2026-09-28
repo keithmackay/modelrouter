@@ -255,6 +255,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     /// is the tier-resolved ceiling this adapter applies to the call.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: Some(

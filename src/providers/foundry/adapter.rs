@@ -270,6 +270,7 @@ impl ProviderAdapter for FoundryAdapter {
     /// Settings forwarded as normalized; the timeout is the configured ceiling.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: Some(self.request_timeout(req).as_secs()),
@@ -391,6 +392,7 @@ mod tests {
             max_tokens: Some(16),
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: serde_json::json!({}),
         }
     }

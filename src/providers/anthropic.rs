@@ -364,6 +364,8 @@ struct AnthropicUsage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    #[serde(default)]
+    output_tokens_details: serde_json::Value,
 }
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -377,6 +379,33 @@ fn apply_tools(body: &mut serde_json::Value, req: &NormalizedRequest) {
     if let Some(tc) = req.tool_choice.as_ref().and_then(translate_tool_choice) {
         body["tool_choice"] = tc;
     }
+}
+
+/// Spell the request's resolved reasoning control in the Anthropic dialect:
+/// `thinking: {type: "disabled"}` and/or `output_config: {effort}`. Shared by
+/// the direct adapter and Claude-on-Vertex. The control was resolved against
+/// the target model (see
+/// [`crate::router::model_capabilities::resolve_reasoning`]), so every field
+/// written here is one that model accepts; without one nothing is written and
+/// the model's own default applies — which, on models that think by default,
+/// means thinking billed as output tokens against `max_tokens`.
+pub(crate) fn apply_reasoning(body: &mut serde_json::Value, req: &NormalizedRequest) {
+    let Some(reasoning) = req.reasoning else { return };
+    if reasoning.disable_thinking {
+        body["thinking"] = serde_json::json!({"type": "disabled"});
+    }
+    if let Some(effort) = reasoning.effort {
+        body["output_config"] = serde_json::json!({"effort": effort});
+    }
+}
+
+/// Thinking tokens from an Anthropic `usage` object
+/// (`output_tokens_details.thinking_tokens`), when reported. They are already
+/// included in `output_tokens`; this is the breakdown.
+pub(crate) fn thinking_tokens_from_usage(usage: &serde_json::Value) -> Option<u32> {
+    usage["output_tokens_details"]["thinking_tokens"]
+        .as_u64()
+        .map(|n| n as u32)
 }
 
 #[async_trait::async_trait]
@@ -403,6 +432,7 @@ impl ProviderAdapter for AnthropicAdapter {
             body["max_tokens"] = serde_json::json!(DEFAULT_MAX_TOKENS);
         }
         apply_tools(&mut body, req);
+        apply_reasoning(&mut body, req);
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
@@ -440,7 +470,9 @@ impl ProviderAdapter for AnthropicAdapter {
             ),
             cache_read_tokens: parsed.usage.cache_read_input_tokens,
             cache_write_tokens: parsed.usage.cache_creation_input_tokens,
-            reasoning_tokens: None,
+            reasoning_tokens: parsed.usage.output_tokens_details["thinking_tokens"]
+                .as_u64()
+                .map(|n| n as u32),
             ttft_ms: Some(ttft_ms),
             tool_calls: tool_calls_from_content(&parsed.content),
         })
@@ -467,6 +499,7 @@ impl ProviderAdapter for AnthropicAdapter {
             body["max_tokens"] = serde_json::json!(DEFAULT_MAX_TOKENS);
         }
         apply_tools(&mut body, req);
+        apply_reasoning(&mut body, req);
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
@@ -519,6 +552,7 @@ impl ProviderAdapter for AnthropicAdapter {
     /// or [`DEFAULT_MAX_TOKENS`]. The timeout is the tier-resolved ceiling.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            reasoning: req.reasoning,
             temperature: req.temperature,
             max_tokens: Some(req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
             timeout_secs: Some(
@@ -542,6 +576,8 @@ pub struct AnthropicSseTranslator {
     input_tokens: u32,
     cache_read_input_tokens: u32,
     output_tokens: u32,
+    /// `output_tokens_details.thinking_tokens`, when the provider reported it.
+    thinking_tokens: Option<u32>,
     /// True once any `usage` object has been seen; without one the final chunk
     /// carries no `usage` and the ledger falls back to its estimate.
     saw_usage: bool,
@@ -571,6 +607,9 @@ impl AnthropicSseTranslator {
         }
         if let Some(n) = usage["output_tokens"].as_u64() {
             self.output_tokens = n as u32;
+        }
+        if let Some(n) = thinking_tokens_from_usage(usage) {
+            self.thinking_tokens = Some(n);
         }
     }
 
@@ -666,6 +705,10 @@ impl AnthropicSseTranslator {
                             "cached_tokens": self.cache_read_input_tokens
                         }
                     });
+                    if let Some(thinking) = self.thinking_tokens {
+                        chunk["usage"]["completion_tokens_details"] =
+                            serde_json::json!({ "reasoning_tokens": thinking });
+                    }
                 }
                 let done = "data: [DONE]\n\n";
                 Some(Bytes::from(format!("data: {}\n\n{}", chunk, done)))
@@ -1108,6 +1151,26 @@ mod sse_translator_tests {
         assert_eq!(v["usage"]["total_tokens"], 57);
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 10);
         assert!(out.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn thinking_tokens_reach_the_final_chunk_as_reasoning_tokens() {
+        let mut t = AnthropicSseTranslator::new();
+        let out = lines(
+            &mut t,
+            &[
+                r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":197,"output_tokens_details":{"thinking_tokens":190}}}"#,
+            ],
+        );
+        let final_chunk = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .rfind(|d| *d != "[DONE]")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(final_chunk).unwrap();
+        assert_eq!(v["usage"]["completion_tokens"], 197);
+        assert_eq!(v["usage"]["completion_tokens_details"]["reasoning_tokens"], 190);
     }
 
     #[test]

@@ -39,6 +39,18 @@ pub struct ModelCapabilityEntry {
     /// leaves the built-in default in force.
     #[serde(default)]
     pub supports_temperature: Option<bool>,
+    /// `true` when the model reasons (thinks) on a request that carries no
+    /// thinking configuration at all. Omitted leaves the built-in default.
+    #[serde(default)]
+    pub thinks_by_default: Option<bool>,
+    /// `true` when the model accepts an explicit request to turn thinking
+    /// off. Omitted leaves the built-in default.
+    #[serde(default)]
+    pub can_disable_thinking: Option<bool>,
+    /// `true` when the model accepts an effort level (`low` … `max`) that
+    /// bounds how much it reasons. Omitted leaves the built-in default.
+    #[serde(default)]
+    pub supports_effort: Option<bool>,
 }
 
 /// Response cache configuration.

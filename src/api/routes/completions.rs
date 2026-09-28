@@ -1807,6 +1807,7 @@ fn build_normalized_request(
         None
     };
 
+    let model_for_reasoning = model.clone();
     crate::providers::adapter::NormalizedRequest {
         model,
         request_model: requested_model.to_string(),
@@ -1816,6 +1817,14 @@ fn build_normalized_request(
         max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
         tools,
         tool_choice,
+        // Resolved against the model the request actually reaches, like
+        // `temperature` above: an alias caller cannot know whether its target
+        // thinks by default or which reasoning fields it accepts.
+        reasoning: crate::router::model_capabilities::resolve_reasoning(
+            &model_for_reasoning,
+            body["reasoning_effort"].as_str(),
+            capabilities,
+        ),
         extra_params: serde_json::Value::Object(Default::default()),
     }
 }
@@ -1911,8 +1920,15 @@ fn completion_settings(
     if body["temperature"].is_number() && req.temperature.is_none() {
         dropped.push("temperature");
     }
+    // A reasoning_effort that produced no provider field (unrecognised value,
+    // a model without reasoning controls, or `none` on a model that does not
+    // think unless asked) is reported rather than silently ignored.
+    if body["reasoning_effort"].is_string() && effective.reasoning.is_none() {
+        dropped.push("reasoning_effort");
+    }
     serde_json::json!({
         "temperature": effective.temperature,
+        "reasoning": effective.reasoning,
         "max_tokens": effective.max_tokens,
         "timeout_secs": effective.timeout_secs,
         "stream": req.stream,
@@ -2105,6 +2121,7 @@ mod openai_response_tests {
             max_tokens: None,
             tools: Some(vec![serde_json::json!({}), serde_json::json!({})]),
             tool_choice: Some(serde_json::json!("auto")),
+            reasoning: None,
             extra_params: serde_json::json!({}),
         }
     }
@@ -2112,6 +2129,7 @@ mod openai_response_tests {
     #[test]
     fn settings_report_what_the_adapter_sends() {
         let effective = EffectiveSettings {
+            reasoning: None,
             temperature: Some(0.3),
             max_tokens: Some(4096),
             timeout_secs: Some(600),
@@ -2133,6 +2151,29 @@ mod openai_response_tests {
         let s = completion_settings(EffectiveSettings::default(), &norm_req(None), &body);
         assert!(s["temperature"].is_null());
         assert_eq!(s["dropped"], serde_json::json!(["temperature"]));
+    }
+
+    #[test]
+    fn settings_report_the_reasoning_control_sent() {
+        let effective = EffectiveSettings {
+            reasoning: Some(crate::providers::adapter::ReasoningControl {
+                disable_thinking: true,
+                effort: None,
+            }),
+            ..Default::default()
+        };
+        let body = serde_json::json!({"reasoning_effort": "none"});
+        let s = completion_settings(effective, &norm_req(None), &body);
+        assert_eq!(s["reasoning"]["disable_thinking"], true);
+        assert_eq!(s["dropped"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn settings_name_a_reasoning_effort_the_target_cannot_honour() {
+        let body = serde_json::json!({"reasoning_effort": "none"});
+        let s = completion_settings(EffectiveSettings::default(), &norm_req(None), &body);
+        assert!(s["reasoning"].is_null());
+        assert_eq!(s["dropped"], serde_json::json!(["reasoning_effort"]));
     }
 }
 
@@ -2188,6 +2229,41 @@ mod tools_request_tests {
         let body = json!({"messages": [], "tools": []});
         let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
         assert!(req.tools.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_none_resolves_against_the_target_model() {
+        let body = json!({"messages": [], "reasoning_effort": "none"});
+        // A model that thinks by default gets thinking disabled...
+        let req = build_normalized_request(
+            &body,
+            "anthropic/claude-sonnet-5".to_string(),
+            "balanced",
+            &[],
+        );
+        let r = req.reasoning.expect("reasoning control resolved");
+        assert!(r.disable_thinking);
+        assert_eq!(r.effort, None);
+        // ...a model that does not think by default gets nothing.
+        let req = build_normalized_request(
+            &body,
+            "anthropic/claude-haiku-4-5".to_string(),
+            "fast",
+            &[],
+        );
+        assert!(req.reasoning.is_none());
+    }
+
+    #[test]
+    fn absent_reasoning_effort_sends_no_reasoning_control() {
+        let body = json!({"messages": []});
+        let req = build_normalized_request(
+            &body,
+            "anthropic/claude-sonnet-5".to_string(),
+            "balanced",
+            &[],
+        );
+        assert!(req.reasoning.is_none());
     }
 }
 

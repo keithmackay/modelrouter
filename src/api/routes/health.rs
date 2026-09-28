@@ -206,6 +206,7 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
         max_tokens: Some(1),
         tools: None,
         tool_choice: None,
+        reasoning: None,
         extra_params: json!({}),
     };
     let started = Instant::now();
