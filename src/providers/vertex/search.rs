@@ -194,7 +194,8 @@ impl VertexSearchAdapter {
         let region = config.region.clone().ok_or_else(|| {
             anyhow::anyhow!("Vertex search needs `region` under [providers.vertex]")
         })?;
-        let token_provider = Arc::new(GoogleCloudAuthProvider::from_config(config)?) as Arc<dyn TokenProvider>;
+        let token_provider =
+            Arc::new(GoogleCloudAuthProvider::from_config(config)?) as Arc<dyn TokenProvider>;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()

@@ -296,15 +296,12 @@ async fn chat_completions_inner(
             .provider_registry
             .get(&provider_name)
             .map_err(ApiError::ProviderError)?;
-        let sse_stream = adapter
-            .stream(&norm_req)
-            .await
-            .map_err(|e| {
-                state
-                    .circuit_breaker
-                    .record_provider_failure(&provider_name, &e);
-                ApiError::ProviderError(e)
-            })?;
+        let sse_stream = adapter.stream(&norm_req).await.map_err(|e| {
+            state
+                .circuit_breaker
+                .record_provider_failure(&provider_name, &e);
+            ApiError::ProviderError(e)
+        })?;
         state.circuit_breaker.record_success(&provider_name);
         let settings = completion_settings(adapter.effective_settings(&norm_req), &norm_req, &body);
 

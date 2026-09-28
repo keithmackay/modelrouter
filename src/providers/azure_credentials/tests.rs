@@ -42,7 +42,9 @@ impl Fake {
             let (q, s) = (q.clone(), s.clone());
             async move {
                 let (parts, body) = req.into_parts();
-                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+                let body = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .unwrap_or_default();
                 s.lock().unwrap().push(Seen {
                     path: parts.uri.path().to_string(),
                     query: parts.uri.query().unwrap_or_default().to_string(),
@@ -55,7 +57,11 @@ impl Fake {
                 });
                 let (status, body) = {
                     let mut q = q.lock().unwrap();
-                    if q.len() > 1 { q.pop_front().unwrap() } else { q.front().cloned().unwrap() }
+                    if q.len() > 1 {
+                        q.pop_front().unwrap()
+                    } else {
+                        q.front().cloned().unwrap()
+                    }
                 };
                 (axum::http::StatusCode::from_u16(status).unwrap(), body)
             }
@@ -76,7 +82,10 @@ impl Fake {
 }
 
 fn ok_token(token: &str, expires_in: u64) -> (u16, String) {
-    (200, format!(r#"{{"access_token":"{token}","expires_in":{expires_in},"token_type":"Bearer"}}"#))
+    (
+        200,
+        format!(r#"{{"access_token":"{token}","expires_in":{expires_in},"token_type":"Bearer"}}"#),
+    )
 }
 
 /// A port nothing listens on: connection refused at once.
@@ -116,7 +125,11 @@ fn secret_settings(authority: &str) -> AzureSettings {
 
 #[tokio::test]
 async fn imds_request_shape_and_caching() {
-    let imds = Fake::start(vec![(200, r#"{"access_token":"mi-1","expires_in":"3600"}"#.into())]).await;
+    let imds = Fake::start(vec![(
+        200,
+        r#"{"access_token":"mi-1","expires_in":"3600"}"#.into(),
+    )])
+    .await;
     let mut s = settings(COGNITIVE_SERVICES_SCOPE);
     s.imds_host = imds.base.clone();
     s.client_id = Some("user-assigned-id".into());
@@ -129,10 +142,27 @@ async fn imds_request_shape_and_caching() {
     let seen = &imds.seen()[0];
     assert_eq!(seen.path, "/metadata/identity/oauth2/token");
     assert_eq!(seen.header("metadata"), Some("true"));
-    assert!(seen.query.contains("api-version=2018-02-01"), "{}", seen.query);
-    assert!(seen.query.contains("resource=https%3A%2F%2Fcognitiveservices.azure.com"), "{}", seen.query);
-    assert!(!seen.query.contains(".default"), "IMDS takes a resource: {}", seen.query);
-    assert!(seen.query.contains("client_id=user-assigned-id"), "{}", seen.query);
+    assert!(
+        seen.query.contains("api-version=2018-02-01"),
+        "{}",
+        seen.query
+    );
+    assert!(
+        seen.query
+            .contains("resource=https%3A%2F%2Fcognitiveservices.azure.com"),
+        "{}",
+        seen.query
+    );
+    assert!(
+        !seen.query.contains(".default"),
+        "IMDS takes a resource: {}",
+        seen.query
+    );
+    assert!(
+        seen.query.contains("client_id=user-assigned-id"),
+        "{}",
+        seen.query
+    );
     assert_eq!(src.kind(), "azure-managed-identity");
 }
 
@@ -153,8 +183,16 @@ async fn app_service_identity_endpoint_shape() {
     assert_eq!(seen.path, "/msi/token");
     assert_eq!(seen.header("x-identity-header"), Some("header-value"));
     assert!(seen.header("metadata").is_none());
-    assert!(seen.query.contains("api-version=2019-08-01"), "{}", seen.query);
-    assert!(seen.query.contains("resource=https%3A%2F%2Fai.azure.com"), "{}", seen.query);
+    assert!(
+        seen.query.contains("api-version=2019-08-01"),
+        "{}",
+        seen.query
+    );
+    assert!(
+        seen.query.contains("resource=https%3A%2F%2Fai.azure.com"),
+        "{}",
+        seen.query
+    );
     // expires_on an hour out: cached.
     src.token().await.unwrap();
     assert_eq!(ep.hits(), 1);
@@ -193,11 +231,16 @@ async fn client_secret_posts_the_documented_form() {
     assert_eq!(src.token().await.unwrap(), "sp-1");
     let seen = &login.seen()[0];
     assert_eq!(seen.path, "/tenant-x/oauth2/v2.0/token");
-    assert!(seen.body.contains("grant_type=client_credentials"), "{}", seen.body);
+    assert!(
+        seen.body.contains("grant_type=client_credentials"),
+        "{}",
+        seen.body
+    );
     assert!(seen.body.contains("client_id=client-x"), "{}", seen.body);
     assert!(seen.body.contains("client_secret=s3cret"), "{}", seen.body);
     assert!(
-        seen.body.contains("scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default"),
+        seen.body
+            .contains("scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default"),
         "{}",
         seen.body
     );
@@ -223,7 +266,11 @@ async fn workload_identity_sends_the_federated_token_and_rereads_it() {
 
     let seen = login.seen();
     assert_eq!(seen[0].path, "/tenant-w/oauth2/v2.0/token");
-    assert!(seen[0].body.contains("grant_type=client_credentials"), "{}", seen[0].body);
+    assert!(
+        seen[0].body.contains("grant_type=client_credentials"),
+        "{}",
+        seen[0].body
+    );
     assert!(
         seen[0]
             .body
@@ -231,8 +278,17 @@ async fn workload_identity_sends_the_federated_token_and_rereads_it() {
         "{}",
         seen[0].body
     );
-    assert!(seen[0].body.contains("client_assertion=jwt-one&") || seen[0].body.ends_with("client_assertion=jwt-one"), "{}", seen[0].body);
-    assert!(seen[1].body.contains("client_assertion=jwt-two"), "the rotated file is re-read: {}", seen[1].body);
+    assert!(
+        seen[0].body.contains("client_assertion=jwt-one&")
+            || seen[0].body.ends_with("client_assertion=jwt-one"),
+        "{}",
+        seen[0].body
+    );
+    assert!(
+        seen[1].body.contains("client_assertion=jwt-two"),
+        "the rotated file is re-read: {}",
+        seen[1].body
+    );
     assert!(!seen[0].body.contains("client_secret"), "{}", seen[0].body);
     assert_eq!(src.kind(), "azure-workload-identity");
 }
@@ -240,10 +296,19 @@ async fn workload_identity_sends_the_federated_token_and_rereads_it() {
 #[test]
 fn explicit_sources_name_missing_settings() {
     let s = settings(COGNITIVE_SERVICES_SCOPE);
-    let err = AppRegistrationSource::client_secret(&s).err().unwrap().to_string();
-    assert!(err.contains("[providers.foundry]") && err.contains("AZURE_TENANT_ID"), "{err}");
+    let err = AppRegistrationSource::client_secret(&s)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains("[providers.foundry]") && err.contains("AZURE_TENANT_ID"),
+        "{err}"
+    );
     assert!(err.contains("AZURE_CLIENT_SECRET"), "{err}");
-    let err = AppRegistrationSource::workload_identity(&s).err().unwrap().to_string();
+    let err = AppRegistrationSource::workload_identity(&s)
+        .err()
+        .unwrap()
+        .to_string();
     assert!(err.contains("AZURE_FEDERATED_TOKEN_FILE"), "{err}");
 }
 
@@ -263,8 +328,16 @@ async fn aadsts_reauth_becomes_credential_expired() {
     let expired = find_credential_expired(&err).expect("typed credential_expired");
     assert_eq!(expired.provider, "foundry");
     assert_eq!(expired.credential_kind, "azure-client-secret");
-    assert!(expired.remediation.contains("client secret"), "{}", expired.remediation);
-    assert!(expired.detail.contains("AADSTS7000222"), "{}", expired.detail);
+    assert!(
+        expired.remediation.contains("client secret"),
+        "{}",
+        expired.remediation
+    );
+    assert!(
+        expired.detail.contains("AADSTS7000222"),
+        "{}",
+        expired.detail
+    );
 
     // Cached: a second request does not call the endpoint again.
     chain.token().await.unwrap_err();
@@ -287,7 +360,10 @@ async fn server_errors_stay_transient() {
         let src = AppRegistrationSource::client_secret(&secret_settings(&login.base)).unwrap();
         let chain = chain("client-secret", Arc::new(src));
         let err = chain.token().await.unwrap_err();
-        assert!(find_credential_expired(&err).is_none(), "{status} must stay transient: {err:#}");
+        assert!(
+            find_credential_expired(&err).is_none(),
+            "{status} must stay transient: {err:#}"
+        );
         assert_ne!(chain.report().verdict.status, CredentialStatus::Expired);
         // Not cached as dead: the next request tries again.
         chain.token().await.unwrap_err();
@@ -309,14 +385,20 @@ fn every_documented_reauth_code_is_permanent() {
         let err: anyhow::Error = AzureTokenError {
             source_kind: "client secret",
             status: 400,
-            body: format!(r#"{{"error":"invalid_request","error_description":"AADSTS{code}: text"}}"#),
+            body: format!(
+                r#"{{"error":"invalid_request","error_description":"AADSTS{code}: text"}}"#
+            ),
         }
         .into();
         assert!(is_azure_reauth(&err), "AADSTS{code}");
     }
     for oauth in ["invalid_grant", "interaction_required"] {
-        let err: anyhow::Error =
-            AzureTokenError { source_kind: "x", status: 400, body: format!(r#"{{"error":"{oauth}"}}"#) }.into();
+        let err: anyhow::Error = AzureTokenError {
+            source_kind: "x",
+            status: 400,
+            body: format!(r#"{{"error":"{oauth}"}}"#),
+        }
+        .into();
         assert!(is_azure_reauth(&err), "{oauth}");
     }
 }
@@ -325,27 +407,45 @@ fn every_documented_reauth_code_is_permanent() {
 fn unrelated_aadsts_codes_are_not_reauth() {
     // AADSTS500011 (resource principal not found) is a configuration error
     // and must not match 50011-style prefixes of the reauth list.
-    for body in ["AADSTS500011: resource not found", "AADSTS501730: made up", "AADSTS90002: tenant not found"] {
-        let err: anyhow::Error = AzureTokenError { source_kind: "x", status: 400, body: body.into() }.into();
+    for body in [
+        "AADSTS500011: resource not found",
+        "AADSTS501730: made up",
+        "AADSTS90002: tenant not found",
+    ] {
+        let err: anyhow::Error = AzureTokenError {
+            source_kind: "x",
+            status: 400,
+            body: body.into(),
+        }
+        .into();
         assert!(!is_azure_reauth(&err), "{body}");
     }
-    assert_eq!(aadsts_codes("x AADSTS70043: y aadsts50076 z AADSTS"), vec!["70043", "50076"]);
+    assert_eq!(
+        aadsts_codes("x AADSTS70043: y aadsts50076 z AADSTS"),
+        vec!["70043", "50076"]
+    );
 }
 
 #[test]
 fn cli_errors_asking_for_login_are_permanent() {
     let login: anyhow::Error = AzureCliError {
         code: "1".into(),
-        stderr: "ERROR: The refresh token has expired. Please run 'az login' to setup account.".into(),
+        stderr: "ERROR: The refresh token has expired. Please run 'az login' to setup account."
+            .into(),
     }
     .into();
     assert!(is_azure_reauth(&login));
-    let aadsts: anyhow::Error =
-        AzureCliError { code: "1".into(), stderr: "ERROR: AADSTS50078: MFA expired".into() }.into();
+    let aadsts: anyhow::Error = AzureCliError {
+        code: "1".into(),
+        stderr: "ERROR: AADSTS50078: MFA expired".into(),
+    }
+    .into();
     assert!(is_azure_reauth(&aadsts));
     let network: anyhow::Error = AzureCliError {
         code: "1".into(),
-        stderr: "ERROR: HTTPSConnectionPool(host='login.microsoftonline.com'): Max retries exceeded".into(),
+        stderr:
+            "ERROR: HTTPSConnectionPool(host='login.microsoftonline.com'): Max retries exceeded"
+                .into(),
     }
     .into();
     assert!(!is_azure_reauth(&network));
@@ -360,16 +460,21 @@ fn every_documented_token_shape_parses() {
     assert_eq!((t.as_str(), d.as_secs()), ("a", 3599));
     let (_, d) = parse_token_response(r#"{"access_token":"a","expires_in":"86399"}"#, now).unwrap();
     assert_eq!(d.as_secs(), 86399);
-    let (_, d) = parse_token_response(r#"{"access_token":"a","expires_on":"1700003600"}"#, now).unwrap();
+    let (_, d) =
+        parse_token_response(r#"{"access_token":"a","expires_on":"1700003600"}"#, now).unwrap();
     assert_eq!(d.as_secs(), 3600);
-    let (t, d) = parse_token_response(r#"{"accessToken":"c","expires_on":1700000600}"#, now).unwrap();
+    let (t, d) =
+        parse_token_response(r#"{"accessToken":"c","expires_on":1700000600}"#, now).unwrap();
     assert_eq!((t.as_str(), d.as_secs()), ("c", 600));
     let (_, d) = parse_token_response(r#"{"access_token":"a"}"#, now).unwrap();
     assert_eq!(d, UNSTATED_LIFETIME);
     // Older CLIs: only a local-time `expiresOn`.
     use chrono::TimeZone;
     let local = chrono::Local.timestamp_opt(now + 1200, 0).unwrap();
-    let doc = format!(r#"{{"accessToken":"d","expiresOn":"{}"}}"#, local.format("%Y-%m-%d %H:%M:%S%.6f"));
+    let doc = format!(
+        r#"{{"accessToken":"d","expiresOn":"{}"}}"#,
+        local.format("%Y-%m-%d %H:%M:%S%.6f")
+    );
     let (_, d) = parse_token_response(&doc, now).unwrap();
     assert_eq!(d.as_secs(), 1200);
     // Already expired: zero, refreshed on next use rather than negative.
@@ -418,7 +523,9 @@ async fn cli_success_passes_resource_and_tenant() {
     let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
     assert_eq!(args.lines().count(), 1, "cached: {args}");
     assert!(
-        args.contains("account get-access-token --resource https://cognitiveservices.azure.com --output json"),
+        args.contains(
+            "account get-access-token --resource https://cognitiveservices.azure.com --output json"
+        ),
         "{args}"
     );
     assert!(args.contains("--tenant tenant-c"), "{args}");
@@ -435,8 +542,16 @@ async fn cli_login_expiry_becomes_credential_expired() {
     let err = chain.token().await.unwrap_err();
     let expired = find_credential_expired(&err).expect("typed");
     assert_eq!(expired.credential_kind, "azure-cli");
-    assert!(expired.remediation.contains("az login"), "{}", expired.remediation);
-    assert!(expired.remediation.contains("managed-identity"), "{}", expired.remediation);
+    assert!(
+        expired.remediation.contains("az login"),
+        "{}",
+        expired.remediation
+    );
+    assert!(
+        expired.remediation.contains("managed-identity"),
+        "{}",
+        expired.remediation
+    );
     assert_eq!(chain.report().verdict.status, CredentialStatus::Expired);
 }
 
@@ -445,7 +560,10 @@ async fn cli_login_expiry_becomes_credential_expired() {
 async fn cli_network_failure_is_transient() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = settings(COGNITIVE_SERVICES_SCOPE);
-    s.cli_program = fake_az(dir.path(), "echo 'ERROR: Connection reset by peer' >&2\nexit 1");
+    s.cli_program = fake_az(
+        dir.path(),
+        "echo 'ERROR: Connection reset by peer' >&2\nexit 1",
+    );
     let chain = chain("cli", Arc::new(CliSource::new(&s)));
     let err = chain.token().await.unwrap_err();
     assert!(find_credential_expired(&err).is_none(), "{err:#}");
@@ -564,7 +682,11 @@ async fn default_dead_cli_login_without_managed_identity_is_expired() {
     let report = chain.report();
     assert!(!report.fallback_active);
     assert_eq!(report.verdict.status, CredentialStatus::Expired);
-    assert!(report.verdict.remediation.contains("az login"), "{}", report.verdict.remediation);
+    assert!(
+        report.verdict.remediation.contains("az login"),
+        "{}",
+        report.verdict.remediation
+    );
 }
 
 // ── verdicts and wiring ─────────────────────────────────────────────────────
@@ -572,9 +694,21 @@ async fn default_dead_cli_login_without_managed_identity_is_expired() {
 #[test]
 fn every_kind_maps_to_a_verdict() {
     let cases = [
-        (AzureKind::ManagedIdentity, "azure-managed-identity", CredentialStatus::Ok),
-        (AzureKind::WorkloadIdentity, "azure-workload-identity", CredentialStatus::Ok),
-        (AzureKind::ClientSecret, "azure-client-secret", CredentialStatus::Warn),
+        (
+            AzureKind::ManagedIdentity,
+            "azure-managed-identity",
+            CredentialStatus::Ok,
+        ),
+        (
+            AzureKind::WorkloadIdentity,
+            "azure-workload-identity",
+            CredentialStatus::Ok,
+        ),
+        (
+            AzureKind::ClientSecret,
+            "azure-client-secret",
+            CredentialStatus::Warn,
+        ),
         (AzureKind::Cli, "azure-cli", CredentialStatus::Warn),
     ];
     for (kind, label, status) in cases {
@@ -583,7 +717,11 @@ fn every_kind_maps_to_a_verdict() {
         assert_eq!(v.status, status, "{label}");
         assert!(!v.reason.is_empty(), "{label}");
         if status == CredentialStatus::Warn {
-            assert!(v.remediation.contains("[providers.azure]"), "{label}: {}", v.remediation);
+            assert!(
+                v.remediation.contains("[providers.azure]"),
+                "{label}: {}",
+                v.remediation
+            );
         }
         let (reason, remediation) = kind.expired_guidance("azure");
         assert!(!reason.is_empty() && !remediation.is_empty(), "{label}");
@@ -613,12 +751,29 @@ fn explicit_sources_report_their_label() {
     let mut s = settings(COGNITIVE_SERVICES_SCOPE);
     s.provider = "azure".into();
     for (source, label, kind) in [
-        (AzureCredentialSource::ManagedIdentity, "managed-identity", "azure-managed-identity"),
+        (
+            AzureCredentialSource::ManagedIdentity,
+            "managed-identity",
+            "azure-managed-identity",
+        ),
         (AzureCredentialSource::Cli, "cli", "azure-cli"),
-        (AzureCredentialSource::Default, "default", "azure-default-unresolved"),
+        (
+            AzureCredentialSource::Default,
+            "default",
+            "azure-default-unresolved",
+        ),
     ] {
-        let report = AzureCredential::build(Some(source), s.clone()).unwrap().report();
-        assert_eq!((report.provider.as_str(), report.source.as_str(), report.kind.as_str()), ("azure", label, kind));
+        let report = AzureCredential::build(Some(source), s.clone())
+            .unwrap()
+            .report();
+        assert_eq!(
+            (
+                report.provider.as_str(),
+                report.source.as_str(),
+                report.kind.as_str()
+            ),
+            ("azure", label, kind)
+        );
     }
 }
 
@@ -633,7 +788,13 @@ fn provider_config(source: Option<&str>, api_key: &str) -> ProviderConfig {
 #[test]
 fn key_auth_stays_the_default_for_the_azure_provider() {
     let t = Duration::from_secs(5);
-    let auth = AzureAuth::key_by_default("azure", &provider_config(None, "k"), COGNITIVE_SERVICES_SCOPE, t).unwrap();
+    let auth = AzureAuth::key_by_default(
+        "azure",
+        &provider_config(None, "k"),
+        COGNITIVE_SERVICES_SCOPE,
+        t,
+    )
+    .unwrap();
     assert_eq!(auth.label(), "api_key");
     assert!(auth.credential_report().is_none());
 
@@ -653,9 +814,21 @@ fn key_auth_stays_the_default_for_the_azure_provider() {
 #[test]
 fn entra_stays_the_default_for_foundry() {
     let t = Duration::from_secs(5);
-    let auth = AzureAuth::entra_by_default("foundry", &provider_config(None, "key"), COGNITIVE_SERVICES_SCOPE, t).unwrap();
+    let auth = AzureAuth::entra_by_default(
+        "foundry",
+        &provider_config(None, "key"),
+        COGNITIVE_SERVICES_SCOPE,
+        t,
+    )
+    .unwrap();
     assert_eq!(auth.label(), "api_key");
-    let auth = AzureAuth::entra_by_default("foundry", &provider_config(Some("cli"), ""), COGNITIVE_SERVICES_SCOPE, t).unwrap();
+    let auth = AzureAuth::entra_by_default(
+        "foundry",
+        &provider_config(Some("cli"), ""),
+        COGNITIVE_SERVICES_SCOPE,
+        t,
+    )
+    .unwrap();
     assert_eq!(auth.label(), "entra");
     assert_eq!(auth.credential_report().unwrap().kind, "azure-cli");
 }
@@ -664,9 +837,16 @@ fn entra_stays_the_default_for_foundry() {
 fn config_validation_rejects_contradictions() {
     use crate::config::schema::validate_azure_credential;
     assert!(validate_azure_credential(&provider_config(Some("workload-identity"), "")).is_ok());
-    let err = validate_azure_credential(&provider_config(Some("gcloud"), "")).unwrap_err().to_string();
-    assert!(err.contains("managed-identity") && err.contains("cli"), "{err}");
-    let err = validate_azure_credential(&provider_config(Some("cli"), "key")).unwrap_err().to_string();
+    let err = validate_azure_credential(&provider_config(Some("gcloud"), ""))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("managed-identity") && err.contains("cli"),
+        "{err}"
+    );
+    let err = validate_azure_credential(&provider_config(Some("cli"), "key"))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("api_key"), "{err}");
 
     let mut c = provider_config(Some("managed-identity"), "");
@@ -677,7 +857,10 @@ fn config_validation_rejects_contradictions() {
     assert!(validate_azure_credential(&c).is_err());
     let mut c = provider_config(None, "");
     c.azure_client_secret = Some("s".into());
-    assert!(validate_azure_credential(&c).is_err(), "a secret with no source is ambiguous");
+    assert!(
+        validate_azure_credential(&c).is_err(),
+        "a secret with no source is ambiguous"
+    );
     let mut c = provider_config(Some("managed-identity"), "");
     c.azure_client_id = Some("user-assigned".into());
     assert!(validate_azure_credential(&c).is_ok());

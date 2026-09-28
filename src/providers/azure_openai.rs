@@ -2,11 +2,11 @@ use anyhow::Context;
 use futures::TryStreamExt;
 
 use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
-use crate::providers::azure_credentials::AzureAuth;
-use crate::providers::azure_entra::COGNITIVE_SERVICES_SCOPE;
 use crate::providers::adapter::{
     CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
 };
+use crate::providers::azure_credentials::AzureAuth;
+use crate::providers::azure_entra::COGNITIVE_SERVICES_SCOPE;
 
 /// GA stable Azure OpenAI API version at time of writing.
 /// Operators should pin `api_version` in config for production deployments.
@@ -34,7 +34,10 @@ impl AzureOpenAIAdapter {
     /// `credential_source` selects an Entra credential, in which case the
     /// audience is `entra_scope` or the Azure OpenAI default,
     /// `https://cognitiveservices.azure.com/.default`.
-    pub fn try_new(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig) -> anyhow::Result<Self> {
+    pub fn try_new(
+        config: &ProviderConfig,
+        tier_timeouts: TierTimeoutsConfig,
+    ) -> anyhow::Result<Self> {
         let scope = config
             .entra_scope
             .as_deref()
@@ -51,7 +54,11 @@ impl AzureOpenAIAdapter {
     }
 
     /// Build with a caller-chosen auth mode (tests).
-    pub fn with_auth(config: &ProviderConfig, tier_timeouts: TierTimeoutsConfig, auth: AzureAuth) -> Self {
+    pub fn with_auth(
+        config: &ProviderConfig,
+        tier_timeouts: TierTimeoutsConfig,
+        auth: AzureAuth,
+    ) -> Self {
         let api_base = config.api_base.clone().unwrap_or_else(|| {
             panic!(
                 "Azure OpenAI adapter requires `api_base` to be set. \
@@ -162,9 +169,7 @@ impl ProviderAdapter for AzureOpenAIAdapter {
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
-        let resp = self
-            .client
-            .post(self.chat_url());
+        let resp = self.client.post(self.chat_url());
         let resp = self
             .auth
             .apply(resp)
@@ -214,10 +219,10 @@ impl ProviderAdapter for AzureOpenAIAdapter {
         // usage chunk so the streaming ledger records provider-counted tokens.
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
-        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
-        let resp = self
-            .client
-            .post(self.chat_url());
+        let timeout_secs = self
+            .tier_timeouts
+            .resolve(&req.request_model, self.default_timeout_secs);
+        let resp = self.client.post(self.chat_url());
         let resp = self
             .auth
             .apply(resp)

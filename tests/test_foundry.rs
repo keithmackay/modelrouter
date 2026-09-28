@@ -567,7 +567,11 @@ async fn configured_workload_identity_exchanges_the_federated_token() {
 
     let forms = forms.lock().unwrap();
     assert_eq!(forms.len(), 1);
-    assert!(forms[0].contains("client_assertion=federated-jwt"), "{}", forms[0]);
+    assert!(
+        forms[0].contains("client_assertion=federated-jwt"),
+        "{}",
+        forms[0]
+    );
     assert!(forms[0].contains("client_id=client-wi"), "{}", forms[0]);
     assert_eq!(
         capture.lock().unwrap().authorization[0].as_deref(),

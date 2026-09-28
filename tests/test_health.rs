@@ -94,7 +94,12 @@ async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
 /// search engines are configured independently of each other, none of which
 /// `test_app` above exposes.
 async fn test_app_with(settings: Settings, search_registry: SearchRegistry) -> TestServer {
-    test_app_with_registries(settings, search_registry, ProviderRegistry::new(HashMap::new())).await
+    test_app_with_registries(
+        settings,
+        search_registry,
+        ProviderRegistry::new(HashMap::new()),
+    )
+    .await
 }
 
 /// As `test_app_with`, with a caller-supplied provider registry.
@@ -367,11 +372,15 @@ async fn deep_health_lists_every_configured_credential() {
     // Key auth holds no managed credential, so it is not listed.
     settings.providers.insert(
         "openai".to_string(),
-        ProviderConfig { api_key: "k".to_string(), ..Default::default() },
+        ProviderConfig {
+            api_key: "k".to_string(),
+            ..Default::default()
+        },
     );
     let registry = ProviderRegistry::new(settings.providers.clone());
     let server =
-        test_app_with_registries(settings, mock_search_registry_health(&["tavily"]), registry).await;
+        test_app_with_registries(settings, mock_search_registry_health(&["tavily"]), registry)
+            .await;
 
     let body: serde_json::Value = server.get("/health/deep").await.json();
     let rows = body["credentials"].as_array().expect("credentials list");
@@ -383,7 +392,10 @@ async fn deep_health_lists_every_configured_credential() {
     assert_eq!(row["source"], "managed-identity");
     assert_eq!(row["kind"], "azure-managed-identity");
     assert_eq!(row["fallback_active"], false);
-    assert!(row["reason"].as_str().is_some_and(|r| !r.is_empty()), "{row}");
+    assert!(
+        row["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "{row}"
+    );
     assert!(row.get("remediation").is_some(), "{row}");
 }
 

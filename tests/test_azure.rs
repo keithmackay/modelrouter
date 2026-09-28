@@ -168,8 +168,15 @@ async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
     let router = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
         let seen = seen_handler.clone();
         async move {
-            let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
-            seen.lock().unwrap().push((get("authorization"), get("api-key")));
+            let get = |k: &str| {
+                headers
+                    .get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            seen.lock()
+                .unwrap()
+                .push((get("authorization"), get("api-key")));
             axum::Json(serde_json::json!({
                 "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}
@@ -177,7 +184,10 @@ async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}/openai/deployments/d", listener.local_addr().unwrap());
+    let base = format!(
+        "http://{}/openai/deployments/d",
+        listener.local_addr().unwrap()
+    );
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
     let req = NormalizedRequest {
@@ -191,7 +201,11 @@ async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
         tool_choice: None,
         extra_params: serde_json::json!({}),
     };
-    let config = ProviderConfig { api_base: Some(base.clone()), timeout_secs: 10, ..Default::default() };
+    let config = ProviderConfig {
+        api_base: Some(base.clone()),
+        timeout_secs: 10,
+        ..Default::default()
+    };
     let tiers = modelrouter::config::schema::TierTimeoutsConfig::default();
 
     let entra = AzureOpenAIAdapter::with_auth(
@@ -202,7 +216,10 @@ async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
     entra.complete(&req).await.unwrap();
 
     let keyed = AzureOpenAIAdapter::new(
-        &ProviderConfig { api_key: "the-key".into(), ..config.clone() },
+        &ProviderConfig {
+            api_key: "the-key".into(),
+            ..config.clone()
+        },
         tiers,
     );
     keyed.complete(&req).await.unwrap();
@@ -233,7 +250,13 @@ fn azure_credential_source_selects_entra() {
     assert_eq!(report.source, "workload-identity");
     assert_eq!(report.kind, "azure-workload-identity");
 
-    let contradictory = ProviderConfig { api_key: "k".into(), ..config };
-    let err = AzureOpenAIAdapter::try_new(&contradictory, tiers).err().unwrap().to_string();
+    let contradictory = ProviderConfig {
+        api_key: "k".into(),
+        ..config
+    };
+    let err = AzureOpenAIAdapter::try_new(&contradictory, tiers)
+        .err()
+        .unwrap()
+        .to_string();
     assert!(err.contains("contradictory"), "{err}");
 }

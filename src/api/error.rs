@@ -122,7 +122,9 @@ mod tests {
     async fn status_and_body(err: ApiError) -> (StatusCode, serde_json::Value) {
         let resp = err.into_response();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
@@ -148,7 +150,10 @@ mod tests {
             "Reauthenticate: gcloud auth application-default login."
         );
         let msg = body["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("gcloud auth application-default login"), "{msg}");
+        assert!(
+            msg.contains("gcloud auth application-default login"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]

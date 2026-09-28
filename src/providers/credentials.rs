@@ -83,8 +83,16 @@ pub struct CredentialVerdict {
 }
 
 impl CredentialVerdict {
-    pub fn new(status: CredentialStatus, reason: impl Into<String>, remediation: impl Into<String>) -> Self {
-        Self { status, reason: reason.into(), remediation: remediation.into() }
+    pub fn new(
+        status: CredentialStatus,
+        reason: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+            remediation: remediation.into(),
+        }
     }
     pub fn ok(reason: impl Into<String>) -> Self {
         Self::new(CredentialStatus::Ok, reason, "")
@@ -207,7 +215,8 @@ impl CredentialChain {
 
     /// The source serving requests right now.
     fn active(&self) -> Arc<dyn CredentialSource> {
-        self.active_fallback().unwrap_or_else(|| self.primary.clone())
+        self.active_fallback()
+            .unwrap_or_else(|| self.primary.clone())
     }
 
     pub fn fallback_active(&self) -> bool {
@@ -221,7 +230,13 @@ impl CredentialChain {
     /// What health reports for this credential.
     pub fn report(&self) -> CredentialReport {
         let active = self.active();
-        let expired = self.state.lock().unwrap().expired.as_ref().map(|(_, e)| e.clone());
+        let expired = self
+            .state
+            .lock()
+            .unwrap()
+            .expired
+            .as_ref()
+            .map(|(_, e)| e.clone());
         let verdict = match expired {
             Some(e) => CredentialVerdict::new(CredentialStatus::Expired, e.reason, e.remediation),
             None => active.verdict(),
@@ -237,7 +252,11 @@ impl CredentialChain {
 
     async fn fetch(&self, force: bool) -> anyhow::Result<String> {
         if let Some(fallback) = self.active_fallback() {
-            let result = if force { fallback.force_refresh().await } else { fallback.token().await };
+            let result = if force {
+                fallback.force_refresh().await
+            } else {
+                fallback.token().await
+            };
             return result.map_err(|e| self.escalate(e, fallback.as_ref()));
         }
 
@@ -245,7 +264,11 @@ impl CredentialChain {
             return Err(anyhow::Error::new(expired));
         }
 
-        let result = if force { self.primary.force_refresh().await } else { self.primary.token().await };
+        let result = if force {
+            self.primary.force_refresh().await
+        } else {
+            self.primary.token().await
+        };
         let err = match result {
             Ok(token) => {
                 self.state.lock().unwrap().expired = None;
@@ -292,7 +315,11 @@ impl CredentialChain {
         anyhow::Error::new(expired)
     }
 
-    fn expired_error(&self, err: &anyhow::Error, source: &dyn CredentialSource) -> CredentialExpired {
+    fn expired_error(
+        &self,
+        err: &anyhow::Error,
+        source: &dyn CredentialSource,
+    ) -> CredentialExpired {
         if let Some(existing) = find_credential_expired(err) {
             return existing.clone();
         }
@@ -408,11 +435,26 @@ pub struct CredentialSupport {
 }
 
 pub fn credential_support() -> &'static [CredentialSupport] {
-    use crate::config::schema::{validate_azure_credential, validate_gcp_credential, AZURE_CREDENTIAL_SOURCES, GCP_CREDENTIAL_SOURCES};
+    use crate::config::schema::{
+        validate_azure_credential, validate_gcp_credential, AZURE_CREDENTIAL_SOURCES,
+        GCP_CREDENTIAL_SOURCES,
+    };
     const SUPPORT: &[CredentialSupport] = &[
-        CredentialSupport { provider: "vertex", values: GCP_CREDENTIAL_SOURCES, validate: validate_gcp_credential },
-        CredentialSupport { provider: "azure", values: AZURE_CREDENTIAL_SOURCES, validate: validate_azure_credential },
-        CredentialSupport { provider: "foundry", values: AZURE_CREDENTIAL_SOURCES, validate: validate_azure_credential },
+        CredentialSupport {
+            provider: "vertex",
+            values: GCP_CREDENTIAL_SOURCES,
+            validate: validate_gcp_credential,
+        },
+        CredentialSupport {
+            provider: "azure",
+            values: AZURE_CREDENTIAL_SOURCES,
+            validate: validate_azure_credential,
+        },
+        CredentialSupport {
+            provider: "foundry",
+            values: AZURE_CREDENTIAL_SOURCES,
+            validate: validate_azure_credential,
+        },
         CredentialSupport {
             provider: "bing_grounding",
             values: AZURE_CREDENTIAL_SOURCES,
@@ -449,7 +491,11 @@ pub(crate) mod testing {
                 kind: kind.into(),
                 result: result.map(str::to_string).map_err(str::to_string),
                 calls: AtomicUsize::new(0),
-                verdict: CredentialVerdict::new(CredentialStatus::Warn, "personal login", "use the workload identity"),
+                verdict: CredentialVerdict::new(
+                    CredentialStatus::Warn,
+                    "personal login",
+                    "use the workload identity",
+                ),
                 fallback: None,
             }
         }
@@ -478,7 +524,10 @@ pub(crate) mod testing {
             self.verdict.clone()
         }
         fn expired_guidance(&self) -> (String, String) {
-            ("the fake login expired".into(), "log in to the fake again".into())
+            (
+                "the fake login expired".into(),
+                "log in to the fake again".into(),
+            )
         }
         fn fallback(&self) -> Option<FallbackFactory> {
             self.fallback.clone()
@@ -573,11 +622,16 @@ mod tests {
         let builds = Arc::new(AtomicUsize::new(0));
         let fb = Arc::new(FakeSource::new("fake-workload", Ok("wl")));
         let (c, _) = chain(
-            FakeSource::new("fake-user", Err("connection reset by peer")).with_fallback(factory(fb, builds.clone())),
+            FakeSource::new("fake-user", Err("connection reset by peer"))
+                .with_fallback(factory(fb, builds.clone())),
         );
         let err = c.token().await.unwrap_err();
         assert!(find_credential_expired(&err).is_none());
-        assert_eq!(builds.load(Ordering::SeqCst), 0, "a transient error must not trigger fallback");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "a transient error must not trigger fallback"
+        );
         assert_eq!(c.report().verdict.status, CredentialStatus::Warn);
     }
 
@@ -587,11 +641,17 @@ mod tests {
         let mut fb = FakeSource::new("fake-workload", Ok("wl-token"));
         fb.verdict = CredentialVerdict::ok("workload identity");
         let fb = Arc::new(fb);
-        let (c, primary) =
-            chain(FakeSource::new("fake-user", Err(REAUTH)).with_fallback(factory(fb.clone(), builds.clone())));
+        let (c, primary) = chain(
+            FakeSource::new("fake-user", Err(REAUTH))
+                .with_fallback(factory(fb.clone(), builds.clone())),
+        );
         assert_eq!(c.token().await.unwrap(), "wl-token");
         assert_eq!(c.force_refresh().await.unwrap(), "wl-token");
-        assert_eq!(primary.calls(), 1, "primary is not asked again after the switch");
+        assert_eq!(
+            primary.calls(),
+            1,
+            "primary is not asked again after the switch"
+        );
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         let json = c.report().to_json();
         assert_eq!(json["kind"], "fake-workload");
@@ -603,7 +663,8 @@ mod tests {
     async fn an_unreachable_fallback_leaves_credential_expired() {
         let builds = Arc::new(AtomicUsize::new(0));
         let fb = Arc::new(FakeSource::new("fake-workload", Err("no route to host")));
-        let (c, _) = chain(FakeSource::new("fake-user", Err(REAUTH)).with_fallback(factory(fb, builds)));
+        let (c, _) =
+            chain(FakeSource::new("fake-user", Err(REAUTH)).with_fallback(factory(fb, builds)));
         let err = c.token().await.unwrap_err();
         assert!(find_credential_expired(&err).is_some());
         assert!(!c.fallback_active());
@@ -630,7 +691,8 @@ mod tests {
                 (String::new(), String::new())
             }
         }
-        let factory: FallbackFactory = Arc::new(|| Ok(Arc::new(Hangs) as Arc<dyn CredentialSource>));
+        let factory: FallbackFactory =
+            Arc::new(|| Ok(Arc::new(Hangs) as Arc<dyn CredentialSource>));
         let c = CredentialChain::new(
             "fakecloud",
             "default",
@@ -650,7 +712,11 @@ mod tests {
             let err = c.token().await.unwrap_err();
             assert!(find_credential_expired(&err).is_some());
         }
-        assert_eq!(primary.calls(), 1, "a known-dead credential must not be refreshed per request");
+        assert_eq!(
+            primary.calls(),
+            1,
+            "a known-dead credential must not be refreshed per request"
+        );
     }
 
     #[tokio::test]
@@ -660,7 +726,10 @@ mod tests {
         let c = CredentialChain::new(
             "fakecloud",
             "default",
-            Arc::new(FakeSource::new("fake-user", Err(REAUTH)).with_fallback(factory(fb, builds.clone()))),
+            Arc::new(
+                FakeSource::new("fake-user", Err(REAUTH))
+                    .with_fallback(factory(fb, builds.clone())),
+            ),
         )
         .with_timings(Duration::from_secs(1), Duration::from_secs(3600));
         c.token().await.unwrap_err();
@@ -690,7 +759,10 @@ mod tests {
                 CredentialVerdict::ok("workload")
             }
             fn expired_guidance(&self) -> (String, String) {
-                ("workload identity refused".into(), "check its role assignment".into())
+                (
+                    "workload identity refused".into(),
+                    "check its role assignment".into(),
+                )
             }
         }
         let fb: Arc<dyn CredentialSource> = Arc::new(DiesSecondTime(AtomicUsize::new(0)));
@@ -705,7 +777,10 @@ mod tests {
         let expired = find_credential_expired(&err).unwrap();
         assert_eq!(expired.credential_kind, "fake-workload");
         assert_eq!(c.report().to_json()["status"], "expired");
-        assert_eq!(c.report().to_json()["remediation"], "check its role assignment");
+        assert_eq!(
+            c.report().to_json()["remediation"],
+            "check its role assignment"
+        );
     }
 
     /// The breaker and the retry loop step aside for the error the chain
@@ -723,7 +798,10 @@ mod tests {
         for _ in 0..5 {
             breaker.record_provider_failure("fakecloud", &err);
         }
-        assert!(!breaker.is_open("fakecloud"), "credential_expired must never open the breaker");
+        assert!(
+            !breaker.is_open("fakecloud"),
+            "credential_expired must never open the breaker"
+        );
     }
 
     #[test]
@@ -742,7 +820,10 @@ mod tests {
     #[test]
     fn support_is_declared_per_provider() {
         assert!(support_for("vertex").unwrap().values.contains(&"metadata"));
-        assert!(support_for("foundry").unwrap().values.contains(&"managed-identity"));
+        assert!(support_for("foundry")
+            .unwrap()
+            .values
+            .contains(&"managed-identity"));
         assert!(support_for("openai").is_none());
     }
 }

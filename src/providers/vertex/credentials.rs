@@ -79,9 +79,9 @@ impl CredentialKind {
                      instance's attached service account"
                 ),
             ),
-            Self::AdcServiceAccount => {
-                CredentialVerdict::ok("service-account key found through Application Default Credentials")
-            }
+            Self::AdcServiceAccount => CredentialVerdict::ok(
+                "service-account key found through Application Default Credentials",
+            ),
             Self::AdcOther => CredentialVerdict::new(
                 CredentialStatus::Unknown,
                 "Application Default Credentials file of a type the router does not classify \
@@ -89,7 +89,9 @@ impl CredentialKind {
                 "",
             ),
             Self::Metadata => CredentialVerdict::ok("the instance's attached service account"),
-            Self::ExplicitFile => CredentialVerdict::ok("service-account key named by credentials_path"),
+            Self::ExplicitFile => {
+                CredentialVerdict::ok("service-account key named by credentials_path")
+            }
         }
     }
 }
@@ -128,7 +130,9 @@ pub(crate) fn detect_adc_kind_with(env_path: Option<&str>, home: Option<&str>) -
 
 pub(crate) fn detect_adc_kind() -> CredentialKind {
     detect_adc_kind_with(
-        std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok().as_deref(),
+        std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .ok()
+            .as_deref(),
         std::env::var("HOME").ok().as_deref(),
     )
 }
@@ -188,13 +192,25 @@ impl GcpSource {
             ResolvedGcpCredential::Adc => fallback,
             _ => None,
         };
-        Self { provider: provider.into(), configured, primary, kind: Box::new(kind), fallback }
+        Self {
+            provider: provider.into(),
+            configured,
+            primary,
+            kind: Box::new(kind),
+            fallback,
+        }
     }
 
     /// The metadata-server source: what `configured = Metadata` uses and what
     /// ADC falls back to.
     pub(crate) fn metadata(provider: impl Into<String>, primary: Arc<dyn TokenProvider>) -> Self {
-        Self::new(provider, ResolvedGcpCredential::Metadata, primary, || CredentialKind::Metadata, None)
+        Self::new(
+            provider,
+            ResolvedGcpCredential::Metadata,
+            primary,
+            || CredentialKind::Metadata,
+            None,
+        )
     }
 
     /// The configured source as health reports it.
@@ -241,7 +257,8 @@ impl CredentialSource for GcpSource {
             ),
             (_, ResolvedGcpCredential::ServiceAccountFile(_)) => (
                 "the service-account key was refused".to_string(),
-                "Replace or re-enable the service-account key named by credentials_path.".to_string(),
+                "Replace or re-enable the service-account key named by credentials_path."
+                    .to_string(),
             ),
             _ => (
                 "the Application Default Credential can no longer be refreshed without \
@@ -280,10 +297,16 @@ mod tests {
 
     impl Scripted {
         fn ok(token: &str) -> Arc<Self> {
-            Arc::new(Self { result: Ok(token.into()), calls: AtomicUsize::new(0) })
+            Arc::new(Self {
+                result: Ok(token.into()),
+                calls: AtomicUsize::new(0),
+            })
         }
         fn err(message: &str) -> Arc<Self> {
-            Arc::new(Self { result: Err(message.into()), calls: AtomicUsize::new(0) })
+            Arc::new(Self {
+                result: Err(message.into()),
+                calls: AtomicUsize::new(0),
+            })
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -301,7 +324,8 @@ mod tests {
     fn metadata_factory(provider: Arc<Scripted>, builds: Arc<AtomicUsize>) -> FallbackFactory {
         Arc::new(move || {
             builds.fetch_add(1, Ordering::SeqCst);
-            Ok(Arc::new(GcpSource::metadata("vertex", provider.clone())) as Arc<dyn CredentialSource>)
+            Ok(Arc::new(GcpSource::metadata("vertex", provider.clone()))
+                as Arc<dyn CredentialSource>)
         })
     }
 
@@ -324,7 +348,11 @@ mod tests {
             r#"body=<{"error":"invalid_grant","error_description":"Token has been expired or revoked."}>"#,
             "Reauthentication required",
         ] {
-            assert_eq!(classify_token_error(&anyhow::anyhow!("{msg}")), TokenFailure::NeedsReauth, "{msg}");
+            assert_eq!(
+                classify_token_error(&anyhow::anyhow!("{msg}")),
+                TokenFailure::NeedsReauth,
+                "{msg}"
+            );
         }
     }
 
@@ -335,7 +363,11 @@ mod tests {
             "failed to refresh user access token, body=<Service Unavailable>: 503",
             "dns error: failed to lookup address information",
         ] {
-            assert_eq!(classify_token_error(&anyhow::anyhow!("{msg}")), TokenFailure::Transient, "{msg}");
+            assert_eq!(
+                classify_token_error(&anyhow::anyhow!("{msg}")),
+                TokenFailure::Transient,
+                "{msg}"
+            );
         }
     }
 
@@ -356,11 +388,21 @@ mod tests {
         let home = dir.to_str().unwrap();
 
         // No file anywhere: ADC lands on the metadata server.
-        assert_eq!(detect_adc_kind_with(None, Some(home)), CredentialKind::Metadata);
+        assert_eq!(
+            detect_adc_kind_with(None, Some(home)),
+            CredentialKind::Metadata
+        );
 
         let well_known = gcloud.join("application_default_credentials.json");
-        std::fs::write(&well_known, r#"{"type":"authorized_user","refresh_token":"x"}"#).unwrap();
-        assert_eq!(detect_adc_kind_with(None, Some(home)), CredentialKind::AdcUser);
+        std::fs::write(
+            &well_known,
+            r#"{"type":"authorized_user","refresh_token":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_adc_kind_with(None, Some(home)),
+            CredentialKind::AdcUser
+        );
 
         // GOOGLE_APPLICATION_CREDENTIALS wins over the well-known file.
         let sa = dir.join("sa.json");
@@ -371,7 +413,10 @@ mod tests {
         );
 
         std::fs::write(&well_known, r#"{"type":"external_account"}"#).unwrap();
-        assert_eq!(detect_adc_kind_with(None, Some(home)), CredentialKind::AdcOther);
+        assert_eq!(
+            detect_adc_kind_with(None, Some(home)),
+            CredentialKind::AdcOther
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -391,7 +436,12 @@ mod tests {
         }
         let user = CredentialKind::AdcUser.verdict("vertex");
         assert!(user.reason.contains("personal login"), "{}", user.reason);
-        assert!(user.remediation.contains("credential_source = \"metadata\""), "{}", user.remediation);
+        assert!(
+            user.remediation
+                .contains("credential_source = \"metadata\""),
+            "{}",
+            user.remediation
+        );
     }
 
     #[tokio::test]
@@ -427,7 +477,11 @@ mod tests {
         assert!(c.fallback_active());
         assert_eq!(c.token().await.unwrap(), "mds-token");
         assert_eq!(c.force_refresh().await.unwrap(), "mds-token");
-        assert_eq!(primary.calls(), 1, "primary must not be asked again after the switch");
+        assert_eq!(
+            primary.calls(),
+            1,
+            "primary must not be asked again after the switch"
+        );
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         let json = c.report().to_json();
         assert_eq!(json["kind"], "metadata");
@@ -450,10 +504,30 @@ mod tests {
         let err = c.token().await.unwrap_err();
         let expired = find_credential_expired(&err).expect("must be the typed permanent error");
         assert_eq!(expired.credential_kind, "adc-user");
-        assert!(expired.remediation.contains("gcloud auth application-default login"), "{}", expired.remediation);
-        assert!(expired.remediation.contains("credential_source = \"metadata\""), "{}", expired.remediation);
-        assert!(expired.reason.contains("reauthentication"), "{}", expired.reason);
-        assert!(expired.detail.contains("invalid_rapt"), "{}", expired.detail);
+        assert!(
+            expired
+                .remediation
+                .contains("gcloud auth application-default login"),
+            "{}",
+            expired.remediation
+        );
+        assert!(
+            expired
+                .remediation
+                .contains("credential_source = \"metadata\""),
+            "{}",
+            expired.remediation
+        );
+        assert!(
+            expired.reason.contains("reauthentication"),
+            "{}",
+            expired.reason
+        );
+        assert!(
+            expired.detail.contains("invalid_rapt"),
+            "{}",
+            expired.detail
+        );
         assert!(!c.fallback_active());
         assert_eq!(c.report().to_json()["status"], "expired");
     }
@@ -470,7 +544,11 @@ mod tests {
         let err = c.token().await.unwrap_err();
         assert!(find_credential_expired(&err).is_none());
         assert!(err.to_string().contains("connection reset"));
-        assert_eq!(builds.load(Ordering::SeqCst), 0, "a transient error must not trigger fallback");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "a transient error must not trigger fallback"
+        );
     }
 
     #[tokio::test]
@@ -481,7 +559,11 @@ mod tests {
                 CredentialKind::ExplicitFile,
                 "credentials_path",
             ),
-            (ResolvedGcpCredential::Metadata, CredentialKind::Metadata, "attached to this instance"),
+            (
+                ResolvedGcpCredential::Metadata,
+                CredentialKind::Metadata,
+                "attached to this instance",
+            ),
         ] {
             let builds = Arc::new(AtomicUsize::new(0));
             let c = chain(
@@ -493,7 +575,11 @@ mod tests {
             let err = c.token().await.unwrap_err();
             let expired = find_credential_expired(&err).unwrap();
             assert_eq!(expired.credential_kind, kind.as_str());
-            assert!(expired.remediation.contains(hint), "{}", expired.remediation);
+            assert!(
+                expired.remediation.contains(hint),
+                "{}",
+                expired.remediation
+            );
             assert_eq!(builds.load(Ordering::SeqCst), 0);
         }
     }

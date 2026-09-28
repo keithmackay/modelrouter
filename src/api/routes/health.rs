@@ -124,13 +124,31 @@ struct CapabilityReport {
 
 impl CapabilityReport {
     fn ok(target: String, latency_ms: i64) -> Self {
-        Self { status: "ok", target, latency_ms, error: None, credential: None }
+        Self {
+            status: "ok",
+            target,
+            latency_ms,
+            error: None,
+            credential: None,
+        }
     }
     fn failed(target: String, latency_ms: i64, error: String) -> Self {
-        Self { status: "failed", target, latency_ms, error: Some(error), credential: None }
+        Self {
+            status: "failed",
+            target,
+            latency_ms,
+            error: Some(error),
+            credential: None,
+        }
     }
     fn skipped(target: String, reason: String) -> Self {
-        Self { status: "skipped", target, latency_ms: 0, error: Some(reason), credential: None }
+        Self {
+            status: "skipped",
+            target,
+            latency_ms: 0,
+            error: Some(reason),
+            credential: None,
+        }
     }
     fn with_credential(mut self, credential: Option<Value>) -> Self {
         self.credential = credential;
@@ -207,7 +225,9 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
             );
             CapabilityReport::ok(target, latency)
         }
-        Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
+        Err(e) => {
+            CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
+        }
     };
     // Read after the call: a fallback taken during it changes the answer.
     report.with_credential(adapter.credential_report().map(|r| r.to_json()))
@@ -248,7 +268,9 @@ async fn probe_embedding(state: &AppState) -> CapabilityReport {
             record_probe_usage(state, model, provider, result.prompt_tokens as i64, 0, cost);
             CapabilityReport::ok(target, latency)
         }
-        Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
+        Err(e) => {
+            CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
+        }
     };
     report.with_credential(adapter.credential_report().map(|r| r.to_json()))
 }
@@ -321,7 +343,9 @@ async fn probe_search(state: &AppState) -> CapabilityReport {
             record_probe_usage(state, target.clone(), engine, 0, 0, cost);
             CapabilityReport::ok(target, latency)
         }
-        Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
+        Err(e) => {
+            CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
+        }
     };
     report.with_credential(adapter.credential_report().map(|r| r.to_json()))
 }

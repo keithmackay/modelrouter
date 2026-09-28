@@ -227,7 +227,7 @@ mod tests {
                 provider: "vertex".into(),
                 credential_kind: "adc-user".into(),
                 reason: "the login has expired".into(),
-            remediation: "Reauthenticate.".into(),
+                remediation: "Reauthenticate.".into(),
                 detail: "invalid_grant".into(),
             },
         ));

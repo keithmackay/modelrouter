@@ -8,10 +8,10 @@
 //! why that matters and what we do about it.
 
 use super::credentials::{detect_adc_kind, CredentialKind, GcpSource};
+use crate::config::schema::{ProviderConfig, ResolvedGcpCredential};
 use crate::providers::credentials::{
     CredentialChain, CredentialReport, CredentialSource, FallbackFactory,
 };
-use crate::config::schema::{ProviderConfig, ResolvedGcpCredential};
 use anyhow::Context;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -271,10 +271,14 @@ impl GoogleCloudAuthProvider {
         let source = config.gcp_credential()?;
         let primary: Arc<dyn TokenProvider> = match &source {
             ResolvedGcpCredential::Adc => Arc::new(RebuildingProvider::new(Self::build_adc)?),
-            ResolvedGcpCredential::Metadata => Arc::new(RebuildingProvider::new(Self::build_metadata)?),
+            ResolvedGcpCredential::Metadata => {
+                Arc::new(RebuildingProvider::new(Self::build_metadata)?)
+            }
             ResolvedGcpCredential::ServiceAccountFile(path) => {
                 let path = path.clone();
-                Arc::new(RebuildingProvider::new(move || Self::build_service_account(&path))?)
+                Arc::new(RebuildingProvider::new(move || {
+                    Self::build_service_account(&path)
+                })?)
             }
         };
         let fallback: Option<FallbackFactory> = match &source {
@@ -282,7 +286,8 @@ impl GoogleCloudAuthProvider {
                 let provider = provider.to_string();
                 Some(Arc::new(move || {
                     let mds = Arc::new(RebuildingProvider::new(Self::build_metadata)?);
-                    Ok(Arc::new(GcpSource::metadata(provider.clone(), mds)) as Arc<dyn CredentialSource>)
+                    Ok(Arc::new(GcpSource::metadata(provider.clone(), mds))
+                        as Arc<dyn CredentialSource>)
                 }))
             }
             _ => None,
@@ -300,13 +305,16 @@ impl GoogleCloudAuthProvider {
         );
         let label = GcpSource::configured_label(&source);
         let gcp = GcpSource::new(provider, source, primary, kind, fallback);
-        Ok(Self { inner: CredentialChain::new(provider, label, Arc::new(gcp)) })
+        Ok(Self {
+            inner: CredentialChain::new(provider, label, Arc::new(gcp)),
+        })
     }
 
     fn build_service_account(
         path: &str,
     ) -> anyhow::Result<google_cloud_auth::credentials::AccessTokenCredentials> {
-        let raw = std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
         let json: serde_json::Value =
             serde_json::from_str(&raw).with_context(|| format!("{path} is not valid JSON"))?;
         google_cloud_auth::credentials::service_account::Builder::new(json)

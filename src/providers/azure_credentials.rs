@@ -80,8 +80,9 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(60);
 /// - 700024: the client assertion (federated token) is outside its validity
 /// - 7000222: the client secret has expired
 /// - 7000215: the client secret is invalid
-pub const REAUTH_AADSTS_CODES: &[&str] =
-    &["50173", "70043", "700082", "50076", "50079", "50078", "700024", "7000222", "7000215"];
+pub const REAUTH_AADSTS_CODES: &[&str] = &[
+    "50173", "70043", "700082", "50076", "50079", "50078", "700024", "7000222", "7000215",
+];
 
 /// OAuth error codes that are permanent whatever AADSTS code accompanies them.
 const REAUTH_OAUTH_ERRORS: &[&str] = &["interaction_required", "invalid_grant"];
@@ -112,7 +113,10 @@ fn aadsts_codes(text: &str) -> Vec<String> {
     let mut codes = Vec::new();
     let mut rest = upper.as_str();
     while let Some(at) = rest.find("AADSTS") {
-        let digits: String = rest[at + 6..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = rest[at + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         if !digits.is_empty() {
             codes.push(digits);
         }
@@ -124,12 +128,17 @@ fn aadsts_codes(text: &str) -> Vec<String> {
 fn text_is_reauth(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     REAUTH_OAUTH_ERRORS.iter().any(|e| lower.contains(e))
-        || aadsts_codes(text).iter().any(|c| REAUTH_AADSTS_CODES.contains(&c.as_str()))
+        || aadsts_codes(text)
+            .iter()
+            .any(|c| REAUTH_AADSTS_CODES.contains(&c.as_str()))
 }
 
 /// Whether an error from any Azure source means the credential is dead.
 pub fn is_azure_reauth(err: &anyhow::Error) -> bool {
-    if let Some(http) = err.chain().find_map(|e| e.downcast_ref::<AzureTokenError>()) {
+    if let Some(http) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<AzureTokenError>())
+    {
         if http.status >= 500 || http.status == 429 {
             return false;
         }
@@ -137,7 +146,9 @@ pub fn is_azure_reauth(err: &anyhow::Error) -> bool {
     }
     if let Some(cli) = err.chain().find_map(|e| e.downcast_ref::<AzureCliError>()) {
         let lower = cli.stderr.to_ascii_lowercase();
-        return lower.contains("az login") || lower.contains("aadsts") || text_is_reauth(&cli.stderr);
+        return lower.contains("az login")
+            || lower.contains("aadsts")
+            || text_is_reauth(&cli.stderr);
     }
     text_is_reauth(&format!("{err:#}"))
 }
@@ -229,7 +240,8 @@ impl AzureKind {
 // ── token parsing and caching ───────────────────────────────────────────────
 
 fn number_or_string(v: &serde_json::Value) -> Option<i64> {
-    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 /// Extract the token and its remaining lifetime from any of the documented
@@ -237,9 +249,11 @@ fn number_or_string(v: &serde_json::Value) -> Option<i64> {
 /// App Service (`expires_on` unix-seconds string), Azure CLI (`accessToken`
 /// with `expires_on` unix seconds, or only `expiresOn` in local time on older
 /// CLIs).
-pub(crate) fn parse_token_response(body: &str, now_unix: i64) -> anyhow::Result<(String, Duration)> {
-    let v: serde_json::Value =
-        serde_json::from_str(body).context("token response is not JSON")?;
+pub(crate) fn parse_token_response(
+    body: &str,
+    now_unix: i64,
+) -> anyhow::Result<(String, Duration)> {
+    let v: serde_json::Value = serde_json::from_str(body).context("token response is not JSON")?;
     let token = v["access_token"]
         .as_str()
         .or_else(|| v["accessToken"].as_str())
@@ -290,7 +304,10 @@ impl TokenCache {
         }
         let (token, lifetime) = fetch().await?;
         let skew = EXPIRY_SKEW.min(lifetime / 2);
-        *slot = Some((token.clone(), Instant::now() + lifetime.saturating_sub(skew)));
+        *slot = Some((
+            token.clone(),
+            Instant::now() + lifetime.saturating_sub(skew),
+        ));
         Ok(token)
     }
 }
@@ -302,7 +319,12 @@ async fn read_response(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(AzureTokenError { source_kind, status: status.as_u16(), body: body.trim().to_string() }.into());
+        return Err(AzureTokenError {
+            source_kind,
+            status: status.as_u16(),
+            body: body.trim().to_string(),
+        }
+        .into());
     }
     parse_token_response(&body, now_unix())
 }
@@ -337,7 +359,12 @@ fn env(key: &str) -> Option<String> {
 }
 
 impl AzureSettings {
-    pub fn from_config(provider: &str, config: &ProviderConfig, scope: &str, timeout: Duration) -> Self {
+    pub fn from_config(
+        provider: &str,
+        config: &ProviderConfig,
+        scope: &str,
+        timeout: Duration,
+    ) -> Self {
         let identity_endpoint = match (env("IDENTITY_ENDPOINT"), env("IDENTITY_HEADER")) {
             (Some(e), Some(h)) => Some((e, h)),
             _ => None,
@@ -347,11 +374,14 @@ impl AzureSettings {
             scope: scope.to_string(),
             tenant_id: non_empty(config.azure_tenant_id.clone()).or_else(|| env("AZURE_TENANT_ID")),
             client_id: non_empty(config.azure_client_id.clone()).or_else(|| env("AZURE_CLIENT_ID")),
-            client_secret: non_empty(config.azure_client_secret.clone()).or_else(|| env("AZURE_CLIENT_SECRET")),
+            client_secret: non_empty(config.azure_client_secret.clone())
+                .or_else(|| env("AZURE_CLIENT_SECRET")),
             federated_token_file: non_empty(config.azure_federated_token_file.clone())
                 .or_else(|| env("AZURE_FEDERATED_TOKEN_FILE")),
-            authority_host: env("AZURE_AUTHORITY_HOST").unwrap_or_else(|| DEFAULT_AUTHORITY_HOST.to_string()),
-            imds_host: env("AZURE_POD_IDENTITY_AUTHORITY_HOST").unwrap_or_else(|| DEFAULT_IMDS_HOST.to_string()),
+            authority_host: env("AZURE_AUTHORITY_HOST")
+                .unwrap_or_else(|| DEFAULT_AUTHORITY_HOST.to_string()),
+            imds_host: env("AZURE_POD_IDENTITY_AUTHORITY_HOST")
+                .unwrap_or_else(|| DEFAULT_IMDS_HOST.to_string()),
             identity_endpoint,
             cli_program: "az".to_string(),
             timeout,
@@ -366,11 +396,19 @@ impl AzureSettings {
     }
 
     fn token_url(&self, tenant: &str) -> String {
-        format!("{}/{}/oauth2/v2.0/token", self.authority_host.trim_end_matches('/'), tenant)
+        format!(
+            "{}/{}/oauth2/v2.0/token",
+            self.authority_host.trim_end_matches('/'),
+            tenant
+        )
     }
 
     fn require(&self, what: &str, missing: &[(&str, bool)]) -> anyhow::Result<()> {
-        let names: Vec<&str> = missing.iter().filter(|(_, absent)| *absent).map(|(n, _)| *n).collect();
+        let names: Vec<&str> = missing
+            .iter()
+            .filter(|(_, absent)| *absent)
+            .map(|(n, _)| *n)
+            .collect();
         if names.is_empty() {
             return Ok(());
         }
@@ -422,9 +460,15 @@ pub struct ManagedIdentitySource {
 impl ManagedIdentitySource {
     pub fn new(s: &AzureSettings) -> anyhow::Result<Self> {
         let endpoint = match &s.identity_endpoint {
-            Some((url, header)) => MiEndpoint::AppService { url: url.clone(), header: header.clone() },
+            Some((url, header)) => MiEndpoint::AppService {
+                url: url.clone(),
+                header: header.clone(),
+            },
             None => MiEndpoint::Imds {
-                url: format!("{}/metadata/identity/oauth2/token", s.imds_host.trim_end_matches('/')),
+                url: format!(
+                    "{}/metadata/identity/oauth2/token",
+                    s.imds_host.trim_end_matches('/')
+                ),
             },
         };
         Ok(Self {
@@ -498,10 +542,17 @@ impl AppRegistrationSource {
             &[
                 ("azure_tenant_id / AZURE_TENANT_ID", s.tenant_id.is_none()),
                 ("azure_client_id / AZURE_CLIENT_ID", s.client_id.is_none()),
-                ("azure_client_secret / AZURE_CLIENT_SECRET", s.client_secret.is_none()),
+                (
+                    "azure_client_secret / AZURE_CLIENT_SECRET",
+                    s.client_secret.is_none(),
+                ),
             ],
         )?;
-        Self::build(s, AzureKind::ClientSecret, ClientAuth::Secret(s.client_secret.clone().unwrap()))
+        Self::build(
+            s,
+            AzureKind::ClientSecret,
+            ClientAuth::Secret(s.client_secret.clone().unwrap()),
+        )
     }
 
     pub fn workload_identity(s: &AzureSettings) -> anyhow::Result<Self> {
@@ -548,16 +599,25 @@ impl AppRegistrationSource {
             ClientAuth::FederatedTokenFile(path) => {
                 assertion = std::fs::read_to_string(path)
                     .with_context(|| format!("failed to read the federated token file {path}"))?;
-                form.push(("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"));
+                form.push((
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ));
                 form.push(("client_assertion", assertion.trim()));
             }
         }
-        let resp = self.http.post(&self.token_url).form(&form).send().await.with_context(|| {
-            format!(
+        let resp = self
+            .http
+            .post(&self.token_url)
+            .form(&form)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
                 "Entra token request to {} failed — check network egress to the login authority",
                 self.token_url
             )
-        })?;
+            })?;
         let label = match self.kind {
             AzureKind::WorkloadIdentity => "workload identity",
             _ => "client secret",
@@ -610,18 +670,36 @@ impl CliSource {
 
     async fn fetch(&self) -> anyhow::Result<(String, Duration)> {
         let mut cmd = tokio::process::Command::new(&self.program);
-        cmd.args(["account", "get-access-token", "--resource", &self.resource, "--output", "json"]);
+        cmd.args([
+            "account",
+            "get-access-token",
+            "--resource",
+            &self.resource,
+            "--output",
+            "json",
+        ]);
         if let Some(t) = &self.tenant_id {
             cmd.args(["--tenant", t]);
         }
         cmd.kill_on_drop(true);
         let out = tokio::time::timeout(CLI_TIMEOUT, cmd.output())
             .await
-            .map_err(|_| anyhow::anyhow!("Azure CLI did not answer within {}s", CLI_TIMEOUT.as_secs()))?
-            .with_context(|| format!("could not run the Azure CLI ({}) — is it installed and on PATH?", self.program))?;
+            .map_err(|_| {
+                anyhow::anyhow!("Azure CLI did not answer within {}s", CLI_TIMEOUT.as_secs())
+            })?
+            .with_context(|| {
+                format!(
+                    "could not run the Azure CLI ({}) — is it installed and on PATH?",
+                    self.program
+                )
+            })?;
         if !out.status.success() {
             return Err(AzureCliError {
-                code: out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "a signal".into()),
+                code: out
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "a signal".into()),
                 stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             }
             .into());
@@ -688,12 +766,28 @@ impl DefaultSource {
             return Ok((source.clone(), None));
         }
         let s = &self.settings;
-        let (kind, source, token) = if s.tenant_id.is_some() && s.client_id.is_some() && s.client_secret.is_some() {
-            (AzureKind::ClientSecret, build_kind(AzureKind::ClientSecret, s)?, None)
-        } else if s.tenant_id.is_some() && s.client_id.is_some() && s.federated_token_file.is_some() {
-            (AzureKind::WorkloadIdentity, build_kind(AzureKind::WorkloadIdentity, s)?, None)
+        let (kind, source, token) = if s.tenant_id.is_some()
+            && s.client_id.is_some()
+            && s.client_secret.is_some()
+        {
+            (
+                AzureKind::ClientSecret,
+                build_kind(AzureKind::ClientSecret, s)?,
+                None,
+            )
+        } else if s.tenant_id.is_some() && s.client_id.is_some() && s.federated_token_file.is_some()
+        {
+            (
+                AzureKind::WorkloadIdentity,
+                build_kind(AzureKind::WorkloadIdentity, s)?,
+                None,
+            )
         } else if s.identity_endpoint.is_some() {
-            (AzureKind::ManagedIdentity, build_kind(AzureKind::ManagedIdentity, s)?, None)
+            (
+                AzureKind::ManagedIdentity,
+                build_kind(AzureKind::ManagedIdentity, s)?,
+                None,
+            )
         } else {
             let imds = build_kind(AzureKind::ManagedIdentity, s)?;
             match tokio::time::timeout(self.imds_probe_timeout, imds.token()).await {
@@ -775,7 +869,9 @@ impl CredentialSource for DefaultSource {
             return None;
         }
         let settings = self.settings.clone();
-        Some(Arc::new(move || build_kind(AzureKind::ManagedIdentity, &settings)))
+        Some(Arc::new(move || {
+            build_kind(AzureKind::ManagedIdentity, &settings)
+        }))
     }
 }
 
@@ -794,20 +890,28 @@ impl AzureCredential {
 
     /// Build for an explicit `credential_source`, or — `None` — the
     /// `environment` behaviour the Entra-by-default providers always had.
-    pub fn build(source: Option<AzureCredentialSource>, settings: AzureSettings) -> anyhow::Result<Self> {
+    pub fn build(
+        source: Option<AzureCredentialSource>,
+        settings: AzureSettings,
+    ) -> anyhow::Result<Self> {
         let provider = settings.provider.clone();
         let scope = settings.scope.clone();
         let (label, primary): (&str, Arc<dyn CredentialSource>) = match source {
-            Some(AzureCredentialSource::Default) => ("default", Arc::new(DefaultSource::new(settings))),
-            Some(AzureCredentialSource::ManagedIdentity) => {
-                ("managed-identity", build_kind(AzureKind::ManagedIdentity, &settings)?)
+            Some(AzureCredentialSource::Default) => {
+                ("default", Arc::new(DefaultSource::new(settings)))
             }
-            Some(AzureCredentialSource::WorkloadIdentity) => {
-                ("workload-identity", build_kind(AzureKind::WorkloadIdentity, &settings)?)
-            }
-            Some(AzureCredentialSource::ClientSecret) => {
-                ("client-secret", build_kind(AzureKind::ClientSecret, &settings)?)
-            }
+            Some(AzureCredentialSource::ManagedIdentity) => (
+                "managed-identity",
+                build_kind(AzureKind::ManagedIdentity, &settings)?,
+            ),
+            Some(AzureCredentialSource::WorkloadIdentity) => (
+                "workload-identity",
+                build_kind(AzureKind::WorkloadIdentity, &settings)?,
+            ),
+            Some(AzureCredentialSource::ClientSecret) => (
+                "client-secret",
+                build_kind(AzureKind::ClientSecret, &settings)?,
+            ),
             Some(AzureCredentialSource::Cli) => ("cli", build_kind(AzureKind::Cli, &settings)?),
             None => ("environment", Self::environment(&settings)?),
         };
@@ -893,7 +997,9 @@ impl AzureAuth {
             return Ok(Self::ApiKey(config.api_key.trim().to_string()));
         }
         let settings = AzureSettings::from_config(provider, config, scope, timeout);
-        Ok(Self::Entra(Arc::new(AzureCredential::build(source, settings)?)))
+        Ok(Self::Entra(Arc::new(AzureCredential::build(
+            source, settings,
+        )?)))
     }
 
     /// Key-by-default providers (`azure`): key auth unless a
@@ -908,7 +1014,10 @@ impl AzureAuth {
             None => Ok(Self::ApiKey(config.api_key.clone())),
             Some(source) => {
                 let settings = AzureSettings::from_config(provider, config, scope, timeout);
-                Ok(Self::Entra(Arc::new(AzureCredential::build(Some(source), settings)?)))
+                Ok(Self::Entra(Arc::new(AzureCredential::build(
+                    Some(source),
+                    settings,
+                )?)))
             }
         }
     }
@@ -922,7 +1031,10 @@ impl AzureAuth {
 
     /// Attach credentials to an outgoing request. Async because the Entra mode
     /// may have to mint a token (cached in-process; usually a no-op).
-    pub async fn apply(&self, req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::RequestBuilder> {
+    pub async fn apply(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         Ok(match self {
             Self::Entra(provider) => req.bearer_auth(provider.token().await?),
             Self::ApiKey(key) => req.header("api-key", key),

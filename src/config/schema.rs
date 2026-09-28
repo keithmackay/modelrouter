@@ -963,8 +963,13 @@ impl Default for ProviderConfig {
 pub const GCP_CREDENTIAL_SOURCES: &[&str] = &["adc", "metadata"];
 
 /// `credential_source` values for the Azure providers.
-pub const AZURE_CREDENTIAL_SOURCES: &[&str] =
-    &["default", "managed-identity", "workload-identity", "client-secret", "cli"];
+pub const AZURE_CREDENTIAL_SOURCES: &[&str] = &[
+    "default",
+    "managed-identity",
+    "workload-identity",
+    "client-secret",
+    "cli",
+];
 
 /// `credential_source` values for `[providers.vertex]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1111,7 +1116,8 @@ impl ProviderConfig {
         let source = match self.credential_source.as_deref() {
             None => None,
             Some(v) => Some(
-                AzureCredentialSource::parse(v).ok_or_else(|| unknown_source(v, AZURE_CREDENTIAL_SOURCES))?,
+                AzureCredentialSource::parse(v)
+                    .ok_or_else(|| unknown_source(v, AZURE_CREDENTIAL_SOURCES))?,
             ),
         };
         if let Some(source) = source {
@@ -1131,7 +1137,9 @@ impl ProviderConfig {
                     source.as_str()
                 );
             }
-            if self.azure_federated_token_file.is_some() && !matches!(source, WorkloadIdentity | Default) {
+            if self.azure_federated_token_file.is_some()
+                && !matches!(source, WorkloadIdentity | Default)
+            {
                 anyhow::bail!(
                     "azure_federated_token_file is only read by credential_source = \
                      \"workload-identity\" or \"default\", not \"{}\"",
@@ -1163,8 +1171,12 @@ pub fn validate_azure_credential(config: &ProviderConfig) -> anyhow::Result<()> 
 /// keys.
 pub const AZURE_PROVIDERS: &[&str] = &["azure", "foundry", "bing_grounding"];
 
-const AZURE_ONLY_KEYS: &[&str] =
-    &["azure_tenant_id", "azure_client_id", "azure_client_secret", "azure_federated_token_file"];
+const AZURE_ONLY_KEYS: &[&str] = &[
+    "azure_tenant_id",
+    "azure_client_id",
+    "azure_client_secret",
+    "azure_federated_token_file",
+];
 
 impl Settings {
     /// Reject provider credential settings that cannot mean what they say.

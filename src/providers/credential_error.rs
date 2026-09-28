@@ -45,8 +45,10 @@ pub struct CredentialExpired {
 /// Find a [`CredentialExpired`] anywhere in an error's chain, so a call site
 /// that added `.context(..)` on top of it does not hide it.
 pub fn find_credential_expired(err: &anyhow::Error) -> Option<&CredentialExpired> {
-    err.downcast_ref::<CredentialExpired>()
-        .or_else(|| err.chain().find_map(|e| e.downcast_ref::<CredentialExpired>()))
+    err.downcast_ref::<CredentialExpired>().or_else(|| {
+        err.chain()
+            .find_map(|e| e.downcast_ref::<CredentialExpired>())
+    })
 }
 
 #[cfg(test)]

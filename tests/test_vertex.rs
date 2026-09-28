@@ -22,7 +22,10 @@ fn provider_config_default_matches_serde_defaults() {
     assert_eq!(from_default.timeout_secs, from_toml.timeout_secs);
     assert_eq!(from_default.api_key, from_toml.api_key);
     assert_eq!(from_default.embedding_region, from_toml.embedding_region);
-    assert_eq!(from_default.embedding_task_type, from_toml.embedding_task_type);
+    assert_eq!(
+        from_default.embedding_task_type,
+        from_toml.embedding_task_type
+    );
     assert_eq!(from_default.credential_source, from_toml.credential_source);
 }
 
@@ -50,26 +53,44 @@ mod credential_source_config {
     /// that provider accepts.
     #[test]
     fn unknown_value_is_a_validation_error() {
-        let msg = vertex(r#"credential_source = "gcloud""#).gcp_credential().unwrap_err().to_string();
-        assert!(msg.contains("gcloud") && msg.contains("adc") && msg.contains("metadata"), "{msg}");
+        let msg = vertex(r#"credential_source = "gcloud""#)
+            .gcp_credential()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("gcloud") && msg.contains("adc") && msg.contains("metadata"),
+            "{msg}"
+        );
         let s = settings("[providers.vertex]\ncredential_source = \"gcloud\"\n");
         let msg = s.validate_provider_credentials().unwrap_err().to_string();
-        assert!(msg.starts_with("[providers.vertex]") && msg.contains("gcloud"), "{msg}");
+        assert!(
+            msg.starts_with("[providers.vertex]") && msg.contains("gcloud"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn precedence_table() {
-        assert_eq!(vertex("").gcp_credential().unwrap(), ResolvedGcpCredential::Adc);
         assert_eq!(
-            vertex(r#"credential_source = "adc""#).gcp_credential().unwrap(),
+            vertex("").gcp_credential().unwrap(),
             ResolvedGcpCredential::Adc
         );
         assert_eq!(
-            vertex(r#"credential_source = "metadata""#).gcp_credential().unwrap(),
+            vertex(r#"credential_source = "adc""#)
+                .gcp_credential()
+                .unwrap(),
+            ResolvedGcpCredential::Adc
+        );
+        assert_eq!(
+            vertex(r#"credential_source = "metadata""#)
+                .gcp_credential()
+                .unwrap(),
             ResolvedGcpCredential::Metadata
         );
         assert_eq!(
-            vertex(r#"credentials_path = "/secrets/sa.json""#).gcp_credential().unwrap(),
+            vertex(r#"credentials_path = "/secrets/sa.json""#)
+                .gcp_credential()
+                .unwrap(),
             ResolvedGcpCredential::ServiceAccountFile("/secrets/sa.json".into())
         );
     }
@@ -104,7 +125,10 @@ mod credential_source_config {
         let s = settings("[providers.openai]\ncredential_source = \"metadata\"\n");
         let msg = s.validate_provider_credentials().unwrap_err().to_string();
         assert!(msg.contains("not supported by this provider"), "{msg}");
-        assert!(msg.contains("[providers.vertex]") && msg.contains("[providers.azure]"), "{msg}");
+        assert!(
+            msg.contains("[providers.vertex]") && msg.contains("[providers.azure]"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -131,7 +155,10 @@ mod credential_source_config {
             .validate_provider_credentials()
             .unwrap_err()
             .to_string();
-        assert!(msg.starts_with("[providers.foundry]") && msg.contains("managed-identity"), "{msg}");
+        assert!(
+            msg.starts_with("[providers.foundry]") && msg.contains("managed-identity"),
+            "{msg}"
+        );
         let msg = settings("[providers.vertex]\ncredential_source = \"cli\"\n")
             .validate_provider_credentials()
             .unwrap_err()
