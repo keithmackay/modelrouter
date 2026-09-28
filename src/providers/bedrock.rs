@@ -148,6 +148,7 @@ impl ProviderAdapter for BedrockAdapter {
     /// Settings forwarded as normalized; the timeout is the configured ceiling.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: Some(self.timeout_secs),

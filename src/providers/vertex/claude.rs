@@ -9,8 +9,8 @@
 
 use crate::providers::adapter::{CompletionResult, NormalizedRequest};
 use crate::providers::anthropic::{
-    map_stop_reason, text_from_content, tool_calls_from_content, translate_messages,
-    translate_tool_choice, translate_tools,
+    apply_reasoning, map_stop_reason, text_from_content, thinking_tokens_from_usage,
+    tool_calls_from_content, translate_messages, translate_tool_choice, translate_tools,
 };
 
 /// Vertex-specific anthropic_version required on every Claude-on-Vertex call.
@@ -56,6 +56,9 @@ pub fn translate_request(req: &NormalizedRequest, streaming: bool) -> serde_json
             body["tool_choice"] = tc;
         }
     }
+    // Reasoning controls (`thinking` / `output_config.effort`) in the same
+    // dialect as the direct adapter; omitted when none was resolved.
+    apply_reasoning(&mut body, req);
     body
 }
 
@@ -68,7 +71,7 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
-        reasoning_tokens: None,
+        reasoning_tokens: thinking_tokens_from_usage(usage),
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
         finish_reason: map_stop_reason(v["stop_reason"].as_str().unwrap_or("end_turn")),
@@ -84,6 +87,70 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
 // `output_tokens` on message_delta) into a `usage` object on the final chunk
 // so the streaming ledger records provider-counted tokens, not estimates
 // (issue #84).
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+    use crate::providers::adapter::ReasoningControl;
+
+    fn req(reasoning: Option<ReasoningControl>) -> NormalizedRequest {
+        NormalizedRequest {
+            model: "claude-sonnet-5".into(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            reasoning,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disable_thinking_reaches_the_vertex_body() {
+        let body = translate_request(
+            &req(Some(ReasoningControl { disable_thinking: true, effort: None })),
+            false,
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn effort_reaches_the_vertex_body() {
+        let body = translate_request(
+            &req(Some(ReasoningControl { disable_thinking: false, effort: Some("low") })),
+            true,
+        );
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn no_reasoning_control_leaves_the_body_untouched() {
+        let body = translate_request(&req(None), false);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn thinking_tokens_are_reported_as_reasoning_tokens() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "4"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 197,
+                      "output_tokens_details": {"thinking_tokens": 190}}
+        });
+        let r = parse_response(v).unwrap();
+        assert_eq!(r.completion_tokens, 197);
+        assert_eq!(r.reasoning_tokens, Some(190));
+    }
+
+    #[test]
+    fn absent_thinking_breakdown_reports_no_reasoning_tokens() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "4"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        assert_eq!(parse_response(v).unwrap().reasoning_tokens, None);
+    }
+}
 
 #[cfg(test)]
 mod tools_tests {

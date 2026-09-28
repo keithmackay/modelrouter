@@ -109,12 +109,185 @@ pub fn supports_temperature(model: &str, overrides: &[ModelCapabilityEntry]) -> 
         .any(|c| TEMPERATURE_UNSUPPORTED.contains(c))
 }
 
+// ── Reasoning (thinking / effort) controls ──────────────────────────────────
+//
+// OpenAI-shaped callers express "how hard should the model think" as
+// `reasoning_effort` (`none` | `minimal` | `low` | `medium` | `high`, plus the
+// `xhigh` / `max` levels some providers add). Anthropic-dialect backends spell
+// it two other ways — `thinking: {type: "disabled"}` and
+// `output_config: {effort}` — and which of those a model accepts differs by
+// model generation:
+//
+// * Newer Claude models reason by default when the request carries no
+//   `thinking` field, and bill that reasoning as output tokens. A caller that
+//   sized `max_tokens` for its visible answer gets an empty or truncated reply
+//   unless the router forwards its request to turn reasoning off.
+// * Some of those models reject `thinking: {type: "disabled"}` (thinking is
+//   always on); the only lever left is the lowest effort.
+// * Older models do not reason unless asked, and reject `output_config.effort`
+//   outright, so nothing may be sent to them.
+//
+// Tables are keyed like the temperature table (provider prefix stripped,
+// lowercased, `@version` suffix ignored) and are overridable from config.
+
+/// Models that reason when the request carries no `thinking` field.
+const THINKS_BY_DEFAULT: &[&str] = &[
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-mythos-5",
+    "claude-mythos-5-1",
+];
+
+/// Models on which thinking is always on: an explicit
+/// `thinking: {type: "disabled"}` is a 400.
+const THINKING_ALWAYS_ON: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-mythos-5",
+    "claude-mythos-5-1",
+];
+
+/// Models that accept `output_config.effort`.
+const EFFORT_SUPPORTED: &[&str] = &[
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-mythos-5",
+    "claude-mythos-5-1",
+];
+
+/// What a model accepts for controlling its reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingCapabilities {
+    pub thinks_by_default: bool,
+    pub can_disable_thinking: bool,
+    pub supports_effort: bool,
+}
+
+/// Look `model` up in `overrides` (pinned name first, then family) for the
+/// field `pick` selects; fall back to membership of the built-in `table`.
+fn lookup_flag(
+    model: &str,
+    overrides: &[ModelCapabilityEntry],
+    pick: impl Fn(&ModelCapabilityEntry) -> Option<bool>,
+    table_default: impl Fn(&str) -> bool,
+) -> bool {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    let mut candidates = vec![key.as_str()];
+    if base != key {
+        candidates.push(base);
+    }
+    for candidate in &candidates {
+        for entry in overrides {
+            if normalize_model_key(&entry.model) == *candidate {
+                if let Some(v) = pick(entry) {
+                    return v;
+                }
+            }
+        }
+    }
+    candidates.iter().any(|c| table_default(c))
+}
+
+/// Resolve the reasoning controls `model` accepts. Unknown models neither
+/// think by default nor accept effort, so nothing is sent to them.
+pub fn thinking_capabilities(
+    model: &str,
+    overrides: &[ModelCapabilityEntry],
+) -> ThinkingCapabilities {
+    ThinkingCapabilities {
+        thinks_by_default: lookup_flag(
+            model,
+            overrides,
+            |e| e.thinks_by_default,
+            |c| THINKS_BY_DEFAULT.contains(&c),
+        ),
+        // Stored inverted in the built-in table: the exception is the model
+        // that cannot turn thinking off.
+        can_disable_thinking: !lookup_flag(
+            model,
+            overrides,
+            |e| e.can_disable_thinking.map(|v| !v),
+            |c| THINKING_ALWAYS_ON.contains(&c),
+        ),
+        supports_effort: lookup_flag(
+            model,
+            overrides,
+            |e| e.supports_effort,
+            |c| EFFORT_SUPPORTED.contains(&c),
+        ),
+    }
+}
+
+/// Translate a caller's `reasoning_effort` into the controls `model` accepts.
+///
+/// * `none` — disable thinking on a model that thinks by default; where it
+///   cannot be disabled, ask for the lowest effort instead. A model that does
+///   not think by default already honours `none`, so nothing is sent.
+/// * `minimal` / `low` — effort `low` (Anthropic has no `minimal`).
+/// * `medium` / `high` / `xhigh` / `max` — that effort.
+///
+/// Effort is only sent to models that accept it. `None` means "send nothing":
+/// the value was absent, unrecognised (logged), or not expressible for this
+/// model — never a field the provider would reject.
+pub fn resolve_reasoning(
+    model: &str,
+    reasoning_effort: Option<&str>,
+    overrides: &[ModelCapabilityEntry],
+) -> Option<crate::providers::adapter::ReasoningControl> {
+    use crate::providers::adapter::ReasoningControl;
+    let requested = reasoning_effort?.trim().to_ascii_lowercase();
+    let caps = thinking_capabilities(model, overrides);
+    let effort = |level: &'static str| {
+        caps.supports_effort.then(|| ReasoningControl {
+            disable_thinking: false,
+            effort: Some(level),
+        })
+    };
+    match requested.as_str() {
+        "none" => {
+            if !caps.thinks_by_default {
+                None
+            } else if caps.can_disable_thinking {
+                Some(ReasoningControl { disable_thinking: true, effort: None })
+            } else {
+                effort("low")
+            }
+        }
+        "minimal" | "low" => effort("low"),
+        "medium" => effort("medium"),
+        "high" => effort("high"),
+        "xhigh" => effort("xhigh"),
+        "max" => effort("max"),
+        other => {
+            tracing::warn!(
+                model,
+                reasoning_effort = other,
+                "unrecognised reasoning_effort; forwarding no reasoning control"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn entry(model: &str, supports_temperature: Option<bool>) -> ModelCapabilityEntry {
-        ModelCapabilityEntry { model: model.to_string(), supports_temperature }
+        ModelCapabilityEntry { model: model.to_string(), supports_temperature, ..Default::default() }
     }
 
     #[test]
@@ -200,5 +373,104 @@ mod tests {
         let overrides = vec![entry("claude-haiku-4-5", Some(false))];
         assert!(!supports_temperature("claude-haiku-4-5", &overrides));
         assert!(supports_temperature("gpt-4o", &overrides));
+    }
+
+    // ── reasoning controls ──────────────────────────────────────────────────
+
+    use crate::providers::adapter::ReasoningControl;
+
+    const DISABLED: Option<ReasoningControl> =
+        Some(ReasoningControl { disable_thinking: true, effort: None });
+
+    fn eff(level: &'static str) -> Option<ReasoningControl> {
+        Some(ReasoningControl { disable_thinking: false, effort: Some(level) })
+    }
+
+    /// The motivating case: a default-thinking model must receive an explicit
+    /// disable when the caller asks for no reasoning, or it spends a small
+    /// `max_tokens` on hidden thinking.
+    #[test]
+    fn none_disables_thinking_on_a_default_thinking_model() {
+        assert_eq!(resolve_reasoning("claude-sonnet-5", Some("none"), &[]), DISABLED);
+        assert_eq!(resolve_reasoning("anthropic/claude-sonnet-5", Some("none"), &[]), DISABLED);
+        assert_eq!(resolve_reasoning("claude-opus-5@20260101", Some("NONE"), &[]), DISABLED);
+    }
+
+    #[test]
+    fn none_falls_back_to_low_effort_where_thinking_is_always_on() {
+        assert_eq!(resolve_reasoning("claude-fable-5-1", Some("none"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("claude-opus-5-5", Some("none"), &[]), eff("low"));
+    }
+
+    /// Older models don't think unless asked and reject both fields.
+    #[test]
+    fn nothing_is_sent_to_a_model_without_reasoning_controls() {
+        for level in ["none", "minimal", "low", "medium", "high"] {
+            assert_eq!(resolve_reasoning("claude-haiku-4-5@20251001", Some(level), &[]), None);
+            assert_eq!(resolve_reasoning("claude-sonnet-4-5", Some(level), &[]), None);
+        }
+    }
+
+    #[test]
+    fn effort_levels_map_on_effort_capable_models() {
+        assert_eq!(resolve_reasoning("claude-sonnet-5", Some("minimal"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("claude-sonnet-5", Some("low"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("claude-sonnet-5", Some("medium"), &[]), eff("medium"));
+        assert_eq!(resolve_reasoning("claude-sonnet-5", Some("high"), &[]), eff("high"));
+        assert_eq!(resolve_reasoning("claude-opus-4-8", Some("xhigh"), &[]), eff("xhigh"));
+        assert_eq!(resolve_reasoning("claude-opus-5", Some("max"), &[]), eff("max"));
+        // Opus 4.x thinks only when asked, so `none` needs no field there.
+        assert_eq!(resolve_reasoning("claude-opus-4-8", Some("none"), &[]), None);
+    }
+
+    #[test]
+    fn absent_or_unrecognised_effort_sends_nothing() {
+        assert_eq!(resolve_reasoning("claude-sonnet-5", None, &[]), None);
+        assert_eq!(resolve_reasoning("claude-sonnet-5", Some("extreme"), &[]), None);
+    }
+
+    #[test]
+    fn config_declares_reasoning_controls_for_a_new_model() {
+        let overrides = vec![ModelCapabilityEntry {
+            model: "claude-sonnet-6".into(),
+            thinks_by_default: Some(true),
+            can_disable_thinking: Some(false),
+            supports_effort: Some(true),
+            ..Default::default()
+        }];
+        assert_eq!(
+            thinking_capabilities("anthropic/claude-sonnet-6@20270101", &overrides),
+            ThinkingCapabilities {
+                thinks_by_default: true,
+                can_disable_thinking: false,
+                supports_effort: true
+            }
+        );
+        assert_eq!(resolve_reasoning("claude-sonnet-6", Some("none"), &overrides), eff("low"));
+    }
+
+    #[test]
+    fn config_retracts_a_built_in_reasoning_entry() {
+        let overrides = vec![ModelCapabilityEntry {
+            model: "claude-fable-5-1".into(),
+            can_disable_thinking: Some(true),
+            ..Default::default()
+        }];
+        assert_eq!(resolve_reasoning("claude-fable-5-1", Some("none"), &overrides), DISABLED);
+        // Other fields keep their built-in values.
+        assert!(thinking_capabilities("claude-fable-5-1", &overrides).supports_effort);
+    }
+
+    #[test]
+    fn unknown_models_get_no_reasoning_controls() {
+        assert_eq!(
+            thinking_capabilities("gpt-4o", &[]),
+            ThinkingCapabilities {
+                thinks_by_default: false,
+                can_disable_thinking: true,
+                supports_effort: false
+            }
+        );
+        assert_eq!(resolve_reasoning("gpt-4o", Some("low"), &[]), None);
     }
 }

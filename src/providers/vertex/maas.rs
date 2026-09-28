@@ -96,6 +96,7 @@ mod tests {
             max_tokens: Some(100),
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: serde_json::Value::Null,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", false);
@@ -118,6 +119,7 @@ mod tests {
             max_tokens: None,
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: serde_json::Value::Null,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", true);

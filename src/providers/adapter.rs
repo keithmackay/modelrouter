@@ -24,7 +24,23 @@ pub struct NormalizedRequest {
     /// OpenAI-shaped `tool_choice` (`"auto"`, `"required"`, `"none"`, or a
     /// named-function object). `None` when absent or null.
     pub tool_choice: Option<serde_json::Value>,
+    /// The caller's `reasoning_effort`, already resolved against what the
+    /// target model accepts (see
+    /// [`crate::router::model_capabilities::resolve_reasoning`]). `None` means
+    /// send no reasoning control and let the provider default apply.
+    pub reasoning: Option<ReasoningControl>,
     pub extra_params: serde_json::Value,
+}
+
+/// A provider-neutral reasoning directive, resolved per model so an adapter
+/// only has to spell it in its own dialect — every field set here is one the
+/// model is known to accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ReasoningControl {
+    /// Turn the model's thinking off explicitly.
+    pub disable_thinking: bool,
+    /// Effort level (`low` | `medium` | `high` | `xhigh` | `max`).
+    pub effort: Option<&'static str>,
 }
 
 /// Serializable so the response cache can persist it in any store backend.
@@ -90,6 +106,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// adapters that fill in defaults or resolve a timeout override it.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: None,
@@ -114,4 +131,7 @@ pub struct EffectiveSettings {
     pub max_tokens: Option<u32>,
     /// HTTP timeout ceiling applied to the provider call, in seconds.
     pub timeout_secs: Option<u64>,
+    /// The reasoning control the adapter actually sent. `None` when the
+    /// request carried none, or the adapter does not translate one.
+    pub reasoning: Option<ReasoningControl>,
 }

@@ -88,6 +88,7 @@ async fn azure_stream_body_always_requests_usage() {
         max_tokens: None,
         tools: None,
         tool_choice: None,
+        reasoning: None,
         extra_params: serde_json::json!({}),
     };
     let mut stream = adapter.stream(&req).await.unwrap();
@@ -140,6 +141,7 @@ async fn openai_compat_stream_body_always_requests_usage() {
         max_tokens: None,
         tools: None,
         tool_choice: None,
+        reasoning: None,
         extra_params: serde_json::json!({}),
     };
     let mut stream = adapter.stream(&req).await.unwrap();
@@ -199,6 +201,7 @@ async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
         max_tokens: None,
         tools: None,
         tool_choice: None,
+        reasoning: None,
         extra_params: serde_json::json!({}),
     };
     let config = ProviderConfig {
