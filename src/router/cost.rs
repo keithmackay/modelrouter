@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 pub struct CostCalculator {
     pricing: HashMap<String, ModelPricing>,
+    /// Pricing keys already reported as unpriced, so the warning fires once
+    /// per model per process instead of on every request.
+    warned_unpriced: Mutex<HashSet<String>>,
 }
 
 struct ModelPricing {
@@ -27,6 +31,21 @@ impl ModelPricing {
             output_per_million,
             cache_read_per_million: None,
             cache_write_per_million: None,
+        }
+    }
+
+    /// Pricing with explicitly published cache rates.
+    fn with_cache(
+        input_per_million: f64,
+        output_per_million: f64,
+        cache_read_per_million: f64,
+        cache_write_per_million: f64,
+    ) -> Self {
+        Self {
+            input_per_million,
+            output_per_million,
+            cache_read_per_million: Some(cache_read_per_million),
+            cache_write_per_million: Some(cache_write_per_million),
         }
     }
 
@@ -70,22 +89,10 @@ impl CostCalculator {
             ModelPricing::simple(15.0, 75.0),
         );
         // OpenAI models
-        pricing.insert(
-            "gpt-4o".to_string(),
-            ModelPricing::simple(2.50, 10.0),
-        );
-        pricing.insert(
-            "gpt-4o-mini".to_string(),
-            ModelPricing::simple(0.15, 0.60),
-        );
-        pricing.insert(
-            "gpt-4-turbo".to_string(),
-            ModelPricing::simple(10.0, 30.0),
-        );
-        pricing.insert(
-            "gpt-4".to_string(),
-            ModelPricing::simple(30.0, 60.0),
-        );
+        pricing.insert("gpt-4o".to_string(), ModelPricing::simple(2.50, 10.0));
+        pricing.insert("gpt-4o-mini".to_string(), ModelPricing::simple(0.15, 0.60));
+        pricing.insert("gpt-4-turbo".to_string(), ModelPricing::simple(10.0, 30.0));
+        pricing.insert("gpt-4".to_string(), ModelPricing::simple(30.0, 60.0));
         pricing.insert(
             "gpt-3.5-turbo".to_string(),
             ModelPricing::simple(0.50, 1.50),
@@ -113,6 +120,44 @@ impl CostCalculator {
             "gemini-2.5-flash-lite".to_string(),
             ModelPricing::simple(0.10, 0.40),
         );
+        // Gemini 3.x on Vertex: Standard tier, global endpoint, prompts <= 200K.
+        // Non-global endpoints list ~10% higher; prompts > 200K and Priority
+        // tier are higher still. Cache read is the published cached-input rate.
+        // Gemini implicit caching has no write premium (explicit-cache storage
+        // is billed per hour and is not modelled here), so cache writes are
+        // priced at the input rate.
+        // Reference: https://cloud.google.com/vertex-ai/generative-ai/pricing
+        pricing.insert(
+            "gemini-3.1-pro-preview".to_string(),
+            ModelPricing::with_cache(2.00, 12.00, 0.20, 2.00),
+        );
+        pricing.insert(
+            "gemini-3.5-flash".to_string(),
+            ModelPricing::with_cache(1.50, 9.00, 0.15, 1.50),
+        );
+        pricing.insert(
+            "gemini-3.5-flash-lite".to_string(),
+            ModelPricing::with_cache(0.30, 2.50, 0.03, 0.30),
+        );
+        // Text/image/video input rate; audio input lists at 2x.
+        pricing.insert(
+            "gemini-3.1-flash-lite".to_string(),
+            ModelPricing::with_cache(0.25, 1.50, 0.025, 0.25),
+        );
+        // OpenAI open-weight models on Vertex Model-as-a-Service. Vertex model
+        // IDs carry a `-maas` suffix; the bare names are priced identically.
+        // gpt-oss-120b lists no cached-input rate, so the default discount
+        // applies to it.
+        // Reference: https://cloud.google.com/vertex-ai/generative-ai/pricing
+        for name in ["gpt-oss-120b", "gpt-oss-120b-maas"] {
+            pricing.insert(name.to_string(), ModelPricing::simple(0.09, 0.36));
+        }
+        for name in ["gpt-oss-20b", "gpt-oss-20b-maas"] {
+            pricing.insert(
+                name.to_string(),
+                ModelPricing::with_cache(0.07, 0.25, 0.007, 0.07),
+            );
+        }
         // DeepSeek models
         pricing.insert(
             "deepseek-chat".to_string(),
@@ -127,18 +172,9 @@ impl CostCalculator {
             ModelPricing::simple(0.55, 2.19),
         );
         // Alibaba Qwen (Tongyi)
-        pricing.insert(
-            "qwen-max".to_string(),
-            ModelPricing::simple(0.40, 1.20),
-        );
-        pricing.insert(
-            "qwen-plus".to_string(),
-            ModelPricing::simple(0.07, 0.21),
-        );
-        pricing.insert(
-            "qwen-turbo".to_string(),
-            ModelPricing::simple(0.05, 0.10),
-        );
+        pricing.insert("qwen-max".to_string(), ModelPricing::simple(0.40, 1.20));
+        pricing.insert("qwen-plus".to_string(), ModelPricing::simple(0.07, 0.21));
+        pricing.insert("qwen-turbo".to_string(), ModelPricing::simple(0.05, 0.10));
         // ByteDance Doubao
         pricing.insert(
             "doubao-lite-4k".to_string(),
@@ -173,8 +209,11 @@ impl CostCalculator {
             "claude-haiku-4-5@20251001".to_string(),
             ModelPricing::simple(0.80, 4.0),
         );
-        // Unknown models return 0 (Ollama etc)
-        Self { pricing }
+        // Unknown models cost 0 (Ollama etc.) and are reported once as unpriced.
+        Self {
+            pricing,
+            warned_unpriced: Mutex::new(HashSet::new()),
+        }
     }
 
     pub fn new_with_config(config_pricing: &[crate::config::schema::PricingEntry]) -> Self {
@@ -255,8 +294,32 @@ impl CostCalculator {
                     + (cache_read_tokens as f64 / 1_000_000.0) * p.cache_read_rate()
                     + (cache_write_tokens as f64 / 1_000_000.0) * p.cache_write_rate()
             }
-            None => 0.0,
+            None => {
+                self.note_unpriced(model);
+                0.0
+            }
         }
+    }
+
+    /// Record that `model` was costed without a pricing entry. Logs a warning
+    /// the first time each model is seen, so a missing price shows up in the
+    /// logs rather than passing as a silent zero in the cost ledger. Returns
+    /// whether this call emitted the warning.
+    fn note_unpriced(&self, model: &str) -> bool {
+        let key = Self::pricing_key(model);
+        let first = match self.warned_unpriced.lock() {
+            Ok(mut seen) => seen.insert(key.clone()),
+            Err(poisoned) => poisoned.into_inner().insert(key.clone()),
+        };
+        if first {
+            tracing::warn!(
+                model = %model,
+                pricing_key = %key,
+                "no pricing entry for model; its cost is recorded as $0 \
+                 (add a [[pricing]] entry to the config to price it)"
+            );
+        }
+        first
     }
 }
 
@@ -332,7 +395,10 @@ mod tests {
         let cost = calc.calculate("vertex/anthropic/claude-x", 1_000_000, 0);
         assert!((cost - 1.0).abs() < 0.001, "basename fallback cost: {cost}");
         let cost = calc.calculate_with_cache("vertex/anthropic/claude-x", 0, 1_000_000, 0, 0);
-        assert!((cost - 2.0).abs() < 0.001, "basename fallback output cost: {cost}");
+        assert!(
+            (cost - 2.0).abs() < 0.001,
+            "basename fallback output cost: {cost}"
+        );
     }
 
     #[test]
@@ -385,6 +451,75 @@ mod tests {
         }]);
         assert!(calc.has_price("custom-model"));
         assert!(calc.has_price("local/Custom-Model"));
+    }
+
+    fn assert_cost(calc: &CostCalculator, model: &str, tokens: (u32, u32, u32, u32), want: f64) {
+        let (input, output, read, write) = tokens;
+        let got = calc.calculate_with_cache(model, input, output, read, write);
+        assert!(
+            (got - want).abs() < 1e-9,
+            "{model} {tokens:?}: got {got}, want {want}"
+        );
+    }
+
+    #[test]
+    fn gemini_3_vertex_list_prices() {
+        let calc = CostCalculator::default();
+        const M: u32 = 1_000_000;
+        // (model, input, output, cache read, cache write) per 1M tokens.
+        let table = [
+            ("google/gemini-3.1-pro-preview", 2.00, 12.00, 0.20, 2.00),
+            ("google/gemini-3.5-flash", 1.50, 9.00, 0.15, 1.50),
+            ("google/gemini-3.5-flash-lite", 0.30, 2.50, 0.03, 0.30),
+            ("google/gemini-3.1-flash-lite", 0.25, 1.50, 0.025, 0.25),
+        ];
+        for (model, input, output, read, write) in table {
+            assert!(calc.has_price(model), "{model} should be priced");
+            assert!(
+                calc.has_price(&format!("vertex/{model}")),
+                "{model} via vertex path"
+            );
+            assert_cost(&calc, model, (M, 0, 0, 0), input);
+            assert_cost(&calc, model, (0, M, 0, 0), output);
+            assert_cost(&calc, model, (0, 0, M, 0), read);
+            assert_cost(&calc, model, (0, 0, 0, M), write);
+        }
+    }
+
+    #[test]
+    fn gpt_oss_vertex_maas_list_prices() {
+        let calc = CostCalculator::default();
+        const M: u32 = 1_000_000;
+        for model in ["openai/gpt-oss-20b-maas", "gpt-oss-20b"] {
+            assert_cost(&calc, model, (M, 0, 0, 0), 0.07);
+            assert_cost(&calc, model, (0, M, 0, 0), 0.25);
+            assert_cost(&calc, model, (0, 0, M, 0), 0.007);
+        }
+        for model in ["openai/gpt-oss-120b-maas", "gpt-oss-120b"] {
+            assert_cost(&calc, model, (M, 0, 0, 0), 0.09);
+            assert_cost(&calc, model, (0, M, 0, 0), 0.36);
+            // No published cached-input rate: default discount of input.
+            assert_cost(&calc, model, (0, 0, M, 0), 0.09 * CACHE_READ_DISCOUNT);
+        }
+    }
+
+    #[test]
+    fn unpriced_model_is_reported_once_per_model() {
+        let calc = CostCalculator::default();
+        assert_eq!(calc.calculate("ollama/llama3", 1000, 1000), 0.0);
+        // Already reported: same model, differently cased or prefixed.
+        assert!(!calc.note_unpriced("ollama/llama3"));
+        assert!(!calc.note_unpriced("other/LLAMA3"));
+        // A different unpriced model is reported on its own.
+        assert!(calc.note_unpriced("mystery-model"));
+        assert!(!calc.note_unpriced("mystery-model"));
+    }
+
+    #[test]
+    fn priced_model_is_never_reported_unpriced() {
+        let calc = CostCalculator::default();
+        calc.calculate("gpt-4o", 1000, 1000);
+        assert!(calc.warned_unpriced.lock().unwrap().is_empty());
     }
 
     #[test]
