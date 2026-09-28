@@ -79,10 +79,10 @@ impl ProviderRegistry {
                 self.tier_timeouts.clone(),
             ))
         } else if provider_name == "azure" {
-            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::new(
+            Arc::new(crate::providers::azure_openai::AzureOpenAIAdapter::try_new(
                 config,
                 self.tier_timeouts.clone(),
-            ))
+            )?)
         } else {
             #[cfg(feature = "vertex")]
             if provider_name == "vertex" {

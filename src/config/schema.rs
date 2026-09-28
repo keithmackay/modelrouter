@@ -770,9 +770,44 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub project: Option<String>,
     /// Path to GCP service-account JSON. If None, uses Application Default Credentials.
-    /// Used only by the Vertex adapter.
+    /// Used only by the Vertex adapter. Mutually exclusive with an explicit
+    /// `credential_source` — see [`ProviderConfig::gcp_credential`].
     #[serde(default)]
     pub credentials_path: Option<String>,
+    /// Which credential a provider authenticates with. Accepted only by
+    /// providers that declare support (`providers::credentials::credential_support`);
+    /// the accepted values are per provider and anything else is a load-time
+    /// error.
+    ///
+    /// - `[providers.vertex]`: `"adc"` (the default) or `"metadata"`. See
+    ///   [`GcpCredentialSource`] and [`ProviderConfig::gcp_credential`] for how
+    ///   it combines with `credentials_path`.
+    /// - `[providers.azure]`, `[providers.foundry]`, `[providers.bing_grounding]`:
+    ///   `"default"`, `"managed-identity"`, `"workload-identity"`,
+    ///   `"client-secret"` or `"cli"` — Microsoft Entra ID bearer tokens. See
+    ///   [`AzureCredentialSource`] and [`ProviderConfig::azure_credential`].
+    #[serde(default)]
+    pub credential_source: Option<String>,
+    /// Microsoft Entra tenant for `credential_source = "workload-identity"`,
+    /// `"client-secret"` or `"cli"` (optional there). Falls back to
+    /// `AZURE_TENANT_ID`.
+    #[serde(default)]
+    pub azure_tenant_id: Option<String>,
+    /// Application (client) id: the app registration for workload identity
+    /// and client secret, or a user-assigned managed identity. Falls back to
+    /// `AZURE_CLIENT_ID`.
+    #[serde(default)]
+    pub azure_client_id: Option<String>,
+    /// Client secret for `credential_source = "client-secret"`. Falls back to
+    /// `AZURE_CLIENT_SECRET`, which is preferred: a secret here is a secret at
+    /// rest in the config file.
+    #[serde(default)]
+    pub azure_client_secret: Option<String>,
+    /// Federated token file for `credential_source = "workload-identity"`.
+    /// Falls back to `AZURE_FEDERATED_TOKEN_FILE`, which AKS workload identity
+    /// injects.
+    #[serde(default)]
+    pub azure_federated_token_file: Option<String>,
     /// Region for the embedding endpoint, when it differs from `region`.
     ///
     /// Vertex serves `text-embedding-*` regionally only — `locations/global`
@@ -903,6 +938,11 @@ impl Default for ProviderConfig {
             region: None,
             project: None,
             credentials_path: None,
+            credential_source: None,
+            azure_tenant_id: None,
+            azure_client_id: None,
+            azure_client_secret: None,
+            azure_federated_token_file: None,
             embedding_region: None,
             maas_region: None,
             catalog_publishers: None,
@@ -916,6 +956,279 @@ impl Default for ProviderConfig {
             custom_search_instance: None,
             generic_chat: true,
         }
+    }
+}
+
+/// `credential_source` values for `[providers.vertex]`.
+pub const GCP_CREDENTIAL_SOURCES: &[&str] = &["adc", "metadata"];
+
+/// `credential_source` values for the Azure providers.
+pub const AZURE_CREDENTIAL_SOURCES: &[&str] = &[
+    "default",
+    "managed-identity",
+    "workload-identity",
+    "client-secret",
+    "cli",
+];
+
+/// `credential_source` values for `[providers.vertex]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GcpCredentialSource {
+    /// Application Default Credentials, resolved in Google's order:
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud user file
+    /// (`~/.config/gcloud/application_default_credentials.json`), then the
+    /// GCE/GKE/Cloud Run metadata server. If the resolved credential later
+    /// needs interactive reauthentication and the metadata server is
+    /// reachable, the adapter falls back to the metadata server for the rest
+    /// of the process, with a WARN.
+    Adc,
+    /// The metadata server's attached service account ONLY. The gcloud user
+    /// file and `GOOGLE_APPLICATION_CREDENTIALS` are ignored, so a stray
+    /// `gcloud auth application-default login` on the host cannot move the
+    /// proxy onto a personal credential.
+    Metadata,
+}
+
+impl GcpCredentialSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Adc => "adc",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
+/// The credential a Vertex provider will actually use, after
+/// [`ProviderConfig::gcp_credential`] has applied the precedence rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedGcpCredential {
+    Adc,
+    Metadata,
+    /// Service-account JSON at this path (`credentials_path`).
+    ServiceAccountFile(String),
+}
+
+/// `credential_source` values for the Azure providers (`azure`, `foundry`,
+/// `bing_grounding`). Every one yields a Microsoft Entra ID bearer token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AzureCredentialSource {
+    /// The analogue of Google ADC: environment client secret, then workload
+    /// identity, then managed identity, then the Azure CLI — whichever
+    /// resolves first. A dead CLI login falls back to managed identity when
+    /// its endpoint answers.
+    Default,
+    /// The platform's managed identity: `IDENTITY_ENDPOINT` +
+    /// `IDENTITY_HEADER` (App Service, Container Apps, Functions) when set,
+    /// otherwise the VM/AKS instance metadata service. `azure_client_id`
+    /// selects a user-assigned identity.
+    ManagedIdentity,
+    /// A federated token file exchanged for an Entra token (AKS workload
+    /// identity and other OIDC federation).
+    WorkloadIdentity,
+    /// An app registration's client secret.
+    ClientSecret,
+    /// `az account get-access-token`: a developer's personal login.
+    Cli,
+}
+
+impl AzureCredentialSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "default" => Self::Default,
+            "managed-identity" => Self::ManagedIdentity,
+            "workload-identity" => Self::WorkloadIdentity,
+            "client-secret" => Self::ClientSecret,
+            "cli" => Self::Cli,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ManagedIdentity => "managed-identity",
+            Self::WorkloadIdentity => "workload-identity",
+            Self::ClientSecret => "client-secret",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+fn unknown_source(value: &str, accepted: &[&str]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "unknown credential_source = \"{value}\"; accepted values here: {}",
+        accepted.join(", ")
+    )
+}
+
+impl ProviderConfig {
+    /// Resolve `credential_source` and `credentials_path` into one choice.
+    ///
+    /// | `credential_source` | `credentials_path` | result |
+    /// |---|---|---|
+    /// | unset | unset | ADC |
+    /// | unset | set | that service-account file |
+    /// | `"adc"` | unset | ADC |
+    /// | `"metadata"` | unset | metadata server only |
+    /// | `"adc"` or `"metadata"` | set | error: contradictory |
+    ///
+    /// A path next to an explicit source is rejected rather than ranked:
+    /// either reading silently ignores something the operator wrote down.
+    pub fn gcp_credential(&self) -> anyhow::Result<ResolvedGcpCredential> {
+        let source = match self.credential_source.as_deref() {
+            None => None,
+            Some("adc") => Some(GcpCredentialSource::Adc),
+            Some("metadata") => Some(GcpCredentialSource::Metadata),
+            Some(other) => return Err(unknown_source(other, GCP_CREDENTIAL_SOURCES)),
+        };
+        match (source, self.credentials_path.as_deref()) {
+            (None, None) | (Some(GcpCredentialSource::Adc), None) => Ok(ResolvedGcpCredential::Adc),
+            (Some(GcpCredentialSource::Metadata), None) => Ok(ResolvedGcpCredential::Metadata),
+            (None, Some(path)) => Ok(ResolvedGcpCredential::ServiceAccountFile(path.to_string())),
+            (Some(source), Some(path)) => anyhow::bail!(
+                "credential_source = \"{}\" and credentials_path = \"{path}\" are contradictory: \
+                 credentials_path selects an explicit service-account file, credential_source \
+                 selects {}. Remove one of them.",
+                source.as_str(),
+                match source {
+                    GcpCredentialSource::Adc => "Application Default Credentials",
+                    GcpCredentialSource::Metadata => "the metadata server",
+                },
+            ),
+        }
+    }
+
+    /// Resolve `credential_source` for an Azure provider.
+    ///
+    /// | `credential_source` | `api_key` | result |
+    /// |---|---|---|
+    /// | unset | unset | provider default (see each provider) |
+    /// | unset | set | key auth |
+    /// | any value | unset | that Entra credential |
+    /// | any value | set | error: contradictory |
+    ///
+    /// The `azure_*` keys are only meaningful next to a `credential_source`
+    /// that reads them, and a secret or token file next to a source that
+    /// ignores it is rejected for the same reason as a contradictory pair:
+    /// the config would silently not mean what it says.
+    pub fn azure_credential(&self) -> anyhow::Result<Option<AzureCredentialSource>> {
+        let source = match self.credential_source.as_deref() {
+            None => None,
+            Some(v) => Some(
+                AzureCredentialSource::parse(v)
+                    .ok_or_else(|| unknown_source(v, AZURE_CREDENTIAL_SOURCES))?,
+            ),
+        };
+        if let Some(source) = source {
+            if !self.api_key.trim().is_empty() {
+                anyhow::bail!(
+                    "credential_source = \"{}\" and api_key are contradictory: api_key selects key \
+                     auth, credential_source selects a Microsoft Entra ID credential. Remove one of \
+                     them.",
+                    source.as_str()
+                );
+            }
+            use AzureCredentialSource::*;
+            if self.azure_client_secret.is_some() && !matches!(source, ClientSecret | Default) {
+                anyhow::bail!(
+                    "azure_client_secret is only read by credential_source = \"client-secret\" or \
+                     \"default\", not \"{}\"",
+                    source.as_str()
+                );
+            }
+            if self.azure_federated_token_file.is_some()
+                && !matches!(source, WorkloadIdentity | Default)
+            {
+                anyhow::bail!(
+                    "azure_federated_token_file is only read by credential_source = \
+                     \"workload-identity\" or \"default\", not \"{}\"",
+                    source.as_str()
+                );
+            }
+        } else if self.azure_client_secret.is_some() || self.azure_federated_token_file.is_some() {
+            anyhow::bail!(
+                "azure_client_secret / azure_federated_token_file need a credential_source \
+                 (\"client-secret\", \"workload-identity\" or \"default\") to take effect"
+            );
+        }
+        Ok(source)
+    }
+}
+
+/// [`crate::providers::credentials::CredentialSupport`] validator for Vertex.
+pub fn validate_gcp_credential(config: &ProviderConfig) -> anyhow::Result<()> {
+    config.gcp_credential().map(|_| ())
+}
+
+/// [`crate::providers::credentials::CredentialSupport`] validator for the
+/// Azure providers.
+pub fn validate_azure_credential(config: &ProviderConfig) -> anyhow::Result<()> {
+    config.azure_credential().map(|_| ())
+}
+
+/// Providers that authenticate with Microsoft Entra ID and read the `azure_*`
+/// keys.
+pub const AZURE_PROVIDERS: &[&str] = &["azure", "foundry", "bing_grounding"];
+
+const AZURE_ONLY_KEYS: &[&str] = &[
+    "azure_tenant_id",
+    "azure_client_id",
+    "azure_client_secret",
+    "azure_federated_token_file",
+];
+
+impl Settings {
+    /// Reject provider credential settings that cannot mean what they say.
+    /// Called by the config loaders, so a contradictory config fails at load
+    /// rather than on the first request that lazily builds the adapter.
+    ///
+    /// `credential_source` is accepted only on providers whose implementation
+    /// declares support, and each validates its own values.
+    pub fn validate_provider_credentials(&self) -> anyhow::Result<()> {
+        use crate::providers::credentials::{credential_support, support_for};
+        let mut names: Vec<&String> = self.providers.keys().collect();
+        names.sort();
+        for name in names {
+            let config = &self.providers[name];
+            match support_for(name) {
+                Some(support) => (support.validate)(config)
+                    .map_err(|e| anyhow::anyhow!("[providers.{name}]: {e}"))?,
+                None if config.credential_source.is_some() => {
+                    let supported: Vec<String> = credential_support()
+                        .iter()
+                        .map(|s| format!("[providers.{}]", s.provider))
+                        .collect();
+                    anyhow::bail!(
+                        "[providers.{name}]: credential_source is not supported by this provider; \
+                         it is accepted by {}",
+                        supported.join(", ")
+                    );
+                }
+                None => {}
+            }
+            if !AZURE_PROVIDERS.contains(&name.as_str()) {
+                let set: Vec<&str> = [
+                    config.azure_tenant_id.is_some(),
+                    config.azure_client_id.is_some(),
+                    config.azure_client_secret.is_some(),
+                    config.azure_federated_token_file.is_some(),
+                ]
+                .iter()
+                .zip(AZURE_ONLY_KEYS)
+                .filter(|(set, _)| **set)
+                .map(|(_, k)| *k)
+                .collect();
+                if !set.is_empty() {
+                    anyhow::bail!(
+                        "[providers.{name}]: {} only apply to the Azure providers (azure, foundry, \
+                         bing_grounding)",
+                        set.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -96,6 +96,24 @@ impl CircuitBreaker {
         }
     }
 
+    /// Same policy as [`Self::record_provider_error`], for call sites holding
+    /// the error itself. Prefer this: it also recognises typed errors such as
+    /// [`crate::providers::credential_error::CredentialExpired`], which a
+    /// string cannot reliably carry once a `.context(..)` sits on top.
+    pub fn record_provider_failure(&self, provider: &str, err: &anyhow::Error) {
+        let classified = crate::router::retry::RetryableError::classify_error(err);
+        if classified.counts_toward_circuit_breaker() {
+            self.record_failure(provider);
+        } else {
+            tracing::debug!(
+                provider,
+                error = %err,
+                kind = ?classified,
+                "not a provider-health failure; not counting toward the provider circuit breaker"
+            );
+        }
+    }
+
     /// Same policy as [`Self::record_provider_error`], for call sites that hold
     /// the upstream HTTP status directly and need no string parsing.
     pub fn record_upstream_status(&self, provider: &str, status: u16) {
@@ -144,4 +162,38 @@ impl CircuitBreaker {
 
 impl Default for CircuitBreaker {
     fn default() -> Self { Self::new(5, 60) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::credential_error::CredentialExpired;
+
+    fn credential_expired() -> anyhow::Error {
+        anyhow::Error::new(CredentialExpired {
+            provider: "vertex".into(),
+            credential_kind: "adc-user".into(),
+            reason: "the login has expired".into(),
+            remediation: "Reauthenticate.".into(),
+            detail: "invalid_grant".into(),
+        })
+    }
+
+    #[test]
+    fn credential_expired_never_opens_the_breaker() {
+        let breaker = CircuitBreaker::new(2, 60);
+        for _ in 0..10 {
+            breaker.record_provider_failure("vertex", &credential_expired());
+        }
+        assert!(!breaker.is_open("vertex"));
+    }
+
+    #[test]
+    fn provider_failures_still_open_the_breaker() {
+        let breaker = CircuitBreaker::new(2, 60);
+        let err = anyhow::anyhow!("Vertex AI returned 503 Service Unavailable");
+        breaker.record_provider_failure("vertex", &err);
+        breaker.record_provider_failure("vertex", &err);
+        assert!(breaker.is_open("vertex"));
+    }
 }

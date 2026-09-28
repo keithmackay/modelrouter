@@ -296,15 +296,12 @@ async fn chat_completions_inner(
             .provider_registry
             .get(&provider_name)
             .map_err(ApiError::ProviderError)?;
-        let sse_stream = adapter
-            .stream(&norm_req)
-            .await
-            .map_err(|e| {
-                state
-                    .circuit_breaker
-                    .record_provider_error(&provider_name, &e.to_string());
-                ApiError::ProviderError(e)
-            })?;
+        let sse_stream = adapter.stream(&norm_req).await.map_err(|e| {
+            state
+                .circuit_breaker
+                .record_provider_failure(&provider_name, &e);
+            ApiError::ProviderError(e)
+        })?;
         state.circuit_breaker.record_success(&provider_name);
         let settings = completion_settings(adapter.effective_settings(&norm_req), &norm_req, &body);
 
@@ -851,7 +848,7 @@ async fn complete_with_retry_and_fallback(
             Err(e) => {
                 state
                     .circuit_breaker
-                    .record_provider_error(&current_provider, &e.to_string());
+                    .record_provider_failure(&current_provider, &e);
                 tracing::warn!(
                     model = current_model.as_str(),
                     provider = current_provider.as_str(),
@@ -908,7 +905,7 @@ where
             Ok(r) => return Ok((r, called.elapsed().as_millis() as i64)),
             Err(e) => {
                 let err_str = e.to_string();
-                let retryable = crate::router::retry::RetryableError::classify(&err_str);
+                let retryable = crate::router::retry::RetryableError::classify_error(&e);
                 if retry_policy.should_retry(retry_attempt, &retryable) {
                     let delay = retry_policy.delay_ms(retry_attempt);
                     tracing::warn!(

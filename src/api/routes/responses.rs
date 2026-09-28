@@ -151,7 +151,7 @@ async fn responses_inner(
     let result = adapter.complete(&norm_req).await.map_err(|e| {
         state
             .circuit_breaker
-            .record_provider_error(&provider_name, &e.to_string());
+            .record_provider_failure(&provider_name, &e);
         ApiError::ProviderError(e)
     })?;
     state.circuit_breaker.record_success(&provider_name);

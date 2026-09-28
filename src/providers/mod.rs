@@ -1,11 +1,14 @@
 pub mod adapter;
 pub mod catalog;
 pub mod catalog_registry;
+pub mod credential_error;
+pub mod credentials;
 pub mod anthropic;
-/// Microsoft Entra ID token source, shared by every Azure provider that
-/// authenticates without a key. Compiled in when any of them is.
-#[cfg(any(feature = "bing-grounding", feature = "foundry"))]
+/// Microsoft Entra ID audiences and token seam, shared by every Azure
+/// provider. Always compiled: the ungated `azure` provider can use Entra too.
 pub mod azure_entra;
+/// Microsoft Entra ID credential sources behind the shared credential trait.
+pub mod azure_credentials;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 #[cfg(feature = "bing-grounding")]
