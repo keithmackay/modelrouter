@@ -137,9 +137,8 @@ impl VertexAdapter {
             .region
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Vertex provider requires `region` in config"))?;
-        let token_provider = Arc::new(
-            GoogleCloudAuthProvider::new(config.credentials_path.as_deref())?,
-        ) as Arc<dyn TokenProvider>;
+        let token_provider =
+            Arc::new(GoogleCloudAuthProvider::from_config(config)?) as Arc<dyn TokenProvider>;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
@@ -297,6 +296,10 @@ impl VertexAdapter {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for VertexAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.token_provider.credential_report()
+    }
+
     /// Tool forwarding is per-publisher (issue #88): Claude bodies translate
     /// through the shared Anthropic layer and MaaS is OpenAI-shaped
     /// passthrough. Gemini's `functionDeclarations` dialect is not yet

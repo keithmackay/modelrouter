@@ -38,7 +38,12 @@ pub struct FoundryEmbeddingAdapter {
 impl FoundryEmbeddingAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        let auth = FoundryAuth::from_config(config, endpoint.scope())?;
+        let auth = FoundryAuth::entra_by_default(
+            "foundry",
+            config,
+            endpoint.scope(),
+            std::time::Duration::from_secs(config.timeout_secs.max(1)),
+        )?;
         Self::build(endpoint, auth, config)
     }
 
@@ -121,6 +126,10 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<EmbeddingResult> {
 
 #[async_trait::async_trait]
 impl EmbeddingAdapter for FoundryEmbeddingAdapter {
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        self.auth.credential_report()
+    }
+
     async fn embed(&self, req: &EmbeddingRequest) -> anyhow::Result<EmbeddingResult> {
         let url = self.endpoint.embeddings_url();
         let body = build_request_body(req);

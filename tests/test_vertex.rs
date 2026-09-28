@@ -22,7 +22,176 @@ fn provider_config_default_matches_serde_defaults() {
     assert_eq!(from_default.timeout_secs, from_toml.timeout_secs);
     assert_eq!(from_default.api_key, from_toml.api_key);
     assert_eq!(from_default.embedding_region, from_toml.embedding_region);
-    assert_eq!(from_default.embedding_task_type, from_toml.embedding_task_type);
+    assert_eq!(
+        from_default.embedding_task_type,
+        from_toml.embedding_task_type
+    );
+    assert_eq!(from_default.credential_source, from_toml.credential_source);
+}
+
+mod credential_source_config {
+    use modelrouter::config::schema::{ProviderConfig, ResolvedGcpCredential, Settings};
+
+    fn vertex(toml_body: &str) -> ProviderConfig {
+        toml::from_str(toml_body).unwrap()
+    }
+
+    #[test]
+    fn parses_both_values() {
+        assert_eq!(
+            vertex(r#"credential_source = "adc""#).credential_source,
+            Some("adc".to_string())
+        );
+        assert_eq!(
+            vertex(r#"credential_source = "metadata""#).credential_source,
+            Some("metadata".to_string())
+        );
+    }
+
+    /// The key is generic in shape (any provider may declare values), so an
+    /// unknown value is rejected by per-provider validation, naming the values
+    /// that provider accepts.
+    #[test]
+    fn unknown_value_is_a_validation_error() {
+        let msg = vertex(r#"credential_source = "gcloud""#)
+            .gcp_credential()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("gcloud") && msg.contains("adc") && msg.contains("metadata"),
+            "{msg}"
+        );
+        let s = settings("[providers.vertex]\ncredential_source = \"gcloud\"\n");
+        let msg = s.validate_provider_credentials().unwrap_err().to_string();
+        assert!(
+            msg.starts_with("[providers.vertex]") && msg.contains("gcloud"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn precedence_table() {
+        assert_eq!(
+            vertex("").gcp_credential().unwrap(),
+            ResolvedGcpCredential::Adc
+        );
+        assert_eq!(
+            vertex(r#"credential_source = "adc""#)
+                .gcp_credential()
+                .unwrap(),
+            ResolvedGcpCredential::Adc
+        );
+        assert_eq!(
+            vertex(r#"credential_source = "metadata""#)
+                .gcp_credential()
+                .unwrap(),
+            ResolvedGcpCredential::Metadata
+        );
+        assert_eq!(
+            vertex(r#"credentials_path = "/secrets/sa.json""#)
+                .gcp_credential()
+                .unwrap(),
+            ResolvedGcpCredential::ServiceAccountFile("/secrets/sa.json".into())
+        );
+    }
+
+    #[test]
+    fn an_explicit_source_next_to_a_path_is_rejected() {
+        for source in ["adc", "metadata"] {
+            let config = vertex(&format!(
+                "credential_source = \"{source}\"\ncredentials_path = \"/secrets/sa.json\""
+            ));
+            let msg = config.gcp_credential().unwrap_err().to_string();
+            assert!(msg.contains("contradictory"), "{msg}");
+            assert!(msg.contains(source), "{msg}");
+        }
+    }
+
+    fn settings(toml_body: &str) -> Settings {
+        toml::from_str(toml_body).unwrap()
+    }
+
+    #[test]
+    fn settings_validation_names_the_provider() {
+        let s = settings(
+            "[providers.vertex]\ncredential_source = \"metadata\"\ncredentials_path = \"/x.json\"\n",
+        );
+        let msg = s.validate_provider_credentials().unwrap_err().to_string();
+        assert!(msg.starts_with("[providers.vertex]"), "{msg}");
+    }
+
+    #[test]
+    fn credential_source_on_another_provider_is_rejected() {
+        let s = settings("[providers.openai]\ncredential_source = \"metadata\"\n");
+        let msg = s.validate_provider_credentials().unwrap_err().to_string();
+        assert!(msg.contains("not supported by this provider"), "{msg}");
+        assert!(
+            msg.contains("[providers.vertex]") && msg.contains("[providers.azure]"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn valid_configs_pass_validation() {
+        for body in [
+            "",
+            "[providers.vertex]\n",
+            "[providers.vertex]\ncredential_source = \"metadata\"\n",
+            "[providers.vertex]\ncredentials_path = \"/x.json\"\n",
+            "[providers.openai]\napi_key = \"k\"\n",
+            "[providers.azure]\napi_key = \"k\"\n",
+            "[providers.azure]\ncredential_source = \"managed-identity\"\nazure_client_id = \"u\"\n",
+            "[providers.foundry]\ncredential_source = \"workload-identity\"\n",
+            "[providers.bing_grounding]\ncredential_source = \"default\"\n",
+        ] {
+            settings(body).validate_provider_credentials().unwrap();
+        }
+    }
+
+    #[test]
+    fn azure_values_are_validated_per_provider() {
+        // A GCP value on an Azure provider, and vice versa.
+        let msg = settings("[providers.foundry]\ncredential_source = \"metadata\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.starts_with("[providers.foundry]") && msg.contains("managed-identity"),
+            "{msg}"
+        );
+        let msg = settings("[providers.vertex]\ncredential_source = \"cli\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.starts_with("[providers.vertex]"), "{msg}");
+        // Key auth and an Entra source together cannot both be meant.
+        let msg = settings("[providers.azure]\napi_key = \"k\"\ncredential_source = \"cli\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("contradictory"), "{msg}");
+        // Azure-only keys belong on Azure providers.
+        let msg = settings("[providers.vertex]\nazure_tenant_id = \"t\"\n")
+            .validate_provider_credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("azure_tenant_id"), "{msg}");
+    }
+
+    #[test]
+    fn the_loader_rejects_a_contradictory_config() {
+        let dir = std::env::temp_dir().join(format!("mr-cred-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[providers.vertex]\ncredential_source = \"adc\"\ncredentials_path = \"/x.json\"\n",
+        )
+        .unwrap();
+        let err = modelrouter::config::load_from_path(path.to_str().unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("contradictory"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(feature = "vertex")]

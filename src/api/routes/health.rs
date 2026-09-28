@@ -101,6 +101,7 @@ pub async fn deep_health(
             "embedding": embedding.to_json(),
             "search": search.to_json(),
         },
+        "credentials": credential_inventory(&state),
         "checked_at": chrono::Utc::now().timestamp(),
         "cached": false,
     });
@@ -116,25 +117,54 @@ struct CapabilityReport {
     target: String,
     latency_ms: i64,
     error: Option<String>,
+    /// The adapter's `credential_report()`, when it has one. Present on
+    /// failure too — that is when "which credential?" matters most.
+    credential: Option<Value>,
 }
 
 impl CapabilityReport {
     fn ok(target: String, latency_ms: i64) -> Self {
-        Self { status: "ok", target, latency_ms, error: None }
+        Self {
+            status: "ok",
+            target,
+            latency_ms,
+            error: None,
+            credential: None,
+        }
     }
     fn failed(target: String, latency_ms: i64, error: String) -> Self {
-        Self { status: "failed", target, latency_ms, error: Some(error) }
+        Self {
+            status: "failed",
+            target,
+            latency_ms,
+            error: Some(error),
+            credential: None,
+        }
     }
     fn skipped(target: String, reason: String) -> Self {
-        Self { status: "skipped", target, latency_ms: 0, error: Some(reason) }
+        Self {
+            status: "skipped",
+            target,
+            latency_ms: 0,
+            error: Some(reason),
+            credential: None,
+        }
+    }
+    fn with_credential(mut self, credential: Option<Value>) -> Self {
+        self.credential = credential;
+        self
     }
     fn to_json(&self) -> Value {
-        json!({
+        let mut body = json!({
             "status": self.status,
             "target": self.target,
             "latency_ms": self.latency_ms,
             "error": self.error,
-        })
+        });
+        if let Some(credential) = &self.credential {
+            body["credential"] = credential.clone();
+        }
+        body
     }
 }
 
@@ -179,7 +209,7 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
         extra_params: json!({}),
     };
     let started = Instant::now();
-    match adapter.complete(&req).await {
+    let report = match adapter.complete(&req).await {
         Ok(result) => {
             let latency = started.elapsed().as_millis() as i64;
             let cost = state
@@ -195,8 +225,12 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
             );
             CapabilityReport::ok(target, latency)
         }
-        Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
-    }
+        Err(e) => {
+            CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
+        }
+    };
+    // Read after the call: a fallback taken during it changes the answer.
+    report.with_credential(adapter.credential_report().map(|r| r.to_json()))
 }
 
 /// One short embedding through the embedding registry.
@@ -227,15 +261,18 @@ async fn probe_embedding(state: &AppState) -> CapabilityReport {
         dimensions: None,
     };
     let started = Instant::now();
-    match adapter.embed(&req).await {
+    let report = match adapter.embed(&req).await {
         Ok(result) => {
             let latency = started.elapsed().as_millis() as i64;
             let cost = state.cost_calc.calculate(&model, result.prompt_tokens, 0);
             record_probe_usage(state, model, provider, result.prompt_tokens as i64, 0, cost);
             CapabilityReport::ok(target, latency)
         }
-        Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
-    }
+        Err(e) => {
+            CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
+        }
+    };
+    report.with_credential(adapter.credential_report().map(|r| r.to_json()))
 }
 
 /// One single-result search on the configured (or inferred) probe engine.
@@ -292,7 +329,7 @@ async fn probe_search(state: &AppState) -> CapabilityReport {
         max_results: Some(1),
     };
     let started = Instant::now();
-    match adapter.search(&req).await {
+    let report = match adapter.search(&req).await {
         Ok(_) => {
             let latency = started.elapsed().as_millis() as i64;
             // Search is priced per query, mirroring api/routes/search.rs.
@@ -306,8 +343,74 @@ async fn probe_search(state: &AppState) -> CapabilityReport {
             record_probe_usage(state, target.clone(), engine, 0, 0, cost);
             CapabilityReport::ok(target, latency)
         }
-        Err(e) => CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string()),
+        Err(e) => {
+            CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
+        }
+    };
+    report.with_credential(adapter.credential_report().map(|r| r.to_json()))
+}
+
+/// Every configured provider's credential verdict, one row per capability
+/// adapter that holds a credential, so a caller sees a dying login on a
+/// provider the probes did not exercise. Reads cached state only: no token is
+/// fetched and no provider is called. A provider whose adapter fails to build
+/// is listed with status `unknown` and the build error as the reason.
+fn credential_inventory(state: &AppState) -> Vec<Value> {
+    use crate::providers::credentials::{support_for, CredentialReport};
+
+    fn row(capability: &str, report: CredentialReport) -> Value {
+        let mut v = report.to_json();
+        v["provider"] = json!(report.provider);
+        v["capability"] = json!(capability);
+        v
     }
+
+    let mut names: Vec<&String> = state
+        .settings
+        .providers
+        .keys()
+        .filter(|n| support_for(n).is_some())
+        .collect();
+    names.sort();
+    let mut rows = Vec::new();
+    for name in names {
+        let mut found = false;
+        let mut build_errors = Vec::new();
+        match state.provider_registry.get(name) {
+            Ok(a) => {
+                if let Some(r) = a.credential_report() {
+                    rows.push(row("llm", r));
+                    found = true;
+                }
+            }
+            Err(e) => build_errors.push(format!("llm: {e:#}")),
+        }
+        if let Ok(a) = state.embedding_registry.get(name) {
+            if let Some(r) = a.credential_report() {
+                rows.push(row("embedding", r));
+                found = true;
+            }
+        }
+        if let Ok(a) = state.search_registry.get(name) {
+            if let Some(r) = a.credential_report() {
+                rows.push(row("search", r));
+                found = true;
+            }
+        }
+        if !found && !build_errors.is_empty() {
+            rows.push(json!({
+                "provider": name,
+                "capability": "llm",
+                "status": "unknown",
+                "reason": format!("adapter could not be built: {}", build_errors.join("; ")),
+                "remediation": format!("fix the [providers.{name}] configuration"),
+                "source": null,
+                "kind": null,
+                "fallback_active": false,
+            }));
+        }
+    }
+    rows
 }
 
 /// Probes are real provider calls and must appear in the ledger like any other

@@ -95,6 +95,14 @@ pub trait ProviderAdapter: Send + Sync {
             timeout_secs: None,
         }
     }
+
+    /// The credential this adapter authenticates with, for `GET /health/deep`
+    /// — its type, source and the router's verdict, never the credential
+    /// itself. `None` (the default) for adapters with nothing beyond a static
+    /// key to report.
+    fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
+        None
+    }
 }
 
 /// Provider-facing settings for one dispatch (see
