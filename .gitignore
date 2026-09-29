@@ -15,3 +15,12 @@ session_stats.md
 /.cargo/
 coverage/
 /logs/
+
+# Local machine / editor / session artifacts -- never commit
+.DS_Store
+.envrc
+.claude/
+.sessionstats/
+*.bak
+# Locally built binaries (Dockerfile.local copies bin/modelrouter after a local build)
+/bin/
