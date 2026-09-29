@@ -258,6 +258,7 @@ mod gemini_tests {
             max_tokens: Some(1024),
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: json!({}),
         }
     }
@@ -414,6 +415,7 @@ mod claude_tests {
             max_tokens: Some(2048),
             tools: None,
             tool_choice: None,
+            reasoning: None,
             extra_params: json!({}),
         }
     }

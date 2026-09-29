@@ -279,6 +279,7 @@ fn req(model: &str) -> NormalizedRequest {
         max_tokens: Some(8),
         tools: None,
         tool_choice: None,
+        reasoning: None,
         extra_params: json!({}),
     }
 }
