@@ -423,7 +423,7 @@ mod claude_tests {
     #[test]
     fn translate_request_includes_anthropic_version_and_omits_model() {
         let r = req(json!([{"role": "user", "content": "Hi"}]));
-        let body = translate_request(&r, false);
+        let body = translate_request(&r, false).unwrap();
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
         assert!(body.get("model").is_none(), "model must live in URL, not body");
         assert_eq!(body["max_tokens"], 2048);
@@ -435,7 +435,7 @@ mod claude_tests {
             {"role": "system", "content": "Be brief."},
             {"role": "user", "content": "Hi"}
         ]));
-        let body = translate_request(&r, false);
+        let body = translate_request(&r, false).unwrap();
         assert_eq!(body["system"], "Be brief.");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     }
@@ -444,7 +444,7 @@ mod claude_tests {
     fn translate_request_defaults_max_tokens_when_missing() {
         let mut r = req(json!([{"role": "user", "content": "Hi"}]));
         r.max_tokens = None;
-        let body = translate_request(&r, false);
+        let body = translate_request(&r, false).unwrap();
         assert!(body["max_tokens"].as_u64().unwrap() > 0, "Anthropic requires max_tokens");
     }
 
@@ -456,14 +456,14 @@ mod claude_tests {
     #[test]
     fn translate_request_streaming_sets_stream_true() {
         let r = req(json!([{"role": "user", "content": "Hi"}]));
-        let body = translate_request(&r, true);
+        let body = translate_request(&r, true).unwrap();
         assert_eq!(body["stream"], true, "streaming body must carry stream: true");
     }
 
     #[test]
     fn translate_request_non_streaming_omits_stream() {
         let r = req(json!([{"role": "user", "content": "Hi"}]));
-        let body = translate_request(&r, false);
+        let body = translate_request(&r, false).unwrap();
         assert!(body.get("stream").is_none(), "non-streaming body must not carry a stream flag");
     }
 

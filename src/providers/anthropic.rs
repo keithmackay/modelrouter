@@ -82,45 +82,97 @@ impl crate::providers::catalog::ProviderCatalog for AnthropicAdapter {
 /// OpenAI `image_url` parts become Anthropic `image` blocks — Anthropic-family
 /// backends reject the OpenAI tag with 400 `Input tag 'image_url' ... invalid`.
 /// A data URL (`data:<media_type>;base64,<data>`) becomes a `base64` source;
-/// any other URL becomes a `url` source. Every other part — text blocks,
-/// already-native image blocks — passes through verbatim, and an `image_url`
-/// part with no usable URL or a malformed data URL also passes through so the
-/// provider's own error names the real problem.
+/// any other URL becomes a `url` source. The Responses-API spellings of the
+/// same parts (`input_image` with a string `image_url`, `input_text`) are
+/// translated the same way, and a `tool_result` block's own content array is
+/// translated recursively. Every other part — text blocks, already-native
+/// image blocks — passes through verbatim, and an image part with no usable
+/// URL or a malformed data URL also passes through so the provider's own
+/// error names the real problem.
 fn translate_content_block(part: &serde_json::Value) -> serde_json::Value {
-    if part["type"] != "image_url" {
-        return part.clone();
+    match part["type"].as_str() {
+        Some("image_url" | "input_image") => translate_image_part(part),
+        Some("input_text") => match part["text"].as_str() {
+            Some(text) => serde_json::json!({"type": "text", "text": text}),
+            None => part.clone(),
+        },
+        Some("tool_result") if part["content"].is_array() => {
+            let mut out = part.clone();
+            out["content"] = serde_json::Value::Array(translate_content_blocks(
+                part["content"].as_array().expect("checked is_array above"),
+            ));
+            out
+        }
+        _ => part.clone(),
     }
-    // OpenAI nests the URL (`image_url: {url}`); some OpenAI-compatible
-    // clients send the legacy flat string form (`image_url: "..."`).
+}
+
+/// An OpenAI image part (`image_url` / Responses `input_image`) → an Anthropic
+/// `image` block; see [`translate_content_block`].
+fn translate_image_part(part: &serde_json::Value) -> serde_json::Value {
+    // OpenAI nests the URL (`image_url: {url}`); the Responses API and some
+    // OpenAI-compatible clients send the flat string form (`image_url: "..."`).
     let url = part["image_url"]["url"]
         .as_str()
         .or_else(|| part["image_url"].as_str());
     let Some(url) = url else {
         return part.clone();
     };
-    if let Some(rest) = url.strip_prefix("data:") {
-        if let Some((meta, data)) = rest.split_once(',') {
-            if let Some(media_type) = meta.strip_suffix(";base64") {
-                return serde_json::json!({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": media_type, "data": data},
-                });
-            }
-        }
+    let Some(rest) = url.strip_prefix("data:") else {
+        return serde_json::json!({
+            "type": "image",
+            "source": {"type": "url", "url": url},
+        });
+    };
+    match rest
+        .split_once(',')
+        .and_then(|(meta, data)| Some((meta.strip_suffix(";base64")?, data)))
+    {
+        Some((media_type, data)) => serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }),
         // Malformed data URL: no comma, or not base64-encoded.
-        return part.clone();
+        None => part.clone(),
     }
-    serde_json::json!({
-        "type": "image",
-        "source": {"type": "url", "url": url},
-    })
 }
 
 /// Map an OpenAI content array to Anthropic-native blocks (see
-/// [`translate_content_block`]). Identity for arrays with no `image_url`
-/// parts, so text-only content stays byte-identical.
+/// [`translate_content_block`]). Identity for arrays with no OpenAI-only
+/// parts, so text-only and already-native content stays byte-identical.
 fn translate_content_blocks(parts: &[serde_json::Value]) -> Vec<serde_json::Value> {
     parts.iter().map(translate_content_block).collect()
+}
+
+/// Translate OpenAI-only content parts inside an otherwise Anthropic-native
+/// `messages` array in place — for the `/v1/messages` passthrough, whose
+/// callers sometimes mix OpenAI `image_url` parts into native requests.
+/// Same per-block translation as [`translate_messages`]; string content and
+/// native blocks are untouched.
+pub fn translate_native_messages(messages: &mut [serde_json::Value]) {
+    for m in messages {
+        if let Some(arr) = m["content"].as_array() {
+            m["content"] = serde_json::Value::Array(translate_content_blocks(arr));
+        }
+    }
+}
+
+/// The first `url`-sourced image block in translated Anthropic messages,
+/// including images nested in `tool_result` content. Backends that accept
+/// only base64 image sources (Claude on Vertex) use this to refuse the request
+/// with a clear error before sending it.
+pub fn find_url_image_source(messages: &[serde_json::Value]) -> Option<&str> {
+    fn in_blocks(blocks: &[serde_json::Value]) -> Option<&str> {
+        blocks.iter().find_map(|b| {
+            if b["type"] == "image" && b["source"]["type"] == "url" {
+                return Some(b["source"]["url"].as_str().unwrap_or(""));
+            }
+            b["content"].as_array().and_then(|nested| in_blocks(nested))
+        })
+    }
+    messages
+        .iter()
+        .find_map(|m| m["content"].as_array().and_then(|blocks| in_blocks(blocks)))
 }
 
 /// Extract system messages (concatenated) and translate the rest to Anthropic
@@ -144,7 +196,7 @@ pub fn translate_messages(
             if let Some(arr) = m["content"].as_array() {
                 let text = arr
                     .iter()
-                    .filter(|block| block["type"] == "text")
+                    .filter(|block| block["type"] == "text" || block["type"] == "input_text")
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -408,33 +460,37 @@ pub(crate) fn thinking_tokens_from_usage(usage: &serde_json::Value) -> Option<u3
         .map(|n| n as u32)
 }
 
+/// The Anthropic Messages body for an OpenAI-shaped request — one builder for
+/// the non-streaming and streaming calls, so both carry the same message,
+/// image, tool and reasoning translation.
+fn build_body(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
+    let (system_text, messages) = translate_messages(&req.messages);
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "messages": messages,
+        "stream": stream,
+        // Anthropic requires max_tokens.
+        "max_tokens": req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+    });
+    if let Some(system) = system_text {
+        body["system"] = serde_json::json!(system);
+    }
+    if let Some(temp) = req.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    apply_tools(&mut body, req);
+    apply_reasoning(&mut body, req);
+    body
+}
+
 #[async_trait::async_trait]
 impl ProviderAdapter for AnthropicAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
-        let (system_text, messages) = translate_messages(&req.messages);
+        let body = build_body(req, false);
 
-        let mut body = serde_json::json!({
-            "model": req.model,
-            "messages": messages,
-            "stream": false,
-        });
-
-        if let Some(system) = system_text {
-            body["system"] = serde_json::json!(system);
-        }
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(max) = req.max_tokens {
-            body["max_tokens"] = serde_json::json!(max);
-        } else {
-            // Anthropic requires max_tokens
-            body["max_tokens"] = serde_json::json!(DEFAULT_MAX_TOKENS);
-        }
-        apply_tools(&mut body, req);
-        apply_reasoning(&mut body, req);
-
-        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
+        let timeout_secs = self
+            .tier_timeouts
+            .resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
         let resp = self
             .client
@@ -465,9 +521,7 @@ impl ProviderAdapter for AnthropicAdapter {
             content: text_from_content(&parsed.content),
             prompt_tokens: parsed.usage.input_tokens,
             completion_tokens: parsed.usage.output_tokens,
-            finish_reason: map_stop_reason(
-                parsed.stop_reason.as_deref().unwrap_or("end_turn"),
-            ),
+            finish_reason: map_stop_reason(parsed.stop_reason.as_deref().unwrap_or("end_turn")),
             cache_read_tokens: parsed.usage.cache_read_input_tokens,
             cache_write_tokens: parsed.usage.cache_creation_input_tokens,
             reasoning_tokens: parsed.usage.output_tokens_details["thinking_tokens"]
@@ -479,29 +533,11 @@ impl ProviderAdapter for AnthropicAdapter {
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
-        let (system_text, messages) = translate_messages(&req.messages);
+        let body = build_body(req, true);
 
-        let mut body = serde_json::json!({
-            "model": req.model,
-            "messages": messages,
-            "stream": true,
-        });
-
-        if let Some(system) = system_text {
-            body["system"] = serde_json::json!(system);
-        }
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(max) = req.max_tokens {
-            body["max_tokens"] = serde_json::json!(max);
-        } else {
-            body["max_tokens"] = serde_json::json!(DEFAULT_MAX_TOKENS);
-        }
-        apply_tools(&mut body, req);
-        apply_reasoning(&mut body, req);
-
-        let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
+        let timeout_secs = self
+            .tier_timeouts
+            .resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
             .client
             .post(ANTHROPIC_API_URL)
@@ -1014,6 +1050,145 @@ mod image_content_tests {
         assert_eq!(result["content"][0], messages[0]["content"][0]);
         assert_eq!(result["content"][1]["type"], "image");
         assert_eq!(result["content"][1]["source"]["data"], "AAAA");
+    }
+}
+
+#[cfg(test)]
+mod image_path_tests {
+    // Issue #86: every Anthropic-shaped path must carry the one image
+    // translation — direct adapter (both calls), Responses-API part
+    // spellings, the native `/v1/messages` passthrough, and the base64-only
+    // guard Claude on Vertex needs.
+    use super::{build_body, find_url_image_source, translate_messages, translate_native_messages};
+    use crate::providers::adapter::NormalizedRequest;
+
+    fn image_request() -> NormalizedRequest {
+        NormalizedRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn assert_translated(body: &serde_json::Value) {
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "AAAA");
+        assert_eq!(blocks[2]["type"], "image");
+        assert_eq!(blocks[2]["source"]["type"], "url");
+        assert_eq!(blocks[2]["source"]["url"], "https://example.com/x.png");
+    }
+
+    #[test]
+    fn direct_non_streaming_body_translates_image_parts() {
+        let body = build_body(&image_request(), false);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["max_tokens"], super::DEFAULT_MAX_TOKENS);
+        assert_translated(&body);
+    }
+
+    #[test]
+    fn direct_streaming_body_translates_image_parts() {
+        let body = build_body(&image_request(), true);
+        assert_eq!(body["stream"], true);
+        assert_translated(&body);
+    }
+
+    #[test]
+    fn responses_api_input_parts_translate_like_chat_parts() {
+        // `/v1/responses` forwards its `input` array as messages; the
+        // Responses API spells parts `input_text` / `input_image` with a
+        // string `image_url`.
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Describe."},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,/9j/"},
+                {"type": "input_image", "image_url": "https://example.com/y.png", "detail": "auto"}
+            ]
+        })];
+        let (_, translated) = translate_messages(&messages);
+        let blocks = translated[0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({"type": "text", "text": "Describe."})
+        );
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[2]["source"]["type"], "url");
+        assert_eq!(blocks[2]["source"]["url"], "https://example.com/y.png");
+    }
+
+    #[test]
+    fn input_text_system_content_is_kept() {
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": [{"type": "input_text", "text": "Be brief."}]
+        })];
+        let (system, _) = translate_messages(&messages);
+        assert_eq!(system.as_deref(), Some("Be brief."));
+    }
+
+    #[test]
+    fn native_messages_translate_mixed_in_image_url_parts() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "plain"}),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/gif;base64,R0lG"}},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.com/z.png"}}
+                    ]}
+                ]
+            }),
+        ];
+        let before = messages.clone();
+        translate_native_messages(&mut messages);
+        assert_eq!(messages[0], before[0], "string content untouched");
+        let blocks = messages[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0], before[1]["content"][0], "native block untouched");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/gif");
+        assert_eq!(
+            blocks[2]["content"][0]["source"]["url"],
+            "https://example.com/z.png"
+        );
+    }
+
+    #[test]
+    fn url_sources_are_found_including_inside_tool_results() {
+        let (_, plain) = translate_messages(&[serde_json::json!({
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        })]);
+        assert_eq!(find_url_image_source(&plain), None, "base64 only");
+
+        let (_, top) = translate_messages(&image_request().messages);
+        assert_eq!(
+            find_url_image_source(&top),
+            Some("https://example.com/x.png")
+        );
+
+        let (_, nested) = translate_messages(&[serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [{"type": "image_url", "image_url": {"url": "https://example.com/n.png"}}]
+        })]);
+        assert_eq!(
+            find_url_image_source(&nested),
+            Some("https://example.com/n.png")
+        );
     }
 }
 

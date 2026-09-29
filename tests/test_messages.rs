@@ -835,3 +835,49 @@ async fn messages_circuit_breaker_records_failure() {
         .await;
     assert!(resp.status_code().as_u16() >= 500);
 }
+
+/// Issue #86: OpenAI `image_url` parts mixed into a native `/v1/messages`
+/// request reach Anthropic as native `image` blocks, on both the streaming and
+/// non-streaming calls; native blocks and the rest of the body are untouched.
+#[tokio::test]
+async fn messages_translate_image_url_parts_on_both_calls() {
+    for stream in [false, true] {
+        let (server, _db, mock) = test_app_with_mock_server().await;
+        let resp = server
+            .post("/v1/messages")
+            .add_header(bearer("test-token").0, bearer("test-token").1)
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-5",
+                "max_tokens": 1024,
+                "stream": stream,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Compare."},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]}]
+            }))
+            .await;
+        assert_eq!(resp.status_code(), 200, "stream={stream}");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        let body = &requests[0].body;
+        assert_eq!(body["max_tokens"], 1024);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({"type": "text", "text": "Compare."})
+        );
+        assert_eq!(
+            blocks[1]["source"]["data"], "BBBB",
+            "native block untouched"
+        );
+        assert_eq!(blocks[2]["type"], "image");
+        assert_eq!(blocks[2]["source"]["type"], "base64");
+        assert_eq!(blocks[2]["source"]["data"], "AAAA");
+        assert_eq!(blocks[3]["type"], "image");
+        assert_eq!(blocks[3]["source"]["type"], "url");
+        assert_eq!(blocks[3]["source"]["url"], "https://example.com/x.png");
+    }
+}

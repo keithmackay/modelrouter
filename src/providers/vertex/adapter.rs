@@ -345,7 +345,7 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req, false),
+            Publisher::Anthropic => claude::translate_request(req, false)?,
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let timeout = self.request_timeout(req);
@@ -387,7 +387,7 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req, true),
+            Publisher::Anthropic => claude::translate_request(req, true)?,
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
         let timeout = self.request_timeout(req);
@@ -956,6 +956,98 @@ mod tests {
         // The non-streaming call must NOT ask for a stream.
         adapter(&base, "global").complete(&req("anthropic/claude-sonnet-4-5")).await.unwrap();
         assert_eq!(seen.lock().unwrap().get("stream"), None);
+    }
+
+    fn image_req(url: &str) -> NormalizedRequest {
+        let mut r = req("anthropic/claude-sonnet-4-5");
+        r.messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe."},
+                {"type": "image_url", "image_url": {"url": url}}
+            ]
+        })];
+        r
+    }
+
+    /// A Claude-on-Vertex server that records every body it receives and
+    /// answers SSE or JSON according to the body's `stream` flag.
+    async fn serve_recording_claude() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let router = Router::new().fallback(post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    let streaming = body["stream"] == true;
+                    sink.lock().unwrap().push(body);
+                    if streaming {
+                        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\
+                         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n"
+                            .to_string()
+                    } else {
+                        "{\"content\":[{\"type\":\"text\",\"text\":\"OK\"}],\"usage\":{}}".to_string()
+                    }
+                }
+            },
+        ));
+        let (base, handle) = serve(router).await;
+        (base, seen, handle)
+    }
+
+    fn assert_base64_image_on_the_wire(body: &serde_json::Value) {
+        let block = &body["messages"][0]["content"][1];
+        assert_eq!(block["type"], "image", "{body}");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], "image/png");
+        assert_eq!(block["source"]["data"], "AAAA");
+    }
+
+    #[tokio::test]
+    async fn claude_complete_sends_image_url_parts_as_base64_image_blocks(/* issue #86 */) {
+        let (base, seen, _s) = serve_recording_claude().await;
+        adapter(&base, "global")
+            .complete(&image_req("data:image/png;base64,AAAA"))
+            .await
+            .unwrap();
+        assert_base64_image_on_the_wire(&seen.lock().unwrap()[0]);
+    }
+
+    #[tokio::test]
+    async fn claude_stream_sends_image_url_parts_as_base64_image_blocks(/* issue #86 */) {
+        let (base, seen, _s) = serve_recording_claude().await;
+        let out = collect(
+            adapter(&base, "global")
+                .stream(&image_req("data:image/png;base64,AAAA"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(out.contains("\"content\":\"OK\""), "{out}");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies[0]["stream"], true);
+        assert_base64_image_on_the_wire(&bodies[0]);
+    }
+
+    #[tokio::test]
+    async fn claude_image_urls_are_refused_before_any_vertex_call(/* issue #86 */) {
+        // Vertex accepts only base64 image sources: a URL is refused locally
+        // with a clear message, on both calls, and Vertex is never contacted.
+        let (base, seen, _s) = serve_recording_claude().await;
+        let a = adapter(&base, "global");
+        let r = image_req("https://example.com/x.png");
+        let err = a.complete(&r).await.unwrap_err().to_string();
+        assert!(err.contains("only base64 image sources"), "{err}");
+        let err = a.stream(&r).await.err().unwrap().to_string();
+        assert!(err.contains("only base64 image sources"), "{err}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no request may reach Vertex"
+        );
     }
 
     #[tokio::test]

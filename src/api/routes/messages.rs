@@ -98,6 +98,19 @@ async fn log_messages_cost(
     }
 }
 
+/// The body forwarded upstream: the caller's native Anthropic request with the
+/// canonical model name, and any OpenAI `image_url` parts mixed into its
+/// content translated to native `image` blocks (issue #86) — Anthropic rejects
+/// the OpenAI tag. Shared by the streaming and non-streaming calls.
+fn build_upstream_body(body: &Value, canonical_model: &str) -> Value {
+    let mut upstream = body.clone();
+    upstream["model"] = Value::String(canonical_model.to_string());
+    if let Some(messages) = upstream["messages"].as_array_mut() {
+        crate::providers::anthropic::translate_native_messages(messages);
+    }
+    upstream
+}
+
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -239,9 +252,7 @@ async fn anthropic_messages_inner(
     let upstream_url = format!("{}/v1/messages", api_base);
     let start = Instant::now();
 
-    // Build upstream body with canonical model name
-    let mut upstream_body = body.clone();
-    upstream_body["model"] = serde_json::Value::String(canonical_model.clone());
+    let upstream_body = build_upstream_body(&body, &canonical_model);
 
     if stream {
         if state.circuit_breaker.is_open("anthropic") {

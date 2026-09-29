@@ -5,12 +5,15 @@
 //!   1. `model` goes in the URL, not the body.
 //!   2. Body must include `"anthropic_version": "vertex-2023-10-16"`.
 //!
-//! MVP scope: string-only message content (consistent with `gemini.rs`).
+//! Content arrays go through the shared Anthropic translation, including
+//! OpenAI `image_url` parts (issue #86). Vertex accepts only base64 image
+//! sources, so a request carrying an image URL is refused before it is sent.
 
 use crate::providers::adapter::{CompletionResult, NormalizedRequest};
 use crate::providers::anthropic::{
-    apply_reasoning, map_stop_reason, text_from_content, thinking_tokens_from_usage,
-    tool_calls_from_content, translate_messages, translate_tool_choice, translate_tools,
+    apply_reasoning, find_url_image_source, map_stop_reason, text_from_content,
+    thinking_tokens_from_usage, tool_calls_from_content, translate_messages, translate_tool_choice,
+    translate_tools,
 };
 
 /// Vertex-specific anthropic_version required on every Claude-on-Vertex call.
@@ -31,8 +34,28 @@ pub(crate) use crate::providers::anthropic::DEFAULT_MAX_TOKENS;
 /// `"stream": true`. Without it the endpoint returns one complete non-SSE
 /// JSON message, every line of which `translate_sse_line` drops — the client
 /// sees a 200 with an empty body.
-pub fn translate_request(req: &NormalizedRequest, streaming: bool) -> serde_json::Value {
+///
+/// Errors when an image arrives as a URL: Claude on Vertex accepts only
+/// base64 image sources, and forwarding a `url` source earns an opaque
+/// upstream 400. The message is phrased `returned 400` so the retry
+/// classifier reads it as a client error (no retry, no circuit-breaker
+/// count) and a fallback to a backend that does accept URLs stays possible.
+pub fn translate_request(
+    req: &NormalizedRequest,
+    streaming: bool,
+) -> anyhow::Result<serde_json::Value> {
     let (system_text, messages) = translate_messages(&req.messages);
+    // The URL itself is deliberately not echoed: the retry classifier
+    // matches status digits as substrings, so a URL containing e.g. `500`
+    // would misread this client error as a server fault.
+    if find_url_image_source(&messages).is_some() {
+        anyhow::bail!(
+            "modelrouter returned 400 Bad Request before contacting Vertex AI: \
+             Claude on Vertex accepts only base64 image sources, but the request \
+             carries an image as a URL; send it inline as a data URL \
+             (data:<media_type>;base64,<data>)"
+        );
+    }
 
     let mut body = serde_json::json!({
         "anthropic_version": VERTEX_ANTHROPIC_VERSION,
@@ -59,7 +82,7 @@ pub fn translate_request(req: &NormalizedRequest, streaming: bool) -> serde_json
     // Reasoning controls (`thinking` / `output_config.effort`) in the same
     // dialect as the direct adapter; omitted when none was resolved.
     apply_reasoning(&mut body, req);
-    body
+    Ok(body)
 }
 
 /// Parse a Vertex Anthropic non-streaming response into the shared `CompletionResult`.
@@ -107,7 +130,8 @@ mod reasoning_tests {
         let body = translate_request(
             &req(Some(ReasoningControl { disable_thinking: true, effort: None })),
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("output_config").is_none());
     }
@@ -117,14 +141,15 @@ mod reasoning_tests {
         let body = translate_request(
             &req(Some(ReasoningControl { disable_thinking: false, effort: Some("low") })),
             true,
-        );
+        )
+        .unwrap();
         assert_eq!(body["output_config"]["effort"], "low");
         assert!(body.get("thinking").is_none());
     }
 
     #[test]
     fn no_reasoning_control_leaves_the_body_untouched() {
-        let body = translate_request(&req(None), false);
+        let body = translate_request(&req(None), false).unwrap();
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
     }
@@ -168,7 +193,7 @@ mod tools_tests {
             tool_choice: Some(serde_json::json!("required")),
             ..Default::default()
         };
-        let body = translate_request(&req, false);
+        let body = translate_request(&req, false).unwrap();
         assert_eq!(body["tools"][0]["name"], "get_weather");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -192,32 +217,53 @@ mod tools_tests {
         assert_eq!(calls[0]["function"]["name"], "get_weather");
     }
 
-    #[test]
-    fn image_url_parts_reach_vertex_as_anthropic_image_blocks() {
-        // Vertex Anthropic 400s on OpenAI `image_url` parts ("Input tag
-        // 'image_url' ... invalid"); they must arrive as native image blocks.
-        let req = NormalizedRequest {
+    fn image_req(url: &str) -> NormalizedRequest {
+        NormalizedRequest {
             model: "claude-sonnet-4-5".into(),
             messages: vec![serde_json::json!({
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "Describe this diagram."},
-                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
-                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                    {"type": "image_url", "image_url": {"url": url}}
                 ]
             })],
             ..Default::default()
-        };
-        let body = translate_request(&req, false);
-        let blocks = body["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[1]["type"], "image");
-        assert_eq!(blocks[1]["source"]["type"], "base64");
-        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
-        assert_eq!(blocks[1]["source"]["data"], "/9j/4AAQ");
-        assert_eq!(blocks[2]["type"], "image");
-        assert_eq!(blocks[2]["source"]["type"], "url");
-        assert_eq!(blocks[2]["source"]["url"], "https://example.com/x.png");
+        }
+    }
+
+    #[test]
+    fn data_url_image_parts_reach_vertex_as_base64_image_blocks() {
+        // Vertex Anthropic 400s on OpenAI `image_url` parts ("Input tag
+        // 'image_url' ... invalid"); they must arrive as native image blocks,
+        // on both the rawPredict and streamRawPredict bodies (issue #86).
+        for streaming in [false, true] {
+            let body = translate_request(&image_req("data:image/jpeg;base64,/9j/4AAQ"), streaming)
+                .unwrap();
+            let blocks = body["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(blocks[0]["type"], "text");
+            assert_eq!(blocks[1]["type"], "image");
+            assert_eq!(blocks[1]["source"]["type"], "base64");
+            assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+            assert_eq!(blocks[1]["source"]["data"], "/9j/4AAQ");
+        }
+    }
+
+    #[test]
+    fn https_image_urls_are_refused_loudly_as_a_client_error() {
+        // Vertex accepts only base64 image sources; a `url` source must not
+        // be forwarded to fail upstream with an opaque 400 (issue #86).
+        for streaming in [false, true] {
+            let err = translate_request(&image_req("https://example.com/500/x.png"), streaming)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("only base64 image sources"), "{err}");
+            assert!(err.contains("data:<media_type>;base64"), "{err}");
+            let kind = crate::router::retry::RetryableError::classify(&err);
+            assert!(
+                matches!(kind, crate::router::retry::RetryableError::ClientError(400)),
+                "must classify as a client error, got {kind:?}"
+            );
+        }
     }
 
     #[test]
