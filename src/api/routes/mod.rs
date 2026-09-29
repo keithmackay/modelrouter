@@ -12,6 +12,7 @@ pub mod models;
 pub mod prometheus;
 pub mod search;
 pub mod systemone;
+pub mod tools;
 
 use crate::{
     api::{app::AppState, error::ApiError},

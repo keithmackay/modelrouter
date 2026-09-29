@@ -156,7 +156,7 @@ async fn authenticated_responses_with_input_returns_200() {
 }
 
 #[tokio::test]
-async fn responses_tools_field_with_non_empty_array_returns_400() {
+async fn responses_tools_on_a_backend_without_tool_support_returns_400() {
     let server = test_app().await;
     let resp = server
         .post("/v1/responses")
@@ -589,4 +589,208 @@ async fn responses_provider_failure_is_recorded_on_the_breaker() {
         "the failure arm must record against the breaker for {}",
         h.provider
     );
+}
+
+// ── Tool forwarding (issue #87) ──────────────────────────────────────────────
+//
+// Function tools are forwarded to tool-capable backends in the
+// chat-completions shape the adapters translate from; hosted/grounded search
+// tools are refused with a pointer to /v1/search.
+
+/// A tool-capable adapter that records the request it was handed and answers
+/// with a tool call.
+struct ToolAdapter {
+    seen: Arc<std::sync::Mutex<Option<NormalizedRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderAdapter for ToolAdapter {
+    async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
+        *self.seen.lock().unwrap() = Some(req.clone());
+        Ok(CompletionResult {
+            content: String::new(),
+            finish_reason: "tool_calls".to_string(),
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            tool_calls: Some(serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+            }])),
+            ..Default::default()
+        })
+    }
+    async fn stream(&self, _req: &NormalizedRequest) -> anyhow::Result<SseStream> {
+        anyhow::bail!("not used")
+    }
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+}
+
+async fn tool_harness() -> (Harness, Arc<std::sync::Mutex<Option<NormalizedRequest>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let h = build_harness(
+        ToolAdapter { seen: seen.clone() },
+        Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
+    )
+    .await;
+    (h, seen)
+}
+
+#[tokio::test]
+async fn responses_forwards_flat_function_tools_to_a_tool_capable_backend() {
+    let (h, seen) = tool_harness().await;
+    let (hk, hv) = auth();
+    let resp = h
+        .server
+        .post("/v1/responses")
+        .add_header(hk, hv)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Weather in Paris?",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Current weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }],
+            "tool_choice": {"type": "function", "name": "get_weather"}
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+
+    let req = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the adapter was called");
+    let tools = req.tools.expect("tools reach the adapter");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], "get_weather");
+    assert_eq!(tools[0]["function"]["description"], "Current weather");
+    assert_eq!(
+        tools[0]["function"]["parameters"]["properties"]["city"]["type"],
+        "string"
+    );
+    assert_eq!(
+        req.tool_choice,
+        Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}}))
+    );
+
+    let body: serde_json::Value = resp.json();
+    let message = &body["choices"][0]["message"];
+    assert!(
+        message["content"].is_null(),
+        "pure tool-call turn reports null content"
+    );
+    assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
+async fn responses_accepts_nested_function_tools_too() {
+    let (h, seen) = tool_harness().await;
+    let (hk, hv) = auth();
+    let resp = h
+        .server
+        .post("/v1/responses")
+        .add_header(hk, hv)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hi",
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "required"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let req = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(req.tools.unwrap()[0]["function"]["name"], "f");
+    assert_eq!(req.tool_choice, Some(serde_json::json!("required")));
+}
+
+#[tokio::test]
+async fn responses_translates_function_call_input_items_into_tool_turns() {
+    let (h, seen) = tool_harness().await;
+    let (hk, hv) = auth();
+    let resp = h
+        .server
+        .post("/v1/responses")
+        .add_header(hk, hv)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "tools": [{"type": "function", "name": "get_weather"}],
+            "input": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+                 "arguments": "{\"city\":\"Paris\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+            ]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    let req = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(req.messages.len(), 3);
+    assert_eq!(req.messages[1]["role"], "assistant");
+    assert_eq!(req.messages[1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        req.messages[1]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(
+        req.messages[2],
+        serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "sunny"})
+    );
+}
+
+#[tokio::test]
+async fn responses_grounded_search_tool_returns_400_even_on_a_tool_capable_backend() {
+    let (h, seen) = tool_harness().await;
+    let (hk, hv) = auth();
+    let resp = h
+        .server
+        .post("/v1/responses")
+        .add_header(hk, hv)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Latest news?",
+            "tools": [{"type": "web_search_preview"}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    let body: serde_json::Value = resp.json();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("web_search_preview"),
+        "names the tool type: {message}"
+    );
+    assert!(
+        message.contains("/v1/search"),
+        "points at /v1/search: {message}"
+    );
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "a refused request never reaches the provider"
+    );
+}
+
+#[tokio::test]
+async fn responses_grounded_search_tool_choice_returns_400() {
+    let (h, seen) = tool_harness().await;
+    let (hk, hv) = auth();
+    let resp = h
+        .server
+        .post("/v1/responses")
+        .add_header(hk, hv)
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Latest news?",
+            "tools": [{"type": "function", "name": "f"}],
+            "tool_choice": {"type": "web_search_preview"}
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(resp.text().contains("/v1/search"), "{}", resp.text());
+    assert!(seen.lock().unwrap().is_none());
 }
