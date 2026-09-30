@@ -948,7 +948,21 @@ The router can serve identical requests from a cache instead of calling the
 provider, so every app behind it saves money without implementing its own cache.
 Disabled by default; enable with `cache.enabled = true`.
 
-**What is cached.** `POST /v1/chat/completions` and `POST /v1/search`.
+**What is cached.** `POST /v1/chat/completions`, `POST /v1/messages` and
+`POST /v1/search`, streamed or not. `POST /v1/responses` has no streaming mode
+and is not cached.
+
+**Streaming.** A streamed completion that finishes cleanly (the provider sent
+its terminal event and usage) is assembled and stored under the same key as the
+equivalent plain request. A stream that errors, is cut off by the client, or
+carries anything the assembler does not understand is not stored. On a hit for
+a `stream: true` request the entry is replayed as SSE in the wire format of the
+endpoint that was called: `chat.completion.chunk` events, the router's
+usage-and-cost chunk and `data: [DONE]` for chat completions, or the
+`message_start` … `message_stop` event sequence with final usage for
+`/v1/messages`. A plain request can hit an entry recorded from a stream and the
+other way round. Clients that rerun identical workloads get the same answer
+whichever mode they use.
 
 **Cache key.** The resolved (post-alias, post-load-balancer) model, plus a
 SHA-256 of the request body with only transport-level fields removed (`stream`,
@@ -961,15 +975,15 @@ options. Exact-match only; there is no semantic or fuzzy matching.
 its `temperature` is explicitly at or below `cache.completions.max_temperature`,
 which defaults to `0.0`. A request that omits `temperature` is scored using
 `cache.completions.assumed_temperature` (default `1.0`, the OpenAI default), so
-**omitting `temperature` means the request is not cached**. Streaming requests
-are never cached. Search queries are cached by default with a shorter TTL
+**omitting `temperature` means the request is not cached**. Search queries are cached by default with a shorter TTL
 (15 minutes vs. 1 hour). Raise `max_temperature` deliberately if you want
 creative sampling replayed.
 
 **Metering.** A cache hit is recorded as a usage row with `cache_hit = true`,
 `cost_usd = 0`, and the avoided provider cost in `saved_usd`. Hits therefore
 never inflate spend, and cache-hit percentage is reported alongside cost.
-Responses carry an `x-modelrouter-cache: HIT|MISS` header.
+Responses carry an `x-modelrouter-cache: HIT|MISS` header, streamed replays
+included, and the `response cache hit` log line records `streamed=true|false`.
 
 **Backends.** `memory` (moka, bounded by `cache.max_entries`, per-process — each
 replica warms its own copy) or `redis` (shared across stateless replicas, keys

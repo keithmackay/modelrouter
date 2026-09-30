@@ -236,9 +236,10 @@ async fn chat_completions_inner(
     span.record("streaming", stream);
 
     // ── Response cache ───────────────────────────────────────────────────────
-    // Eligibility is conservative (see `router::cache`): streaming and
-    // nondeterministic sampling are never served from cache, and neither is
-    // a bound request — a cached answer says nothing about the pinned model.
+    // Eligibility is conservative (see `router::cache`): nondeterministic
+    // sampling is never served from cache, and neither is a bound request — a
+    // cached answer says nothing about the pinned model. Streamed and plain
+    // requests share entries; `stream` is not part of the key.
     let cache_key = if binding.is_none()
         && state.policy.cache_enabled(&user, &canonical_model)
         && state.response_cache.completion_eligible(&body)
@@ -298,6 +299,7 @@ async fn chat_completions_inner(
         )
         .unwrap_or_default();
 
+        let cache_consulted = cache_key.is_some();
         // The streaming path has no fallback loop, so the resolved pair is
         // also the pair that answers.
         let logged_stream = log_streaming_request(
@@ -322,12 +324,17 @@ async fn chat_completions_inner(
                 attribution: attribution.clone(),
                 experiment_id,
                 experiment_variant,
+                cache_key,
             },
         );
 
-        return Ok(
-            streaming_response(Box::pin(logged_stream), request_id).into_response(),
-        );
+        let mut response = streaming_response(Box::pin(logged_stream), request_id).into_response();
+        if cache_consulted {
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
+        }
+        return Ok(response);
     }
 
     let ProviderCallOutcome {
@@ -645,9 +652,11 @@ async fn try_serve_cached_completion(
     skip_log: bool,
 ) -> Option<Response> {
     let cached = state.response_cache.get_completion(key, canonical_model).await?;
+    let stream = body["stream"].as_bool().unwrap_or(false);
     tracing::info!(
         cache_key = key,
         model = canonical_model,
+        streamed = stream,
         "response cache hit"
     );
     // What the call would have cost. Recorded as a saving, not as spend.
@@ -710,11 +719,39 @@ async fn try_serve_cached_completion(
             fallbacks: 0,
         },
     };
-    let mut response = Json(build_openai_response(request_id, &cached, &meta)).into_response();
+    let mut response = if stream {
+        streaming_response(
+            replay_completion_stream(&request_id, &cached, &meta),
+            request_id,
+        )
+        .into_response()
+    } else {
+        Json(build_openai_response(request_id, &cached, &meta)).into_response()
+    };
     response
         .headers_mut()
         .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("HIT"));
     Some(response)
+}
+
+/// A cached completion as the SSE a live stream would have sent: the answer,
+/// the router's usage-and-cost chunk, then `[DONE]`.
+fn replay_completion_stream(
+    request_id: &str,
+    cached: &crate::providers::adapter::CompletionResult,
+    meta: &RouterMeta,
+) -> crate::providers::adapter::SseStream {
+    let created = chrono::Utc::now().timestamp();
+    let mut sse: String =
+        crate::router::cache::stream::chat_replay_chunks(cached, request_id, &meta.model, created)
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect();
+    sse.push_str(&cost_chunk_event(request_id, meta));
+    sse.push_str("data: [DONE]\n\n");
+    Box::pin(futures::stream::once(
+        async move { Ok(bytes::Bytes::from(sse)) },
+    ))
 }
 
 /// What `complete_with_retry_and_fallback` settled on: the completion plus the
@@ -1067,17 +1104,17 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
 
 /// Everything needed to meter a cache hit, gathered at the call site so the
 /// spawned task borrows nothing.
-struct CacheHitCtx {
-    user_id: i64,
-    api_key_id: Option<i64>,
-    user_project: Option<String>,
-    request_model: String,
-    canonical_model: String,
-    provider: String,
-    messages_json: String,
-    avoided_cost: f64,
-    skip_log: bool,
-    attribution: crate::api::attribution::Attribution,
+pub(crate) struct CacheHitCtx {
+    pub(crate) user_id: i64,
+    pub(crate) api_key_id: Option<i64>,
+    pub(crate) user_project: Option<String>,
+    pub(crate) request_model: String,
+    pub(crate) canonical_model: String,
+    pub(crate) provider: String,
+    pub(crate) messages_json: String,
+    pub(crate) avoided_cost: f64,
+    pub(crate) skip_log: bool,
+    pub(crate) attribution: crate::api::attribution::Attribution,
 }
 
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
@@ -1159,7 +1196,7 @@ async fn next_available_fallback_with_policy(
     None
 }
 
-fn record_cache_hit(
+pub(crate) fn record_cache_hit(
     state: &AppState,
     ctx: CacheHitCtx,
     result: &crate::providers::adapter::CompletionResult,
@@ -1275,6 +1312,9 @@ struct StreamLogCtx {
     attribution: crate::api::attribution::Attribution,
     experiment_id: Option<i64>,
     experiment_variant: Option<String>,
+    /// Response-cache key when the request is cacheable; a stream that
+    /// completes cleanly is stored under it.
+    cache_key: Option<String>,
 }
 
 /// Usage as the provider reported it inside a streamed chunk (OpenAI shape:
@@ -1389,6 +1429,9 @@ struct StreamSettlement {
 struct StreamLogger {
     ctx: StreamLogCtx,
     acc: StreamAcc,
+    /// Assembles the response for the cache; `None` when the request is not
+    /// cacheable or the stream broke.
+    capture: Option<crate::router::cache::stream::ChatStreamCapture>,
 }
 
 impl StreamLogger {
@@ -1396,10 +1439,17 @@ impl StreamLogger {
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(e) => {
+                self.capture = None;
                 self.record(Some(e.to_string()));
                 return Err(e);
             }
         };
+        if let Some(capture) = self.capture.as_mut() {
+            capture.feed(&chunk);
+            if capture.is_done() {
+                self.spawn_cache_store();
+            }
+        }
         if self.acc.ttft_ms.is_none() {
             self.acc.ttft_ms = Some(self.ctx.start.elapsed().as_millis() as i64);
         }
@@ -1423,6 +1473,55 @@ impl StreamLogger {
         let chunk = insert_before_done(&chunk, &event);
         self.spawn_ledger_write(settlement, None);
         Ok(chunk)
+    }
+
+    /// Store the captured response, priced as the ledger prices it, after the
+    /// same response guardrails a non-streamed answer passes before it is
+    /// cached. The caller already has the stream; this only decides what a
+    /// later hit replays.
+    fn spawn_cache_store(&mut self) {
+        let (Some(capture), Some(key)) = (self.capture.take(), self.ctx.cache_key.clone()) else {
+            return;
+        };
+        let Some(mut result) = capture.finish() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let ctx = self.ctx.clone();
+        handle.spawn(async move {
+            let guardrail_ctx = crate::guardrails::GuardrailContext {
+                messages: serde_json::from_str(&ctx.messages_json).unwrap_or(Value::Null),
+                model: ctx.model.clone(),
+                user_id: ctx.user_id,
+            };
+            match ctx
+                .state
+                .guardrails
+                .check_response(&guardrail_ctx, &result.content)
+                .await
+            {
+                crate::guardrails::GuardrailDecision::Allow => {}
+                crate::guardrails::GuardrailDecision::Block { .. } => return,
+                crate::guardrails::GuardrailDecision::Replace { content } => {
+                    result.content = content
+                }
+            }
+            let cost = ctx.state.cost_calc.calculate_with_cache(
+                &ctx.canonical_model,
+                result
+                    .prompt_tokens
+                    .saturating_sub(result.cache_read_tokens),
+                result.completion_tokens,
+                result.cache_read_tokens,
+                0,
+            );
+            ctx.state
+                .response_cache
+                .put_completion(&key, &ctx.canonical_model, &result, cost)
+                .await;
+        });
     }
 
     fn finish_reason(&self, provider_error: Option<&String>) -> String {
@@ -1626,9 +1725,14 @@ fn log_streaming_request(
 ) -> impl futures::Stream<Item = anyhow::Result<bytes::Bytes>> + Send {
     use futures::StreamExt;
 
+    let capture = ctx
+        .cache_key
+        .as_ref()
+        .map(|_| crate::router::cache::stream::ChatStreamCapture::new());
     let mut logger = StreamLogger {
         ctx,
         acc: StreamAcc::default(),
+        capture,
     };
     // The closure owns the logger, so dropping the mapped stream drops the
     // logger and its guard fires.

@@ -5,6 +5,14 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-09-28
+
+**Features**
+- Streamed completions are cacheable. A stream that finishes cleanly on `/v1/chat/completions` or `/v1/messages` is stored under the same key as the plain request; a hit on a `stream: true` request is replayed as SSE in the endpoint's wire format (chat chunks plus the usage-and-cost chunk and `[DONE]`, or the Anthropic `message_start` … `message_stop` sequence with final usage). Streamed and plain requests hit each other's entries. Errored, client-aborted and usage-less streams are not stored. `/v1/messages` joins the response cache for the first time, streamed or not, under the chat-completions eligibility rules.
+
+**Fixes**
+- The Anthropic adapter no longer drops an SSE event whose line is split across two network reads; streamed content and usage survive any chunking.
+
 ### Week of 2026-09-21
 
 **Fixes**

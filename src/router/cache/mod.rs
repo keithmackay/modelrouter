@@ -23,6 +23,7 @@
 //! Exact-match only. Semantic/fuzzy matching is explicitly out of scope.
 
 pub mod store;
+pub mod stream;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,6 +56,10 @@ pub const VOLATILE_FIELDS: &[&str] = &[
 /// Cache class, used as the first key segment and recorded on entries.
 pub const CLASS_COMPLETION: &str = "completion";
 pub const CLASS_SEARCH: &str = "search";
+/// Anthropic Messages API responses, stored as the native `message` object.
+/// Its own class because the payload shape differs from [`CLASS_COMPLETION`];
+/// it shares the completion eligibility rules and TTL.
+pub const CLASS_MESSAGES: &str = "messages";
 
 // ── Runtime policy ────────────────────────────────────────────────────────────
 
@@ -243,16 +248,11 @@ impl ResponseCache {
     // ── Eligibility ───────────────────────────────────────────────────────────
 
     /// Is this completion request deterministic enough to serve from cache?
-    ///
-    /// Streaming requests are never cached: the router would have to synthesize
-    /// an SSE stream from a stored body, and callers asking for a stream are
-    /// generally asking for a fresh generation.
+    /// `stream` plays no part: a streamed and a plain request share an entry
+    /// and a hit is replayed in whichever shape was asked for.
     pub fn completion_eligible(&self, body: &Value) -> bool {
         let policy = self.policy.load();
         if !policy.enabled || !policy.completions.enabled {
-            return false;
-        }
-        if body["stream"].as_bool().unwrap_or(false) {
             return false;
         }
         let temperature = body
@@ -292,6 +292,23 @@ impl ResponseCache {
             return;
         };
         self.store_entry(key, CLASS_COMPLETION, model, payload, original_cost_usd)
+            .await;
+    }
+
+    /// Look up a native Anthropic `message`. Records the hit/miss against
+    /// `model`.
+    pub async fn get_message(&self, key: &str, model: &str) -> Option<Value> {
+        Some(self.lookup(key, model).await?.payload)
+    }
+
+    pub async fn put_message(
+        &self,
+        key: &str,
+        model: &str,
+        message: Value,
+        original_cost_usd: f64,
+    ) {
+        self.store_entry(key, CLASS_MESSAGES, model, message, original_cost_usd)
             .await;
     }
 
@@ -461,6 +478,16 @@ pub fn completion_cache_key(resolved_model: &str, body: &Value) -> String {
     format!(
         "{}:{}:{}",
         CLASS_COMPLETION,
+        model_fingerprint(resolved_model),
+        make_cache_key(body)
+    )
+}
+
+/// Full store key for a `/v1/messages` call: `messages:{model_fp}:{body_hash}`.
+pub fn messages_cache_key(resolved_model: &str, body: &Value) -> String {
+    format!(
+        "{}:{}:{}",
+        CLASS_MESSAGES,
         model_fingerprint(resolved_model),
         make_cache_key(body)
     )
