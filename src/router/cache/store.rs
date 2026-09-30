@@ -39,17 +39,62 @@ pub struct CachedEntry {
     /// Unix seconds when the entry was stored.
     #[serde(default)]
     pub stored_at: i64,
-    /// Unix seconds after which the entry is stale. Redis enforces this itself;
-    /// the memory backend checks it on read so both honour the same TTL.
+    /// Unix seconds after which the entry is stale; 0 means it never
+    /// expires. Redis enforces this itself; the memory backend checks it on
+    /// read so both honour the same TTL.
     #[serde(default)]
     pub expires_at: i64,
+}
+
+/// How long a stored entry lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryTtl {
+    /// Expires after this long (at least one second).
+    Finite(Duration),
+    /// Never expires. It stays until purged, evicted by capacity (memory) or
+    /// by Redis's `maxmemory` policy, or lost when a non-persistent Redis
+    /// restarts.
+    Unlimited,
+}
+
+impl EntryTtl {
+    /// `0` means unlimited, the convention used by config and headers.
+    pub fn from_secs(secs: u64) -> Self {
+        if secs == 0 {
+            EntryTtl::Unlimited
+        } else {
+            EntryTtl::Finite(Duration::from_secs(secs))
+        }
+    }
+
+    /// Whole seconds, at least 1; `None` when unlimited.
+    pub fn secs(self) -> Option<u64> {
+        match self {
+            EntryTtl::Finite(d) => Some(d.as_secs().max(1)),
+            EntryTtl::Unlimited => None,
+        }
+    }
+
+    /// The shorter of the two lifetimes.
+    pub fn min(self, other: EntryTtl) -> EntryTtl {
+        match (self.secs(), other.secs()) {
+            (Some(a), Some(b)) => EntryTtl::Finite(Duration::from_secs(a.min(b))),
+            (Some(_), None) => self,
+            (None, _) => other,
+        }
+    }
+
+    /// The `expires_at` for an entry stored at `stored_at`.
+    fn expires_at(self, stored_at: i64) -> i64 {
+        self.secs().map_or(0, |ttl| stored_at + ttl as i64)
+    }
 }
 
 /// A cache backend. Implementations must be safe to share across tasks.
 #[async_trait]
 pub trait CacheStore: Send + Sync {
     async fn get(&self, key: &str) -> Option<CachedEntry>;
-    async fn put(&self, key: &str, entry: CachedEntry, ttl: Duration);
+    async fn put(&self, key: &str, entry: CachedEntry, ttl: EntryTtl);
     /// Remove one key. Returns true if it existed.
     async fn purge_key(&self, key: &str) -> bool;
     /// Remove every entry whose key carries `model_fp` (see
@@ -149,12 +194,12 @@ impl CacheStore for MemoryStore {
         Some(entry)
     }
 
-    async fn put(&self, key: &str, entry: CachedEntry, ttl: Duration) {
+    async fn put(&self, key: &str, entry: CachedEntry, ttl: EntryTtl) {
         // Per-entry TTL lives on the entry rather than in a moka expiry policy,
         // so every backend enforces the same deadline the same way.
         let mut entry = entry;
         entry.stored_at = now_secs();
-        entry.expires_at = entry.stored_at + ttl.as_secs().max(1) as i64;
+        entry.expires_at = ttl.expires_at(entry.stored_at);
         self.inner.insert(key.to_string(), entry).await;
     }
 
@@ -468,6 +513,17 @@ impl RedisStore {
     }
 }
 
+/// `SET key value [EX ttl]`. An unlimited entry is written without `EX`, so it
+/// lives until purged or evicted by Redis's `maxmemory` policy.
+fn set_command(full_key: &str, raw: &str, ttl: EntryTtl) -> redis::Cmd {
+    let mut cmd = redis::cmd("SET");
+    cmd.arg(full_key).arg(raw);
+    if let Some(secs) = ttl.secs() {
+        cmd.arg("EX").arg(secs);
+    }
+    cmd
+}
+
 #[async_trait]
 impl CacheStore for RedisStore {
     async fn get(&self, key: &str) -> Option<CachedEntry> {
@@ -493,22 +549,17 @@ impl CacheStore for RedisStore {
         }
     }
 
-    async fn put(&self, key: &str, entry: CachedEntry, ttl: Duration) {
+    async fn put(&self, key: &str, entry: CachedEntry, ttl: EntryTtl) {
         let Some(mut conn) = self.conn().await else {
             return;
         };
-        let ttl = ttl.as_secs().max(1);
         let mut entry = entry;
         entry.stored_at = now_secs();
-        entry.expires_at = entry.stored_at + ttl as i64;
+        entry.expires_at = ttl.expires_at(entry.stored_at);
         let Ok(raw) = serde_json::to_string(&entry) else {
             return;
         };
-        if let Err(e) = redis::cmd("SET")
-            .arg(self.full_key(key))
-            .arg(raw)
-            .arg("EX")
-            .arg(ttl)
+        if let Err(e) = set_command(&self.full_key(key), &raw, ttl)
             .query_async::<()>(&mut conn)
             .await
         {
@@ -568,6 +619,67 @@ pub(super) fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Entry TTLs ────────────────────────────────────────────────────────────
+
+    fn secs(n: u64) -> EntryTtl {
+        EntryTtl::Finite(Duration::from_secs(n))
+    }
+
+    #[test]
+    fn entry_ttl_zero_is_unlimited_and_min_prefers_the_finite_bound() {
+        assert_eq!(EntryTtl::from_secs(0), EntryTtl::Unlimited);
+        assert_eq!(EntryTtl::from_secs(5), secs(5));
+        assert_eq!(secs(0).secs(), Some(1), "a finite TTL is at least a second");
+        assert_eq!(secs(5).min(secs(9)), secs(5));
+        assert_eq!(secs(9).min(secs(5)), secs(5));
+        assert_eq!(secs(5).min(EntryTtl::Unlimited), secs(5));
+        assert_eq!(EntryTtl::Unlimited.min(secs(5)), secs(5));
+        assert_eq!(
+            EntryTtl::Unlimited.min(EntryTtl::Unlimited),
+            EntryTtl::Unlimited
+        );
+        assert_eq!(secs(10).expires_at(100), 110);
+        assert_eq!(EntryTtl::Unlimited.expires_at(100), 0);
+    }
+
+    fn command_args(cmd: &redis::Cmd) -> Vec<String> {
+        cmd.args_iter()
+            .map(|arg| match arg {
+                redis::Arg::Simple(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                _ => "<non-simple>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn redis_set_carries_ex_only_for_a_finite_ttl() {
+        assert_eq!(
+            command_args(&set_command("ns:k", "{}", secs(30))),
+            ["SET", "ns:k", "{}", "EX", "30"]
+        );
+        assert_eq!(
+            command_args(&set_command("ns:k", "{}", EntryTtl::Unlimited)),
+            ["SET", "ns:k", "{}"]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_store_keeps_an_unlimited_entry() {
+        let store = MemoryStore::new(&CacheConfig::default());
+        let entry = CachedEntry {
+            class: "completion".to_string(),
+            model: "m".to_string(),
+            payload: serde_json::json!({}),
+            original_cost_usd: 0.0,
+            stored_at: 0,
+            expires_at: 0,
+        };
+        store.put("forever", entry, EntryTtl::Unlimited).await;
+        let got = store.get("forever").await.expect("stored");
+        assert_eq!(got.expires_at, 0);
+        assert!(got.stored_at > 0);
+    }
 
     // ── ReconnectGate: the pure decision logic ────────────────────────────────
 
@@ -769,7 +881,13 @@ mod tests {
             stored_at: 0,
             expires_at: 0,
         };
-        store.put("live-test-key", entry, Duration::from_secs(30)).await;
+        store
+            .put(
+                "live-test-key",
+                entry,
+                EntryTtl::Finite(Duration::from_secs(30)),
+            )
+            .await;
         let got = store.get("live-test-key").await.expect("entry should round-trip");
         assert_eq!(got.payload["content"], "live round trip");
         assert!(store.entry_count().await >= 1);

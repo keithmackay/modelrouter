@@ -998,6 +998,27 @@ widen what is cached, so an operator can refuse them with
 `bypass` only narrows and is always honoured. `use` suits clients that rerun
 identical workloads with sampling on and want the first answer replayed.
 
+**Per-request TTL.** `x-modelrouter-cache-ttl: <seconds>` sets how long the
+entry this request stores will live, in place of the class TTL; `0` asks for an
+entry that never expires. The value is capped by `cache.max_ttl_seconds`
+(default `86400`, one day), so with the default a request for `0` or for a week
+is stored for a day. Setting `max_ttl_seconds = 0` lifts the cap and lets
+callers store entries with no expiry. The header only affects what this
+request stores: it does not change the lifetime of an entry it hits, and it is
+ignored under `bypass`. A value that is not a whole number of seconds, or is
+longer than ten years, is a 400. It applies to all three cached endpoints and
+combines with `use` and `refresh`, e.g. `refresh` plus a TTL re-records an
+answer with a new lifetime.
+
+Entries without an expiry stay until they are purged or evicted. On the
+`memory` backend that means the `max_entries` bound, and they vanish on
+restart. On `redis` they are written without `EX`, so they survive only as
+long as Redis keeps its data. If you allow unlimited entries, run Redis with
+persistence (AOF or RDB snapshots) so a restart does not drop them, and set a
+`maxmemory` limit with an eviction policy that fits (`allkeys-lru` evicts any
+key under memory pressure; `volatile-lru` evicts only keys with a TTL, so
+unlimited entries are never evicted and Redis refuses writes once full).
+
 **Metering.** A cache hit is recorded as a usage row with `cache_hit = true`,
 `cost_usd = 0`, and the avoided provider cost in `saved_usd`. Hits therefore
 never inflate spend, and cache-hit percentage is reported alongside cost.

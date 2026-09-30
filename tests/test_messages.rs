@@ -1177,3 +1177,53 @@ async fn messages_unknown_cache_mode_is_a_400() {
     assert_eq!(resp.status_code(), 400);
     assert!(mock.requests().is_empty());
 }
+
+async fn post_messages_with_ttl(
+    server: &TestServer,
+    body: &serde_json::Value,
+    ttl: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-ttl"),
+            axum::http::HeaderValue::from_static(ttl),
+        )
+        .json(body)
+        .await
+}
+
+#[tokio::test]
+async fn messages_ttl_header_sets_the_entry_lifetime() {
+    let (server, _db, _mock, _cache) = cached_app().await;
+    let first = post_messages_with_ttl(&server, &deterministic(false), "1").await;
+    assert_eq!(first.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let hit = post_messages(&server, &deterministic(false)).await;
+    assert_eq!(hit.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let expired = post_messages(&server, &deterministic(false)).await;
+    assert_eq!(
+        expired.headers().get("x-modelrouter-cache").unwrap(),
+        "MISS"
+    );
+}
+
+#[tokio::test]
+async fn messages_ttl_header_applies_to_a_streamed_store() {
+    let (server, _db, mock, cache) = cached_app().await;
+    mock.set_streaming_response(axum::http::StatusCode::OK, full_anthropic_stream());
+    let live = post_messages_with_ttl(&server, &deterministic(true), "1").await;
+    let _ = live.text();
+    wait_for_cache_stores(&cache, 1).await;
+    let hit = post_messages(&server, &deterministic(true)).await;
+    assert_eq!(hit.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let expired = post_messages(&server, &deterministic(true)).await;
+    assert_eq!(
+        expired.headers().get("x-modelrouter-cache").unwrap(),
+        "MISS"
+    );
+}

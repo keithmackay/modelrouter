@@ -38,7 +38,7 @@ use serde_json::Value;
 use crate::config::schema::{CacheConfig, CompletionCachePolicy, SearchCachePolicy};
 use crate::providers::adapter::CompletionResult;
 pub use request::{CacheDirectives, CacheMode, CachePlan};
-use store::{CacheStore, CachedEntry};
+use store::{CacheStore, CachedEntry, EntryTtl};
 
 /// Request-body fields that describe *transport*, not the answer. Excluded from
 /// the key so a streamed and a non-streamed ask for the same thing share an
@@ -75,6 +75,8 @@ pub struct CachePolicy {
     pub search: SearchCachePolicy,
     /// See [`CacheConfig::allow_header_opt_in`]. Config-only.
     pub allow_header_opt_in: bool,
+    /// See [`CacheConfig::max_ttl_seconds`]. Config-only.
+    pub max_ttl_seconds: u64,
 }
 
 impl CachePolicy {
@@ -85,6 +87,7 @@ impl CachePolicy {
             completions: config.completions.clone(),
             search: config.search.clone(),
             allow_header_opt_in: config.allow_header_opt_in,
+            max_ttl_seconds: config.max_ttl_seconds,
         }
     }
 
@@ -98,6 +101,18 @@ impl CachePolicy {
 
     pub fn search_ttl(&self) -> Duration {
         Duration::from_secs(self.search.ttl_seconds)
+    }
+
+    /// The lifetime of an entry stored in `class`: the caller's requested
+    /// TTL capped by `max_ttl_seconds`, else the class default.
+    pub fn entry_ttl(&self, class: &str, directives: &CacheDirectives) -> EntryTtl {
+        if let Some(requested) = directives.ttl {
+            return requested.min(EntryTtl::from_secs(self.max_ttl_seconds));
+        }
+        EntryTtl::Finite(match class {
+            CLASS_SEARCH => self.search_ttl(),
+            _ => self.completion_ttl(),
+        })
     }
 }
 
@@ -311,12 +326,20 @@ impl ResponseCache {
         model: &str,
         result: &CompletionResult,
         original_cost_usd: f64,
+        directives: &CacheDirectives,
     ) {
         let Ok(payload) = serde_json::to_value(result) else {
             return;
         };
-        self.store_entry(key, CLASS_COMPLETION, model, payload, original_cost_usd)
-            .await;
+        self.store_entry(
+            key,
+            CLASS_COMPLETION,
+            model,
+            payload,
+            original_cost_usd,
+            directives,
+        )
+        .await;
     }
 
     /// Look up a native Anthropic `message`. Records the hit/miss against
@@ -331,9 +354,17 @@ impl ResponseCache {
         model: &str,
         message: Value,
         original_cost_usd: f64,
+        directives: &CacheDirectives,
     ) {
-        self.store_entry(key, CLASS_MESSAGES, model, message, original_cost_usd)
-            .await;
+        self.store_entry(
+            key,
+            CLASS_MESSAGES,
+            model,
+            message,
+            original_cost_usd,
+            directives,
+        )
+        .await;
     }
 
     /// Look up a search response envelope. Records the hit/miss against
@@ -342,9 +373,23 @@ impl ResponseCache {
         Some(self.lookup(key, model).await?.payload)
     }
 
-    pub async fn put_search(&self, key: &str, model: &str, payload: Value, original_cost_usd: f64) {
-        self.store_entry(key, CLASS_SEARCH, model, payload, original_cost_usd)
-            .await;
+    pub async fn put_search(
+        &self,
+        key: &str,
+        model: &str,
+        payload: Value,
+        original_cost_usd: f64,
+        directives: &CacheDirectives,
+    ) {
+        self.store_entry(
+            key,
+            CLASS_SEARCH,
+            model,
+            payload,
+            original_cost_usd,
+            directives,
+        )
+        .await;
     }
 
     async fn lookup(&self, key: &str, model: &str) -> Option<CachedEntry> {
@@ -374,11 +419,9 @@ impl ResponseCache {
         model: &str,
         payload: Value,
         original_cost_usd: f64,
+        directives: &CacheDirectives,
     ) {
-        let ttl = match class {
-            CLASS_SEARCH => self.policy.load().search_ttl(),
-            _ => self.policy.load().completion_ttl(),
-        };
+        let ttl = self.policy.load().entry_ttl(class, directives);
         self.store
             .put(
                 key,

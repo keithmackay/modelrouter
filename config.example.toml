@@ -526,6 +526,12 @@ fail_open    = true
 # # `x-modelrouter-cache: use` or `refresh` header. `bypass` is always honoured.
 # allow_header_opt_in = true
 #
+# # Upper bound on the TTL a caller may request per entry with the
+# # `x-modelrouter-cache-ttl` header (where 0 asks for no expiry). 0 here lifts
+# # the bound. Entries with no expiry on Redis need persistence (AOF/RDB) and a
+# # maxmemory eviction policy; see "Response cache" in the README.
+# max_ttl_seconds = 86400
+#
 # [cache.completions]
 # enabled = true
 # # Only cache requests whose temperature is at or below this value. The default
