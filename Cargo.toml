@@ -110,6 +110,9 @@ axum-test = "14"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serial_test = "3"
+# Generates the mock OIDC issuer's RSA signing key at test time. Already in the
+# build graph as jsonwebtoken's crypto backend.
+aws-lc-rs = "1"
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 
 [profile.release]

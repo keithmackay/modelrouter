@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
     extract::State,
@@ -29,43 +29,48 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-/// TEST-ONLY RSA-2048 private key, generated for this file and used nowhere
-/// else. It signs the ID tokens the mock issuer hands back so the production
-/// `validate_id_token` path runs for real against a matching JWKS. It grants
-/// access to nothing: no service, deployment or environment has ever trusted
-/// it. Do not reuse it outside this test mock.
-const TEST_RSA_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwtZNG5PL0abYr
-FGgGqaSMxxYmI4/ohyl4Zo+zzhdH/wh9UK3YuDQLyvvYdAzVkdMaZlgTPx5vWSxa
-XxVHjuvMKOUOhNAuJHKyiO0KVfSdN5LE9Qbmn1Ta77AYteMdY26spma9vi5xRKIR
-UK26cOsDdGHQfIRDrkxEvlVzGVGe5joeDsVFhLozRCwlwgufouI3MixGGGAjtCsj
-3ZjYU449q1k/sfqJa3Xmp6MACWn6KCCjZLL2H88pxToh9bRT9zE6o7QqmL1zrfUz
-UdZazlhDmEg9n0JaHehFrcdRVT2VgxtuP9xjRs7garAqxJiRWfOmyywGDOUlPxqp
-M7z68sFZAgMBAAECggEADaDra2/T9xrCFH996GmkCcF/CVD709y8y47pbV4rOH/I
-aVXUGp9WUESG+PI2XTBifio/h7h6Ae94Nr4Xl43DzNqok96VacGg4PkjgwUPGSME
-nFEjh5zpP/t1cupwSj91dTZePSsSTOUUtM4qn/L+hSUwOBKqZsfmFPUzBO4CeAU7
-YVtXHlqKufIBSneSyO23N0qCvfq7Yk+3R1DDii2scNq2PKRKu2J7eMZQuSgjmQY2
-7wlfp+uzXSXw8+Yzc+BGbU2/1+rtFiNRAXE+IPnObKgTwWsIvDkAqr2DUIHL1dLh
-5QMg5LMqo2qZSuYhcm+H7laiV3jxcoWJrT/fd7jaMwKBgQD519tFsmBKMZ9+dfFP
-7vT0EhVqinQYCIv3FV2xf/60Apz/8D/ccBf2GBMkeH84+cKWNldpqjm+ed26WMCz
-/yzl4d0/Qk36J9HJQNsxzqgrI1qDFUoE7L330y0dEdWBsomx1H/9oRm8iGHOK9Gs
-xMXERddgjS4mK4VYKlgIszbSzwKBgQC1EFnqghDbqMUOTJPd7ZViTkCWqEunmb8a
-tKxhQe8rskyDvELrixiNZJWvQRH3NDgPngnIJ5dk/47cM4JfnxRGjnp6MQ853CK3
-i4jFaCrD1KyrEvhegz4crQrhZxMgnomyifizsO1qVyljYExSj3klVOuOLsh3CCk5
-zro9gYhTVwKBgG4xZzOpRdDTbB4RlNoFcaJIa4uu/x8ufdT/ZnCIHGV2lZpIc1Id
-WmQfICpAvxP5DHrGAu3Gt2ssQsASrwN0c2/8m2FwNAY2E8/ovASOuhs0n5IbDKd5
-Zxvr1wTwPbPTc+mr6LuLl1dQ65pMN1E1BGjZyPF7szQAk/Jb0rIboP1/AoGBAJrG
-rXYvVOXQcRJ2F3iAXVA5gDDJEFLmtFvJ0gkZaa+6rHl39uSOdKB5ORMk1oywkLOY
-7tewMFRfuOk3Bt1iiNx/cub9BPz61pp7pqDJGLVqGWfrwXBZVEEDEuf3Snx5yU9b
-bcN9HJXoiDKw4M06Y96rpuhVyXsm+Ma3lrB5B+XlAoGBAKhzAnOZ8aaFpvDypnZ2
-qxrn+84KcQ5LdMRHc8ki+knTaRRgaNKQYEXExpem/ONX6n1/jamWbexlRGa/ozAk
-UDTNzn4nyaKbyPR3WUN9x0uK0XssA556RqKxeQZjLHuBn2juvpsOFUCgOEfafpz/
-pNdOtuRmRT3ZCnI0FQ3Dedmr
------END PRIVATE KEY-----";
+/// The RSA-2048 key the mock issuer signs ID tokens with, generated once per
+/// test process so the production `validate_id_token` path runs for real
+/// against a matching JWKS. Nothing is committed: a private key checked into the
+/// tree trips secret scanners even when it grants access to nothing.
+struct TestSigningKey {
+    /// PKCS#8 PEM, the form `EncodingKey::from_rsa_pem` accepts.
+    private_pem: String,
+    /// Base64url big-endian modulus, the JWKS `n` member.
+    modulus_b64url: String,
+}
 
-/// Base64url modulus of the key above — the public half, restated here so the
-/// JWKS the mock serves is derivable without an RSA crate in the dev tree.
-const TEST_RSA_MODULUS_B64URL: &str = "sLWTRuTy9Gm2KxRoBqmkjMcWJiOP6IcpeGaPs84XR_8IfVCt2Lg0C8r72HQM1ZHTGmZYEz8eb1ksWl8VR47rzCjlDoTQLiRysojtClX0nTeSxPUG5p9U2u-wGLXjHWNurKZmvb4ucUSiEVCtunDrA3Rh0HyEQ65MRL5VcxlRnuY6Hg7FRYS6M0QsJcILn6LiNzIsRhhgI7QrI92Y2FOOPatZP7H6iWt15qejAAlp-iggo2Sy9h_PKcU6IfW0U_cxOqO0Kpi9c631M1HWWs5YQ5hIPZ9CWh3oRa3HUVU9lYMbbj_cY0bO4GqwKsSYkVnzpsssBgzlJT8aqTO8-vLBWQ";
+fn test_signing_key() -> &'static TestSigningKey {
+    use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::rsa::{KeyPair, KeySize};
+    use aws_lc_rs::signature::KeyPair as _;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+
+    static KEY: OnceLock<TestSigningKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let key_pair = KeyPair::generate(KeySize::Rsa2048).expect("RSA-2048 test key generates");
+        let pkcs8 = key_pair.as_der().expect("test key encodes as PKCS#8");
+        let body = STANDARD.encode(pkcs8.as_ref());
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).expect("base64 is ASCII"))
+            .collect();
+        // The label is spliced in so the source holds no literal PEM header for
+        // secret scanners to match.
+        let label = "PRIVATE KEY";
+        let private_pem = format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        );
+        let modulus = key_pair.public_key().modulus();
+        TestSigningKey {
+            private_pem,
+            modulus_b64url: URL_SAFE_NO_PAD.encode(modulus.big_endian_without_leading_zero()),
+        }
+    })
+}
 
 /// The `kid` the mock signs with, and the one its JWKS advertises.
 pub const TEST_KID: &str = "mock-oidc-key-1";
@@ -237,7 +242,7 @@ fn jwks_document() -> Value {
             "use": "sig",
             "alg": "RS256",
             "kid": TEST_KID,
-            "n": TEST_RSA_MODULUS_B64URL,
+            "n": test_signing_key().modulus_b64url,
             "e": "AQAB",
         }]
     })
@@ -263,7 +268,7 @@ fn sign_id_token(spec: &IdTokenClaimSpec, base_url: &str, kid: Option<&str>) -> 
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = kid.map(str::to_string);
-    let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes())
+    let key = EncodingKey::from_rsa_pem(test_signing_key().private_pem.as_bytes())
         .expect("test RSA PEM parses as an RS256 signing key");
     encode(&header, &claims, &key).expect("test ID token signs")
 }

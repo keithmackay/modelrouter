@@ -2604,6 +2604,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "aws-config",
+ "aws-lc-rs",
  "aws-sdk-bedrockruntime",
  "axum",
  "axum-test",
