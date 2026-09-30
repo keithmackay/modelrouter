@@ -176,12 +176,15 @@ pub enum CacheCommands {
     },
     /// Purge cached responses
     Purge {
-        /// Purge everything (default when neither --model nor --key is given)
+        /// Purge everything (default when no narrower scope is given)
         #[arg(long)]
         all: bool,
         /// Purge every entry for one model
         #[arg(long)]
         model: Option<String>,
+        /// Purge every entry stored under one x-modelrouter-cache-namespace
+        #[arg(long)]
+        namespace: Option<String>,
         /// Purge one exact cache key
         #[arg(long)]
         key: Option<String>,

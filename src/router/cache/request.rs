@@ -19,6 +19,11 @@ pub const MODE_HEADER: &str = "x-modelrouter-cache";
 /// `cache.max_ttl_seconds`.
 pub const TTL_HEADER: &str = "x-modelrouter-cache-ttl";
 
+/// Request header scoping this request's cache entries to a namespace. Entries
+/// in different namespaces never serve each other, and a namespace can be
+/// purged on its own.
+pub const NAMESPACE_HEADER: &str = "x-modelrouter-cache-namespace";
+
 /// Largest TTL a caller can write, ten years. Anything longer is a request
 /// for "forever", which is spelled `0`; refusing it keeps absurd values away
 /// from the store's expiry arithmetic.
@@ -39,6 +44,42 @@ pub enum CacheMode {
     Refresh,
 }
 
+/// A validated cache namespace: 1–64 characters from `A-Z a-z 0-9 . _ -`.
+///
+/// The charset keeps the name safe inside a store key and a Redis `SCAN`
+/// pattern: no `:` separator and no glob metacharacters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CacheNamespace(String);
+
+impl CacheNamespace {
+    pub const MAX_LEN: usize = 64;
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let valid = (1..=Self::MAX_LEN).contains(&raw.len())
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if valid {
+            Ok(Self(raw.to_string()))
+        } else {
+            Err(format!(
+                "cache namespace must be 1-{} characters from A-Z a-z 0-9 . _ - (got {raw:?})",
+                Self::MAX_LEN
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CacheNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The caller's cache directives for one request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheDirectives {
@@ -46,6 +87,8 @@ pub struct CacheDirectives {
     /// TTL for an entry this request stores, before the operator's cap.
     /// `None` keeps the class default.
     pub ttl: Option<EntryTtl>,
+    /// `None` is the shared default namespace.
+    pub namespace: Option<CacheNamespace>,
 }
 
 impl CacheDirectives {
@@ -75,7 +118,14 @@ impl CacheDirectives {
                 }
             },
         };
-        Ok(Self { mode, ttl })
+        let namespace = header_str(headers, NAMESPACE_HEADER)?
+            .map(|v| CacheNamespace::parse(v).map_err(|e| format!("{NAMESPACE_HEADER}: {e}")))
+            .transpose()?;
+        Ok(Self {
+            mode,
+            ttl,
+            namespace,
+        })
     }
 }
 
@@ -183,6 +233,30 @@ mod tests {
         );
         assert_eq!(with_header(TTL_HEADER, "").unwrap().ttl, None);
         assert!(with_header(TTL_HEADER, &MAX_REQUESTED_TTL_SECS.to_string()).is_ok());
+    }
+
+    #[test]
+    fn namespace_header_is_validated() {
+        assert_eq!(
+            CacheDirectives::from_headers(&HeaderMap::new())
+                .unwrap()
+                .namespace,
+            None
+        );
+        let ns = with_header(NAMESPACE_HEADER, " batch-2026.v1_a ")
+            .unwrap()
+            .namespace;
+        assert_eq!(ns.unwrap().as_str(), "batch-2026.v1_a");
+        assert_eq!(with_header(NAMESPACE_HEADER, "").unwrap().namespace, None);
+        let longest = "a".repeat(CacheNamespace::MAX_LEN);
+        assert!(with_header(NAMESPACE_HEADER, &longest).is_ok());
+
+        let too_long = "a".repeat(CacheNamespace::MAX_LEN + 1);
+        for bad in ["a:b", "a*", "a b", "ns/1", "[x]", too_long.as_str()] {
+            let err = with_header(NAMESPACE_HEADER, bad).unwrap_err();
+            assert!(err.starts_with(NAMESPACE_HEADER), "{bad}: {err}");
+        }
+        assert!(CacheNamespace::parse("").is_err());
     }
 
     #[test]

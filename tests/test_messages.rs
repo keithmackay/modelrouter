@@ -1227,3 +1227,54 @@ async fn messages_ttl_header_applies_to_a_streamed_store() {
         "MISS"
     );
 }
+
+async fn post_messages_in(
+    server: &TestServer,
+    body: &serde_json::Value,
+    namespace: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-namespace"),
+            axum::http::HeaderValue::from_static(namespace),
+        )
+        .json(body)
+        .await
+}
+
+#[tokio::test]
+async fn messages_namespaces_are_isolated() {
+    let (server, _db, mock, cache) = cached_app().await;
+    let body = deterministic(false);
+
+    let a = post_messages_in(&server, &body, "tenant-a").await;
+    assert_eq!(a.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let b = post_messages_in(&server, &body, "tenant-b").await;
+    assert_eq!(b.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let default = post_messages(&server, &body).await;
+    assert_eq!(
+        default.headers().get("x-modelrouter-cache").unwrap(),
+        "MISS"
+    );
+    let a_hit = post_messages_in(&server, &body, "tenant-a").await;
+    assert_eq!(a_hit.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(mock.requests().len(), 3);
+
+    let stats = cache.stats().await;
+    let a_stats = stats
+        .by_namespace
+        .iter()
+        .find(|n| n.namespace == "tenant-a")
+        .unwrap();
+    assert_eq!((a_stats.hits, a_stats.misses, a_stats.stores), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn messages_reject_an_invalid_namespace() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    let resp = post_messages_in(&server, &deterministic(false), "no/slashes").await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(mock.requests().is_empty());
+}

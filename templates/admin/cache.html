@@ -123,6 +123,34 @@
 </table>
 {% endif %}
 
+{% if live_namespaces %}
+<h2 style="font-size:1.1rem;margin:1.5rem 0 0.75rem;">Namespaces (this process)</h2>
+<table>
+    <thead><tr><th>Namespace</th><th>Hits</th><th>Misses</th><th>Stores</th><th>Hit rate</th><th>Saved (USD)</th><th></th></tr></thead>
+    <tbody>
+        {% for row in live_namespaces %}
+        <tr>
+            <td>{% if row.purgeable %}{{ row.namespace }}{% else %}<em>other</em>{% endif %}</td>
+            <td>{{ row.hits }}</td>
+            <td>{{ row.misses }}</td>
+            <td>{{ row.stores }}</td>
+            <td>{{ row.hit_rate_pct }}%</td>
+            <td>{{ row.saved_usd | money }}</td>
+            <td>
+                {% if row.purgeable %}
+                <form method="POST" action="/admin/cache/purge">
+                    <input type="hidden" name="scope" value="namespace">
+                    <input type="hidden" name="namespace" value="{{ row.namespace }}">
+                    <button class="btn btn-danger" type="submit">Purge</button>
+                </form>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
 <h2 style="font-size:1.1rem;margin:1.5rem 0 0.75rem;">Policy</h2>
 <div class="stat-card" style="margin-bottom:1.5rem;">
     <p style="font-size:0.85rem;color:#777;margin-bottom:1rem;">
@@ -172,12 +200,18 @@
             <select name="scope" id="purge-scope" style="padding:0.5rem;border:1px solid #ccc;border-radius:4px;">
                 <option value="all">Everything</option>
                 <option value="model">One model</option>
+                <option value="namespace">One namespace</option>
                 <option value="key">One key</option>
             </select>
         </div>
         <div>
             <label for="purge-model" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Model (scope = model)</label>
             <input type="text" name="model" id="purge-model" placeholder="gpt-4o-mini"
+                   style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;">
+        </div>
+        <div>
+            <label for="purge-namespace" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Namespace (scope = namespace)</label>
+            <input type="text" name="namespace" id="purge-namespace" placeholder="nightly-eval"
                    style="padding:0.4rem;border:1px solid #ccc;border-radius:4px;">
         </div>
         <div>

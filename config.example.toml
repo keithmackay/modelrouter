@@ -513,7 +513,8 @@ fail_open    = true
 # backend = "memory"
 # redis_url = "redis://127.0.0.1:6379"
 #
-# # Key prefix, so several environments can share one Redis safely.
+# # Redis key prefix, so several environments can share one Redis safely.
+# # Unrelated to the per-request x-modelrouter-cache-namespace header.
 # namespace = "modelrouter"
 #
 # # Bound on the in-memory backend only.
@@ -531,6 +532,12 @@ fail_open    = true
 # # the bound. Entries with no expiry on Redis need persistence (AOF/RDB) and a
 # # maxmemory eviction policy; see "Response cache" in the README.
 # max_ttl_seconds = 86400
+#
+# # Default TTL for one x-modelrouter-cache-namespace, in place of the class
+# # TTL; 0 means never expire. A caller's x-modelrouter-cache-ttl header still
+# # wins (within max_ttl_seconds). Not capped by max_ttl_seconds.
+# [cache.namespaces.nightly-eval]
+# ttl_seconds = 0
 #
 # [cache.completions]
 # enabled = true

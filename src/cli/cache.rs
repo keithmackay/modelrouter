@@ -81,8 +81,13 @@ pub async fn run(args: CacheArgs) -> Result<()> {
             }
             print_stats(&stats);
         }
-        CacheCommands::Purge { all, model, key } => {
-            let body = build_purge_body(all, model, key);
+        CacheCommands::Purge {
+            all,
+            model,
+            namespace,
+            key,
+        } => {
+            let body = build_purge_body(all, model, namespace, key);
             let res = send(
                 &client,
                 reqwest::Method::POST,
@@ -209,6 +214,14 @@ fn print_stats(stats: &serde_json::Value) {
         ledger["saved_usd"].as_f64().unwrap_or(0.0)
     );
 
+    let namespaces = namespace_rows(live);
+    if !namespaces.is_empty() {
+        println!("\nBy namespace (this process):");
+        for row in namespaces {
+            println!("{}", row);
+        }
+    }
+
     if let Some(models) = ledger["by_model"].as_array() {
         if !models.is_empty() {
             println!("\nBy model:");
@@ -226,13 +239,46 @@ fn print_stats(stats: &serde_json::Value) {
     }
 }
 
+/// One line per entry in `live.by_namespace`; `*` is the overflow bucket.
+fn namespace_rows(live: &serde_json::Value) -> Vec<String> {
+    let Some(namespaces) = live["by_namespace"].as_array() else {
+        return Vec::new();
+    };
+    namespaces
+        .iter()
+        .map(|n| {
+            let name = match n["namespace"].as_str().unwrap_or("?") {
+                "*" => "(other)",
+                name => name,
+            };
+            format!(
+                "  {:<32} {:>6} hits / {:>6} misses / {:>6} stores  {:>7}  ${:.4}",
+                name,
+                n["hits"].as_u64().unwrap_or(0),
+                n["misses"].as_u64().unwrap_or(0),
+                n["stores"].as_u64().unwrap_or(0),
+                pct(n["hit_rate"].as_f64().unwrap_or(0.0)),
+                n["saved_usd"].as_f64().unwrap_or(0.0)
+            )
+        })
+        .collect()
+}
+
 /// Request body for `POST /admin/api/cache/purge`.
 ///
-/// `--model` wins over `--key`; with neither, the purge covers everything,
-/// whether or not `--all` was passed (the documented default).
-fn build_purge_body(_all: bool, model: Option<String>, key: Option<String>) -> serde_json::Value {
+/// `--model` wins over `--namespace`, which wins over `--key`; with none, the
+/// purge covers everything, whether or not `--all` was passed (the documented
+/// default).
+fn build_purge_body(
+    _all: bool,
+    model: Option<String>,
+    namespace: Option<String>,
+    key: Option<String>,
+) -> serde_json::Value {
     if let Some(model) = model {
         json!({ "scope": "model", "model": model })
+    } else if let Some(namespace) = namespace {
+        json!({ "scope": "namespace", "namespace": namespace })
     } else if let Some(key) = key {
         json!({ "scope": "key", "key": key })
     } else {
@@ -242,17 +288,17 @@ fn build_purge_body(_all: bool, model: Option<String>, key: Option<String>) -> s
 
 #[cfg(test)]
 mod tests {
-    use super::{build_policy_update, build_purge_body};
+    use super::{build_policy_update, build_purge_body, namespace_rows};
     use serde_json::json;
 
     #[test]
     fn purge_defaults_to_all_with_or_without_flag() {
         assert_eq!(
-            build_purge_body(false, None, None),
+            build_purge_body(false, None, None, None),
             json!({ "scope": "all" })
         );
         assert_eq!(
-            build_purge_body(true, None, None),
+            build_purge_body(true, None, None, None),
             json!({ "scope": "all" })
         );
     }
@@ -260,7 +306,7 @@ mod tests {
     #[test]
     fn purge_by_model_takes_precedence() {
         assert_eq!(
-            build_purge_body(true, Some("m".into()), Some("k".into())),
+            build_purge_body(true, Some("m".into()), Some("n".into()), Some("k".into())),
             json!({ "scope": "model", "model": "m" })
         );
     }
@@ -268,9 +314,38 @@ mod tests {
     #[test]
     fn purge_by_key() {
         assert_eq!(
-            build_purge_body(false, None, Some("k".into())),
+            build_purge_body(false, None, None, Some("k".into())),
             json!({ "scope": "key", "key": "k" })
         );
+    }
+
+    #[test]
+    fn purge_by_namespace_wins_over_key() {
+        assert_eq!(
+            build_purge_body(false, None, Some("n".into()), Some("k".into())),
+            json!({ "scope": "namespace", "namespace": "n" })
+        );
+    }
+
+    #[test]
+    fn namespace_rows_label_the_overflow_bucket() {
+        let live = json!({ "by_namespace": [
+            { "namespace": "batch", "hits": 3, "misses": 1, "stores": 1, "hit_rate": 0.75, "saved_usd": 0.5 },
+            { "namespace": "*", "hits": 0, "misses": 2, "stores": 2, "hit_rate": 0.0, "saved_usd": 0.0 },
+        ]});
+        let rows = namespace_rows(&live);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].contains("batch") && rows[0].contains("75.0%"),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("(other)") && !rows[1].contains('*'),
+            "{}",
+            rows[1]
+        );
+        assert!(namespace_rows(&json!({})).is_empty());
     }
 
     #[test]

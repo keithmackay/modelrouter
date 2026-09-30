@@ -347,9 +347,12 @@ async fn search_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan
-        .store()
-        .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results));
+    let cache_key = cache_plan.store().then(|| {
+        crate::router::cache::namespaced_key(
+            crate::router::cache::search_cache_key(&engine, &query, max_results),
+            cache_directives.namespace.as_ref(),
+        )
+    });
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(payload) = state.response_cache.get_search(key, &requested_pseudo_model).await {

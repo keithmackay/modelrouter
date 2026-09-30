@@ -250,9 +250,12 @@ async fn chat_completions_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan
-        .store()
-        .then(|| crate::router::cache::completion_cache_key(&canonical_model, &body));
+    let cache_key = cache_plan.store().then(|| {
+        crate::router::cache::namespaced_key(
+            crate::router::cache::completion_cache_key(&canonical_model, &body),
+            cache_directives.namespace.as_ref(),
+        )
+    });
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(response) = try_serve_cached_completion(

@@ -16,7 +16,7 @@ use super::auth::{AdminSession, SuperAdminSession};
 use super::dashboard::{DashboardError, DashboardSession};
 use crate::api::{app::AppState, error::ApiError};
 use crate::db::repositories::costs::{CacheUsageSummary, CostRepository};
-use crate::router::cache::CachePolicyUpdate;
+use crate::router::cache::{CacheNamespace, CachePolicyUpdate, OTHER_NAMESPACES};
 
 /// Lookback for the ledger-derived (cross-process, durable) hit rate.
 const LEDGER_WINDOW_DAYS: i64 = 30;
@@ -104,10 +104,11 @@ pub async fn put_cache_policy(
 
 #[derive(Debug, Deserialize)]
 pub struct PurgeRequest {
-    /// `all` (default), `model`, or `key`.
+    /// `all` (default), `model`, `namespace`, or `key`.
     #[serde(default)]
     pub scope: Option<String>,
     pub model: Option<String>,
+    pub namespace: Option<String>,
     pub key: Option<String>,
 }
 
@@ -142,6 +143,15 @@ async fn purge(state: &AppState, req: &PurgeRequest) -> Result<(String, u64), Ap
             Ok((
                 format!("model:{}", model),
                 state.response_cache.purge_model(model).await,
+            ))
+        }
+        "namespace" => {
+            let raw = req.namespace.as_deref().unwrap_or_default();
+            let namespace =
+                CacheNamespace::parse(raw).map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+            Ok((
+                format!("namespace:{}", namespace),
+                state.response_cache.purge_namespace(&namespace).await,
             ))
         }
         "key" => {
@@ -213,6 +223,22 @@ pub async fn get_cache_page(
         })
         .collect();
 
+    let live_namespaces: Vec<minijinja::Value> = live
+        .by_namespace
+        .iter()
+        .map(|n| {
+            minijinja::context! {
+                namespace => n.namespace.clone(),
+                hits => n.hits,
+                misses => n.misses,
+                stores => n.stores,
+                hit_rate_pct => (n.hit_rate * 100.0).round(),
+                saved_usd => n.saved_usd,
+                purgeable => n.namespace != OTHER_NAMESPACES,
+            }
+        })
+        .collect();
+
     super::dashboard::render(
         "cache.html",
         minijinja::context! {
@@ -228,6 +254,7 @@ pub async fn get_cache_page(
             live_hit_rate_pct => (live.hit_rate * 100.0).round(),
             live_saved_usd => live.saved_usd,
             live_models => live_models,
+            live_namespaces => live_namespaces,
             window_days => LEDGER_WINDOW_DAYS,
             ledger_hits => ledger.hits,
             ledger_requests => ledger.requests,
@@ -272,6 +299,8 @@ pub struct PurgeForm {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
     pub key: Option<String>,
 }
 
@@ -284,6 +313,7 @@ pub async fn post_cache_purge_page(
     let req = PurgeRequest {
         scope: form.scope,
         model: form.model,
+        namespace: form.namespace,
         key: form.key,
     };
     let (scope, removed) = purge(&state, &req)

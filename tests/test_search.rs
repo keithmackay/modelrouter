@@ -1125,3 +1125,61 @@ async fn search_fallback_permitted_by_model_allow_list_serves_request() {
     let ledger = common::wait_for_ledger_rows(&*db, 1).await;
     assert_eq!(ledger[0].provider, "vertex");
 }
+
+async fn post_search_in(
+    server: &TestServer,
+    body: serde_json::Value,
+    namespace: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-namespace"),
+            axum::http::HeaderValue::from_static(namespace),
+        )
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn search_namespaces_are_isolated() {
+    let (server, _db) =
+        test_app_with_pricing_and_cache(search_pricing(), enabled_cache_config()).await;
+    let query = serde_json::json!({ "query": "rust programming language", "max_results": 5 });
+    let outcome = |r: &axum_test::TestResponse| {
+        r.headers()
+            .get("x-modelrouter-cache")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+
+    assert_eq!(
+        outcome(&post_search_in(&server, query.clone(), "a").await),
+        "MISS"
+    );
+    assert_eq!(
+        outcome(&post_search_in(&server, query.clone(), "b").await),
+        "MISS"
+    );
+    assert_eq!(outcome(&post_search(&server, query.clone()).await), "MISS");
+    assert_eq!(
+        outcome(&post_search_in(&server, query.clone(), "a").await),
+        "HIT"
+    );
+    assert_eq!(outcome(&post_search(&server, query).await), "HIT");
+}
+
+#[tokio::test]
+async fn search_rejects_an_invalid_namespace() {
+    let (server, _db) =
+        test_app_with_pricing_and_cache(search_pricing(), enabled_cache_config()).await;
+    let query = serde_json::json!({ "query": "rust" });
+    let resp = post_search_in(&server, query, "bad namespace").await;
+    assert_eq!(resp.status_code(), 400);
+}

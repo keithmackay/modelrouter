@@ -100,6 +100,9 @@ pub trait CacheStore: Send + Sync {
     /// Remove every entry whose key carries `model_fp` (see
     /// [`super::model_fingerprint`]). Returns the number removed.
     async fn purge_model(&self, model_fp: &str) -> u64;
+    /// Remove every entry whose key is scoped to the cache namespace `ns`
+    /// (see [`super::namespaced_key`]). Returns the number removed.
+    async fn purge_namespace(&self, ns: &str) -> u64;
     /// Remove everything in this namespace. Returns the number removed.
     async fn purge_all(&self) -> u64;
     /// Approximate live entry count.
@@ -181,6 +184,26 @@ impl MemoryStore {
     }
 }
 
+impl MemoryStore {
+    async fn purge_matching(&self, matches: impl Fn(&str) -> bool) -> u64 {
+        // moka applies writes asynchronously; without this the iterator can miss
+        // entries that were just inserted.
+        self.inner.run_pending_tasks().await;
+        let mut removed = 0;
+        let keys: Vec<String> = self
+            .inner
+            .iter()
+            .filter(|(k, _)| matches(k))
+            .map(|(k, _)| (*k).clone())
+            .collect();
+        for k in keys {
+            self.inner.invalidate(&k).await;
+            removed += 1;
+        }
+        removed
+    }
+}
+
 #[async_trait]
 impl CacheStore for MemoryStore {
     async fn get(&self, key: &str) -> Option<CachedEntry> {
@@ -210,21 +233,12 @@ impl CacheStore for MemoryStore {
     }
 
     async fn purge_model(&self, model_fp: &str) -> u64 {
-        // moka applies writes asynchronously; without this the iterator can miss
-        // entries that were just inserted.
-        self.inner.run_pending_tasks().await;
-        let mut removed = 0;
-        let keys: Vec<String> = self
-            .inner
-            .iter()
-            .filter(|(k, _)| k.contains(model_fp))
-            .map(|(k, _)| (*k).clone())
-            .collect();
-        for k in keys {
-            self.inner.invalidate(&k).await;
-            removed += 1;
-        }
-        removed
+        self.purge_matching(|k| k.contains(model_fp)).await
+    }
+
+    async fn purge_namespace(&self, ns: &str) -> u64 {
+        self.purge_matching(|k| super::key_namespace(k) == Some(ns))
+            .await
     }
 
     async fn purge_all(&self) -> u64 {
@@ -513,6 +527,13 @@ impl RedisStore {
     }
 }
 
+/// `SCAN` pattern for every key in cache namespace `ns` under the Redis key
+/// `prefix`: `{prefix}:{class}:{fp}:ns-{ns}:{hash}`. The namespace charset has
+/// no glob metacharacters, and the trailing `:` stops `ns-a` matching `ns-ab`.
+fn namespace_pattern(prefix: &str, ns: &str) -> String {
+    format!("{prefix}:*:*:ns-{ns}:*")
+}
+
 /// `SET key value [EX ttl]`. An unlimited entry is written without `EX`, so it
 /// lives until purged or evicted by Redis's `maxmemory` policy.
 fn set_command(full_key: &str, raw: &str, ttl: EntryTtl) -> redis::Cmd {
@@ -575,6 +596,11 @@ impl CacheStore for RedisStore {
         let keys = self
             .scan(&format!("{}:*:{}:*", self.namespace, model_fp))
             .await;
+        self.delete_keys(keys).await
+    }
+
+    async fn purge_namespace(&self, ns: &str) -> u64 {
+        let keys = self.scan(&namespace_pattern(&self.namespace, ns)).await;
         self.delete_keys(keys).await
     }
 
@@ -650,6 +676,37 @@ mod tests {
                 _ => "<non-simple>".to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn redis_namespace_pattern_matches_only_that_namespace() {
+        assert_eq!(namespace_pattern("mr", "team-a"), "mr:*:*:ns-team-a:*");
+    }
+
+    #[tokio::test]
+    async fn memory_store_purges_one_namespace() {
+        let store = MemoryStore::new(&CacheConfig::default());
+        let entry = || CachedEntry {
+            class: "completion".to_string(),
+            model: "m".to_string(),
+            payload: serde_json::json!({}),
+            original_cost_usd: 0.0,
+            stored_at: 0,
+            expires_at: 0,
+        };
+        let ttl = EntryTtl::Finite(Duration::from_secs(60));
+        for key in [
+            "completion:fp:ns-a:h1",
+            "search:fp:ns-a:h2",
+            "completion:fp:ns-ab:h3",
+            "completion:fp:h4",
+        ] {
+            store.put(key, entry(), ttl).await;
+        }
+        assert_eq!(store.purge_namespace("a").await, 2);
+        assert!(store.get("completion:fp:ns-a:h1").await.is_none());
+        assert!(store.get("completion:fp:ns-ab:h3").await.is_some());
+        assert!(store.get("completion:fp:h4").await.is_some());
     }
 
     #[test]

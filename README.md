@@ -1019,6 +1019,37 @@ persistence (AOF or RDB snapshots) so a restart does not drop them, and set a
 key under memory pressure; `volatile-lru` evicts only keys with a TTL, so
 unlimited entries are never evicted and Redis refuses writes once full).
 
+**Namespaces.** `x-modelrouter-cache-namespace: <name>` stores and looks up
+entries in a separate namespace. The name is 1-64 characters from
+`A-Z a-z 0-9 . _ -`; anything else is a 400. The namespace is part of the
+cache key, so the same request in two namespaces makes two entries, and neither
+hits the other or the default namespace (requests without the header). It
+applies to all three cached endpoints and combines with the mode and TTL
+headers. Namespaces let clients that rerun identical workloads keep separate
+caches per workload, then purge one without touching the rest:
+
+```bash
+modelrouter cache purge --namespace nightly-eval --admin alice
+# or: POST /admin/api/cache/purge {"scope":"namespace","namespace":"nightly-eval"}
+```
+
+An operator can give a namespace its own default TTL:
+
+```toml
+[cache.namespaces.nightly-eval]
+ttl_seconds = 0        # 0 = never expire; otherwise seconds
+```
+
+A caller's `x-modelrouter-cache-ttl` still wins, within `max_ttl_seconds`. The
+namespace default is operator config, so it is not capped by
+`max_ttl_seconds`; the Redis persistence advice above applies to it too. A
+namespace without an entry uses the class TTL.
+
+`cache stats` and `GET /admin/api/cache/stats` report hits, misses, stores and
+savings per namespace under `live.by_namespace`, for this process. The first
+256 namespaces seen are tracked individually and the rest are counted together
+under `*`. Default-namespace traffic appears only in the totals.
+
 **Metering.** A cache hit is recorded as a usage row with `cache_hit = true`,
 `cost_usd = 0`, and the avoided provider cost in `saved_usd`. Hits therefore
 never inflate spend, and cache-hit percentage is reported alongside cost.
@@ -1027,7 +1058,8 @@ streamed replays included, and the `response cache hit` log line records `stream
 
 **Backends.** `memory` (moka, bounded by `cache.max_entries`, per-process — each
 replica warms its own copy) or `redis` (shared across stateless replicas, keys
-namespaced by `cache.namespace`). Backends sit behind the `CacheStore` trait in
+prefixed by `cache.namespace`; that setting is the Redis key prefix, unrelated
+to the per-request namespace header). Backends sit behind the `CacheStore` trait in
 `src/router/cache/store.rs`; adding another one touches no call sites.
 
 **Operator surfaces.**
@@ -1036,18 +1068,19 @@ namespaced by `cache.namespace`). Backends sit behind the `CacheStore` trait in
 # CLI (talks to the running router's admin API)
 modelrouter cache stats --admin alice
 modelrouter cache purge --model gpt-4o-mini --admin alice
+modelrouter cache purge --namespace nightly-eval --admin alice
 modelrouter cache policy get --admin alice
 modelrouter cache policy set --max-temperature 0.2 --admin alice
 
 # REST (admin JWT)
 GET  /admin/api/cache/stats
-POST /admin/api/cache/purge     {"scope":"all"|"model"|"key", "model":…, "key":…}
+POST /admin/api/cache/purge     {"scope":"all"|"model"|"namespace"|"key", "model":…, "namespace":…, "key":…}
 GET  /admin/api/cache/policy
 PUT  /admin/api/cache/policy    {"completions_max_temperature": 0.2, …}
 ```
 
 The dashboard page at `/admin/cache` shows hit rate over time, cache size, top
-cached models, purge controls, and the policy form; `/admin/cost` shows cache-hit
+cached models, per-namespace counters, purge controls, and the policy form; `/admin/cost` shows cache-hit
 % and dollars saved next to spend. Policy changes made at runtime are **not**
 written back to the config file — a restart returns to the configured policy.
 
