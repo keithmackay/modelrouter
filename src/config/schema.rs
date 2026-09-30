@@ -81,6 +81,11 @@ pub struct CacheConfig {
     pub completions: CompletionCachePolicy,
     #[serde(default)]
     pub search: SearchCachePolicy,
+    /// Honour the `x-modelrouter-cache: use|refresh` request header, which
+    /// lets a caller cache a request the eligibility rules would refuse.
+    /// `bypass` only narrows caching and is honoured either way.
+    #[serde(default = "default_true")]
+    pub allow_header_opt_in: bool,
 }
 
 impl Default for CacheConfig {
@@ -94,6 +99,7 @@ impl Default for CacheConfig {
             ttl_seconds: default_cache_ttl(),
             completions: CompletionCachePolicy::default(),
             search: SearchCachePolicy::default(),
+            allow_header_opt_in: true,
         }
     }
 }

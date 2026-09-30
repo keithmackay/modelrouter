@@ -74,6 +74,8 @@ async fn chat_completions_inner(
     // rewrite the body, and attribution describes the caller's intent, not the
     // rewritten request.
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    let cache_directives = crate::router::cache::CacheDirectives::from_headers(&headers)
+        .map_err(ApiError::InvalidRequest)?;
     // Experiment binding (spec §7a). `None` when the header is absent, in
     // which case nothing below changes. A bound request is pinned to its
     // variant's `provider/model`, so the adaptive layers — complexity
@@ -239,17 +241,20 @@ async fn chat_completions_inner(
     // Eligibility is conservative (see `router::cache`): nondeterministic
     // sampling is never served from cache, and neither is a bound request — a
     // cached answer says nothing about the pinned model. Streamed and plain
-    // requests share entries; `stream` is not part of the key.
-    let cache_key = if binding.is_none()
-        && state.policy.cache_enabled(&user, &canonical_model)
-        && state.response_cache.completion_eligible(&body)
-    {
-        Some(crate::router::cache::completion_cache_key(&canonical_model, &body))
+    // requests share entries; `stream` is not part of the key. The caller's
+    // `x-modelrouter-cache` header can widen or narrow that per request.
+    let cache_plan = if binding.is_none() && state.policy.cache_enabled(&user, &canonical_model) {
+        state
+            .response_cache
+            .completion_plan(cache_directives.mode, &body)
     } else {
-        None
+        crate::router::cache::CachePlan::Skip
     };
+    let cache_key = cache_plan
+        .store()
+        .then(|| crate::router::cache::completion_cache_key(&canonical_model, &body));
 
-    if let Some(ref key) = cache_key {
+    if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(response) = try_serve_cached_completion(
             &state,
             key,
@@ -299,7 +304,6 @@ async fn chat_completions_inner(
         )
         .unwrap_or_default();
 
-        let cache_consulted = cache_key.is_some();
         // The streaming path has no fallback loop, so the resolved pair is
         // also the pair that answers.
         let logged_stream = log_streaming_request(
@@ -329,10 +333,10 @@ async fn chat_completions_inner(
         );
 
         let mut response = streaming_response(Box::pin(logged_stream), request_id).into_response();
-        if cache_consulted {
+        if let Some(outcome) = cache_plan.miss_header() {
             response
                 .headers_mut()
-                .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
+                .insert(CACHE_HEADER, axum::http::HeaderValue::from_static(outcome));
         }
         return Ok(response);
     }
@@ -453,14 +457,17 @@ async fn chat_completions_inner(
         },
     };
     let mut response = Json(build_openai_response(request_id, &result, &meta)).into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_HEADER, axum::http::HeaderValue::from_static("MISS"));
+    response.headers_mut().insert(
+        CACHE_HEADER,
+        axum::http::HeaderValue::from_static(cache_plan.miss_header().unwrap_or("MISS")),
+    );
     Ok(response)
 }
 
-/// Response header telling callers whether the body came from the router cache.
-pub const CACHE_HEADER: &str = "x-modelrouter-cache";
+/// Response header telling callers whether the body came from the router
+/// cache: `HIT`, `MISS`, `BYPASS` or `REFRESH`. Also the request header that
+/// selects the cache mode.
+pub const CACHE_HEADER: &str = crate::router::cache::request::MODE_HEADER;
 
 /// Fire `on_request_received` lifecycle hooks.
 fn fire_request_received_hooks(state: &AppState, user_name: &str, model: &str, body: &Value) {

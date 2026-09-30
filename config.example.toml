@@ -522,6 +522,10 @@ fail_open    = true
 # # Fallback TTL for classes that do not set their own.
 # ttl_seconds = 3600
 #
+# # Whether callers may widen caching per request with the
+# # `x-modelrouter-cache: use` or `refresh` header. `bypass` is always honoured.
+# allow_header_opt_in = true
+#
 # [cache.completions]
 # enabled = true
 # # Only cache requests whose temperature is at or below this value. The default

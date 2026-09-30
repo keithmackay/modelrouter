@@ -22,6 +22,7 @@
 //!
 //! Exact-match only. Semantic/fuzzy matching is explicitly out of scope.
 
+pub mod request;
 pub mod store;
 pub mod stream;
 
@@ -36,6 +37,7 @@ use serde_json::Value;
 
 use crate::config::schema::{CacheConfig, CompletionCachePolicy, SearchCachePolicy};
 use crate::providers::adapter::CompletionResult;
+pub use request::{CacheDirectives, CacheMode, CachePlan};
 use store::{CacheStore, CachedEntry};
 
 /// Request-body fields that describe *transport*, not the answer. Excluded from
@@ -71,6 +73,8 @@ pub struct CachePolicy {
     pub default_ttl_seconds: u64,
     pub completions: CompletionCachePolicy,
     pub search: SearchCachePolicy,
+    /// See [`CacheConfig::allow_header_opt_in`]. Config-only.
+    pub allow_header_opt_in: bool,
 }
 
 impl CachePolicy {
@@ -80,6 +84,7 @@ impl CachePolicy {
             default_ttl_seconds: config.ttl_seconds,
             completions: config.completions.clone(),
             search: config.search.clone(),
+            allow_header_opt_in: config.allow_header_opt_in,
         }
     }
 
@@ -265,6 +270,25 @@ impl ResponseCache {
     pub fn search_eligible(&self) -> bool {
         let policy = self.policy.load();
         policy.enabled && policy.search.enabled
+    }
+
+    /// The plan for a completion-shaped request (`/v1/chat/completions`,
+    /// `/v1/messages`) under the caller's `mode`.
+    pub fn completion_plan(&self, mode: CacheMode, body: &Value) -> CachePlan {
+        let policy = self.policy.load();
+        CachePlan::decide(
+            mode,
+            policy.enabled && policy.completions.enabled,
+            self.completion_eligible(body),
+            policy.allow_header_opt_in,
+        )
+    }
+
+    /// The plan for a search under the caller's `mode`.
+    pub fn search_plan(&self, mode: CacheMode) -> CachePlan {
+        let policy = self.policy.load();
+        let enabled = policy.enabled && policy.search.enabled;
+        CachePlan::decide(mode, enabled, enabled, policy.allow_header_opt_in)
     }
 
     // ── Typed access ──────────────────────────────────────────────────────────
