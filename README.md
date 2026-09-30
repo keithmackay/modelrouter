@@ -966,10 +966,13 @@ whichever mode they use.
 
 **Cache key.** The resolved (post-alias, post-load-balancer) model, plus a
 SHA-256 of the request body with only transport-level fields removed (`stream`,
-`stream_options`, `user`, `session_id`, `metadata`). Every field that can change
-the answer — messages, tools, `temperature`, `top_p`, `max_tokens`, `seed`,
-`response_format` — is part of the key. For search the key is engine + query +
-options. Exact-match only; there is no semantic or fuzzy matching.
+`stream_options`, `user`, `session_id`, `metadata`, `attribution`). Every field
+that can change the answer — messages, tools, `temperature`, `top_p`,
+`max_tokens`, `seed`, `response_format` — is part of the key. For search the key
+is engine + query + options. Nothing else goes in: who is asking and the
+`x-modelrouter-cache*` request headers never change the key, so rerunning the
+same prompts or queries hits the cache. Exact-match only; there is no semantic
+or fuzzy matching.
 
 **Eligibility (the default is conservative).** A completion is cached only when
 its `temperature` is explicitly at or below `cache.completions.max_temperature`,
@@ -1019,19 +1022,25 @@ persistence (AOF or RDB snapshots) so a restart does not drop them, and set a
 key under memory pressure; `volatile-lru` evicts only keys with a TTL, so
 unlimited entries are never evicted and Redis refuses writes once full).
 
-**Namespaces.** `x-modelrouter-cache-namespace: <name>` stores and looks up
-entries in a separate namespace. The name is 1-64 characters from
-`A-Z a-z 0-9 . _ -`; anything else is a 400. The namespace is part of the
-cache key, so the same request in two namespaces makes two entries, and neither
-hits the other or the default namespace (requests without the header). It
-applies to all three cached endpoints and combines with the mode and TTL
-headers. Namespaces let clients that rerun identical workloads keep separate
-caches per workload, then purge one without touching the rest:
+**Namespaces.** `x-modelrouter-cache-namespace: <name>` labels the entries a
+request stores and the hits and misses it scores. The name is 1-64 characters
+from `A-Z a-z 0-9 . _ -`; anything else is a 400. The label is not part of the
+cache key: the same prompt or query hits the same entry whichever namespace
+(or none) asks, so a rerun is served from the cache no matter how it is
+labelled. It applies to all three cached endpoints and combines with the mode
+and TTL headers. A test suite can label its traffic, watch its hit rate, give
+its entries their own lifetime, and purge what it recorded:
 
 ```bash
 modelrouter cache purge --namespace nightly-eval --admin alice
 # or: POST /admin/api/cache/purge {"scope":"namespace","namespace":"nightly-eval"}
 ```
+
+Purge removes the entries that requests in that namespace stored, including
+ones other callers have since been hitting. An entry keeps the label of the
+request that stored it; a later hit from another namespace does not relabel
+it, while a `refresh` does. On Redis the label is inside the stored value, so a
+namespace purge reads every entry under the key prefix.
 
 An operator can give a namespace its own default TTL:
 
@@ -1046,7 +1055,8 @@ namespace default is operator config, so it is not capped by
 namespace without an entry uses the class TTL.
 
 `cache stats` and `GET /admin/api/cache/stats` report hits, misses, stores and
-savings per namespace under `live.by_namespace`, for this process. The first
+savings per namespace under `live.by_namespace`, for this process. A hit counts
+for the namespace that asked, not the one that stored the entry. The first
 256 namespaces seen are tracked individually and the rest are counted together
 under `*`. Default-namespace traffic appears only in the totals.
 

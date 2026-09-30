@@ -1245,30 +1245,29 @@ async fn post_messages_in(
 }
 
 #[tokio::test]
-async fn messages_namespaces_are_isolated() {
+async fn messages_namespaces_share_entries_for_the_same_prompt() {
     let (server, _db, mock, cache) = cached_app().await;
     let body = deterministic(false);
 
-    let a = post_messages_in(&server, &body, "tenant-a").await;
+    let a = post_messages_in(&server, &body, "run-a").await;
     assert_eq!(a.headers().get("x-modelrouter-cache").unwrap(), "MISS");
-    let b = post_messages_in(&server, &body, "tenant-b").await;
-    assert_eq!(b.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let b = post_messages_in(&server, &body, "run-b").await;
+    assert_eq!(b.headers().get("x-modelrouter-cache").unwrap(), "HIT");
     let default = post_messages(&server, &body).await;
-    assert_eq!(
-        default.headers().get("x-modelrouter-cache").unwrap(),
-        "MISS"
-    );
-    let a_hit = post_messages_in(&server, &body, "tenant-a").await;
-    assert_eq!(a_hit.headers().get("x-modelrouter-cache").unwrap(), "HIT");
-    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(default.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(mock.requests().len(), 1);
 
     let stats = cache.stats().await;
-    let a_stats = stats
-        .by_namespace
-        .iter()
-        .find(|n| n.namespace == "tenant-a")
-        .unwrap();
-    assert_eq!((a_stats.hits, a_stats.misses, a_stats.stores), (1, 1, 1));
+    let counts = |name: &str| {
+        let n = stats
+            .by_namespace
+            .iter()
+            .find(|n| n.namespace == name)
+            .unwrap();
+        (n.hits, n.misses, n.stores)
+    };
+    assert_eq!(counts("run-a"), (0, 1, 1));
+    assert_eq!(counts("run-b"), (1, 0, 0));
 }
 
 #[tokio::test]

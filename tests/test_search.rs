@@ -1146,7 +1146,7 @@ async fn post_search_in(
 }
 
 #[tokio::test]
-async fn search_namespaces_are_isolated() {
+async fn search_namespaces_share_entries_for_the_same_query() {
     let (server, _db) =
         test_app_with_pricing_and_cache(search_pricing(), enabled_cache_config()).await;
     let query = serde_json::json!({ "query": "rust programming language", "max_results": 5 });
@@ -1165,11 +1165,6 @@ async fn search_namespaces_are_isolated() {
     );
     assert_eq!(
         outcome(&post_search_in(&server, query.clone(), "b").await),
-        "MISS"
-    );
-    assert_eq!(outcome(&post_search(&server, query.clone()).await), "MISS");
-    assert_eq!(
-        outcome(&post_search_in(&server, query.clone(), "a").await),
         "HIT"
     );
     assert_eq!(outcome(&post_search(&server, query).await), "HIT");

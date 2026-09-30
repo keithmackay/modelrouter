@@ -365,9 +365,15 @@ impl ResponseCache {
 
     // ── Typed access ──────────────────────────────────────────────────────────
 
-    /// Look up a completion. Records the hit/miss against `model`.
-    pub async fn get_completion(&self, key: &str, model: &str) -> Option<CompletionResult> {
-        let entry = self.lookup(key, model).await?;
+    /// Look up a completion. Records the hit/miss against `model` and the
+    /// caller's namespace.
+    pub async fn get_completion(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<CompletionResult> {
+        let entry = self.lookup(key, model, directives).await?;
         match serde_json::from_value::<CompletionResult>(entry.payload) {
             Ok(result) => Some(result),
             Err(e) => {
@@ -401,8 +407,13 @@ impl ResponseCache {
 
     /// Look up a native Anthropic `message`. Records the hit/miss against
     /// `model`.
-    pub async fn get_message(&self, key: &str, model: &str) -> Option<Value> {
-        Some(self.lookup(key, model).await?.payload)
+    pub async fn get_message(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<Value> {
+        Some(self.lookup(key, model, directives).await?.payload)
     }
 
     pub async fn put_message(
@@ -426,8 +437,13 @@ impl ResponseCache {
 
     /// Look up a search response envelope. Records the hit/miss against
     /// `search/{engine}`.
-    pub async fn get_search(&self, key: &str, model: &str) -> Option<Value> {
-        Some(self.lookup(key, model).await?.payload)
+    pub async fn get_search(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<Value> {
+        Some(self.lookup(key, model, directives).await?.payload)
     }
 
     pub async fn put_search(
@@ -449,10 +465,17 @@ impl ResponseCache {
         .await;
     }
 
-    async fn lookup(&self, key: &str, model: &str) -> Option<CachedEntry> {
+    /// The namespace never takes part in the lookup: any caller asking the
+    /// same question hits the same entry. It only picks the stats bucket.
+    async fn lookup(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<CachedEntry> {
         let entry = self.store.get(key).await;
         let counters = self.by_model.entry(model.to_string()).or_default();
-        let ns_counters = self.namespace_counters(key);
+        let ns_counters = self.namespace_counters(directives.namespace.as_ref());
         match entry {
             Some(entry) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -475,13 +498,12 @@ impl ResponseCache {
         }
     }
 
-    /// The counters for the namespace `key` belongs to; `None` for the
-    /// default namespace.
+    /// The counters for `namespace`; `None` for the default namespace.
     fn namespace_counters(
         &self,
-        key: &str,
+        namespace: Option<&CacheNamespace>,
     ) -> Option<dashmap::mapref::one::Ref<'_, String, Counters>> {
-        let ns = key_namespace(key)?;
+        let ns = namespace?.as_str();
         if let Some(counters) = self.by_namespace.get(ns) {
             return Some(counters);
         }
@@ -514,12 +536,13 @@ impl ResponseCache {
                     original_cost_usd,
                     stored_at: 0,
                     expires_at: 0,
+                    namespace: directives.namespace.as_ref().map(|ns| ns.to_string()),
                 },
                 ttl,
             )
             .await;
         self.stores.fetch_add(1, Ordering::Relaxed);
-        if let Some(ns) = self.namespace_counters(key) {
+        if let Some(ns) = self.namespace_counters(directives.namespace.as_ref()) {
             ns.stores.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -534,8 +557,9 @@ impl ResponseCache {
         self.store.purge_model(&model_fingerprint(model)).await
     }
 
-    /// Remove every entry stored under `namespace`, across all classes and
-    /// models. The default namespace cannot be purged on its own.
+    /// Remove every entry that was stored by a request in `namespace`, across
+    /// all classes and models. The default namespace cannot be purged on its
+    /// own.
     pub async fn purge_namespace(&self, namespace: &CacheNamespace) -> u64 {
         self.store.purge_namespace(namespace.as_str()).await
     }
@@ -642,29 +666,6 @@ pub fn make_cache_key(body: &Value) -> String {
             .as_bytes(),
     );
     hex::encode(hasher.finalize())
-}
-
-/// Marks the namespace segment of a store key: `{class}:{fp}:ns-{name}:{hash}`.
-const NAMESPACE_SEGMENT: &str = "ns-";
-
-/// `key` scoped to `namespace`: `{class}:{fp}:{hash}` becomes
-/// `{class}:{fp}:ns-{name}:{hash}`. The default namespace keeps the unscoped
-/// key, so entries stored before namespaces existed stay reachable.
-pub fn namespaced_key(key: String, namespace: Option<&CacheNamespace>) -> String {
-    let Some(ns) = namespace else {
-        return key;
-    };
-    match key.rsplit_once(':') {
-        Some((prefix, hash)) => format!("{prefix}:{NAMESPACE_SEGMENT}{ns}:{hash}"),
-        None => format!("{NAMESPACE_SEGMENT}{ns}:{key}"),
-    }
-}
-
-/// The namespace a store key belongs to; `None` for the default namespace.
-pub fn key_namespace(key: &str) -> Option<&str> {
-    let mut segments = key.split(':');
-    let scoped = segments.nth(2)?.strip_prefix(NAMESPACE_SEGMENT)?;
-    segments.next().is_some().then_some(scoped)
 }
 
 /// Full store key for a completion: `completion:{model_fp}:{body_hash}`.

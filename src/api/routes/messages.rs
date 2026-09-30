@@ -244,16 +244,13 @@ async fn anthropic_messages_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan.store().then(|| {
-        crate::router::cache::namespaced_key(
-            crate::router::cache::messages_cache_key(&canonical_model, &body),
-            cache_directives.namespace.as_ref(),
-        )
-    });
+    let cache_key = cache_plan
+        .store()
+        .then(|| crate::router::cache::messages_cache_key(&canonical_model, &body));
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(message) = state
             .response_cache
-            .get_message(key, &canonical_model)
+            .get_message(key, &canonical_model, &cache_directives)
             .await
         {
             return Ok(serve_cached_message(

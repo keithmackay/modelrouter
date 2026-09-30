@@ -36,7 +36,10 @@ fn sample_result(content: &str) -> CompletionResult {
 #[tokio::test]
 async fn cache_miss_returns_none() {
     let cache = enabled_cache(100, 60);
-    assert!(cache.get_completion("nonexistent-key", "gpt-4o").await.is_none());
+    assert!(cache
+        .get_completion("nonexistent-key", "gpt-4o", &Default::default())
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -51,7 +54,10 @@ async fn cache_hit_returns_value() {
             &Default::default(),
         )
         .await;
-    let hit = cache.get_completion("key-1", "gpt-4o").await.unwrap();
+    let hit = cache
+        .get_completion("key-1", "gpt-4o", &Default::default())
+        .await
+        .unwrap();
     assert_eq!(hit.content, "cached!");
     assert_eq!(hit.prompt_tokens, 5);
 }
@@ -68,8 +74,14 @@ async fn stats_track_hits_misses_and_savings() {
             &Default::default(),
         )
         .await;
-    cache.get_completion("k", "gpt-4o").await.unwrap();
-    assert!(cache.get_completion("missing", "gpt-4o").await.is_none());
+    cache
+        .get_completion("k", "gpt-4o", &Default::default())
+        .await
+        .unwrap();
+    assert!(cache
+        .get_completion("missing", "gpt-4o", &Default::default())
+        .await
+        .is_none());
 
     let stats = cache.stats().await;
     assert_eq!(stats.hits, 1);
@@ -92,6 +104,7 @@ fn entry(model: &str) -> CachedEntry {
         original_cost_usd: 0.01,
         stored_at: 0,
         expires_at: 0,
+        namespace: None,
     }
 }
 
@@ -240,8 +253,14 @@ async fn cache_purge_by_model_leaves_other_models() {
         .await;
 
     assert_eq!(cache.purge_model("gpt-4o").await, 1);
-    assert!(cache.get_completion(&gpt_key, "gpt-4o").await.is_none());
-    assert!(cache.get_completion(&claude_key, "claude-opus").await.is_some());
+    assert!(cache
+        .get_completion(&gpt_key, "gpt-4o", &Default::default())
+        .await
+        .is_none());
+    assert!(cache
+        .get_completion(&claude_key, "claude-opus", &Default::default())
+        .await
+        .is_some());
 }
 
 #[tokio::test]
@@ -1344,69 +1363,75 @@ fn namespace_stats(
 }
 
 #[tokio::test]
-async fn namespaces_isolate_identical_requests() {
+async fn namespaces_share_entries_for_the_same_prompt() {
     let adapter = VersionedAdapter::default();
     let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
 
-    let a = post_in(&server, "tenant-a").await;
-    let b = post_in(&server, "tenant-b").await;
-    let default = post_completion(&server, &prompt(1)).await;
-    for resp in [&a, &b, &default] {
-        assert_eq!(cache_outcome(resp).as_deref(), Some("MISS"));
+    let a = post_in(&server, "run-a").await;
+    assert_eq!(cache_outcome(&a).as_deref(), Some("MISS"));
+    for resp in [
+        post_in(&server, "run-b").await,
+        post_completion(&server, &prompt(1)).await,
+        post_in(&server, "run-a").await,
+    ] {
+        assert_eq!(cache_outcome(&resp).as_deref(), Some("HIT"));
+        assert_eq!(content_of(&resp), "answer 1");
     }
-    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-
-    let a_hit = post_in(&server, "tenant-a").await;
-    assert_eq!(cache_outcome(&a_hit).as_deref(), Some("HIT"));
-    assert_eq!(content_of(&a_hit), "answer 1");
-    let default_hit = post_completion(&server, &prompt(1)).await;
-    assert_eq!(cache_outcome(&default_hit).as_deref(), Some("HIT"));
-    assert_eq!(content_of(&default_hit), "answer 3");
+    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let stats = cache.stats().await;
-    assert_eq!(namespace_stats(&stats, "tenant-a"), (1, 1, 1));
-    assert_eq!(namespace_stats(&stats, "tenant-b"), (0, 1, 1));
+    assert_eq!(namespace_stats(&stats, "run-a"), (1, 1, 1));
+    assert_eq!(
+        namespace_stats(&stats, "run-b"),
+        (1, 0, 0),
+        "a hit counts for the asking namespace"
+    );
     assert_eq!(
         stats.by_namespace.len(),
         2,
         "the default namespace is only in the totals"
     );
-    assert_eq!((stats.hits, stats.misses, stats.stores), (2, 3, 3));
+    assert_eq!((stats.hits, stats.misses, stats.stores), (3, 1, 1));
 }
 
 #[tokio::test]
-async fn purging_a_namespace_leaves_the_others_cached() {
+async fn purging_a_namespace_removes_only_what_it_stored() {
     let (server, _db, cache) = test_app_with_adapter(VersionedAdapter::default()).await;
-    post_in(&server, "tenant-a").await;
-    post_in(&server, "tenant-b").await;
-    post_completion(&server, &prompt(1)).await;
+    let ns = "x-modelrouter-cache-namespace";
+    post_with_headers(&server, &prompt(1), &[(ns, "run-a")]).await;
+    post_with_headers(&server, &prompt(2), &[(ns, "run-b")]).await;
+    post_completion(&server, &prompt(3)).await;
 
     let removed = cache
-        .purge_namespace(&modelrouter::router::cache::CacheNamespace::parse("tenant-a").unwrap())
+        .purge_namespace(&modelrouter::router::cache::CacheNamespace::parse("run-a").unwrap())
         .await;
     assert_eq!(removed, 1);
+    let outcome = |r: axum_test::TestResponse| cache_outcome(&r);
     assert_eq!(
-        cache_outcome(&post_in(&server, "tenant-a").await).as_deref(),
+        outcome(post_completion(&server, &prompt(1)).await).as_deref(),
         Some("MISS")
     );
     assert_eq!(
-        cache_outcome(&post_in(&server, "tenant-b").await).as_deref(),
+        outcome(post_completion(&server, &prompt(2)).await).as_deref(),
         Some("HIT")
     );
     assert_eq!(
-        cache_outcome(&post_completion(&server, &prompt(1)).await).as_deref(),
+        outcome(post_completion(&server, &prompt(3)).await).as_deref(),
         Some("HIT")
     );
 }
 
 #[tokio::test]
-async fn namespace_applies_to_streamed_completions() {
+async fn namespaced_stream_replays_for_any_caller() {
     let adapter = StreamingAdapter::default();
     let (server, _db, cache) = test_app_with_adapter(adapter).await;
-    let headers = [("x-modelrouter-cache-namespace", "streams")];
-    let _ = post_with_headers(&server, &ask(true), &headers)
-        .await
-        .text();
+    let _ = post_with_headers(
+        &server,
+        &ask(true),
+        &[("x-modelrouter-cache-namespace", "streams")],
+    )
+    .await
+    .text();
     wait_for_stores(&cache, 1).await;
 
     let other = post_with_headers(
@@ -1415,9 +1440,7 @@ async fn namespace_applies_to_streamed_completions() {
         &[("x-modelrouter-cache-namespace", "elsewhere")],
     )
     .await;
-    assert_ne!(cache_outcome(&other).as_deref(), Some("HIT"));
-    let hit = post_with_headers(&server, &ask(true), &headers).await;
-    assert_eq!(cache_outcome(&hit).as_deref(), Some("HIT"));
+    assert_eq!(cache_outcome(&other).as_deref(), Some("HIT"));
 }
 
 #[tokio::test]
@@ -1499,19 +1522,15 @@ async fn namespace_default_ttl_applies_below_the_header() {
 async fn namespace_stats_are_bounded() {
     let cache = enabled_cache(1000, 60);
     for i in 0..300 {
-        let ns = modelrouter::router::cache::CacheNamespace::parse(&format!("ns{i}")).unwrap();
-        let key = modelrouter::router::cache::namespaced_key(
-            completion_cache_key("gpt-4o", &json!({ "i": i })),
-            Some(&ns),
-        );
+        let directives = CacheDirectives {
+            namespace: Some(
+                modelrouter::router::cache::CacheNamespace::parse(&format!("ns{i}")).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let key = completion_cache_key("gpt-4o", &json!({ "i": i }));
         cache
-            .put_completion(
-                &key,
-                "gpt-4o",
-                &sample_result("x"),
-                0.0,
-                &Default::default(),
-            )
+            .put_completion(&key, "gpt-4o", &sample_result("x"), 0.0, &directives)
             .await;
     }
     let stats = cache.stats().await;
@@ -1524,22 +1543,4 @@ async fn namespace_stats_are_bounded() {
         namespace_stats(&stats, modelrouter::router::cache::OTHER_NAMESPACES);
     assert_eq!(overflow_stores, 44);
     assert_eq!(stats.stores, 300);
-}
-
-#[test]
-fn namespaced_keys_round_trip_and_leave_the_default_unchanged() {
-    use modelrouter::router::cache::{key_namespace, namespaced_key, CacheNamespace};
-    let base = completion_cache_key("gpt-4o", &json!({"m": 1}));
-    assert_eq!(namespaced_key(base.clone(), None), base);
-    assert_eq!(key_namespace(&base), None);
-
-    let ns = CacheNamespace::parse("team.a_1").unwrap();
-    let scoped = namespaced_key(base.clone(), Some(&ns));
-    assert_ne!(scoped, base);
-    assert_eq!(key_namespace(&scoped), Some("team.a_1"));
-    let hash = base.rsplit(':').next().unwrap();
-    assert!(
-        scoped.ends_with(&format!(":ns-team.a_1:{hash}")),
-        "{scoped}"
-    );
 }

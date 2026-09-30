@@ -19,9 +19,9 @@ pub const MODE_HEADER: &str = "x-modelrouter-cache";
 /// `cache.max_ttl_seconds`.
 pub const TTL_HEADER: &str = "x-modelrouter-cache-ttl";
 
-/// Request header scoping this request's cache entries to a namespace. Entries
-/// in different namespaces never serve each other, and a namespace can be
-/// purged on its own.
+/// Request header labelling the cache entries this request stores, for
+/// per-namespace stats, purge and default TTL. It never changes what a lookup
+/// returns: the same prompt hits the same entry from any namespace.
 pub const NAMESPACE_HEADER: &str = "x-modelrouter-cache-namespace";
 
 /// Largest TTL a caller can write, ten years. Anything longer is a request
@@ -87,7 +87,7 @@ pub struct CacheDirectives {
     /// TTL for an entry this request stores, before the operator's cap.
     /// `None` keeps the class default.
     pub ttl: Option<EntryTtl>,
-    /// `None` is the shared default namespace.
+    /// `None` is the default (unlabelled) namespace.
     pub namespace: Option<CacheNamespace>,
 }
 

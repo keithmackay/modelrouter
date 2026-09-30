@@ -112,7 +112,10 @@ async fn stats_reports_live_and_ledger_views() {
             &Default::default(),
         )
         .await;
-    cache.get_completion("completion:x:y", "gpt-4o").await.unwrap();
+    cache
+        .get_completion("completion:x:y", "gpt-4o", &Default::default())
+        .await
+        .unwrap();
 
     let (n, v) = bearer(&jwt(&settings, "viewer"));
     let resp = server.get("/admin/api/cache/stats").add_header(n, v).await;
@@ -186,7 +189,10 @@ async fn purge_all_empties_the_cache() {
     assert_eq!(resp.status_code(), 200);
     let body: serde_json::Value = resp.json();
     assert_eq!(body["removed"], 2);
-    assert!(cache.get_completion("completion:a:1", "gpt-4o").await.is_none());
+    assert!(cache
+        .get_completion("completion:a:1", "gpt-4o", &Default::default())
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -214,7 +220,10 @@ async fn purge_by_model_only_removes_that_model() {
         .await;
     assert_eq!(resp.status_code(), 200);
     assert_eq!(resp.json::<serde_json::Value>()["removed"], 1);
-    assert!(cache.get_completion(&claude_key, "claude").await.is_some());
+    assert!(cache
+        .get_completion(&claude_key, "claude", &Default::default())
+        .await
+        .is_some());
 }
 
 #[tokio::test]
@@ -355,19 +364,21 @@ async fn dashboard_policy_form() {
 
 // ── Purge by namespace ────────────────────────────────────────────────────────
 
+/// Store a distinct prompt as a request in `namespace` would.
 async fn put_namespaced(cache: &ResponseCache, namespace: Option<&str>) -> String {
-    let ns = namespace.map(|n| modelrouter::router::cache::CacheNamespace::parse(n).unwrap());
-    let key = modelrouter::router::cache::namespaced_key(
-        modelrouter::router::cache::completion_cache_key("gpt-4o", &json!({"m": 1})),
-        ns.as_ref(),
-    );
+    let directives = modelrouter::router::cache::CacheDirectives {
+        namespace: namespace.map(|n| modelrouter::router::cache::CacheNamespace::parse(n).unwrap()),
+        ..Default::default()
+    };
+    let key =
+        modelrouter::router::cache::completion_cache_key("gpt-4o", &json!({ "ns": namespace }));
     cache
         .put_completion(
             &key,
             "gpt-4o",
             &modelrouter::providers::adapter::CompletionResult::default(),
             0.0,
-            &Default::default(),
+            &directives,
         )
         .await;
     key
@@ -390,9 +401,18 @@ async fn purge_by_namespace_only_removes_that_namespace() {
     let body: serde_json::Value = resp.json();
     assert_eq!(body["scope"], "namespace:batch");
     assert_eq!(body["removed"], 1);
-    assert!(cache.get_completion(&batch, "gpt-4o").await.is_none());
-    assert!(cache.get_completion(&batch_2, "gpt-4o").await.is_some());
-    assert!(cache.get_completion(&default, "gpt-4o").await.is_some());
+    assert!(cache
+        .get_completion(&batch, "gpt-4o", &Default::default())
+        .await
+        .is_none());
+    assert!(cache
+        .get_completion(&batch_2, "gpt-4o", &Default::default())
+        .await
+        .is_some());
+    assert!(cache
+        .get_completion(&default, "gpt-4o", &Default::default())
+        .await
+        .is_some());
 }
 
 #[tokio::test]
@@ -450,5 +470,8 @@ async fn dashboard_lists_namespaces_and_purges_one() {
         .form(&json!({ "scope": "namespace", "namespace": "batch" }))
         .await;
     assert_eq!(resp.status_code(), 303);
-    assert!(cache.get_completion(&batch, "gpt-4o").await.is_none());
+    assert!(cache
+        .get_completion(&batch, "gpt-4o", &Default::default())
+        .await
+        .is_none());
 }
