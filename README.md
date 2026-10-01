@@ -1063,6 +1063,20 @@ under `*`. Default-namespace traffic appears only in the totals.
 **Metering.** A cache hit is recorded as a usage row with `cache_hit = true`,
 `cost_usd = 0`, and the avoided provider cost in `saved_usd`. Hits therefore
 never inflate spend, and cache-hit percentage is reported alongside cost.
+
+**Uncached cost.** A rerun of an identical workload is mostly served from the
+cache, so its paid cost says more about the order runs happened in than about
+the workload: whichever run went last looks cheapest. Cost views therefore
+list an uncached cost, `cost_usd + saved_usd`, next to the paid cost. It prices
+every request as if the cache were empty, so reruns of the same work land on
+the same figure. It appears as `uncached_cost_usd` in response `usage` and
+`x_router.cost`, in `/admin/api/compare` (with `uncached_cost_per_request` and
+deltas), experiment results, attributed usage, and the `report cost`,
+`report usage`, `report compare` and `experiment results` CLI output, and as an
+"Uncached" column on the dashboard's cost, reports, compare, attribution and
+experiment pages. Budgets, budget burndown and the overview page stay on
+paid cost. Only the router's response cache is undone: discounts the provider
+applies for its own prompt cache are already in `cost_usd` and remain there.
 Responses carry an `x-modelrouter-cache: HIT|MISS|BYPASS|REFRESH` header,
 streamed replays included, and the `response cache hit` log line records `streamed=true|false`.
 
@@ -1575,7 +1589,9 @@ Two additive fields; the OpenAI shape is otherwise unchanged:
 - `usage.cost_usd` — USD charged for this call (the ledger row's
   `cost_usd`), after retries and fallback. On a response-cache hit it is
   `0`, with `usage.cache_hit: true` and `usage.saved_usd` carrying the
-  avoided cost. `usage.tokens_estimated: true` appears when the provider
+  avoided cost. `usage.uncached_cost_usd` is always present: the call's
+  cost had it not been served from the cache, equal to `cost_usd` on a live
+  call. `usage.tokens_estimated: true` appears when the provider
   reported no usage and the counts (and so the cost) are the router's
   estimate.
 - `x_router` — the full per-call record:
@@ -1608,7 +1624,7 @@ Two additive fields; the OpenAI shape is otherwise unchanged:
 | `settings` | Values actually sent to the provider after router resolution and adapter defaults. `dropped` lists caller parameters the router deliberately did not forward (e.g. `temperature` to a model that rejects it). Search reports `max_results`. |
 | `tokens` | Chat/embeddings only. `prompt` includes provider-cache reads; `reasoning` is `null` when the provider gave no figure; `estimated` mirrors the ledger's `tokens_estimated`. |
 | `results` | Search only: results returned. |
-| `cost` | `cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
+| `cost` | `cost_usd`, `uncached_cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
 | `timing` | `total_ms` from request receipt; `latency_ms` dispatch to completion including retries and fallback hops (0 on a hit); `provider_ms` for the answering provider call; `ttft_ms` for streams (first byte); `attempts` provider calls made; `fallbacks` hops to another model. |
 
 **Streams.** The router splices one extra `chat.completion.chunk` with

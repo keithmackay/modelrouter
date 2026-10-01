@@ -323,7 +323,7 @@ impl CostRepository for PostgresDb {
         filter_project: Option<&str>,
         filter_api_key_id: Option<i64>,
         since: &str,
-    ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64)>> {
+    ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64, f64)>> {
         if let Some(ids) = filter_user_ids {
             if ids.is_empty() {
                 return Ok(vec![]);
@@ -336,7 +336,8 @@ impl CostRepository for PostgresDb {
                     COALESCE(SUM(cost_usd), 0.0), \
                     COALESCE(SUM(tokens_in), 0), \
                     COALESCE(SUM(tokens_out), 0), \
-                    COUNT(*) \
+                    COUNT(*), \
+                    COALESCE(SUM(cost_usd), 0.0) + COALESCE(SUM(saved_usd), 0.0) \
              FROM cost_ledger \
              WHERE created_at >= ${}", param
         );
@@ -357,7 +358,7 @@ impl CostRepository for PostgresDb {
         }
         sql.push_str(" GROUP BY user_id HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0");
 
-        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64, f64)>(&sql);
         q = q.bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
@@ -560,7 +561,8 @@ impl CostRepository for PostgresDb {
                               COALESCE(SUM(cost_usd), 0.0), \
                               COALESCE(SUM(tokens_in), 0), \
                               COALESCE(SUM(tokens_out), 0), \
-                              COUNT(*) \
+                              COUNT(*), \
+                              COALESCE(SUM(saved_usd), 0.0) \
                        FROM cost_ledger \
                        WHERE created_at >= $1"
             .to_string();
@@ -579,18 +581,22 @@ impl CostRepository for PostgresDb {
         let _ = param;
         sql.push_str(" GROUP BY model HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0 ORDER BY SUM(cost_usd) DESC");
 
-        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64, f64)>(&sql);
         q = q.bind(since);
         if let Some(p) = filter_project { q = q.bind(p.to_string()); }
         if let Some(m) = filter_model { q = q.bind(m.to_string()); }
         let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(model, cost, ti, to, rc)| ModelSummaryRow {
-            model,
-            total_cost_usd: cost,
-            tokens_in: ti,
-            tokens_out: to,
-            request_count: rc,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(model, cost, ti, to, rc, saved)| ModelSummaryRow {
+                model,
+                total_cost_usd: cost,
+                tokens_in: ti,
+                tokens_out: to,
+                request_count: rc,
+                uncached_cost_usd: cost + saved,
+            })
+            .collect())
     }
 
     async fn distinct_attribution_tag_keys(&self) -> anyhow::Result<Vec<String>> {
@@ -933,7 +939,15 @@ fn totals_select() -> String {
 
 fn totals_from_row(row: TotalsRow) -> AttributionTotals {
     let (cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits) = row;
-    AttributionTotals { cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits }
+    AttributionTotals {
+        cost_usd,
+        saved_usd,
+        uncached_cost_usd: cost_usd + saved_usd,
+        tokens_in,
+        tokens_out,
+        requests,
+        cache_hits,
+    }
 }
 
 fn breakdown_from_row(row: BreakdownRow) -> AttributionBreakdownRow {
@@ -941,7 +955,13 @@ fn breakdown_from_row(row: BreakdownRow) -> AttributionBreakdownRow {
     AttributionBreakdownRow {
         key,
         totals: AttributionTotals {
-            cost_usd, saved_usd, tokens_in, tokens_out, requests, cache_hits,
+            cost_usd,
+            saved_usd,
+            uncached_cost_usd: cost_usd + saved_usd,
+            tokens_in,
+            tokens_out,
+            requests,
+            cache_hits,
         },
     }
 }

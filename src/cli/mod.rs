@@ -1079,7 +1079,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     print_rows(
                         &rows,
                         &["User", "Model", "Window", "Group", "Project", "Key",
-                          "Cost (USD)", "Requests", "Tokens In (Prompts)", "Tokens Out (Completions)"],
+                          "Uncached (USD)", "Cost (USD)", "Saved (USD)", "Requests",
+                          "Tokens In (Prompts)", "Tokens Out (Completions)"],
                         |r| {
                             vec![
                                 r.user_name.clone(),
@@ -1088,7 +1089,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 r.groups.clone(),
                                 r.project.clone(),
                                 r.key.clone(),
+                                format!("{:.2}", r.uncached_cost_usd),
                                 format!("{:.2}", r.total_cost_usd),
+                                format!("{:.2}", r.saved_usd),
                                 r.request_count.to_string(),
                                 r.total_tokens_out.to_string(),
                                 r.total_tokens_in.to_string(),
@@ -1172,14 +1175,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                                     "tokens_in": r.tokens_in,
                                     "tokens_out": r.tokens_out,
                                     "cost_usd": r.cost_usd,
+                                    "saved_usd": r.saved_usd,
+                                    "uncached_cost_usd": r.uncached_cost_usd(),
                                 })
                             }).collect();
                             println!("{}", serde_json::to_string_pretty(&json_rows)?);
                         }
                         OutputFormat::Csv => {
-                            println!("bucket,user,project,model,tokens_in,tokens_out,cost_usd");
+                            println!("bucket,user,project,model,tokens_in,tokens_out,cost_usd,saved_usd,uncached_cost_usd");
                             for r in &rows {
-                                println!("{},{},{},{},{},{},{:.2}",
+                                println!(
+                                    "{},{},{},{},{},{},{:.2},{:.2},{:.2}",
                                     r.bucket.as_deref().unwrap_or(""),
                                     r.user_name.as_deref().unwrap_or(""),
                                     r.project.as_deref().unwrap_or(""),
@@ -1187,6 +1193,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                                     r.tokens_in,
                                     r.tokens_out,
                                     r.cost_usd,
+                                    r.saved_usd,
+                                    r.uncached_cost_usd(),
                                 );
                             }
                         }
@@ -1203,12 +1211,21 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 buckets.push((r.bucket.clone(), vec![i]));
                             }
 
-                            let header = format!("{:<20} {:<20} {:<28} {:>12} {:>12} {:>10}",
-                                "User", "Project", "Model", "Tokens Out (Completions)", "Tokens In (Prompts)", "Cost USD");
+                            let header = format!(
+                                "{:<20} {:<20} {:<28} {:>12} {:>12} {:>10} {:>12}",
+                                "User",
+                                "Project",
+                                "Model",
+                                "Tokens Out (Completions)",
+                                "Tokens In (Prompts)",
+                                "Cost USD",
+                                "Uncached USD"
+                            );
 
                             let mut grand_in: i64 = 0;
                             let mut grand_out: i64 = 0;
                             let mut grand_cost: f64 = 0.0;
+                            let mut grand_uncached: f64 = 0.0;
 
                             fn fmt_num(n: i64) -> String {
                                 // Simple thousands formatting
@@ -1231,6 +1248,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 let mut user_in: i64 = 0;
                                 let mut user_out: i64 = 0;
                                 let mut user_cost: f64 = 0.0;
+                                let mut user_uncached: f64 = 0.0;
                                 let mut last_user: Option<String> = None;
 
                                 for &idx in indices {
@@ -1238,44 +1256,62 @@ pub async fn run(cli: Cli) -> Result<()> {
                                     if granularity == UsageGranularity::Detail {
                                         let cur_user = r.user_name.clone();
                                         if last_user.is_some() && last_user != cur_user {
-                                            println!("  {:30} {:>12} {:>12} {:>10}",
-                                                format!("Subtotal: {}", last_user.as_deref().unwrap_or("")),
-                                                fmt_num(user_in), fmt_num(user_out),
-                                                format!("${:.2}", user_cost));
-                                            user_in = 0; user_out = 0; user_cost = 0.0;
+                                            println!(
+                                                "  {:30} {:>12} {:>12} {:>10} {:>12}",
+                                                format!(
+                                                    "Subtotal: {}",
+                                                    last_user.as_deref().unwrap_or("")
+                                                ),
+                                                fmt_num(user_in),
+                                                fmt_num(user_out),
+                                                format!("${:.2}", user_cost),
+                                                format!("${:.2}", user_uncached)
+                                            );
+                                            user_in = 0;
+                                            user_out = 0;
+                                            user_cost = 0.0;
+                                            user_uncached = 0.0;
                                         }
                                         last_user = cur_user;
                                         user_in += r.tokens_in;
                                         user_out += r.tokens_out;
                                         user_cost += r.cost_usd;
+                                        user_uncached += r.uncached_cost_usd();
                                     }
 
-                                    println!("{:<20} {:<20} {:<28} {:>12} {:>12} {:>10}",
+                                    println!(
+                                        "{:<20} {:<20} {:<28} {:>12} {:>12} {:>10} {:>12}",
                                         r.user_name.as_deref().unwrap_or(""),
                                         r.project.as_deref().unwrap_or(""),
                                         r.model.as_deref().unwrap_or(""),
                                         fmt_num(r.tokens_in),
                                         fmt_num(r.tokens_out),
                                         format!("${:.2}", r.cost_usd),
+                                        format!("${:.2}", r.uncached_cost_usd()),
                                     );
 
                                     grand_in += r.tokens_in;
                                     grand_out += r.tokens_out;
                                     grand_cost += r.cost_usd;
+                                    grand_uncached += r.uncached_cost_usd();
                                 }
 
                                 if granularity == UsageGranularity::Detail {
                                     if let Some(ref u) = last_user {
-                                        println!("  {:30} {:>12} {:>12} {:>10}",
+                                        println!(
+                                            "  {:30} {:>12} {:>12} {:>10} {:>12}",
                                             format!("Subtotal: {}", u),
                                             fmt_num(user_in), fmt_num(user_out),
-                                            format!("${:.2}", user_cost));
+                                            format!("${:.2}", user_cost),
+                                            format!("${:.2}", user_uncached)
+                                        );
                                     }
                                 }
                             }
 
                             println!();
-                            println!("{:<48} {:>12} {:>12} {:>10}",
+                            println!(
+                                "{:<48} {:>12} {:>12} {:>10} {:>12}",
                                 "Grand Total:",
                                 {
                                     let s = grand_in.to_string();
@@ -1296,6 +1332,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                     r.chars().rev().collect::<String>()
                                 },
                                 format!("${:.2}", grand_cost),
+                                format!("${:.2}", grand_uncached),
                             );
                         }
                     }
@@ -1877,12 +1914,8 @@ pub async fn run(cli: Cli) -> Result<()> {
 #[derive(Debug, serde::Serialize)]
 struct AttributionReportRow {
     scope: String,
-    cost_usd: f64,
-    saved_usd: f64,
-    requests: i64,
-    cache_hits: i64,
-    tokens_in: i64,
-    tokens_out: i64,
+    #[serde(flatten)]
+    totals: crate::db::repositories::costs::AttributionTotals,
 }
 
 /// Parse `--tag key=value` / `--correlation-id id` into a repository filter.
@@ -2021,6 +2054,7 @@ fn write_comparison(
 
     let rows = vec![
         row("Requests", int(a.requests), int(b.requests), delta(d.requests, &|v| format!("{:.0}", v))),
+        row("Uncached cost / request (USD)", opt(a.uncached_cost_per_request, &usd), opt(b.uncached_cost_per_request, &usd), delta(d.uncached_cost_per_request, &usd)),
         row("Cost / request (USD)", opt(a.cost_per_request, &usd), opt(b.cost_per_request, &usd), delta(d.cost_per_request, &usd)),
         row("Tokens in / request", opt(a.tokens_in_per_request, &one), opt(b.tokens_in_per_request, &one), delta(d.tokens_in_per_request, &one)),
         row("Tokens out / request", opt(a.tokens_out_per_request, &one), opt(b.tokens_out_per_request, &one), delta(d.tokens_out_per_request, &one)),
@@ -2032,7 +2066,9 @@ fn write_comparison(
         row("p95 TTFT (ms)", opt_i(a.ttft.p95_ms), opt_i(b.ttft.p95_ms), delta(c.ttft.as_ref().and_then(|t| t.delta.p95_ms), &one)),
         row("Cache hit rate", pct(a.hit_rate), pct(b.hit_rate), delta(d.hit_rate, &pct)),
         row("Error rate", pct(a.error_rate), pct(b.error_rate), delta(d.error_rate, &pct)),
+        row("Uncached total cost (USD)", usd(a.uncached_cost_usd), usd(b.uncached_cost_usd), delta(d.uncached_cost_usd, &usd)),
         row("Total cost (USD)", usd(a.cost_usd), usd(b.cost_usd), delta(d.cost_usd, &usd)),
+        row("Saved by cache (USD)", usd(a.saved_usd), usd(b.saved_usd), (dash.clone(), dash.clone())),
         row("Total tokens in", int(a.tokens_in), int(b.tokens_in), delta(d.tokens_in, &|v| format!("{:.0}", v))),
         row("Total tokens out", int(a.tokens_out), int(b.tokens_out), delta(d.tokens_out, &|v| format!("{:.0}", v))),
         row("Cache hits", int(a.cache_hits), int(b.cache_hits), (dash.clone(), dash.clone())),
@@ -2133,22 +2169,12 @@ async fn report_attribution(
         .into_iter()
         .map(|r| AttributionReportRow {
             scope: r.key,
-            cost_usd: r.totals.cost_usd,
-            saved_usd: r.totals.saved_usd,
-            requests: r.totals.requests,
-            cache_hits: r.totals.cache_hits,
-            tokens_in: r.totals.tokens_in,
-            tokens_out: r.totals.tokens_out,
+            totals: r.totals,
         })
         .collect();
     rows.push(AttributionReportRow {
         scope: "TOTAL".to_string(),
-        cost_usd: totals.cost_usd,
-        saved_usd: totals.saved_usd,
-        requests: totals.requests,
-        cache_hits: totals.cache_hits,
-        tokens_in: totals.tokens_in,
-        tokens_out: totals.tokens_out,
+        totals,
     });
 
     if matches!(format, OutputFormat::Table) {
@@ -2161,6 +2187,7 @@ async fn report_attribution(
                 AttributionBreakdown::Model => "Model",
                 AttributionBreakdown::Day => "Day",
             },
+            "Uncached (USD)",
             "Cost (USD)",
             "Saved (USD)",
             "Requests",
@@ -2169,14 +2196,16 @@ async fn report_attribution(
             "Tokens Out (Completions)",
         ],
         |r| {
+            let t = &r.totals;
             vec![
                 r.scope.clone(),
-                format!("{:.4}", r.cost_usd),
-                format!("{:.4}", r.saved_usd),
-                r.requests.to_string(),
-                r.cache_hits.to_string(),
-                r.tokens_in.to_string(),
-                r.tokens_out.to_string(),
+                format!("{:.4}", t.uncached_cost_usd),
+                format!("{:.4}", t.cost_usd),
+                format!("{:.4}", t.saved_usd),
+                t.requests.to_string(),
+                t.cache_hits.to_string(),
+                t.tokens_in.to_string(),
+                t.tokens_out.to_string(),
             ]
         },
         format,
@@ -2187,7 +2216,28 @@ async fn report_attribution(
 #[cfg(test)]
 mod attribution_cli_tests {
     use super::*;
-    use crate::db::repositories::costs::AttributionFilter;
+    use crate::db::repositories::costs::{AttributionFilter, AttributionTotals};
+
+    #[test]
+    fn json_rows_are_flat_and_carry_the_uncached_cost() {
+        let row = AttributionReportRow {
+            scope: "TOTAL".to_string(),
+            totals: AttributionTotals {
+                cost_usd: 0.25,
+                saved_usd: 0.75,
+                uncached_cost_usd: 1.0,
+                requests: 2,
+                cache_hits: 1,
+                ..Default::default()
+            },
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["scope"], "TOTAL");
+        assert_eq!(v["cost_usd"], 0.25);
+        assert_eq!(v["saved_usd"], 0.75);
+        assert_eq!(v["uncached_cost_usd"], 1.0);
+        assert_eq!(v["cache_hits"], 1);
+    }
 
     #[test]
     fn parses_tag_pair() {
@@ -2385,6 +2435,9 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("Latency samples,2,1,-,-"), "{}", text);
         assert!(text.contains("Unpriced models,m1,m2,-,-"), "{}", text);
+        assert!(text.contains("Uncached total cost (USD),"), "{}", text);
+        assert!(text.contains("Uncached cost / request (USD),"), "{}", text);
+        assert!(text.contains("Saved by cache (USD),"), "{}", text);
         assert!(!text.contains("Coverage:"), "{}", text);
     }
 
@@ -2941,6 +2994,7 @@ fn write_experiment_results(
                 v.requests.to_string(),
                 v.unbound_requests.to_string(),
                 v.turns.to_string(),
+                usd(v.uncached_cost_usd),
                 usd(v.cost_usd),
                 usd(v.saved_usd),
                 v.tokens.prompt.to_string(),
@@ -2962,6 +3016,7 @@ fn write_experiment_results(
         t.requests.to_string(),
         t.unbound_requests.to_string(),
         t.turns.to_string(),
+        usd(t.uncached_cost_usd),
         usd(t.cost_usd),
         usd(t.saved_usd),
         t.tokens.prompt.to_string(),
@@ -2976,8 +3031,8 @@ fn write_experiment_results(
     write_rows(
         &variant_rows,
         &[
-            "Variant", "Runs", "Mixed", "Requests", "Unbound", "Turns", "Cost (USD)",
-            "Saved (USD)", "Tokens In", "Tokens Out", "Estimated", "Failures",
+            "Variant", "Runs", "Mixed", "Requests", "Unbound", "Turns", "Uncached (USD)",
+            "Cost (USD)", "Saved (USD)", "Tokens In", "Tokens Out", "Estimated", "Failures",
             "Latency (ms)", "Samples", "Success Rate", "Unpriced",
         ],
         |row| row.clone(),
@@ -3004,7 +3059,9 @@ fn write_experiment_results(
                 yes_no(run.mixed),
                 run.turns.to_string(),
                 run.unbound_requests.to_string(),
+                usd(run.uncached_cost_usd),
                 usd(run.cost_usd),
+                usd(run.saved_usd),
                 run.tokens.prompt.to_string(),
                 run.tokens.completion.to_string(),
                 run.failures.to_string(),
@@ -3020,9 +3077,9 @@ fn write_experiment_results(
     write_rows(
         &run_rows,
         &[
-            "User", "Correlation ID", "Variant", "Mixed", "Turns", "Unbound", "Cost (USD)",
-            "Tokens In", "Tokens Out", "Failures", "Latency (ms)", "Samples", "Span (s)",
-            "First", "Last", "Outcome",
+            "User", "Correlation ID", "Variant", "Mixed", "Turns", "Unbound", "Uncached (USD)",
+            "Cost (USD)", "Saved (USD)", "Tokens In", "Tokens Out", "Failures", "Latency (ms)",
+            "Samples", "Span (s)", "First", "Last", "Outcome",
         ],
         |row| row.clone(),
         format,
@@ -3189,8 +3246,13 @@ mod experiment_cli_tests {
         let mut out = Vec::new();
         write_experiment_results(&results, OutputFormat::Csv, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.starts_with("Variant,Runs,Mixed,Requests"), "{text}");
-        assert!(text.contains("\n\nUser,Correlation ID,Variant"), "{text}");
+        assert!(
+            text.starts_with(
+                "Variant,Runs,Mixed,Requests,Unbound,Turns,Uncached (USD),Cost (USD),Saved (USD),"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\n\nUser,Correlation ID,Variant,Mixed,Turns,Unbound,Uncached (USD),Cost (USD),Saved (USD),"), "{text}");
     }
 
     #[tokio::test]

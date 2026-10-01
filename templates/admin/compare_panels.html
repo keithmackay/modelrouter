@@ -49,7 +49,7 @@
         </thead>
         <tbody>
             {% for r in rows %}
-            <tr{% if loop.index0 == 8 %} style="border-top:2px solid #eee;"{% endif %}>
+            <tr{% if loop.index0 == 9 %} style="border-top:2px solid #eee;"{% endif %}>
                 <td style="padding:0.35rem 0.5rem;">{{ r.label }}</td>
                 <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ r.a }}</td>
                 <td style="padding:0.35rem 0.5rem;text-align:right;font-variant-numeric:tabular-nums;">{{ r.b }}</td>
@@ -89,7 +89,7 @@
 </div>
 
 <div class="stat-card">
-    <h3>Daily cost</h3>
+    <h3>Daily uncached cost</h3>
     <div id="compare-daily-chart" data-chart-data="{{ daily_json }}" style="width:100%;height:240px;"></div>
 </div>
 
@@ -161,6 +161,7 @@
         if (!data.a.requests || !data.b.requests) { noData(el); return; }
 
         var metrics = [
+            { key: 'uncached_cost_per_request', label: 'Uncached cost / req', fmt: fmtMoney },
             { key: 'cost_per_request',       label: 'Cost / req',   fmt: fmtMoney },
             { key: 'tokens_in_per_request',  label: 'Tokens in',    fmt: fmtNum },
             { key: 'tokens_out_per_request', label: 'Tokens out',   fmt: fmtNum },
@@ -199,7 +200,8 @@
         legend(f.svg, 0, -24, arms);
     }
 
-    // Daily cost of both arms over the window, one line each.
+    // Daily uncached cost of both arms over the window, one line each, so a
+    // rerun served from cache doesn't dip below the run that paid for it.
     function initDailyChart() {
         var el = document.getElementById('compare-daily-chart');
         if (!el || typeof d3 === 'undefined') return;
@@ -210,7 +212,7 @@
 
         var parseDate = d3.timeParse('%Y-%m-%d');
         function points(arm) {
-            return (arm.series || []).map(function(d) { return { date: parseDate(d.day), v: d.cost_usd }; })
+            return (arm.series || []).map(function(d) { return { date: parseDate(d.day), v: d.uncached_cost_usd }; })
                 .filter(function(p) { return p.date; });
         }
         var pa = points(data.a), pb = points(data.b);

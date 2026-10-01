@@ -13,6 +13,10 @@ pub struct CostRow {
     pub project: String,
     pub key: String,
     pub total_cost_usd: f64,
+    /// Avoided by response-cache hits.
+    pub saved_usd: f64,
+    /// `total_cost_usd + saved_usd`: the spend with no response cache.
+    pub uncached_cost_usd: f64,
     pub request_count: i64,
     pub total_tokens_out: i64,
     pub total_tokens_in: i64,
@@ -120,6 +124,7 @@ pub async fn cost_by_user_window(
                           COALESCE(ak.project, '') as key_project, \
                           COALESCE(ak.label, '') as key_label, \
                           COALESCE(SUM(cl.cost_usd), 0.0), \
+                          COALESCE(SUM(cl.saved_usd), 0.0), \
                           COALESCE(SUM(cl.tokens_in), 0), \
                           COALESCE(SUM(cl.tokens_out), 0), \
                           COUNT(*) \
@@ -141,7 +146,7 @@ pub async fn cost_by_user_window(
     sql.push_str(" GROUP BY u.id, u.name, cl.model, cl.project, cl.api_key_id \
                    ORDER BY SUM(cl.cost_usd) DESC");
 
-    type Row = (i64, String, String, String, Option<i64>, String, String, f64, i64, i64, i64);
+    type Row = (i64, String, String, String, Option<i64>, String, String, f64, f64, i64, i64, i64);
     let mut q = sqlx::query_as::<_, Row>(&sql);
     q = q.bind(&window_start);
     if let Some(v) = user_name { q = q.bind(v); }
@@ -152,7 +157,7 @@ pub async fn cost_by_user_window(
     let rows = q.fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .map(|(uid, uname, mdl, proj, _api_key_id, key_proj, key_lbl, cost, tin, tout, cnt)| {
+        .map(|(uid, uname, mdl, proj, _api_key_id, key_proj, key_lbl, cost, saved, tin, tout, cnt)| {
             let groups_str = user_group_map.get(&uid)
                 .map(|gs| gs.join(", "))
                 .unwrap_or_default();
@@ -171,6 +176,8 @@ pub async fn cost_by_user_window(
                 project: proj,
                 key: key_str,
                 total_cost_usd: cost,
+                saved_usd: saved,
+                uncached_cost_usd: cost + saved,
                 request_count: cnt,
                 total_tokens_out: tout,
                 total_tokens_in: tin,
@@ -436,6 +443,15 @@ pub struct UsageReportRow {
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub cost_usd: f64,
+    /// Avoided by response-cache hits.
+    pub saved_usd: f64,
+}
+
+impl UsageReportRow {
+    /// The spend with no response cache.
+    pub fn uncached_cost_usd(&self) -> f64 {
+        self.cost_usd + self.saved_usd
+    }
 }
 
 pub async fn fetch_usage_rows(
@@ -457,19 +473,21 @@ pub async fn fetch_usage_rows(
             "{} as bucket, NULL as user_name, NULL as project_col, NULL as model_col, \
              COALESCE(SUM(cl.tokens_in), 0) as tokens_in, \
              COALESCE(SUM(cl.tokens_out), 0) as tokens_out, \
-             COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd",
+             COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd, \
+             COALESCE(SUM(cl.saved_usd), 0.0) as saved_usd",
             bucket_expr
         ),
         UsageGranularity::Subtotal => format!(
             "{} as bucket, u.name as user_name, cl.project as project_col, NULL as model_col, \
              COALESCE(SUM(cl.tokens_in), 0) as tokens_in, \
              COALESCE(SUM(cl.tokens_out), 0) as tokens_out, \
-             COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd",
+             COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd, \
+             COALESCE(SUM(cl.saved_usd), 0.0) as saved_usd",
             bucket_expr
         ),
         UsageGranularity::Detail => format!(
             "{} as bucket, u.name as user_name, cl.project as project_col, cl.model as model_col, \
-             cl.tokens_in as tokens_in, cl.tokens_out as tokens_out, cl.cost_usd",
+             cl.tokens_in as tokens_in, cl.tokens_out as tokens_out, cl.cost_usd, cl.saved_usd",
             bucket_expr
         ),
     };
@@ -553,7 +571,19 @@ pub async fn fetch_usage_rows(
         "SELECT {select_fields} FROM cost_ledger cl {joins} {where_clause} {group_by} {order_by}"
     );
 
-    let mut q = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, f64)>(&sql);
+    let mut q = sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            f64,
+            f64,
+        ),
+    >(&sql);
     for val in &bind_values {
         q = q.bind(val);
     }
@@ -561,17 +591,20 @@ pub async fn fetch_usage_rows(
     let rows = q.fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .map(|(bucket, user_name, project, model, tokens_in, tokens_out, cost_usd)| {
-            UsageReportRow {
-                bucket,
-                user_name,
-                project,
-                model,
-                tokens_in,
-                tokens_out,
-                cost_usd,
-            }
-        })
+        .map(
+            |(bucket, user_name, project, model, tokens_in, tokens_out, cost_usd, saved_usd)| {
+                UsageReportRow {
+                    bucket,
+                    user_name,
+                    project,
+                    model,
+                    tokens_in,
+                    tokens_out,
+                    cost_usd,
+                    saved_usd,
+                }
+            },
+        )
         .collect())
 }
 

@@ -791,10 +791,30 @@ async fn experiments_panels_render_variant_cards_and_run_rows() {
     assert_eq!(body.matches("class=\"run-row\"").count(), 2, "one row per run: {body}");
     assert!(body.contains("<code>run-a</code>") && body.contains("<code>run-b</code>"));
     assert!(body.contains("exp-user"), "runs must name the user: {body}");
-    assert!(body.contains("no samples"), "no prompt rows means no latency samples: {body}");
-    assert!(body.contains("computed "), "the panel header must show computed_at: {body}");
-    assert!(body.contains("1–2 of 2"), "paging must show the total: {body}");
-    assert!(body.contains("gpt-4o-mini"), "the per-model table must list the model: {body}");
+    assert!(
+        body.contains("no samples"),
+        "no prompt rows means no latency samples: {body}"
+    );
+    assert!(
+        body.contains("computed "),
+        "the panel header must show computed_at: {body}"
+    );
+    assert!(
+        body.contains("1–2 of 2"),
+        "paging must show the total: {body}"
+    );
+    assert!(
+        body.contains("gpt-4o-mini"),
+        "the per-model table must list the model: {body}"
+    );
+    assert!(
+        body.contains(">Uncached cost<"),
+        "cost is shown as if uncached too: {body}"
+    );
+    assert!(
+        body.contains("uncached ("),
+        "per-run line carries the uncached cost: {body}"
+    );
 
     // Paging: one run per page, and the second page links back.
     let second = server
@@ -2128,6 +2148,28 @@ async fn cost_page_with_project_filter() {
         experiment_variant: None,
         tokens_estimated: false,
     }).await.unwrap();
+    // A rerun of the same call served from the response cache.
+    CostRepository::create_cache_hit(
+        &raw_db,
+        NewCostLedgerEntry {
+            user_id: user.id,
+            prompt_id: None,
+            model: "test-model".to_string(),
+            provider: "test".to_string(),
+            project: Some("proj-a".to_string()),
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 0.05,
+            api_key_id: None,
+            attribution_correlation_id: None,
+            attribution_tags: "{}".to_string(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
+        },
+    )
+    .await
+    .unwrap();
 
     let settings = Arc::new(Settings::default());
     let token = viewer_jwt(&settings);
@@ -2143,6 +2185,75 @@ async fn cost_page_with_project_filter() {
     assert_eq!(resp.status_code(), 200);
     let body = resp.text();
     assert!(body.contains("proj-a"), "cost page must show filtered project");
+    assert!(body.contains(">Uncached (USD)</th>"), "{body}");
+    // Uncached $0.10, paid $0.05, saved $0.05, in that column order.
+    assert!(
+        body.contains("<td>$0.1000</td>\n            <td>$0.0500</td>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn reports_panels_list_uncached_spend_by_user_model_and_project() {
+    use modelrouter::db::models::{NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = common::in_memory_db().await;
+    let user = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "rerun-user".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+    let entry = || NewCostLedgerEntry {
+        user_id: user.id,
+        prompt_id: None,
+        model: "test-model".to_string(),
+        provider: "test".to_string(),
+        project: Some("proj-a".to_string()),
+        tokens_in: 10,
+        tokens_out: 5,
+        cost_usd: 0.25,
+        api_key_id: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
+    };
+    CostRepository::create(&raw_db, entry()).await.unwrap();
+    CostRepository::create_cache_hit(&raw_db, entry())
+        .await
+        .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+
+    let resp = server
+        .get("/admin/reports/panels")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body = resp.text();
+    assert_eq!(
+        body.matches("<th>Uncached (USD)</th><th>Cost (USD)</th>")
+            .count(),
+        3,
+        "{body}"
+    );
+    // Each table lists uncached $0.50 then paid $0.25: the cache hit counts
+    // at full price in the first column and free in the second.
+    for name in ["rerun-user", "test-model", "proj-a"] {
+        let row = format!(
+            "<td>{name}</td>\n                <td>$0.5000</td>\n                <td>$0.2500</td>"
+        );
+        assert!(body.contains(&row), "missing {name} row in {body}");
+    }
 }
 
 // ── Users page: list, create, disable, enable ────────────────────────────────

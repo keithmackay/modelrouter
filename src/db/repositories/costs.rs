@@ -8,6 +8,8 @@ pub struct ModelSummaryRow {
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub request_count: i64,
+    /// `total_cost_usd` plus the spend response-cache hits avoided.
+    pub uncached_cost_usd: f64,
 }
 
 /// Cache-hit aggregates for one grouping key.
@@ -90,11 +92,14 @@ impl ArmFilter {
 ///
 /// `cost_usd` is what was actually paid; `saved_usd` is what the response cache
 /// avoided. Cache-hit rows always contribute to the second and never the first,
-/// so the two never double-count.
+/// so the two never double-count. `uncached_cost_usd` is their sum: the spend
+/// had nothing come from cache, which stays the same across reruns of the
+/// same work.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct AttributionTotals {
     pub cost_usd: f64,
     pub saved_usd: f64,
+    pub uncached_cost_usd: f64,
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub requests: i64,
@@ -269,7 +274,7 @@ pub trait CostRepository: Send + Sync {
     /// Return (cost_usd, tokens_in, tokens_out, request_count) for a user since a timestamp.
     async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)>;
     /// Aggregate cost stats grouped by user_id with optional filters.
-    /// Returns Vec of (user_id, cost_usd, tokens_in, tokens_out, request_count).
+    /// Returns Vec of (user_id, cost_usd, tokens_in, tokens_out, request_count, uncached_cost_usd).
     /// `filter_user_ids`: None = all users; Some(&[]) = no users (empty result).
     /// `since`: ISO 8601 UTC; use "1970-01-01T00:00:00Z" for all-time.
     async fn cost_stats_grouped(
@@ -278,7 +283,7 @@ pub trait CostRepository: Send + Sync {
         filter_project: Option<&str>,
         filter_api_key_id: Option<i64>,
         since: &str,
-    ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64)>>;
+    ) -> anyhow::Result<Vec<(i64, f64, i64, i64, i64, f64)>>;
     /// Distinct non-null project values present in the cost ledger, sorted.
     async fn distinct_projects_in_ledger(&self) -> anyhow::Result<Vec<String>>;
     /// Distinct non-null model values present in the cost ledger, sorted.

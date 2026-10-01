@@ -713,6 +713,13 @@ async fn cache_hit_is_metered_with_zero_cost() {
     assert_eq!(meta["cost"]["cost_usd"].as_f64(), Some(0.0));
     assert_eq!(meta["cost"]["cache_hit"], true);
     assert!(close(&meta["cost"]["saved_usd"], hit.saved_usd));
+    // The rerun reports the same uncached cost as the call that paid for it.
+    assert!(close(&miss["usage"]["uncached_cost_usd"], live.cost_usd));
+    assert!(close(
+        &hit_body["usage"]["uncached_cost_usd"],
+        live.cost_usd
+    ));
+    assert!(close(&meta["cost"]["uncached_cost_usd"], live.cost_usd));
     assert_eq!(meta["model"], hit.model.as_str(), "a hit names the model that produced it");
     assert_eq!(meta["timing"]["attempts"], 0, "no provider call on a hit");
     assert!(meta["timing"]["provider_ms"].is_null());

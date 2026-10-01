@@ -53,6 +53,30 @@ async fn cost_report_sums_cost_ledger_by_window() {
 }
 
 #[tokio::test]
+async fn cost_report_shows_cache_hits_at_their_uncached_cost() {
+    let db = common::in_memory_db().await;
+    setup_test_data(&db.pool).await;
+    sqlx::query(
+        "INSERT INTO cost_ledger (user_id, model, provider, tokens_in, tokens_out, cost_usd, saved_usd, cache_hit, created_at) \
+         SELECT id, 'gpt-4o', 'openai', 100, 50, 0.0, 0.00075, 1, ? FROM users WHERE name = 'alice'"
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let rows =
+        report::cost_by_user_window(&db.pool, "monthly", Some("alice"), None, None, None, None)
+            .await
+            .unwrap();
+    let alice = rows.iter().find(|r| r.user_name == "alice").unwrap();
+    assert_eq!(alice.request_count, 2);
+    assert!((alice.total_cost_usd - 0.00075).abs() < 1e-12);
+    assert!((alice.saved_usd - 0.00075).abs() < 1e-12);
+    assert!((alice.uncached_cost_usd - 0.0015).abs() < 1e-12);
+}
+
+#[tokio::test]
 async fn cost_report_filters_by_user() {
     let db = common::in_memory_db().await;
     setup_test_data(&db.pool).await;
@@ -109,6 +133,8 @@ async fn csv_format_has_correct_headers() {
         project: String::new(),
         key: String::new(),
         total_cost_usd: 0.0075,
+        saved_usd: 0.0,
+        uncached_cost_usd: 0.0075,
         total_tokens_in: 1000,
         total_tokens_out: 500,
         request_count: 3,
