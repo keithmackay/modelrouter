@@ -1322,7 +1322,7 @@ async fn report_cost_with_data() {
     // Insert cost ledger entries
     sqlx::query(
         "INSERT INTO cost_ledger (user_id, model, provider, project, tokens_in, tokens_out, cost_usd, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(user_id)
     .bind("gpt-4")
@@ -1331,6 +1331,9 @@ async fn report_cost_with_data() {
     .bind(100)
     .bind(200)
     .bind(0.05)
+    // RFC 3339, as the router writes it. SQLite's datetime('now') sorts
+    // before the window start on the first day of a month.
+    .bind(chrono::Utc::now().to_rfc3339())
     .execute(&pool)
     .await.expect("insert cost");
 
