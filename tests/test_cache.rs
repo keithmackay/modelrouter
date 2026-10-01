@@ -365,6 +365,24 @@ async fn test_app_with_cache() -> (TestServer, Arc<dyn DatabaseProvider>) {
 async fn test_app_with_adapter<A: modelrouter::providers::adapter::ProviderAdapter + 'static>(
     adapter: A,
 ) -> (TestServer, Arc<dyn DatabaseProvider>, Arc<ResponseCache>) {
+    test_app_with_cache_config(
+        adapter,
+        CacheConfig {
+            enabled: true,
+            max_entries: 10,
+            ttl_seconds: 60,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn test_app_with_cache_config<
+    A: modelrouter::providers::adapter::ProviderAdapter + 'static,
+>(
+    adapter: A,
+    cache_config: CacheConfig,
+) -> (TestServer, Arc<dyn DatabaseProvider>, Arc<ResponseCache>) {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
@@ -390,12 +408,7 @@ async fn test_app_with_adapter<A: modelrouter::providers::adapter::ProviderAdapt
 
     let settings = Arc::new(Settings::default());
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
-    let response_cache = Arc::new(ResponseCache::new(&CacheConfig {
-        enabled: true,
-        max_entries: 10,
-        ttl_seconds: 60,
-        ..Default::default()
-    }));
+    let response_cache = Arc::new(ResponseCache::new(&cache_config));
 
     let state = AppState {
         settings: settings.clone(),
@@ -792,4 +805,235 @@ async fn stream_replay_is_metered_as_a_cache_hit() {
     assert!(hit.saved_usd > 0.0);
     assert_eq!((hit.tokens_in, hit.tokens_out), (40, 2));
     assert_eq!(cache.stats().await.hits, 1);
+}
+
+// ── Per-request cache mode (`x-modelrouter-cache`) ──────────────────────────
+
+/// Answers `answer N` on the Nth call, so a test can tell a fresh answer from
+/// a cached one.
+#[derive(Clone, Default)]
+struct VersionedAdapter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::adapter::ProviderAdapter for VersionedAdapter {
+    async fn complete(
+        &self,
+        _req: &modelrouter::providers::adapter::NormalizedRequest,
+    ) -> anyhow::Result<CompletionResult> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(CompletionResult {
+            content: format!("answer {n}"),
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn stream(
+        &self,
+        _req: &modelrouter::providers::adapter::NormalizedRequest,
+    ) -> anyhow::Result<modelrouter::providers::adapter::SseStream> {
+        anyhow::bail!("not used")
+    }
+}
+
+async fn post_with_mode(
+    server: &TestServer,
+    body: &serde_json::Value,
+    mode: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache"),
+            axum::http::HeaderValue::from_static(mode),
+        )
+        .json(body)
+        .await
+}
+
+fn cache_outcome(resp: &axum_test::TestResponse) -> Option<String> {
+    resp.headers()
+        .get("x-modelrouter-cache")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+fn content_of(resp: &axum_test::TestResponse) -> String {
+    resp.json::<serde_json::Value>()["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn sampled() -> serde_json::Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "be creative"}],
+        "temperature": 0.9
+    })
+}
+
+#[tokio::test]
+async fn use_mode_caches_a_sampled_request() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, _cache) = test_app_with_adapter(adapter.clone()).await;
+
+    let first = post_with_mode(&server, &sampled(), "use").await;
+    assert_eq!(first.status_code(), 200);
+    assert_eq!(cache_outcome(&first).as_deref(), Some("MISS"));
+    let second = post_with_mode(&server, &sampled(), "use").await;
+    assert_eq!(cache_outcome(&second).as_deref(), Some("HIT"));
+    assert_eq!(content_of(&second), "answer 1");
+    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Without the header the same sampled request stays ineligible.
+    let plain = post_completion(&server, &sampled()).await;
+    assert_eq!(content_of(&plain), "answer 2");
+}
+
+#[tokio::test]
+async fn use_mode_stores_and_replays_a_sampled_stream() {
+    let adapter = StreamingAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+    let mut body = ask(true);
+    body["temperature"] = json!(0.9);
+
+    let first = post_with_mode(&server, &body, "use").await;
+    assert_eq!(cache_outcome(&first).as_deref(), Some("MISS"));
+    let _ = first.text();
+    wait_for_stores(&cache, 1).await;
+
+    let second = post_with_mode(&server, &body, "use").await;
+    assert_eq!(cache_outcome(&second).as_deref(), Some("HIT"));
+    assert!(second.text().contains("data: [DONE]"));
+    assert_eq!(adapter.calls(), 1);
+}
+
+#[tokio::test]
+async fn bypass_mode_neither_reads_nor_writes_the_cache() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "deterministic"}],
+        "temperature": 0.0
+    });
+
+    let bypassed = post_with_mode(&server, &body, "bypass").await;
+    assert_eq!(cache_outcome(&bypassed).as_deref(), Some("BYPASS"));
+    assert_eq!(cache.stats().await.stores, 0, "bypass does not store");
+
+    let cached = post_completion(&server, &body).await;
+    assert_eq!(cache_outcome(&cached).as_deref(), Some("MISS"));
+    assert_eq!(content_of(&cached), "answer 2");
+
+    let bypassed = post_with_mode(&server, &body, "bypass").await;
+    assert_eq!(cache_outcome(&bypassed).as_deref(), Some("BYPASS"));
+    assert_eq!(
+        content_of(&bypassed),
+        "answer 3",
+        "bypass ignores the stored entry"
+    );
+}
+
+#[tokio::test]
+async fn refresh_mode_replaces_the_entry() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, _cache) = test_app_with_adapter(adapter.clone()).await;
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "deterministic"}],
+        "temperature": 0.0
+    });
+
+    assert_eq!(
+        content_of(&post_completion(&server, &body).await),
+        "answer 1"
+    );
+    let hit = post_completion(&server, &body).await;
+    assert_eq!(cache_outcome(&hit).as_deref(), Some("HIT"));
+    assert_eq!(content_of(&hit), "answer 1");
+
+    let refreshed = post_with_mode(&server, &body, "refresh").await;
+    assert_eq!(cache_outcome(&refreshed).as_deref(), Some("REFRESH"));
+    assert_eq!(
+        content_of(&refreshed),
+        "answer 2",
+        "refresh skips the lookup"
+    );
+
+    let hit = post_completion(&server, &body).await;
+    assert_eq!(cache_outcome(&hit).as_deref(), Some("HIT"));
+    assert_eq!(
+        content_of(&hit),
+        "answer 2",
+        "later requests see the refreshed answer"
+    );
+}
+
+#[tokio::test]
+async fn refresh_mode_stores_a_stream() {
+    let adapter = StreamingAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+
+    let refreshed = post_with_mode(&server, &ask(true), "refresh").await;
+    assert_eq!(cache_outcome(&refreshed).as_deref(), Some("REFRESH"));
+    let _ = refreshed.text();
+    wait_for_stores(&cache, 1).await;
+
+    let hit = post_completion(&server, &ask(false)).await;
+    assert_eq!(cache_outcome(&hit).as_deref(), Some("HIT"));
+    assert_eq!(adapter.calls(), 1);
+}
+
+#[tokio::test]
+async fn unknown_cache_mode_is_a_400() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, _cache) = test_app_with_adapter(adapter.clone()).await;
+    let resp = post_with_mode(&server, &sampled(), "sometimes").await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(resp.text().contains("use, bypass, refresh"));
+    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn operator_can_disable_header_opt_in() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, cache) = test_app_with_cache_config(
+        adapter.clone(),
+        CacheConfig {
+            enabled: true,
+            max_entries: 10,
+            ttl_seconds: 60,
+            allow_header_opt_in: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for mode in ["use", "refresh"] {
+        post_with_mode(&server, &sampled(), mode).await;
+    }
+    assert_eq!(
+        content_of(&post_with_mode(&server, &sampled(), "use").await),
+        "answer 3"
+    );
+    assert_eq!(
+        cache.stats().await.stores,
+        0,
+        "use/refresh cannot widen eligibility"
+    );
+
+    // Narrowing is still honoured.
+    let mut deterministic = sampled();
+    deterministic["temperature"] = json!(0.0);
+    let bypassed = post_with_mode(&server, &deterministic, "bypass").await;
+    assert_eq!(cache_outcome(&bypassed).as_deref(), Some("BYPASS"));
 }

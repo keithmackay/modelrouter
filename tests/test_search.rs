@@ -536,6 +536,65 @@ async fn search_is_not_cached_when_the_cache_is_disabled() {
     );
 }
 
+async fn post_search_with_mode(
+    server: &TestServer,
+    body: serde_json::Value,
+    mode: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache"),
+            axum::http::HeaderValue::from_static(mode),
+        )
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn search_honours_the_cache_mode_header() {
+    let (server, _db) =
+        test_app_with_pricing_and_cache(search_pricing(), enabled_cache_config()).await;
+    let query = serde_json::json!({ "query": "rust" });
+    let outcome = |resp: &axum_test::TestResponse| {
+        resp.headers()
+            .get("x-modelrouter-cache")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let bypassed = post_search_with_mode(&server, query.clone(), "bypass").await;
+    assert_eq!(outcome(&bypassed), "BYPASS");
+    assert_eq!(
+        outcome(&post_search(&server, query.clone()).await),
+        "MISS",
+        "bypass did not store"
+    );
+
+    let refreshed = post_search_with_mode(&server, query.clone(), "refresh").await;
+    assert_eq!(outcome(&refreshed), "REFRESH");
+    assert_eq!(outcome(&post_search(&server, query.clone()).await), "HIT");
+
+    let bad = post_search_with_mode(&server, query, "nope").await;
+    assert_eq!(bad.status_code(), 400);
+}
+
+#[tokio::test]
+async fn search_use_mode_cannot_enable_a_disabled_cache() {
+    let (server, _db) = test_app_with_pricing(search_pricing()).await;
+    let query = serde_json::json!({ "query": "rust" });
+    for _ in 0..2 {
+        let resp = post_search_with_mode(&server, query.clone(), "use").await;
+        assert_eq!(resp.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    }
+}
+
 // ── Search engine fallback chains (issue #42) ────────────────────────────────
 
 /// Build a test app with a custom search registry and fallback chain config.

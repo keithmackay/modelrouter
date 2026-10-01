@@ -141,6 +141,8 @@ async fn anthropic_messages_inner(
     use std::time::Instant;
 
     crate::api::routes::reject_experiment_header("/v1/messages", &headers)?;
+    let cache_directives = crate::router::cache::CacheDirectives::from_headers(&headers)
+        .map_err(ApiError::InvalidRequest)?;
     let user = user.0;
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
     let requested_model = body["model"]
@@ -235,10 +237,17 @@ async fn anthropic_messages_inner(
     // The chat-completions eligibility rules, over the native request body. A
     // streamed and a plain call share one entry: the stored payload is the
     // `message` object either way.
-    let cache_key = (state.policy.cache_enabled(&user, &canonical_model)
-        && state.response_cache.completion_eligible(&body))
-    .then(|| crate::router::cache::messages_cache_key(&canonical_model, &body));
-    if let Some(ref key) = cache_key {
+    let cache_plan = if state.policy.cache_enabled(&user, &canonical_model) {
+        state
+            .response_cache
+            .completion_plan(cache_directives.mode, &body)
+    } else {
+        crate::router::cache::CachePlan::Skip
+    };
+    let cache_key = cache_plan
+        .store()
+        .then(|| crate::router::cache::messages_cache_key(&canonical_model, &body));
+    if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(message) = state
             .response_cache
             .get_message(key, &canonical_model)
@@ -380,10 +389,10 @@ async fn anthropic_messages_inner(
             .header("X-Accel-Buffering", "no")
             .body(Body::from_stream(byte_stream))
             .unwrap();
-        if cache_key.is_some() {
+        if let Some(outcome) = cache_plan.miss_header() {
             response
                 .headers_mut()
-                .insert(CACHE_HEADER, HeaderValue::from_static("MISS"));
+                .insert(CACHE_HEADER, HeaderValue::from_static(outcome));
         }
 
         return Ok(response);
@@ -569,10 +578,10 @@ async fn anthropic_messages_inner(
     });
 
     let mut response = Json(resp_json).into_response();
-    if cache_key.is_some() {
+    if let Some(outcome) = cache_plan.miss_header() {
         response
             .headers_mut()
-            .insert(CACHE_HEADER, HeaderValue::from_static("MISS"));
+            .insert(CACHE_HEADER, HeaderValue::from_static(outcome));
     }
     Ok(response)
 }

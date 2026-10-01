@@ -9,6 +9,7 @@ commit; `git log v0.1.0..` has the detail.
 
 **Features**
 - Streamed completions are cacheable. A stream that finishes cleanly on `/v1/chat/completions` or `/v1/messages` is stored under the same key as the plain request; a hit on a `stream: true` request is replayed as SSE in the endpoint's wire format (chat chunks plus the usage-and-cost chunk and `[DONE]`, or the Anthropic `message_start` … `message_stop` sequence with final usage). Streamed and plain requests hit each other's entries. Errored, client-aborted and usage-less streams are not stored. `/v1/messages` joins the response cache for the first time, streamed or not, under the chat-completions eligibility rules.
+- `x-modelrouter-cache: use|bypass|refresh` request header on `/v1/chat/completions`, `/v1/messages` and `/v1/search`. `use` caches a request the default rules would skip (e.g. a sampled temperature), `bypass` neither reads nor writes the cache, and `refresh` skips the lookup and stores the fresh answer. The response header reports `HIT`, `MISS`, `BYPASS` or `REFRESH`; an unknown value is a 400. `cache.allow_header_opt_in = false` makes the router ignore `use` and `refresh`. Requests without the header behave as before.
 
 **Fixes**
 - The Anthropic adapter no longer drops an SSE event whose line is split across two network reads; streamed content and usage survive any chunking.

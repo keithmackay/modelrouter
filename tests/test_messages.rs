@@ -1114,3 +1114,66 @@ async fn messages_sampled_requests_bypass_the_cache() {
     }
     assert_eq!(mock.requests().len(), 2);
 }
+
+async fn post_messages_with_mode(
+    server: &TestServer,
+    body: &serde_json::Value,
+    mode: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache"),
+            axum::http::HeaderValue::from_static(mode),
+        )
+        .json(body)
+        .await
+}
+
+#[tokio::test]
+async fn messages_use_mode_caches_a_sampled_request() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    let mut body = deterministic(false);
+    body.as_object_mut().unwrap().remove("temperature");
+
+    let first = post_messages_with_mode(&server, &body, "use").await;
+    assert_eq!(first.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let second = post_messages_with_mode(&server, &body, "use").await;
+    assert_eq!(second.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn messages_bypass_and_refresh_modes() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    let body = deterministic(false);
+
+    let bypassed = post_messages_with_mode(&server, &body, "bypass").await;
+    assert_eq!(
+        bypassed.headers().get("x-modelrouter-cache").unwrap(),
+        "BYPASS"
+    );
+    let refreshed = post_messages_with_mode(&server, &body, "refresh").await;
+    assert_eq!(
+        refreshed.headers().get("x-modelrouter-cache").unwrap(),
+        "REFRESH"
+    );
+    assert_eq!(mock.requests().len(), 2, "neither mode looks up");
+
+    let hit = post_messages(&server, &body).await;
+    assert_eq!(
+        hit.headers().get("x-modelrouter-cache").unwrap(),
+        "HIT",
+        "refresh stored"
+    );
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn messages_unknown_cache_mode_is_a_400() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    let resp = post_messages_with_mode(&server, &deterministic(false), "always").await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(mock.requests().is_empty());
+}

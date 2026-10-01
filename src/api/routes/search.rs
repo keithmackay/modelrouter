@@ -286,6 +286,8 @@ async fn search_inner(
     tracing::Span::current().record("user_id", user.id);
 
     let attribution = crate::api::attribution::Attribution::extract(&body, &headers)?;
+    let cache_directives = crate::router::cache::CacheDirectives::from_headers(&headers)
+        .map_err(ApiError::InvalidRequest)?;
 
     let query = body["query"].as_str().unwrap_or("").to_string();
     if query.trim().is_empty() {
@@ -340,19 +342,16 @@ async fn search_inner(
     // ── Response cache ───────────────────────────────────────────────────────
     // Search queries are deterministic enough to cache by default; the key is
     // engine + query + options, and the TTL is shorter than for completions.
-    let cache_key = if state.policy.cache_enabled(&user, &requested_pseudo_model)
-        && state.response_cache.search_eligible()
-    {
-        Some(crate::router::cache::search_cache_key(
-            &engine,
-            &query,
-            max_results,
-        ))
+    let cache_plan = if state.policy.cache_enabled(&user, &requested_pseudo_model) {
+        state.response_cache.search_plan(cache_directives.mode)
     } else {
-        None
+        crate::router::cache::CachePlan::Skip
     };
+    let cache_key = cache_plan
+        .store()
+        .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results));
 
-    if let Some(ref key) = cache_key {
+    if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(payload) = state.response_cache.get_search(key, &requested_pseudo_model).await {
             // Cache hit: the cached payload already names the serving engine.
             let cached_engine = payload["engine"].as_str().unwrap_or(&engine).to_string();
@@ -570,7 +569,7 @@ async fn search_inner(
     let mut response = Json(payload).into_response();
     response.headers_mut().insert(
         crate::api::routes::completions::CACHE_HEADER,
-        axum::http::HeaderValue::from_static("MISS"),
+        axum::http::HeaderValue::from_static(cache_plan.miss_header().unwrap_or("MISS")),
     );
     Ok(response)
 }

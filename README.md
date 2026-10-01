@@ -979,11 +979,30 @@ which defaults to `0.0`. A request that omits `temperature` is scored using
 (15 minutes vs. 1 hour). Raise `max_temperature` deliberately if you want
 creative sampling replayed.
 
+**Per-request control.** A caller can steer the cache for one request with the
+`x-modelrouter-cache` request header, on `/v1/chat/completions`,
+`/v1/messages` and `/v1/search`:
+
+| Value | Effect | Response header |
+|---|---|---|
+| (absent) | The eligibility rules above decide | `HIT` / `MISS` |
+| `use` | Look up and store even when the request is not eligible by default, e.g. a sampled `temperature` | `HIT` / `MISS` |
+| `bypass` | Neither look up nor store | `BYPASS` |
+| `refresh` | Skip the lookup, call the provider, store the fresh answer over the old entry | `REFRESH` |
+
+Values are case-insensitive; anything else is a 400. The header never switches
+on a cache or class the operator has disabled, and it never overrides a
+per-group `cache_enabled = false` or an experiment binding. `use` and `refresh`
+widen what is cached, so an operator can refuse them with
+`cache.allow_header_opt_in = false`; the router then treats them as absent.
+`bypass` only narrows and is always honoured. `use` suits clients that rerun
+identical workloads with sampling on and want the first answer replayed.
+
 **Metering.** A cache hit is recorded as a usage row with `cache_hit = true`,
 `cost_usd = 0`, and the avoided provider cost in `saved_usd`. Hits therefore
 never inflate spend, and cache-hit percentage is reported alongside cost.
-Responses carry an `x-modelrouter-cache: HIT|MISS` header, streamed replays
-included, and the `response cache hit` log line records `streamed=true|false`.
+Responses carry an `x-modelrouter-cache: HIT|MISS|BYPASS|REFRESH` header,
+streamed replays included, and the `response cache hit` log line records `streamed=true|false`.
 
 **Backends.** `memory` (moka, bounded by `cache.max_entries`, per-process — each
 replica warms its own copy) or `redis` (shared across stateless replicas, keys
