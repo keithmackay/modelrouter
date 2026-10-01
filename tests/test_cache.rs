@@ -281,9 +281,15 @@ fn omitted_temperature_is_not_cached_by_default() {
 }
 
 #[test]
-fn streaming_is_never_cached() {
+fn streaming_is_eligible_and_shares_the_plain_key() {
     let cache = enabled_cache(10, 60);
-    assert!(!cache.completion_eligible(&json!({"temperature": 0.0, "stream": true})));
+    let streamed = json!({"temperature": 0.0, "stream": true, "messages": []});
+    let plain = json!({"temperature": 0.0, "messages": []});
+    assert!(cache.completion_eligible(&streamed));
+    assert_eq!(
+        completion_cache_key("gpt-4o", &streamed),
+        completion_cache_key("gpt-4o", &plain)
+    );
 }
 
 #[test]
@@ -349,6 +355,16 @@ use modelrouter::router::{
 use std::collections::HashMap;
 
 async fn test_app_with_cache() -> (TestServer, Arc<dyn DatabaseProvider>) {
+    let (server, db, _cache) = test_app_with_adapter(common::MockAdapter {
+        response: "cached response".to_string(),
+    })
+    .await;
+    (server, db)
+}
+
+async fn test_app_with_adapter<A: modelrouter::providers::adapter::ProviderAdapter + 'static>(
+    adapter: A,
+) -> (TestServer, Arc<dyn DatabaseProvider>, Arc<ResponseCache>) {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
@@ -387,13 +403,11 @@ async fn test_app_with_cache() -> (TestServer, Arc<dyn DatabaseProvider>) {
         pool: None,
         router: Arc::new(RequestRouter::new(settings.clone())),
         cost_calc: Arc::new(CostCalculator::new()),
-        provider_registry: Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
-            response: "cached response".to_string(),
-        })),
+        provider_registry: Arc::new(ProviderRegistry::new_with_mock(adapter)),
         policy: Arc::new(PolicyEngine::new(db.clone())),
         fallback: Arc::new(FallbackChain::new(HashMap::new())),
         complexity_router: Arc::new(ComplexityRouter::new(None)),
-        response_cache,
+        response_cache: response_cache.clone(),
         embedding_registry: Arc::new(
             modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
                 common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
@@ -419,7 +433,11 @@ async fn test_app_with_cache() -> (TestServer, Arc<dyn DatabaseProvider>) {
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
-    (TestServer::new(build_router(state)).unwrap(), db)
+    (
+        TestServer::new(build_router(state)).unwrap(),
+        db,
+        response_cache,
+    )
 }
 
 async fn post_completion(server: &TestServer, body: &serde_json::Value) -> axum_test::TestResponse {
@@ -555,8 +573,189 @@ async fn cache_hit_is_metered_with_zero_cost() {
     assert!(meta["timing"]["provider_ms"].is_null());
 }
 
+/// Streams like a real adapter: usage in a final `choices: []` chunk, and
+/// chunk boundaries that fall mid-line. Counts provider calls.
+#[derive(Clone, Default)]
+struct StreamingAdapter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Break the stream with an error after the first chunk.
+    fail_mid_stream: bool,
+}
+
+impl StreamingAdapter {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::adapter::ProviderAdapter for StreamingAdapter {
+    async fn complete(
+        &self,
+        _req: &modelrouter::providers::adapter::NormalizedRequest,
+    ) -> anyhow::Result<CompletionResult> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(CompletionResult {
+            content: "Hello world".to_string(),
+            prompt_tokens: 40,
+            completion_tokens: 2,
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn stream(
+        &self,
+        _req: &modelrouter::providers::adapter::NormalizedRequest,
+    ) -> anyhow::Result<modelrouter::providers::adapter::SseStream> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sse = [
+            json!({"id": "c1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hello"}, "finish_reason": null}]}),
+            json!({"id": "c1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": " world"}, "finish_reason": "stop"}]}),
+            json!({"id": "c1", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42}}),
+        ]
+        .iter()
+        .map(|c| format!("data: {c}\n\n"))
+        .collect::<String>()
+            + "data: [DONE]\n\n";
+        let (head, tail) = sse.split_at(sse.len() / 2);
+        let mut chunks: Vec<anyhow::Result<bytes::Bytes>> =
+            vec![Ok(bytes::Bytes::from(head.to_string()))];
+        if self.fail_mid_stream {
+            chunks.push(Err(anyhow::anyhow!("upstream reset")));
+        }
+        chunks.push(Ok(bytes::Bytes::from(tail.to_string())));
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
+async fn wait_for_stores(cache: &ResponseCache, want: u64) {
+    for _ in 0..200 {
+        if cache.stats().await.stores >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {want} cache stores");
+}
+
+/// The `data:` payloads of an SSE body; `[DONE]` as a JSON string.
+fn sse_data(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap_or_else(|_| json!(d)))
+        .collect()
+}
+
+fn ask(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "say hello"}],
+        "temperature": 0.0,
+        "stream": stream
+    })
+}
+
 #[tokio::test]
-async fn streaming_requests_are_not_cached() {
+async fn completed_stream_is_stored_and_replayed_as_sse() {
+    let adapter = StreamingAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+
+    let live = post_completion(&server, &ask(true)).await;
+    assert_eq!(live.status_code(), 200);
+    assert_eq!(live.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    wait_for_stores(&cache, 1).await;
+
+    let replay = post_completion(&server, &ask(true)).await;
+    assert_eq!(replay.status_code(), 200);
+    assert_eq!(replay.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(
+        replay.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(adapter.calls(), 1, "the replay never reaches the provider");
+
+    let events = sse_data(&replay.text());
+    assert_eq!(events.last().unwrap(), "[DONE]");
+    let text: String = events
+        .iter()
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(text, "Hello world");
+    assert!(events
+        .iter()
+        .any(|e| e["choices"][0]["finish_reason"] == "stop"));
+    let usage = &events[events.len() - 2]["usage"];
+    assert_eq!(
+        (
+            usage["prompt_tokens"].as_u64(),
+            usage["completion_tokens"].as_u64()
+        ),
+        (Some(40), Some(2))
+    );
+    assert_eq!(usage["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(usage["cache_hit"], true);
+}
+
+#[tokio::test]
+async fn streamed_entry_serves_a_plain_request_and_the_reverse() {
+    let adapter = StreamingAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+
+    assert_eq!(
+        post_completion(&server, &ask(true)).await.status_code(),
+        200
+    );
+    wait_for_stores(&cache, 1).await;
+    let plain = post_completion(&server, &ask(false)).await;
+    assert_eq!(plain.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    let body: serde_json::Value = plain.json();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+    assert_eq!(body["usage"]["prompt_tokens"], 40);
+
+    let other = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "other"}], "temperature": 0.0});
+    assert_eq!(
+        post_completion(&server, &other)
+            .await
+            .headers()
+            .get("x-modelrouter-cache")
+            .unwrap(),
+        "MISS"
+    );
+    let mut other_stream = other.clone();
+    other_stream["stream"] = json!(true);
+    let replay = post_completion(&server, &other_stream).await;
+    assert_eq!(replay.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    let text: String = sse_data(&replay.text())
+        .iter()
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(text, "Hello world");
+    assert_eq!(adapter.calls(), 2);
+}
+
+#[tokio::test]
+async fn errored_stream_is_not_stored() {
+    let adapter = StreamingAdapter {
+        fail_mid_stream: true,
+        ..Default::default()
+    };
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+    // axum-test panics on a body that errors mid-stream, which is the point.
+    use futures::FutureExt;
+    let broken = std::panic::AssertUnwindSafe(post_completion(&server, &ask(true)))
+        .catch_unwind()
+        .await;
+    assert!(broken.is_err(), "the client sees the stream break");
+    let _ = post_completion(&server, &ask(false)).await;
+    assert_eq!(adapter.calls(), 2, "the broken stream left nothing to hit");
+    assert_eq!(cache.stats().await.stores, 1, "only the plain call stored");
+}
+
+#[tokio::test]
+async fn stream_without_usage_is_not_stored() {
+    // `common::MockAdapter` streams no usage chunk; a hit replaying it would
+    // have no real token counts to report.
     let (server, _db) = test_app_with_cache().await;
     let messages = json!([{"role": "user", "content": "stream me"}]);
 
@@ -575,9 +774,22 @@ async fn streaming_requests_are_not_cached() {
     assert_eq!(non_stream.status_code(), 200);
     assert_eq!(
         non_stream.headers().get("x-modelrouter-cache").unwrap(),
-        "MISS",
-        "a streamed response must not populate the cache"
+        "MISS"
     );
-    let body: serde_json::Value = non_stream.json();
-    assert!(body["choices"][0]["message"]["content"].is_string());
+}
+
+#[tokio::test]
+async fn stream_replay_is_metered_as_a_cache_hit() {
+    let adapter = StreamingAdapter::default();
+    let (server, db, cache) = test_app_with_adapter(adapter).await;
+    post_completion(&server, &ask(true)).await;
+    wait_for_stores(&cache, 1).await;
+    post_completion(&server, &ask(true)).await;
+
+    let rows = common::wait_for_ledger_rows(&*db, 2).await;
+    let hit = rows.iter().find(|r| r.cache_hit).expect("a cache-hit row");
+    assert_eq!(hit.cost_usd, 0.0);
+    assert!(hit.saved_usd > 0.0);
+    assert_eq!((hit.tokens_in, hit.tokens_out), (40, 2));
+    assert_eq!(cache.stats().await.hits, 1);
 }

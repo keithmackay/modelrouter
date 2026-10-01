@@ -2,9 +2,13 @@ use axum::{extract::State, response::{IntoResponse, Response}, Json};
 use serde_json::Value;
 use tracing::Instrument;
 
+use axum::http::HeaderValue;
+
 use crate::{
+    api::routes::completions::{record_cache_hit, CacheHitCtx, CACHE_HEADER},
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     db::models::{NewCostLedgerEntry, NewPrompt},
+    router::cache::stream::{message_as_completion, messages_replay_sse},
     router::policy::PolicyDecision,
 };
 
@@ -227,6 +231,33 @@ async fn anthropic_messages_inner(
     span.record("model", model.as_str());
     span.record("streaming", stream);
 
+    // ── Response cache ───────────────────────────────────────────────────────
+    // The chat-completions eligibility rules, over the native request body. A
+    // streamed and a plain call share one entry: the stored payload is the
+    // `message` object either way.
+    let cache_key = (state.policy.cache_enabled(&user, &canonical_model)
+        && state.response_cache.completion_eligible(&body))
+    .then(|| crate::router::cache::messages_cache_key(&canonical_model, &body));
+    if let Some(ref key) = cache_key {
+        if let Some(message) = state
+            .response_cache
+            .get_message(key, &canonical_model)
+            .await
+        {
+            return Ok(serve_cached_message(
+                &state,
+                key,
+                message,
+                stream,
+                &user,
+                &attribution,
+                &model,
+                &canonical_model,
+                &body,
+            ));
+        }
+    }
+
     // Fix 2: Always use the "anthropic" provider config for the Messages API
     let anthropic_config = state.settings.providers.get("anthropic")
         .ok_or_else(|| ApiError::ProviderError(anyhow::anyhow!("No 'anthropic' provider configured")))?
@@ -290,11 +321,33 @@ async fn anthropic_messages_inner(
 
         use axum::body::Body;
         use axum::http::{header, StatusCode};
-        use futures::TryStreamExt;
+        use futures::StreamExt;
 
-        let byte_stream = upstream_resp
-            .bytes_stream()
-            .map_err(|e| std::io::Error::other(e.to_string()));
+        let mut capture = cache_key.clone().map(|key| {
+            (
+                key,
+                crate::router::cache::stream::MessagesStreamCapture::new(),
+            )
+        });
+        let cache_state = state.clone();
+        let cache_model = canonical_model.clone();
+        let byte_stream = upstream_resp.bytes_stream().map(move |chunk| {
+            match &chunk {
+                Ok(bytes) => {
+                    if let Some((_, cap)) = capture.as_mut() {
+                        cap.feed(bytes);
+                        if cap.is_done() {
+                            if let Some((key, cap)) = capture.take() {
+                                store_streamed_message(&cache_state, key, &cache_model, cap);
+                            }
+                        }
+                    }
+                }
+                // A broken stream is never stored.
+                Err(_) => capture = None,
+            }
+            chunk.map_err(|e| std::io::Error::other(e.to_string()))
+        });
 
         // Fix 3: Fire-and-forget approximate cost for streaming
         let state_c = state.clone();
@@ -320,13 +373,18 @@ async fn anthropic_messages_inner(
                                attribution_s).await;
         });
 
-        let response = Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .header("X-Accel-Buffering", "no")
             .body(Body::from_stream(byte_stream))
             .unwrap();
+        if cache_key.is_some() {
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("MISS"));
+        }
 
         return Ok(response);
     }
@@ -396,6 +454,13 @@ async fn anthropic_messages_inner(
         cache_read_tokens,
         cache_write_tokens,
     );
+
+    if let Some(ref key) = cache_key {
+        state
+            .response_cache
+            .put_message(key, &canonical_model, resp_json.clone(), cost)
+            .await;
+    }
 
     // Fix 1 & Fix 4: Capture user_name before spawn; use model_clone consistently (no model_c)
     let state_clone = state.clone();
@@ -503,5 +568,106 @@ async fn anthropic_messages_inner(
         }
     });
 
-    Ok(Json(resp_json).into_response())
+    let mut response = Json(resp_json).into_response();
+    if cache_key.is_some() {
+        response
+            .headers_mut()
+            .insert(CACHE_HEADER, HeaderValue::from_static("MISS"));
+    }
+    Ok(response)
+}
+
+/// Store a stream's assembled `message`, priced from its own usage, once the
+/// capture confirms the stream ended cleanly.
+fn store_streamed_message(
+    state: &AppState,
+    key: String,
+    canonical_model: &str,
+    capture: crate::router::cache::stream::MessagesStreamCapture,
+) {
+    let Some(message) = capture.finish() else {
+        return;
+    };
+    let usage = message_as_completion(&message);
+    let cost = state.cost_calc.calculate_with_cache(
+        canonical_model,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+    );
+    let state = state.clone();
+    let model = canonical_model.to_string();
+    tokio::spawn(async move {
+        state
+            .response_cache
+            .put_message(&key, &model, message, cost)
+            .await;
+    });
+}
+
+/// Answer from a cached `message`: the JSON as-is, or replayed as the Messages
+/// event stream when the request asked to stream. The hit is metered like a
+/// chat-completions hit (zero spend, the avoided cost as savings).
+#[allow(clippy::too_many_arguments)]
+fn serve_cached_message(
+    state: &AppState,
+    key: &str,
+    mut message: Value,
+    stream: bool,
+    user: &crate::db::models::User,
+    attribution: &crate::api::attribution::Attribution,
+    request_model: &str,
+    canonical_model: &str,
+    body: &Value,
+) -> Response {
+    tracing::info!(
+        cache_key = key,
+        model = canonical_model,
+        streamed = stream,
+        "response cache hit"
+    );
+    let usage = message_as_completion(&message);
+    let avoided_cost = state.cost_calc.calculate_with_cache(
+        canonical_model,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+    );
+    record_cache_hit(
+        state,
+        CacheHitCtx {
+            user_id: user.id,
+            api_key_id: user.api_key_id,
+            user_project: attribution.project_or(user.api_key_project.clone()),
+            request_model: request_model.to_string(),
+            canonical_model: canonical_model.to_string(),
+            provider: "anthropic".to_string(),
+            messages_json: serde_json::to_string(
+                &body["messages"].as_array().cloned().unwrap_or_default(),
+            )
+            .unwrap_or_default(),
+            avoided_cost,
+            skip_log: false,
+            attribution: attribution.clone(),
+        },
+        &usage,
+    );
+    // Each response gets its own id, as a live call would.
+    message["id"] = Value::String(format!("msg_mr_{}", uuid::Uuid::new_v4().simple()));
+    let mut response = if stream {
+        Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
+            .body(axum::body::Body::from(messages_replay_sse(&message)))
+            .unwrap()
+    } else {
+        Json(message).into_response()
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_HEADER, HeaderValue::from_static("HIT"));
+    response
 }

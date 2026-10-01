@@ -100,6 +100,9 @@ struct MessagesAppOpts {
     /// Turn off prompt logging, so the storage policy skips the insert
     /// entirely rather than attempting and failing it.
     disable_prompt_storage: bool,
+    /// Response cache to wire in (the test keeps a handle to observe stores);
+    /// a disabled cache when unset.
+    response_cache: Option<Arc<modelrouter::router::cache::ResponseCache>>,
 }
 
 async fn build_mock_app(
@@ -153,9 +156,11 @@ async fn build_mock_app(
         policy: Arc::new(PolicyEngine::new(db.clone())),
         fallback: Arc::new(FallbackChain::new(HashMap::new())),
         complexity_router: Arc::new(modelrouter::router::complexity::ComplexityRouter::new(None)),
-        response_cache: Arc::new(modelrouter::router::cache::ResponseCache::new(
-            &modelrouter::config::schema::CacheConfig::default(),
-        )),
+        response_cache: opts.response_cache.unwrap_or_else(|| {
+            Arc::new(modelrouter::router::cache::ResponseCache::new(
+                &modelrouter::config::schema::CacheConfig::default(),
+            ))
+        }),
         embedding_registry: Arc::new(
             modelrouter::providers::embed_registry::EmbeddingRegistry::new_with_mock(
                 common::MockEmbeddingAdapter { embedding: vec![0.1_f32, 0.2] },
@@ -880,4 +885,232 @@ async fn messages_translate_image_url_parts_on_both_calls() {
         assert_eq!(blocks[3]["source"]["type"], "url");
         assert_eq!(blocks[3]["source"]["url"], "https://example.com/x.png");
     }
+}
+
+// ── Response cache ────────────────────────────────────────────────────────────
+
+fn enabled_cache() -> Arc<modelrouter::router::cache::ResponseCache> {
+    Arc::new(modelrouter::router::cache::ResponseCache::new(
+        &modelrouter::config::schema::CacheConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    ))
+}
+
+async fn cached_app() -> (
+    TestServer,
+    Arc<dyn DatabaseProvider>,
+    common::mock_anthropic::MockAnthropicServer,
+    Arc<modelrouter::router::cache::ResponseCache>,
+) {
+    let cache = enabled_cache();
+    let (server, db, mock) = build_mock_app(MessagesAppOpts {
+        response_cache: Some(cache.clone()),
+        ..Default::default()
+    })
+    .await;
+    (server, db, mock, cache)
+}
+
+/// The store after a stream runs on its own task once the stream ends.
+async fn wait_for_cache_stores(cache: &modelrouter::router::cache::ResponseCache, want: u64) {
+    for _ in 0..200 {
+        if cache.stats().await.stores >= want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {want} cache stores");
+}
+
+/// A complete Anthropic event stream: text plus a tool call split over
+/// several `input_json_delta` events.
+fn full_anthropic_stream() -> String {
+    let events = [
+        serde_json::json!({"type": "message_start", "message": {"id": "msg_up", "type": "message", "role": "assistant",
+            "model": "claude-opus-4-5", "content": [], "stop_reason": null, "stop_sequence": null,
+            "usage": {"input_tokens": 30, "output_tokens": 1}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Checking "}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "now."}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}}),
+        serde_json::json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"q\":"}}),
+        serde_json::json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"x\"}"}}),
+        serde_json::json!({"type": "content_block_stop", "index": 1}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 12}}),
+        serde_json::json!({"type": "message_stop"}),
+    ];
+    events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect()
+}
+
+/// The `data:` payloads of an SSE body, in order.
+fn sse_events(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect()
+}
+
+fn deterministic(stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-opus-4-5",
+        "max_tokens": 256,
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": "Look up x"}],
+        "stream": stream
+    })
+}
+
+async fn post_messages(server: &TestServer, body: &serde_json::Value) -> axum_test::TestResponse {
+    server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .json(body)
+        .await
+}
+
+#[tokio::test]
+async fn messages_repeat_call_is_served_from_cache_and_metered() {
+    let (server, db, mock, _cache) = cached_app().await;
+
+    let first = post_messages(&server, &deterministic(false)).await;
+    assert_eq!(first.status_code(), 200);
+    assert_eq!(first.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let second = post_messages(&server, &deterministic(false)).await;
+    assert_eq!(second.status_code(), 200);
+    assert_eq!(second.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(mock.requests().len(), 1, "the hit never reaches upstream");
+
+    let (a, b): (serde_json::Value, serde_json::Value) = (first.json(), second.json());
+    assert_eq!(a["content"], b["content"]);
+    assert_eq!(a["usage"], b["usage"]);
+    assert_ne!(a["id"], b["id"], "each response carries its own id");
+
+    let rows = common::wait_for_ledger_rows(&*db, 2).await;
+    let hit = rows
+        .iter()
+        .find(|r| r.cache_hit)
+        .expect("a cache-hit ledger row");
+    assert_eq!(hit.cost_usd, 0.0);
+    assert!(hit.saved_usd > 0.0);
+    assert_eq!((hit.tokens_in, hit.tokens_out), (10, 5));
+}
+
+#[tokio::test]
+async fn messages_stream_is_stored_and_replays_in_both_shapes() {
+    let (server, _db, mock, cache) = cached_app().await;
+    mock.set_streaming_response(axum::http::StatusCode::OK, full_anthropic_stream());
+
+    let live = post_messages(&server, &deterministic(true)).await;
+    assert_eq!(live.status_code(), 200);
+    assert_eq!(live.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    wait_for_cache_stores(&cache, 1).await;
+
+    let replay = post_messages(&server, &deterministic(true)).await;
+    assert_eq!(replay.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(
+        replay.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let events = sse_events(&replay.text());
+    let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds.first(), Some(&"message_start"));
+    assert_eq!(&kinds[kinds.len() - 2..], ["message_delta", "message_stop"]);
+    let text: String = events
+        .iter()
+        .filter_map(|e| e["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "Checking now.");
+    let tool_json: String = events
+        .iter()
+        .filter_map(|e| e["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&tool_json).unwrap(),
+        serde_json::json!({"q": "x"})
+    );
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .unwrap();
+    assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    assert_eq!(delta["usage"]["output_tokens"], 12);
+    assert_eq!(delta["usage"]["input_tokens"], 30);
+
+    let plain = post_messages(&server, &deterministic(false)).await;
+    assert_eq!(plain.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    let message: serde_json::Value = plain.json();
+    assert_eq!(message["stop_reason"], "tool_use");
+    assert_eq!(
+        message["content"][0],
+        serde_json::json!({"type": "text", "text": "Checking now."})
+    );
+    assert_eq!(
+        message["content"][1],
+        serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}})
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "one upstream call served all three"
+    );
+}
+
+#[tokio::test]
+async fn messages_plain_entry_replays_as_a_stream() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    assert_eq!(
+        post_messages(&server, &deterministic(false))
+            .await
+            .status_code(),
+        200
+    );
+
+    let replay = post_messages(&server, &deterministic(true)).await;
+    assert_eq!(replay.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    let events = sse_events(&replay.text());
+    let text: String = events
+        .iter()
+        .filter_map(|e| e["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "Hello from mock");
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn messages_incomplete_stream_is_not_stored() {
+    let (server, _db, mock, cache) = cached_app().await;
+    let truncated = full_anthropic_stream().replace(
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "",
+    );
+    mock.set_streaming_response(axum::http::StatusCode::OK, truncated);
+
+    for _ in 0..2 {
+        let resp = post_messages(&server, &deterministic(true)).await;
+        assert_eq!(resp.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    }
+    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(cache.stats().await.stores, 0);
+}
+
+#[tokio::test]
+async fn messages_sampled_requests_bypass_the_cache() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    let mut body = deterministic(false);
+    body.as_object_mut().unwrap().remove("temperature");
+    for _ in 0..2 {
+        let resp = post_messages(&server, &body).await;
+        assert!(
+            resp.headers().get("x-modelrouter-cache").is_none(),
+            "not consulted"
+        );
+    }
+    assert_eq!(mock.requests().len(), 2);
 }

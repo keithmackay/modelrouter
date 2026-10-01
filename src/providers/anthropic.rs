@@ -483,6 +483,28 @@ fn build_body(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
     body
 }
 
+
+/// Translate an Anthropic event-stream body into OpenAI-compatible chunks.
+fn translate_sse_stream(
+    body: impl futures::Stream<Item = anyhow::Result<Bytes>> + Send + 'static,
+) -> SseStream {
+    // One translator per stream: usage arrives split across events
+    // (`message_start` carries input tokens, `message_delta` output
+    // tokens), so the final OpenAI chunk needs state from earlier lines.
+    let mut translator = AnthropicSseTranslator::new();
+    // An event split across body chunks must be translated whole, not
+    // dropped half by half; see `SseLineBuffer`.
+    let mut lines = crate::providers::sse_lines::SseLineBuffer::new();
+    Box::pin(body.map_ok(move |chunk| {
+        let mut out = String::new();
+        for line in lines.push(&chunk) {
+            if let Some(translated) = translator.translate_line(&line) {
+                out.push_str(&String::from_utf8_lossy(&translated));
+            }
+        }
+        Bytes::from(out)
+    }))
+}
 #[async_trait::async_trait]
 impl ProviderAdapter for AnthropicAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
@@ -556,26 +578,10 @@ impl ProviderAdapter for AnthropicAdapter {
             anyhow::bail!("Anthropic returned {}: {}", status, text);
         }
 
-        // One translator per stream: usage arrives split across events
-        // (`message_start` carries input tokens, `message_delta` output
-        // tokens), so the final OpenAI chunk needs state from earlier lines.
-        let mut translator = AnthropicSseTranslator::new();
-        let stream = resp
-            .bytes_stream()
-            .map_err(|e| anyhow::anyhow!("Stream error: {}", e))
-            .map_ok(move |chunk| {
-                // Translate Anthropic SSE lines to OpenAI-compatible format
-                let text = String::from_utf8_lossy(&chunk);
-                let mut out = String::new();
-                for line in text.lines() {
-                    if let Some(translated) = translator.translate_line(line) {
-                        out.push_str(&String::from_utf8_lossy(&translated));
-                    }
-                }
-                Bytes::from(out)
-            });
-
-        Ok(Box::pin(stream))
+        Ok(translate_sse_stream(
+            resp.bytes_stream()
+                .map_err(|e| anyhow::anyhow!("Stream error: {}", e)),
+        ))
     }
 
     /// Claude models take tools natively; the adapter translates the OpenAI
@@ -1424,6 +1430,48 @@ mod sse_translator_tests {
             .collect();
         assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "Hello");
         assert!(chunks[1].get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn events_split_across_body_chunks_translate_whole() {
+        use futures::StreamExt;
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Grüße\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+        )
+        .as_bytes();
+        // Seven-byte reads split every event, and the `ü` mid-character.
+        let chunks: Vec<anyhow::Result<bytes::Bytes>> = body
+            .chunks(7)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let out: String = super::translate_sse_stream(futures::stream::iter(chunks))
+            .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
+            .collect()
+            .await;
+        let data: Vec<serde_json::Value> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect();
+        assert_eq!(data[0]["choices"][0]["delta"]["content"], "Grüße");
+        let usage = data
+            .iter()
+            .find_map(|c| c.get("usage"))
+            .expect("usage survives chunking");
+        assert_eq!(
+            (
+                usage["prompt_tokens"].as_u64(),
+                usage["completion_tokens"].as_u64()
+            ),
+            (Some(7), Some(3))
+        );
+        assert!(out.ends_with("data: [DONE]\n\n"));
     }
 }
 

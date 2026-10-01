@@ -500,6 +500,11 @@ fail_open    = true
 #
 # Exact-match only — no semantic/fuzzy matching.
 #
+# Covers /v1/chat/completions, /v1/messages and /v1/search. Streamed and plain
+# requests share entries: a stream that finishes cleanly is stored, and a hit
+# on a stream: true request is replayed as SSE in the endpoint's own format.
+# Errored or client-aborted streams are never stored.
+#
 # [cache]
 # enabled = false
 #
