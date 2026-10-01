@@ -1093,8 +1093,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 format!("{:.2}", r.total_cost_usd),
                                 format!("{:.2}", r.saved_usd),
                                 r.request_count.to_string(),
-                                r.total_tokens_out.to_string(),
                                 r.total_tokens_in.to_string(),
+                                r.total_tokens_out.to_string(),
                             ]
                         },
                         format,
@@ -1216,8 +1216,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 "User",
                                 "Project",
                                 "Model",
-                                "Tokens Out (Completions)",
                                 "Tokens In (Prompts)",
+                                "Tokens Out (Completions)",
                                 "Cost USD",
                                 "Uncached USD"
                             );
