@@ -19,7 +19,9 @@ use std::sync::Arc;
 /// (nothing configured — capabilities must read "skipped").
 async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
     let db = common::in_memory_db().await;
-    let settings = Arc::new(Settings::default());
+    let mut settings = Settings::default();
+    settings.health.embedding_probe_model = "openai/text-embedding-3-small".to_string();
+    let settings = Arc::new(settings);
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
 
     let provider_registry = if with_mocks {
@@ -98,6 +100,7 @@ async fn test_app_with(settings: Settings, search_registry: SearchRegistry) -> T
         settings,
         search_registry,
         ProviderRegistry::new(HashMap::new()),
+        EmbeddingRegistry::new(HashMap::new()),
     )
     .await
 }
@@ -107,6 +110,7 @@ async fn test_app_with_registries(
     settings: Settings,
     search_registry: SearchRegistry,
     provider_registry: ProviderRegistry,
+    embedding_registry: EmbeddingRegistry,
 ) -> TestServer {
     let db = common::in_memory_db().await;
     let settings = Arc::new(settings);
@@ -124,7 +128,7 @@ async fn test_app_with_registries(
         fallback: Arc::new(FallbackChain::new(HashMap::new())),
         complexity_router: Arc::new(ComplexityRouter::new(None)),
         response_cache: Arc::new(ResponseCache::new(&CacheConfig::default())),
-        embedding_registry: Arc::new(EmbeddingRegistry::new(HashMap::new())),
+        embedding_registry: Arc::new(embedding_registry),
         search_registry,
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
             HashMap::new(),
@@ -378,9 +382,13 @@ async fn deep_health_lists_every_configured_credential() {
         },
     );
     let registry = ProviderRegistry::new(settings.providers.clone());
-    let server =
-        test_app_with_registries(settings, mock_search_registry_health(&["tavily"]), registry)
-            .await;
+    let server = test_app_with_registries(
+        settings,
+        mock_search_registry_health(&["tavily"]),
+        registry,
+        EmbeddingRegistry::new(HashMap::new()),
+    )
+    .await;
 
     let body: serde_json::Value = server.get("/health/deep").await.json();
     let rows = body["credentials"].as_array().expect("credentials list");
@@ -404,4 +412,86 @@ async fn deep_health_credentials_is_empty_without_managed_credentials() {
     let server = test_app(CacheConfig::default(), true).await;
     let body: serde_json::Value = server.get("/health/deep").await.json();
     assert_eq!(body["credentials"], serde_json::json!([]), "{body:#}");
+}
+
+struct RecordingEmbeddingAdapter(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl modelrouter::providers::embedding::EmbeddingAdapter for RecordingEmbeddingAdapter {
+    async fn embed(
+        &self,
+        request: &modelrouter::providers::embedding::EmbeddingRequest,
+    ) -> anyhow::Result<modelrouter::providers::embedding::EmbeddingResult> {
+        self.0.lock().unwrap().push(request.model.clone());
+        Ok(modelrouter::providers::embedding::EmbeddingResult {
+            embeddings: vec![vec![0.1, 0.2]],
+            prompt_tokens: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn embedding_probe_never_substitutes_the_default_chat_model() {
+    let mut settings = Settings::default();
+    settings.routing.default_model = "openai/chat-model".to_string();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let embeddings = EmbeddingRegistry::new(HashMap::new());
+    embeddings.register("openai", RecordingEmbeddingAdapter(calls.clone()));
+    let server = test_app_with_registries(
+        settings,
+        SearchRegistry::new(HashMap::new()),
+        ProviderRegistry::new(HashMap::new()),
+        embeddings,
+    )
+    .await;
+
+    let body: serde_json::Value = server.get("/health/deep").await.json();
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "unresolved probe must not call the chat model"
+    );
+    let embedding = &body["capabilities"]["embedding"];
+    assert_eq!(embedding["status"], "failed", "{embedding}");
+    assert_eq!(embedding["target"], "text-embedding-3-small");
+    assert!(embedding["error"]
+        .as_str()
+        .unwrap()
+        .contains("embedding_probe_model"));
+}
+
+#[tokio::test]
+async fn embedding_probe_uses_explicit_models_and_aliases() {
+    for requested in ["openai/embedding-model", "embed"] {
+        let mut settings = Settings::default();
+        settings.health.embedding_probe_model = requested.to_string();
+        settings
+            .routing
+            .model_aliases
+            .insert("embed".to_string(), "openai/embedding-model".to_string());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embeddings = EmbeddingRegistry::new(HashMap::new());
+        embeddings.register("openai", RecordingEmbeddingAdapter(calls.clone()));
+        let server = test_app_with_registries(
+            settings,
+            SearchRegistry::new(HashMap::new()),
+            ProviderRegistry::new(HashMap::new()),
+            embeddings,
+        )
+        .await;
+
+        let body: serde_json::Value = server.get("/health/deep").await.json();
+        assert_eq!(*calls.lock().unwrap(), vec!["embedding-model"]);
+        assert_eq!(body["capabilities"]["embedding"]["status"], "ok");
+        assert_eq!(
+            body["capabilities"]["embedding"]["target"],
+            "openai/embedding-model"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unresolved_embedding_probe_without_a_provider_remains_skipped() {
+    let server = test_app_with(Settings::default(), SearchRegistry::new(HashMap::new())).await;
+    let body: serde_json::Value = server.get("/health/deep").await.json();
+    assert_eq!(body["capabilities"]["embedding"]["status"], "skipped");
 }

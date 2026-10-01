@@ -237,8 +237,13 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
 /// One short embedding through the embedding registry.
 async fn probe_embedding(state: &AppState) -> CapabilityReport {
     let requested = state.settings.health.embedding_probe_model.clone();
-    let (provider, model) = state.router.resolve(&requested);
-    let target = format!("{}/{}", provider, model);
+    let resolution = state.router.resolve_detailed(&requested);
+    let (provider, model) = (resolution.provider, resolution.model);
+    let target = if resolution.substituted {
+        requested.clone()
+    } else {
+        format!("{}/{}", provider, model)
+    };
 
     let adapter = match state.embedding_registry.get(&provider) {
         Ok(a) => a,
@@ -252,6 +257,16 @@ async fn probe_embedding(state: &AppState) -> CapabilityReport {
             );
         }
     };
+    if resolution.substituted {
+        return CapabilityReport::failed(
+            target,
+            0,
+            format!(
+                "embedding probe model '{requested}' is unresolved; set \
+                 [health] embedding_probe_model to a provider/model or a configured alias"
+            ),
+        );
+    }
     if let Err(unavailable) = state.router.check_available(&provider, &model) {
         return CapabilityReport::failed(target, 0, unavailable.message());
     }
