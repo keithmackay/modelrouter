@@ -352,7 +352,11 @@ async fn search_inner(
         .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results));
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
-        if let Some(payload) = state.response_cache.get_search(key, &requested_pseudo_model).await {
+        if let Some(payload) = state
+            .response_cache
+            .get_search(key, &requested_pseudo_model, &cache_directives)
+            .await
+        {
             // Cache hit: the cached payload already names the serving engine.
             let cached_engine = payload["engine"].as_str().unwrap_or(&engine).to_string();
             let cached_engine = cached_engine.as_str();

@@ -267,6 +267,7 @@ async fn chat_completions_inner(
             &attribution,
             &body,
             skip_log,
+            &cache_directives,
         )
         .await
         {
@@ -658,8 +659,12 @@ async fn try_serve_cached_completion(
     attribution: &crate::api::attribution::Attribution,
     body: &Value,
     skip_log: bool,
+    directives: &crate::router::cache::CacheDirectives,
 ) -> Option<Response> {
-    let cached = state.response_cache.get_completion(key, canonical_model).await?;
+    let cached = state
+        .response_cache
+        .get_completion(key, canonical_model, directives)
+        .await?;
     let stream = body["stream"].as_bool().unwrap_or(false);
     tracing::info!(
         cache_key = key,

@@ -36,7 +36,10 @@ fn sample_result(content: &str) -> CompletionResult {
 #[tokio::test]
 async fn cache_miss_returns_none() {
     let cache = enabled_cache(100, 60);
-    assert!(cache.get_completion("nonexistent-key", "gpt-4o").await.is_none());
+    assert!(cache
+        .get_completion("nonexistent-key", "gpt-4o", &Default::default())
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -51,7 +54,10 @@ async fn cache_hit_returns_value() {
             &Default::default(),
         )
         .await;
-    let hit = cache.get_completion("key-1", "gpt-4o").await.unwrap();
+    let hit = cache
+        .get_completion("key-1", "gpt-4o", &Default::default())
+        .await
+        .unwrap();
     assert_eq!(hit.content, "cached!");
     assert_eq!(hit.prompt_tokens, 5);
 }
@@ -68,8 +74,14 @@ async fn stats_track_hits_misses_and_savings() {
             &Default::default(),
         )
         .await;
-    cache.get_completion("k", "gpt-4o").await.unwrap();
-    assert!(cache.get_completion("missing", "gpt-4o").await.is_none());
+    cache
+        .get_completion("k", "gpt-4o", &Default::default())
+        .await
+        .unwrap();
+    assert!(cache
+        .get_completion("missing", "gpt-4o", &Default::default())
+        .await
+        .is_none());
 
     let stats = cache.stats().await;
     assert_eq!(stats.hits, 1);
@@ -92,6 +104,7 @@ fn entry(model: &str) -> CachedEntry {
         original_cost_usd: 0.01,
         stored_at: 0,
         expires_at: 0,
+        namespace: None,
     }
 }
 
@@ -240,8 +253,14 @@ async fn cache_purge_by_model_leaves_other_models() {
         .await;
 
     assert_eq!(cache.purge_model("gpt-4o").await, 1);
-    assert!(cache.get_completion(&gpt_key, "gpt-4o").await.is_none());
-    assert!(cache.get_completion(&claude_key, "claude-opus").await.is_some());
+    assert!(cache
+        .get_completion(&gpt_key, "gpt-4o", &Default::default())
+        .await
+        .is_none());
+    assert!(cache
+        .get_completion(&claude_key, "claude-opus", &Default::default())
+        .await
+        .is_some());
 }
 
 #[tokio::test]
@@ -1174,6 +1193,9 @@ impl CacheStore for TtlRecordingStore {
     async fn purge_model(&self, model_fp: &str) -> u64 {
         self.inner.purge_model(model_fp).await
     }
+    async fn purge_namespace(&self, ns: &str) -> u64 {
+        self.inner.purge_namespace(ns).await
+    }
     async fn purge_all(&self) -> u64 {
         self.inner.purge_all().await
     }
@@ -1189,13 +1211,23 @@ async fn ttl_app<A: modelrouter::providers::adapter::ProviderAdapter + 'static>(
     adapter: A,
     max_ttl_seconds: u64,
 ) -> (TestServer, Arc<ResponseCache>, Arc<TtlRecordingStore>) {
-    let config = CacheConfig {
-        enabled: true,
-        max_entries: 10,
-        ttl_seconds: 60,
-        max_ttl_seconds,
-        ..Default::default()
-    };
+    recording_app(
+        adapter,
+        CacheConfig {
+            enabled: true,
+            max_entries: 10,
+            ttl_seconds: 60,
+            max_ttl_seconds,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn recording_app<A: modelrouter::providers::adapter::ProviderAdapter + 'static>(
+    adapter: A,
+    config: CacheConfig,
+) -> (TestServer, Arc<ResponseCache>, Arc<TtlRecordingStore>) {
     let store = Arc::new(TtlRecordingStore {
         inner: MemoryStore::new(&config),
         ttls: Default::default(),
@@ -1287,4 +1319,228 @@ async fn malformed_ttl_header_is_a_400() {
     assert!(resp.text().contains("x-modelrouter-cache-ttl"));
     assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(store.ttls.lock().unwrap().is_empty());
+}
+
+// ── Namespaces (`x-modelrouter-cache-namespace`) ─────────────────────────────
+
+async fn post_with_headers(
+    server: &TestServer,
+    body: &serde_json::Value,
+    headers: &[(&'static str, &'static str)],
+) -> axum_test::TestResponse {
+    let mut req = server.post("/v1/chat/completions").add_header(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer test-token"),
+    );
+    for (name, value) in headers {
+        req = req.add_header(
+            axum::http::HeaderName::from_static(name),
+            axum::http::HeaderValue::from_static(value),
+        );
+    }
+    req.json(body).await
+}
+
+async fn post_in(server: &TestServer, namespace: &'static str) -> axum_test::TestResponse {
+    post_with_headers(
+        server,
+        &prompt(1),
+        &[("x-modelrouter-cache-namespace", namespace)],
+    )
+    .await
+}
+
+fn namespace_stats(
+    stats: &modelrouter::router::cache::CacheStats,
+    namespace: &str,
+) -> (u64, u64, u64) {
+    let n = stats
+        .by_namespace
+        .iter()
+        .find(|n| n.namespace == namespace)
+        .unwrap_or_else(|| panic!("no stats for {namespace}"));
+    (n.hits, n.misses, n.stores)
+}
+
+#[tokio::test]
+async fn namespaces_share_entries_for_the_same_prompt() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter.clone()).await;
+
+    let a = post_in(&server, "run-a").await;
+    assert_eq!(cache_outcome(&a).as_deref(), Some("MISS"));
+    for resp in [
+        post_in(&server, "run-b").await,
+        post_completion(&server, &prompt(1)).await,
+        post_in(&server, "run-a").await,
+    ] {
+        assert_eq!(cache_outcome(&resp).as_deref(), Some("HIT"));
+        assert_eq!(content_of(&resp), "answer 1");
+    }
+    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let stats = cache.stats().await;
+    assert_eq!(namespace_stats(&stats, "run-a"), (1, 1, 1));
+    assert_eq!(
+        namespace_stats(&stats, "run-b"),
+        (1, 0, 0),
+        "a hit counts for the asking namespace"
+    );
+    assert_eq!(
+        stats.by_namespace.len(),
+        2,
+        "the default namespace is only in the totals"
+    );
+    assert_eq!((stats.hits, stats.misses, stats.stores), (3, 1, 1));
+}
+
+#[tokio::test]
+async fn purging_a_namespace_removes_only_what_it_stored() {
+    let (server, _db, cache) = test_app_with_adapter(VersionedAdapter::default()).await;
+    let ns = "x-modelrouter-cache-namespace";
+    post_with_headers(&server, &prompt(1), &[(ns, "run-a")]).await;
+    post_with_headers(&server, &prompt(2), &[(ns, "run-b")]).await;
+    post_completion(&server, &prompt(3)).await;
+
+    let removed = cache
+        .purge_namespace(&modelrouter::router::cache::CacheNamespace::parse("run-a").unwrap())
+        .await;
+    assert_eq!(removed, 1);
+    let outcome = |r: axum_test::TestResponse| cache_outcome(&r);
+    assert_eq!(
+        outcome(post_completion(&server, &prompt(1)).await).as_deref(),
+        Some("MISS")
+    );
+    assert_eq!(
+        outcome(post_completion(&server, &prompt(2)).await).as_deref(),
+        Some("HIT")
+    );
+    assert_eq!(
+        outcome(post_completion(&server, &prompt(3)).await).as_deref(),
+        Some("HIT")
+    );
+}
+
+#[tokio::test]
+async fn namespaced_stream_replays_for_any_caller() {
+    let adapter = StreamingAdapter::default();
+    let (server, _db, cache) = test_app_with_adapter(adapter).await;
+    let _ = post_with_headers(
+        &server,
+        &ask(true),
+        &[("x-modelrouter-cache-namespace", "streams")],
+    )
+    .await
+    .text();
+    wait_for_stores(&cache, 1).await;
+
+    let other = post_with_headers(
+        &server,
+        &ask(true),
+        &[("x-modelrouter-cache-namespace", "elsewhere")],
+    )
+    .await;
+    assert_eq!(cache_outcome(&other).as_deref(), Some("HIT"));
+}
+
+#[tokio::test]
+async fn invalid_namespace_header_is_a_400() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, _cache) = test_app_with_adapter(adapter.clone()).await;
+    for bad in ["has space", "a:b", "*"] {
+        let resp = post_with_headers(
+            &server,
+            &prompt(1),
+            &[("x-modelrouter-cache-namespace", bad)],
+        )
+        .await;
+        assert_eq!(resp.status_code(), 400, "{bad}");
+        assert!(resp.text().contains("x-modelrouter-cache-namespace"));
+    }
+    let too_long = "n".repeat(65);
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-namespace"),
+            axum::http::HeaderValue::from_str(&too_long).unwrap(),
+        )
+        .json(&prompt(1))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn namespace_default_ttl_applies_below_the_header() {
+    let finite = |s| EntryTtl::Finite(Duration::from_secs(s));
+    let config: CacheConfig = toml::from_str(
+        r#"
+        enabled = true
+        max_entries = 10
+        ttl_seconds = 60
+        max_ttl_seconds = 3600
+        [namespaces.archive]
+        ttl_seconds = 0
+        [namespaces.short]
+        ttl_seconds = 30
+        [namespaces.plain]
+        "#,
+    )
+    .unwrap();
+    let (server, _cache, store) = recording_app(VersionedAdapter::default(), config).await;
+
+    let ns = "x-modelrouter-cache-namespace";
+    post_with_headers(&server, &prompt(1), &[(ns, "archive")]).await;
+    post_with_headers(&server, &prompt(2), &[(ns, "short")]).await;
+    post_with_headers(&server, &prompt(3), &[(ns, "plain")]).await;
+    post_with_headers(&server, &prompt(4), &[(ns, "unconfigured")]).await;
+    post_with_headers(
+        &server,
+        &prompt(5),
+        &[(ns, "archive"), ("x-modelrouter-cache-ttl", "120")],
+    )
+    .await;
+
+    assert_eq!(
+        *store.ttls.lock().unwrap(),
+        [
+            EntryTtl::Unlimited,
+            finite(30),
+            finite(60),
+            finite(60),
+            finite(120)
+        ],
+        "operator-set unlimited is not capped; the header still wins"
+    );
+}
+
+#[tokio::test]
+async fn namespace_stats_are_bounded() {
+    let cache = enabled_cache(1000, 60);
+    for i in 0..300 {
+        let directives = CacheDirectives {
+            namespace: Some(
+                modelrouter::router::cache::CacheNamespace::parse(&format!("ns{i}")).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let key = completion_cache_key("gpt-4o", &json!({ "i": i }));
+        cache
+            .put_completion(&key, "gpt-4o", &sample_result("x"), 0.0, &directives)
+            .await;
+    }
+    let stats = cache.stats().await;
+    assert_eq!(
+        stats.by_namespace.len(),
+        257,
+        "256 tracked plus the overflow"
+    );
+    let (_, _, overflow_stores) =
+        namespace_stats(&stats, modelrouter::router::cache::OTHER_NAMESPACES);
+    assert_eq!(overflow_stores, 44);
+    assert_eq!(stats.stores, 300);
 }

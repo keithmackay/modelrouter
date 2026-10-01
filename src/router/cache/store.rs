@@ -44,6 +44,10 @@ pub struct CachedEntry {
     /// read so both honour the same TTL.
     #[serde(default)]
     pub expires_at: i64,
+    /// The `x-modelrouter-cache-namespace` of the request that stored it.
+    /// A label for stats and purge only; it is not part of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// How long a stored entry lives.
@@ -100,6 +104,9 @@ pub trait CacheStore: Send + Sync {
     /// Remove every entry whose key carries `model_fp` (see
     /// [`super::model_fingerprint`]). Returns the number removed.
     async fn purge_model(&self, model_fp: &str) -> u64;
+    /// Remove every entry labelled with the cache namespace `ns` (see
+    /// [`CachedEntry::namespace`]). Returns the number removed.
+    async fn purge_namespace(&self, ns: &str) -> u64;
     /// Remove everything in this namespace. Returns the number removed.
     async fn purge_all(&self) -> u64;
     /// Approximate live entry count.
@@ -181,6 +188,26 @@ impl MemoryStore {
     }
 }
 
+impl MemoryStore {
+    async fn purge_matching(&self, matches: impl Fn(&str, &CachedEntry) -> bool) -> u64 {
+        // moka applies writes asynchronously; without this the iterator can miss
+        // entries that were just inserted.
+        self.inner.run_pending_tasks().await;
+        let mut removed = 0;
+        let keys: Vec<String> = self
+            .inner
+            .iter()
+            .filter(|(k, entry)| matches(k, entry))
+            .map(|(k, _)| (*k).clone())
+            .collect();
+        for k in keys {
+            self.inner.invalidate(&k).await;
+            removed += 1;
+        }
+        removed
+    }
+}
+
 #[async_trait]
 impl CacheStore for MemoryStore {
     async fn get(&self, key: &str) -> Option<CachedEntry> {
@@ -210,21 +237,12 @@ impl CacheStore for MemoryStore {
     }
 
     async fn purge_model(&self, model_fp: &str) -> u64 {
-        // moka applies writes asynchronously; without this the iterator can miss
-        // entries that were just inserted.
-        self.inner.run_pending_tasks().await;
-        let mut removed = 0;
-        let keys: Vec<String> = self
-            .inner
-            .iter()
-            .filter(|(k, _)| k.contains(model_fp))
-            .map(|(k, _)| (*k).clone())
-            .collect();
-        for k in keys {
-            self.inner.invalidate(&k).await;
-            removed += 1;
-        }
-        removed
+        self.purge_matching(|k, _| k.contains(model_fp)).await
+    }
+
+    async fn purge_namespace(&self, ns: &str) -> u64 {
+        self.purge_matching(|_, entry| entry.namespace.as_deref() == Some(ns))
+            .await
     }
 
     async fn purge_all(&self) -> u64 {
@@ -487,6 +505,27 @@ impl RedisStore {
         found
     }
 
+    async fn keys_labelled(&self, keys: Vec<String>, ns: &str) -> Vec<String> {
+        let Some(mut conn) = self.conn().await else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for chunk in keys.chunks(200) {
+            let mut cmd = redis::cmd("MGET");
+            for k in chunk {
+                cmd.arg(k);
+            }
+            match cmd.query_async::<Vec<Option<String>>>(&mut conn).await {
+                Ok(raws) => found.extend(labelled_with(chunk, raws, ns)),
+                Err(e) => {
+                    self.mark_broken("mget", &e).await;
+                    break;
+                }
+            }
+        }
+        found
+    }
+
     async fn delete_keys(&self, keys: Vec<String>) -> u64 {
         if keys.is_empty() {
             return 0;
@@ -511,6 +550,21 @@ impl RedisStore {
         }
         removed
     }
+}
+
+/// `SCAN` pattern for every key in cache namespace `ns` under the Redis key
+/// `prefix`: `{prefix}:{class}:{fp}:ns-{ns}:{hash}`. The namespace charset has
+/// no glob metacharacters, and the trailing `:` stops `ns-a` matching `ns-ab`.
+/// The keys whose stored entry is labelled `ns`. Unparseable values and
+/// keys that vanished between SCAN and MGET are skipped.
+fn labelled_with(keys: &[String], raws: Vec<Option<String>>, ns: &str) -> Vec<String> {
+    keys.iter()
+        .zip(raws)
+        .filter_map(|(key, raw)| {
+            let entry = serde_json::from_str::<CachedEntry>(&raw?).ok()?;
+            (entry.namespace.as_deref() == Some(ns)).then(|| key.clone())
+        })
+        .collect()
 }
 
 /// `SET key value [EX ttl]`. An unlimited entry is written without `EX`, so it
@@ -576,6 +630,14 @@ impl CacheStore for RedisStore {
             .scan(&format!("{}:*:{}:*", self.namespace, model_fp))
             .await;
         self.delete_keys(keys).await
+    }
+
+    /// The label lives in the value, not the key, so this reads every entry
+    /// under the prefix. Purge is a rare operator action; lookups stay O(1).
+    async fn purge_namespace(&self, ns: &str) -> u64 {
+        let keys = self.scan(&format!("{}:*", self.namespace)).await;
+        let labelled = self.keys_labelled(keys, ns).await;
+        self.delete_keys(labelled).await
     }
 
     async fn purge_all(&self) -> u64 {
@@ -652,6 +714,62 @@ mod tests {
             .collect()
     }
 
+    fn labelled(namespace: Option<&str>) -> CachedEntry {
+        CachedEntry {
+            class: "completion".to_string(),
+            model: "m".to_string(),
+            payload: serde_json::json!({}),
+            original_cost_usd: 0.0,
+            stored_at: 0,
+            expires_at: 0,
+            namespace: namespace.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn redis_purge_selects_keys_by_label() {
+        let keys: Vec<String> = ["k1", "k2", "k3", "k4", "k5"].map(String::from).to_vec();
+        let raw = |ns| Some(serde_json::to_string(&labelled(ns)).unwrap());
+        let raws = vec![
+            raw(Some("a")),
+            raw(Some("ab")),
+            raw(None),
+            None,
+            Some("not json".to_string()),
+        ];
+        assert_eq!(labelled_with(&keys, raws, "a"), ["k1"]);
+    }
+
+    #[test]
+    fn unlabelled_entries_serialize_as_before() {
+        let json = serde_json::to_value(labelled(None)).unwrap();
+        assert!(json.get("namespace").is_none());
+        let old: CachedEntry = serde_json::from_str(
+            r#"{"class":"completion","model":"m","payload":{},"expires_at":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.namespace, None);
+    }
+
+    #[tokio::test]
+    async fn memory_store_purges_one_namespace() {
+        let store = MemoryStore::new(&CacheConfig::default());
+        let ttl = EntryTtl::Finite(Duration::from_secs(60));
+        for (key, ns) in [
+            ("completion:fp:h1", Some("a")),
+            ("search:fp:h2", Some("a")),
+            ("completion:fp:h3", Some("ab")),
+            ("completion:fp:h4", None),
+        ] {
+            store.put(key, labelled(ns), ttl).await;
+        }
+        assert_eq!(store.purge_namespace("a").await, 2);
+        assert!(store.get("completion:fp:h1").await.is_none());
+        assert!(store.get("search:fp:h2").await.is_none());
+        assert!(store.get("completion:fp:h3").await.is_some());
+        assert!(store.get("completion:fp:h4").await.is_some());
+    }
+
     #[test]
     fn redis_set_carries_ex_only_for_a_finite_ttl() {
         assert_eq!(
@@ -674,6 +792,7 @@ mod tests {
             original_cost_usd: 0.0,
             stored_at: 0,
             expires_at: 0,
+            namespace: None,
         };
         store.put("forever", entry, EntryTtl::Unlimited).await;
         let got = store.get("forever").await.expect("stored");
@@ -880,6 +999,7 @@ mod tests {
             original_cost_usd: 0.0,
             stored_at: 0,
             expires_at: 0,
+            namespace: None,
         };
         store
             .put(

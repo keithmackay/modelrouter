@@ -91,6 +91,10 @@ pub struct CacheConfig {
     /// entries that never expire.
     #[serde(default = "default_cache_max_ttl")]
     pub max_ttl_seconds: u64,
+    /// Per-namespace settings, keyed by the value callers send in
+    /// `x-modelrouter-cache-namespace`.
+    #[serde(default)]
+    pub namespaces: HashMap<String, NamespaceCacheConfig>,
 }
 
 impl Default for CacheConfig {
@@ -106,6 +110,7 @@ impl Default for CacheConfig {
             search: SearchCachePolicy::default(),
             allow_header_opt_in: true,
             max_ttl_seconds: default_cache_max_ttl(),
+            namespaces: HashMap::new(),
         }
     }
 }
@@ -159,6 +164,16 @@ impl Default for SearchCachePolicy {
             ttl_seconds: default_search_cache_ttl(),
         }
     }
+}
+
+/// `[cache.namespaces.<name>]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct NamespaceCacheConfig {
+    /// Default TTL for entries stored in this namespace, in place of the class
+    /// TTL; `0` means they never expire. A caller's `x-modelrouter-cache-ttl`
+    /// still takes precedence, within `max_ttl_seconds`.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
 }
 
 fn default_cache_max_entries() -> u64 { 1000 }

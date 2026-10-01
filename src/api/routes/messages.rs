@@ -250,7 +250,7 @@ async fn anthropic_messages_inner(
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(message) = state
             .response_cache
-            .get_message(key, &canonical_model)
+            .get_message(key, &canonical_model, &cache_directives)
             .await
         {
             return Ok(serve_cached_message(

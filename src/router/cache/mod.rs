@@ -35,9 +35,11 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::schema::{CacheConfig, CompletionCachePolicy, SearchCachePolicy};
+use crate::config::schema::{
+    CacheConfig, CompletionCachePolicy, NamespaceCacheConfig, SearchCachePolicy,
+};
 use crate::providers::adapter::CompletionResult;
-pub use request::{CacheDirectives, CacheMode, CachePlan};
+pub use request::{CacheDirectives, CacheMode, CacheNamespace, CachePlan};
 use store::{CacheStore, CachedEntry, EntryTtl};
 
 /// Request-body fields that describe *transport*, not the answer. Excluded from
@@ -77,6 +79,8 @@ pub struct CachePolicy {
     pub allow_header_opt_in: bool,
     /// See [`CacheConfig::max_ttl_seconds`]. Config-only.
     pub max_ttl_seconds: u64,
+    /// See [`CacheConfig::namespaces`]. Config-only.
+    pub namespaces: std::collections::HashMap<String, NamespaceCacheConfig>,
 }
 
 impl CachePolicy {
@@ -88,6 +92,7 @@ impl CachePolicy {
             search: config.search.clone(),
             allow_header_opt_in: config.allow_header_opt_in,
             max_ttl_seconds: config.max_ttl_seconds,
+            namespaces: config.namespaces.clone(),
         }
     }
 
@@ -104,10 +109,19 @@ impl CachePolicy {
     }
 
     /// The lifetime of an entry stored in `class`: the caller's requested
-    /// TTL capped by `max_ttl_seconds`, else the class default.
+    /// TTL capped by `max_ttl_seconds`, else the namespace's configured
+    /// default, else the class default.
     pub fn entry_ttl(&self, class: &str, directives: &CacheDirectives) -> EntryTtl {
         if let Some(requested) = directives.ttl {
             return requested.min(EntryTtl::from_secs(self.max_ttl_seconds));
+        }
+        let namespace_ttl = directives
+            .namespace
+            .as_ref()
+            .and_then(|ns| self.namespaces.get(ns.as_str()))
+            .and_then(|config| config.ttl_seconds);
+        if let Some(secs) = namespace_ttl {
+            return EntryTtl::from_secs(secs);
         }
         EntryTtl::Finite(match class {
             CLASS_SEARCH => self.search_ttl(),
@@ -147,6 +161,9 @@ pub struct CacheStats {
     pub hit_rate: f64,
     pub saved_usd: f64,
     pub by_model: Vec<ModelCacheStats>,
+    /// Traffic that carried `x-modelrouter-cache-namespace`, per namespace.
+    /// Requests without one appear only in the totals.
+    pub by_namespace: Vec<NamespaceCacheStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,11 +175,48 @@ pub struct ModelCacheStats {
     pub saved_usd: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NamespaceCacheStats {
+    /// The namespace, or [`OTHER_NAMESPACES`] for traffic past the tracking
+    /// limit.
+    pub namespace: String,
+    pub hits: u64,
+    pub misses: u64,
+    pub stores: u64,
+    pub hit_rate: f64,
+    pub saved_usd: f64,
+}
+
+/// Namespaces are caller-chosen, so per-namespace counters are bounded: past
+/// this many, further namespaces are counted together under
+/// [`OTHER_NAMESPACES`].
+const MAX_TRACKED_NAMESPACES: usize = 256;
+
+/// Stats bucket for namespaces past [`MAX_TRACKED_NAMESPACES`]. `*` is outside
+/// the namespace charset, so it cannot collide with a real namespace.
+pub const OTHER_NAMESPACES: &str = "*";
+
 #[derive(Default)]
-struct ModelCounters {
+struct Counters {
     hits: AtomicU64,
     misses: AtomicU64,
+    stores: AtomicU64,
     saved_micro_usd: AtomicU64,
+}
+
+impl Counters {
+    fn hit(&self, micro_usd: u64) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.saved_micro_usd.fetch_add(micro_usd, Ordering::Relaxed);
+    }
+
+    fn miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn saved_usd(&self) -> f64 {
+        self.saved_micro_usd.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
 }
 
 // ── The cache ─────────────────────────────────────────────────────────────────
@@ -172,14 +226,16 @@ struct ModelCounters {
 pub struct ResponseCache {
     store: Arc<dyn CacheStore>,
     policy: ArcSwap<CachePolicy>,
-    /// Configured key namespace, surfaced by /health so an operator can see at
-    /// a glance WHICH cache a gateway is (or is not) attached to.
+    /// Configured Redis key prefix (`cache.namespace`), surfaced by /health so
+    /// an operator can see at a glance WHICH cache a gateway is (or is not)
+    /// attached to. Unrelated to the per-request [`CacheNamespace`].
     namespace: String,
     hits: AtomicU64,
     misses: AtomicU64,
     stores: AtomicU64,
     saved_micro_usd: AtomicU64,
-    by_model: DashMap<String, ModelCounters>,
+    by_model: DashMap<String, Counters>,
+    by_namespace: DashMap<String, Counters>,
 }
 
 impl ResponseCache {
@@ -202,6 +258,7 @@ impl ResponseCache {
             stores: AtomicU64::new(0),
             saved_micro_usd: AtomicU64::new(0),
             by_model: DashMap::new(),
+            by_namespace: DashMap::new(),
         }
     }
 
@@ -308,9 +365,15 @@ impl ResponseCache {
 
     // ── Typed access ──────────────────────────────────────────────────────────
 
-    /// Look up a completion. Records the hit/miss against `model`.
-    pub async fn get_completion(&self, key: &str, model: &str) -> Option<CompletionResult> {
-        let entry = self.lookup(key, model).await?;
+    /// Look up a completion. Records the hit/miss against `model` and the
+    /// caller's namespace.
+    pub async fn get_completion(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<CompletionResult> {
+        let entry = self.lookup(key, model, directives).await?;
         match serde_json::from_value::<CompletionResult>(entry.payload) {
             Ok(result) => Some(result),
             Err(e) => {
@@ -344,8 +407,13 @@ impl ResponseCache {
 
     /// Look up a native Anthropic `message`. Records the hit/miss against
     /// `model`.
-    pub async fn get_message(&self, key: &str, model: &str) -> Option<Value> {
-        Some(self.lookup(key, model).await?.payload)
+    pub async fn get_message(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<Value> {
+        Some(self.lookup(key, model, directives).await?.payload)
     }
 
     pub async fn put_message(
@@ -369,8 +437,13 @@ impl ResponseCache {
 
     /// Look up a search response envelope. Records the hit/miss against
     /// `search/{engine}`.
-    pub async fn get_search(&self, key: &str, model: &str) -> Option<Value> {
-        Some(self.lookup(key, model).await?.payload)
+    pub async fn get_search(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<Value> {
+        Some(self.lookup(key, model, directives).await?.payload)
     }
 
     pub async fn put_search(
@@ -392,24 +465,55 @@ impl ResponseCache {
         .await;
     }
 
-    async fn lookup(&self, key: &str, model: &str) -> Option<CachedEntry> {
+    /// The namespace never takes part in the lookup: any caller asking the
+    /// same question hits the same entry. It only picks the stats bucket.
+    async fn lookup(
+        &self,
+        key: &str,
+        model: &str,
+        directives: &CacheDirectives,
+    ) -> Option<CachedEntry> {
         let entry = self.store.get(key).await;
         let counters = self.by_model.entry(model.to_string()).or_default();
+        let ns_counters = self.namespace_counters(directives.namespace.as_ref());
         match entry {
             Some(entry) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                counters.hits.fetch_add(1, Ordering::Relaxed);
                 let micro = (entry.original_cost_usd.max(0.0) * 1_000_000.0) as u64;
                 self.saved_micro_usd.fetch_add(micro, Ordering::Relaxed);
-                counters.saved_micro_usd.fetch_add(micro, Ordering::Relaxed);
+                counters.hit(micro);
+                if let Some(ns) = ns_counters {
+                    ns.hit(micro);
+                }
                 Some(entry)
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
-                counters.misses.fetch_add(1, Ordering::Relaxed);
+                counters.miss();
+                if let Some(ns) = ns_counters {
+                    ns.miss();
+                }
                 None
             }
         }
+    }
+
+    /// The counters for `namespace`; `None` for the default namespace.
+    fn namespace_counters(
+        &self,
+        namespace: Option<&CacheNamespace>,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, Counters>> {
+        let ns = namespace?.as_str();
+        if let Some(counters) = self.by_namespace.get(ns) {
+            return Some(counters);
+        }
+        let bucket = if self.by_namespace.len() < MAX_TRACKED_NAMESPACES {
+            ns
+        } else {
+            OTHER_NAMESPACES
+        };
+        self.by_namespace.entry(bucket.to_string()).or_default();
+        self.by_namespace.get(bucket)
     }
 
     async fn store_entry(
@@ -432,11 +536,15 @@ impl ResponseCache {
                     original_cost_usd,
                     stored_at: 0,
                     expires_at: 0,
+                    namespace: directives.namespace.as_ref().map(|ns| ns.to_string()),
                 },
                 ttl,
             )
             .await;
         self.stores.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = self.namespace_counters(directives.namespace.as_ref()) {
+            ns.stores.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // ── Operator surface ──────────────────────────────────────────────────────
@@ -447,6 +555,13 @@ impl ResponseCache {
 
     pub async fn purge_model(&self, model: &str) -> u64 {
         self.store.purge_model(&model_fingerprint(model)).await
+    }
+
+    /// Remove every entry that was stored by a request in `namespace`, across
+    /// all classes and models. The default namespace cannot be purged on its
+    /// own.
+    pub async fn purge_namespace(&self, namespace: &CacheNamespace) -> u64 {
+        self.store.purge_namespace(namespace.as_str()).await
     }
 
     pub async fn purge_key(&self, key: &str) -> u64 {
@@ -467,12 +582,28 @@ impl ResponseCache {
                     hits: h,
                     misses: m,
                     hit_rate: hit_rate(h, m),
-                    saved_usd: e.value().saved_micro_usd.load(Ordering::Relaxed) as f64
-                        / 1_000_000.0,
+                    saved_usd: e.value().saved_usd(),
                 }
             })
             .collect();
         by_model.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.model.cmp(&b.model)));
+        let mut by_namespace: Vec<NamespaceCacheStats> = self
+            .by_namespace
+            .iter()
+            .map(|e| {
+                let h = e.value().hits.load(Ordering::Relaxed);
+                let m = e.value().misses.load(Ordering::Relaxed);
+                NamespaceCacheStats {
+                    namespace: e.key().clone(),
+                    hits: h,
+                    misses: m,
+                    stores: e.value().stores.load(Ordering::Relaxed),
+                    hit_rate: hit_rate(h, m),
+                    saved_usd: e.value().saved_usd(),
+                }
+            })
+            .collect();
+        by_namespace.sort_by(|a, b| a.namespace.cmp(&b.namespace));
 
         let policy = self.policy.load();
         CacheStats {
@@ -487,6 +618,7 @@ impl ResponseCache {
             hit_rate: hit_rate(hits, misses),
             saved_usd: self.saved_micro_usd.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             by_model,
+            by_namespace,
         }
     }
 }

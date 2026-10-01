@@ -1227,3 +1227,53 @@ async fn messages_ttl_header_applies_to_a_streamed_store() {
         "MISS"
     );
 }
+
+async fn post_messages_in(
+    server: &TestServer,
+    body: &serde_json::Value,
+    namespace: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-namespace"),
+            axum::http::HeaderValue::from_static(namespace),
+        )
+        .json(body)
+        .await
+}
+
+#[tokio::test]
+async fn messages_namespaces_share_entries_for_the_same_prompt() {
+    let (server, _db, mock, cache) = cached_app().await;
+    let body = deterministic(false);
+
+    let a = post_messages_in(&server, &body, "run-a").await;
+    assert_eq!(a.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let b = post_messages_in(&server, &body, "run-b").await;
+    assert_eq!(b.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    let default = post_messages(&server, &body).await;
+    assert_eq!(default.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+    assert_eq!(mock.requests().len(), 1);
+
+    let stats = cache.stats().await;
+    let counts = |name: &str| {
+        let n = stats
+            .by_namespace
+            .iter()
+            .find(|n| n.namespace == name)
+            .unwrap();
+        (n.hits, n.misses, n.stores)
+    };
+    assert_eq!(counts("run-a"), (0, 1, 1));
+    assert_eq!(counts("run-b"), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn messages_reject_an_invalid_namespace() {
+    let (server, _db, mock, _cache) = cached_app().await;
+    let resp = post_messages_in(&server, &deterministic(false), "no/slashes").await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(mock.requests().is_empty());
+}

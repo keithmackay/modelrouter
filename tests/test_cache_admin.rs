@@ -112,7 +112,10 @@ async fn stats_reports_live_and_ledger_views() {
             &Default::default(),
         )
         .await;
-    cache.get_completion("completion:x:y", "gpt-4o").await.unwrap();
+    cache
+        .get_completion("completion:x:y", "gpt-4o", &Default::default())
+        .await
+        .unwrap();
 
     let (n, v) = bearer(&jwt(&settings, "viewer"));
     let resp = server.get("/admin/api/cache/stats").add_header(n, v).await;
@@ -186,7 +189,10 @@ async fn purge_all_empties_the_cache() {
     assert_eq!(resp.status_code(), 200);
     let body: serde_json::Value = resp.json();
     assert_eq!(body["removed"], 2);
-    assert!(cache.get_completion("completion:a:1", "gpt-4o").await.is_none());
+    assert!(cache
+        .get_completion("completion:a:1", "gpt-4o", &Default::default())
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -214,7 +220,10 @@ async fn purge_by_model_only_removes_that_model() {
         .await;
     assert_eq!(resp.status_code(), 200);
     assert_eq!(resp.json::<serde_json::Value>()["removed"], 1);
-    assert!(cache.get_completion(&claude_key, "claude").await.is_some());
+    assert!(cache
+        .get_completion(&claude_key, "claude", &Default::default())
+        .await
+        .is_some());
 }
 
 #[tokio::test]
@@ -351,4 +360,118 @@ async fn dashboard_policy_form() {
     assert_eq!(resp.status_code(), 303); // Redirect
     let location = resp.headers().get("location").unwrap().to_str().unwrap();
     assert!(location.contains("/admin/cache"));
+}
+
+// ── Purge by namespace ────────────────────────────────────────────────────────
+
+/// Store a distinct prompt as a request in `namespace` would.
+async fn put_namespaced(cache: &ResponseCache, namespace: Option<&str>) -> String {
+    let directives = modelrouter::router::cache::CacheDirectives {
+        namespace: namespace.map(|n| modelrouter::router::cache::CacheNamespace::parse(n).unwrap()),
+        ..Default::default()
+    };
+    let key =
+        modelrouter::router::cache::completion_cache_key("gpt-4o", &json!({ "ns": namespace }));
+    cache
+        .put_completion(
+            &key,
+            "gpt-4o",
+            &modelrouter::providers::adapter::CompletionResult::default(),
+            0.0,
+            &directives,
+        )
+        .await;
+    key
+}
+
+#[tokio::test]
+async fn purge_by_namespace_only_removes_that_namespace() {
+    let (server, settings, cache) = build_server().await;
+    let batch = put_namespaced(&cache, Some("batch")).await;
+    let batch_2 = put_namespaced(&cache, Some("batch-2")).await;
+    let default = put_namespaced(&cache, None).await;
+
+    let (n, v) = bearer(&jwt(&settings, "superadmin"));
+    let resp = server
+        .post("/admin/api/cache/purge")
+        .add_header(n, v)
+        .json(&json!({ "scope": "namespace", "namespace": "batch" }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["scope"], "namespace:batch");
+    assert_eq!(body["removed"], 1);
+    assert!(cache
+        .get_completion(&batch, "gpt-4o", &Default::default())
+        .await
+        .is_none());
+    assert!(cache
+        .get_completion(&batch_2, "gpt-4o", &Default::default())
+        .await
+        .is_some());
+    assert!(cache
+        .get_completion(&default, "gpt-4o", &Default::default())
+        .await
+        .is_some());
+}
+
+#[tokio::test]
+async fn purge_by_namespace_rejects_a_missing_or_invalid_namespace() {
+    let (server, settings, _cache) = build_server().await;
+    for body in [
+        json!({ "scope": "namespace" }),
+        json!({ "scope": "namespace", "namespace": "" }),
+        json!({ "scope": "namespace", "namespace": "a:b" }),
+        json!({ "scope": "namespace", "namespace": "*" }),
+    ] {
+        let (n, v) = bearer(&jwt(&settings, "superadmin"));
+        let resp = server
+            .post("/admin/api/cache/purge")
+            .add_header(n, v)
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), 400, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn purge_by_namespace_requires_superadmin() {
+    let (server, settings, _cache) = build_server().await;
+    let (n, v) = bearer(&jwt(&settings, "viewer"));
+    let resp = server
+        .post("/admin/api/cache/purge")
+        .add_header(n, v)
+        .json(&json!({ "scope": "namespace", "namespace": "batch" }))
+        .await;
+    assert_eq!(resp.status_code(), 403);
+}
+
+#[tokio::test]
+async fn dashboard_lists_namespaces_and_purges_one() {
+    let (server, settings, cache) = build_server().await;
+    let batch = put_namespaced(&cache, Some("batch")).await;
+    let cookie = axum::http::HeaderValue::from_str(&format!(
+        "mr_admin_session={}",
+        jwt(&settings, "superadmin")
+    ))
+    .unwrap();
+
+    let html = server
+        .get("/admin/cache")
+        .add_header(axum::http::header::COOKIE, cookie.clone())
+        .await
+        .text();
+    assert!(html.contains("Namespaces (this process)"));
+    assert!(html.contains(r#"name="namespace" value="batch""#));
+
+    let resp = server
+        .post("/admin/cache/purge")
+        .add_header(axum::http::header::COOKIE, cookie)
+        .form(&json!({ "scope": "namespace", "namespace": "batch" }))
+        .await;
+    assert_eq!(resp.status_code(), 303);
+    assert!(cache
+        .get_completion(&batch, "gpt-4o", &Default::default())
+        .await
+        .is_none());
 }
