@@ -570,8 +570,9 @@ fail_open    = true
 # # Model the LLM probe requests (goes through aliases/routing like any
 # # caller). Defaults to routing.default_model.
 # #llm_probe_model = "balanced"
-# # Model the embedding probe requests.
-# embedding_probe_model = "text-embedding-3-small"
+# # Embedding provider/model or a configured alias. Unresolved names fail
+# # without substituting the default chat model.
+# embedding_probe_model = "openai/text-embedding-3-small"
 # # Engine the search probe uses. Unset (the default) infers from
 # # [routing] default_search_engine, then from the sole configured search
 # # provider when there is exactly one -- set this explicitly only when
