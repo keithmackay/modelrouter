@@ -1657,6 +1657,7 @@ pub async fn get_cost(
                 total_tokens_in  => tokens_in,
                 total_tokens_out => tokens_out,
                 total_cost_usd   => cost,
+                uncached_cost_usd => cost + cache.saved_usd,
                 cache_hits       => cache.hits,
                 cache_hit_pct    => (cache.hit_rate() * 100.0).round(),
                 cache_saved_usd  => cache.saved_usd,

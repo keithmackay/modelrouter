@@ -144,53 +144,81 @@ pub async fn get_reports_panels(
     let user_name_map: std::collections::HashMap<i64, String> =
         all_users.iter().map(|u| (u.id, u.name.clone())).collect();
 
-    let by_user_rows: Vec<minijinja::Value> = user_stats.iter().map(|(uid, cost, ti, to, rc)| {
-        minijinja::context! {
-            name => user_name_map.get(uid).cloned().unwrap_or_else(|| format!("#{}", uid)),
-            cost_usd => format!("{:.2}", cost),
-            tokens_in => *ti,
-            tokens_out => *to,
-            requests => *rc,
-        }
-    }).collect();
+    let by_user_rows: Vec<minijinja::Value> = user_stats
+        .iter()
+        .map(|(uid, cost, ti, to, rc, uncached)| {
+            minijinja::context! {
+                name => user_name_map.get(uid).cloned().unwrap_or_else(|| format!("#{}", uid)),
+                cost_usd => format!("{:.2}", cost),
+                uncached_cost_usd => format!("{:.2}", uncached),
+                tokens_in => *ti,
+                tokens_out => *to,
+                requests => *rc,
+            }
+        })
+        .collect();
 
     // ── Model summary ────────────────────────────────────────────────────────
     let model_rows = CostRepository::summarize_by_model(
         &*state.db, eff_user_ids_ref, filter_project, filter_model_opt, &start,
     ).await.map_err(|_| DashboardError::Internal)?;
 
-    let by_model_rows: Vec<minijinja::Value> = model_rows.iter().map(|r| {
-        minijinja::context! {
-            model => r.model.clone(),
-            cost_usd => format!("{:.2}", r.total_cost_usd),
-            tokens_in => r.tokens_in,
-            tokens_out => r.tokens_out,
-            requests => r.request_count,
-        }
-    }).collect();
+    let by_model_rows: Vec<minijinja::Value> = model_rows
+        .iter()
+        .map(|r| {
+            minijinja::context! {
+                model => r.model.clone(),
+                cost_usd => format!("{:.2}", r.total_cost_usd),
+                uncached_cost_usd => format!("{:.2}", r.uncached_cost_usd),
+                tokens_in => r.tokens_in,
+                tokens_out => r.tokens_out,
+                requests => r.request_count,
+            }
+        })
+        .collect();
 
     // ── Project summary (derived from cost_rows_grouped) ─────────────────────
     let detail_rows = CostRepository::cost_rows_grouped(
         &*state.db, eff_user_ids_ref, filter_project, None, filter_model_opt, &start,
     ).await.map_err(|_| DashboardError::Internal)?;
 
-    let mut project_map: std::collections::BTreeMap<String, (f64, i64, i64, i64)> =
+    let cache_rows = CostRepository::cache_rows_grouped(
+        &*state.db,
+        eff_user_ids_ref,
+        filter_project,
+        None,
+        filter_model_opt,
+        &start,
+    )
+    .await
+    .map_err(|_| DashboardError::Internal)?;
+
+    let mut project_map: std::collections::BTreeMap<String, (f64, i64, i64, i64, f64)> =
         std::collections::BTreeMap::new();
     for (_, _, proj, _, cost, ti, to, rc) in &detail_rows {
         if let Some(p) = proj {
-            let e = project_map.entry(p.clone()).or_insert((0.0, 0, 0, 0));
+            let e = project_map.entry(p.clone()).or_insert((0.0, 0, 0, 0, 0.0));
             e.0 += cost; e.1 += ti; e.2 += to; e.3 += rc;
         }
     }
-    let mut by_project_rows: Vec<minijinja::Value> = project_map.iter().map(|(p, (cost, ti, to, rc))| {
-        minijinja::context! {
-            project => p.clone(),
-            cost_usd => format!("{:.2}", cost),
-            tokens_in => *ti,
-            tokens_out => *to,
-            requests => *rc,
+    for (_, _, proj, _, cache) in &cache_rows {
+        if let Some(e) = proj.as_ref().and_then(|p| project_map.get_mut(p)) {
+            e.4 += cache.saved_usd;
         }
-    }).collect();
+    }
+    let mut by_project_rows: Vec<minijinja::Value> = project_map
+        .iter()
+        .map(|(p, (cost, ti, to, rc, saved))| {
+            minijinja::context! {
+                project => p.clone(),
+                cost_usd => format!("{:.2}", cost),
+                uncached_cost_usd => format!("{:.2}", cost + saved),
+                tokens_in => *ti,
+                tokens_out => *to,
+                requests => *rc,
+            }
+        })
+        .collect();
     // sort by cost desc
     by_project_rows.sort_by(|a, b| {
         let ac: f64 = a.get_attr("cost_usd").ok()
@@ -210,11 +238,18 @@ pub async fn get_reports_panels(
 
     // ── Chart: Token Usage per user (JSON for D3) ─────────────────────────────
     let token_usage_json = serde_json::to_string(
-        &user_stats.iter().map(|(uid, _, ti, to, _)| {
-            let name = user_name_map.get(uid).cloned().unwrap_or_else(|| format!("#{}", uid));
-            serde_json::json!({ "user": name, "tokens_in": ti, "tokens_out": to })
-        }).collect::<Vec<_>>()
-    ).unwrap_or_else(|_| "[]".to_string());
+        &user_stats
+            .iter()
+            .map(|(uid, _, ti, to, _, _)| {
+                let name = user_name_map
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{}", uid));
+                serde_json::json!({ "user": name, "tokens_in": ti, "tokens_out": to })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
 
     // ── Chart: Burndown (remaining budget per day) ───────────────────────────
     let daily = CostRepository::list_daily_spend(
@@ -301,6 +336,7 @@ async fn attribution_panels(
                     key => r.key.clone(),
                     cost_usd => format!("{:.4}", r.totals.cost_usd),
                     saved_usd => format!("{:.4}", r.totals.saved_usd),
+                    uncached_cost_usd => format!("{:.4}", r.totals.uncached_cost_usd),
                     requests => r.totals.requests,
                     cache_hits => r.totals.cache_hits,
                 }
@@ -314,6 +350,7 @@ async fn attribution_panels(
             filter_label => report.filter,
             cost_usd => format!("{:.4}", report.totals.cost_usd),
             saved_usd => format!("{:.4}", report.totals.saved_usd),
+            uncached_cost_usd => format!("{:.4}", report.totals.uncached_cost_usd),
             requests => report.totals.requests,
             cache_hits => report.totals.cache_hits,
             hit_rate => format!("{:.0}%", report.hit_rate * 100.0),

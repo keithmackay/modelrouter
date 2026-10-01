@@ -360,6 +360,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
       "turns": 121,                            // requests of the runs attributed here (== requests unless runs are mixed)
       "cost_usd": 0.1573,
       "saved_usd": 0.0,                        // always 0: bound requests never hit the cache
+      "uncached_cost_usd": 0.1573,             // cost_usd + saved_usd, so equal to cost_usd here
       "tokens": { "prompt": 97900, "completion": 34300, "total": 132200 },
       "estimated_rows": 0,                     // rows whose tokens were estimated (streamed calls)
       "failures": 0,                           // failure-log rows stamped with this variant
@@ -370,10 +371,10 @@ abridged. Field names and order are what the endpoint returns; the CLI's
       "attempts_tracked": 121,                 // rows that recorded a provider-attempt count
       "attempts": 124,                         // provider calls behind those rows; > attempts_tracked means retries happened
       "retried_requests": 3,                   // requests that took more than one attempt (retry or failover hop)
-      "per_run":     { "turns": 2.95, "cost_usd": 0.003837, "tokens": 3224.4, "span_secs": 36.8 },   // null when runs == 0
-      "per_request": { "cost_usd": 0.0013, "tokens_in": 809.1, "tokens_out": 283.5 },              // null when requests == 0
+      "per_run":     { "turns": 2.95, "cost_usd": 0.003837, "uncached_cost_usd": 0.003837, "tokens": 3224.4, "span_secs": 36.8 },   // null when runs == 0
+      "per_request": { "cost_usd": 0.0013, "uncached_cost_usd": 0.0013, "tokens_in": 809.1, "tokens_out": 283.5 },              // null when requests == 0
       "models": [                              // the pinned (backing) models this variant actually called
-        { "model": "claude-haiku-4-5", "requests": 121, "cost_usd": 0.1573, "saved_usd": 0.0,
+        { "model": "claude-haiku-4-5", "requests": 121, "cost_usd": 0.1573, "saved_usd": 0.0, "uncached_cost_usd": 0.1573,
           "tokens": { "prompt": 97900, "completion": 34300, "total": 132200 }, "estimated_rows": 0, "unpriced": false }
       ],
       "unpriced": false,                       // true if any model here has no pricing entry
@@ -386,14 +387,14 @@ abridged. Field names and order are what the endpoint returns; the CLI's
     {
       "label": "control",
       "runs": 40, "mixed_runs": 0, "requests": 118, "unbound_requests": 2, "turns": 118,
-      "cost_usd": 0.2214, "saved_usd": 0.0,
+      "cost_usd": 0.2214, "saved_usd": 0.0, "uncached_cost_usd": 0.2214,
       "tokens": { "prompt": 96500, "completion": 30100, "total": 126600 },
       "estimated_rows": 0, "failures": 1,
       "latency": { "samples": 118, "mean_ms": 1420.3, "p50_ms": 1388, "p95_ms": 2210 }, "latency_samples": 118,
       "ttft": { "samples": 118, "mean_ms": 655.1, "p50_ms": 630, "p95_ms": 1105 }, "ttft_samples": 118,
       "attempts_tracked": 118, "attempts": 118, "retried_requests": 0,
-      "per_run": { "turns": 2.95, "cost_usd": 0.005535, "tokens": 3165.0, "span_secs": 41.2 },
-      "per_request": { "cost_usd": 0.001876, "tokens_in": 817.8, "tokens_out": 255.1 },
+      "per_run": { "turns": 2.95, "cost_usd": 0.005535, "uncached_cost_usd": 0.005535, "tokens": 3165.0, "span_secs": 41.2 },
+      "per_request": { "cost_usd": 0.001876, "uncached_cost_usd": 0.001876, "tokens_in": 817.8, "tokens_out": 255.1 },
       "models": [ { "model": "gpt-4o-mini", "requests": 118, … } ],
       "unpriced": false, "unpriced_models": [],
       "outcomes": { "reported": 38, "success": 31, "failure": 7, "success_rate": 0.8158,
@@ -402,7 +403,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
   ],
   "totals": {                                  // sums of the per-variant columns
     "runs": 81, "mixed_runs": 0, "requests": 239, "unbound_requests": 2, "turns": 239,
-    "cost_usd": 0.3787, "saved_usd": 0.0,
+    "cost_usd": 0.3787, "saved_usd": 0.0, "uncached_cost_usd": 0.3787,
     "tokens": { "prompt": 194400, "completion": 64400, "total": 258800 },
     "estimated_rows": 0, "failures": 1, "latency_samples": 239, "ttft_samples": 239,
     "attempts_tracked": 239, "attempts": 242, "retried_requests": 3,
@@ -419,7 +420,7 @@ abridged. Field names and order are what the endpoint returns; the CLI's
         "variant": "candidate",                // variant of the run's earliest bound request
         "mixed": false,
         "requests": 3, "unbound_requests": 0, "turns": 3,
-        "cost_usd": 0.0041, "saved_usd": 0.0,
+        "cost_usd": 0.0041, "saved_usd": 0.0, "uncached_cost_usd": 0.0041,
         "tokens": { "prompt": 2410, "completion": 860, "total": 3270 },
         "estimated_rows": 0, "failures": 0,
         "latency": { "samples": 3, "mean_ms": 1012.7 }, "latency_samples": 3,
@@ -741,6 +742,8 @@ document.
     "cost_usd": 1.0061025,
     "cost_per_request": 0.005528,          // null when requests == 0
     "saved_usd": 0.06484,                  // what cache hits would have cost
+    "uncached_cost_usd": 1.0709425,        // cost_usd + saved_usd: the arm priced as if nothing hit the cache
+    "uncached_cost_per_request": 0.005884, // null when requests == 0
     "tokens_in": 190633,
     "tokens_out": 59436,
     "tokens_in_per_request": 1047.43,
@@ -765,7 +768,7 @@ document.
     "unpriced": false,                     // true if any model in the arm has no price
     "unpriced_models": [],
     "by_day": [
-      { "key": "2026-09-01", "cost_usd": 0.339, "saved_usd": 0.019,
+      { "key": "2026-09-01", "cost_usd": 0.339, "saved_usd": 0.019, "uncached_cost_usd": 0.358,
         "tokens_in": 62766, "tokens_out": 20119, "requests": 60, "cache_hits": 3 },
       …
     ]
@@ -775,6 +778,8 @@ document.
     "requests":            { "abs": 0.0,      "pct": 0.0 },
     "cost_usd":            { "abs": -0.944,   "pct": -93.85 },
     "cost_per_request":    { "abs": -0.00519, "pct": -93.85 },
+    "uncached_cost_usd":   { "abs": -0.9426,  "pct": -88.02 },
+    "uncached_cost_per_request": { "abs": -0.00518, "pct": -88.02 },
     "tokens_in":           { "abs": -2005.0,  "pct": -1.05 },
     "tokens_out":          { "abs": 6828.0,   "pct": 11.49 },
     "tokens_in_per_request":  { "abs": -11.0, "pct": -1.05 },

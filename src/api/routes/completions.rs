@@ -2101,10 +2101,18 @@ mod openai_response_tests {
         let response = respond("m", &plain_result(), CallCost::spent(0.0123));
         assert_eq!(response["usage"]["cost_usd"].as_f64(), Some(0.0123));
         assert_eq!(response["usage"]["total_tokens"], 15);
-        // A live call carries no cache fields.
+        // A live call carries no cache-hit fields; its uncached cost is
+        // what it paid.
         assert!(response["usage"].get("cache_hit").is_none());
         assert!(response["usage"].get("saved_usd").is_none());
-        assert_eq!(response["x_router"]["cost"]["cost_usd"].as_f64(), Some(0.0123));
+        assert_eq!(
+            response["usage"]["uncached_cost_usd"].as_f64(),
+            Some(0.0123)
+        );
+        assert_eq!(
+            response["x_router"]["cost"]["cost_usd"].as_f64(),
+            Some(0.0123)
+        );
         assert_eq!(response["x_router"]["tokens"]["prompt"], 10);
     }
 
@@ -2114,7 +2122,12 @@ mod openai_response_tests {
         assert_eq!(response["usage"]["cost_usd"].as_f64(), Some(0.0));
         assert_eq!(response["usage"]["cache_hit"], true);
         assert_eq!(response["usage"]["saved_usd"].as_f64(), Some(0.5));
+        assert_eq!(response["usage"]["uncached_cost_usd"].as_f64(), Some(0.5));
         assert_eq!(response["x_router"]["cost"]["cache_hit"], true);
+        assert_eq!(
+            response["x_router"]["cost"]["uncached_cost_usd"].as_f64(),
+            Some(0.5)
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 <div class="stat-card" style="grid-column:1/-1;">
     <h3 style="margin-bottom:0.75rem;font-size:1rem;">Attributed usage — {{ filter_label }}</h3>
     <div style="display:flex;gap:2rem;flex-wrap:wrap;">
+        <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;" title="Spend had nothing come from the response cache">Uncached cost</div>
+             <div style="font-size:1.5rem;font-weight:600;">{{ uncached_cost_usd | money }}</div></div>
         <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Spend</div>
              <div style="font-size:1.5rem;font-weight:600;">{{ cost_usd | money }}</div></div>
         <div><div style="font-size:0.75rem;text-transform:uppercase;color:#777;">Saved by cache</div>
@@ -21,13 +23,14 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>Model</th><th>Cost (USD)</th><th>Saved (USD)</th><th>Requests</th><th>Cache Hits</th>
+                <th>Model</th><th>Uncached (USD)</th><th>Cost (USD)</th><th>Saved (USD)</th><th>Requests</th><th>Cache Hits</th>
             </tr>
         </thead>
         <tbody>
         {% for row in by_model_rows %}
             <tr>
                 <td>{{ row.key }}</td>
+                <td>{{ row.uncached_cost_usd | money }}</td>
                 <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.saved_usd | money }}</td>
                 <td>{{ row.requests }}</td>
@@ -47,13 +50,14 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>Day</th><th>Cost (USD)</th><th>Saved (USD)</th><th>Requests</th><th>Cache Hits</th>
+                <th>Day</th><th>Uncached (USD)</th><th>Cost (USD)</th><th>Saved (USD)</th><th>Requests</th><th>Cache Hits</th>
             </tr>
         </thead>
         <tbody>
         {% for row in by_day_rows %}
             <tr>
                 <td>{{ row.key }}</td>
+                <td>{{ row.uncached_cost_usd | money }}</td>
                 <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.saved_usd | money }}</td>
                 <td>{{ row.requests }}</td>

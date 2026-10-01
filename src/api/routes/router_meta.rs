@@ -21,6 +21,10 @@ pub struct CallCost {
     pub cache_hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved_usd: Option<f64>,
+    /// What this call costs with no response cache: `cost_usd` plus any
+    /// `saved_usd`. Equal across reruns of the same work, so runs compare as
+    /// if each were the first.
+    pub uncached_cost_usd: f64,
 }
 
 impl CallCost {
@@ -30,6 +34,7 @@ impl CallCost {
             cost_usd,
             cache_hit: false,
             saved_usd: None,
+            uncached_cost_usd: cost_usd,
         }
     }
 
@@ -39,13 +44,16 @@ impl CallCost {
             cost_usd: 0.0,
             cache_hit: true,
             saved_usd: Some(avoided),
+            uncached_cost_usd: avoided,
         }
     }
 
     /// Write the cost fields into an OpenAI-shaped `usage` object
-    /// (`cost_usd` always; `cache_hit`/`saved_usd` only on a hit).
+    /// (`cost_usd` and `uncached_cost_usd` always; `cache_hit`/`saved_usd`
+    /// only on a hit).
     pub fn write_into(&self, usage: &mut Value) {
         usage["cost_usd"] = serde_json::json!(self.cost_usd);
+        usage["uncached_cost_usd"] = serde_json::json!(self.uncached_cost_usd);
         if self.cache_hit {
             usage["cache_hit"] = Value::Bool(true);
         }
@@ -174,6 +182,7 @@ mod tests {
         assert_eq!(v["cost"]["cost_usd"].as_f64(), Some(0.5));
         assert_eq!(v["cost"]["cache_hit"], false);
         assert!(v["cost"].get("saved_usd").is_none());
+        assert_eq!(v["cost"]["uncached_cost_usd"].as_f64(), Some(0.5));
         assert_eq!(v["timing"]["provider_ms"], 9);
         assert!(v["timing"]["ttft_ms"].is_null());
         assert!(v.get("results").is_none(), "results is search-only");
@@ -190,18 +199,27 @@ mod tests {
         assert_eq!(v["results"], 3);
         assert_eq!(v["cost"]["cost_usd"].as_f64(), Some(0.0));
         assert_eq!(v["cost"]["saved_usd"].as_f64(), Some(0.035));
+        assert_eq!(v["cost"]["uncached_cost_usd"].as_f64(), Some(0.035));
     }
 
     #[test]
     fn write_into_adds_cache_fields_only_on_a_hit() {
         let mut usage = serde_json::json!({});
         CallCost::spent(1.0).write_into(&mut usage);
-        assert_eq!(usage, serde_json::json!({"cost_usd": 1.0}));
+        assert_eq!(
+            usage,
+            serde_json::json!({"cost_usd": 1.0, "uncached_cost_usd": 1.0})
+        );
         let mut usage = serde_json::json!({});
         CallCost::cache_hit(2.0).write_into(&mut usage);
         assert_eq!(
             usage,
-            serde_json::json!({"cost_usd": 0.0, "cache_hit": true, "saved_usd": 2.0})
+            serde_json::json!({
+                "cost_usd": 0.0,
+                "uncached_cost_usd": 2.0,
+                "cache_hit": true,
+                "saved_usd": 2.0
+            })
         );
     }
 

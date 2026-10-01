@@ -377,6 +377,9 @@ async fn two_differently_attributed_requests_share_one_cache_entry() {
     .unwrap();
     assert_eq!(miss.cache_hits, 0);
     assert!(miss.cost_usd > 0.0);
+    // Uncached, the rerun costs exactly what the first run paid.
+    assert_eq!(miss.uncached_cost_usd, miss.cost_usd);
+    assert_eq!(hit.uncached_cost_usd, miss.cost_usd);
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -615,6 +618,14 @@ async fn admin_usage_endpoint_returns_spend_and_savings() {
     assert_eq!(body["totals"]["requests"], 1);
     assert_eq!(body["totals"]["cache_hits"], 0);
     assert!(body["totals"]["cost_usd"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        body["totals"]["uncached_cost_usd"],
+        body["totals"]["cost_usd"]
+    );
+    assert_eq!(
+        body["by_model"][0]["uncached_cost_usd"],
+        body["by_model"][0]["cost_usd"]
+    );
     assert_eq!(body["by_model"].as_array().unwrap().len(), 1);
     assert_eq!(body["by_day"].as_array().unwrap().len(), 1);
 
@@ -718,6 +729,8 @@ async fn reports_page_filters_by_attribution() {
     let html = resp.text();
     assert!(html.contains("Attributed usage — engagement=A"), "{}", html);
     assert!(html.contains("Saved by cache"));
+    assert!(html.contains("Uncached cost"), "{}", html);
+    assert!(html.contains("<th>Uncached (USD)</th>"), "{}", html);
 
     // With no value selected, the ordinary reports panels still render.
     let resp = server

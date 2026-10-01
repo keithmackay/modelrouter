@@ -285,6 +285,11 @@ pub struct ArmMetrics {
     pub cost_usd: f64,
     pub cost_per_request: Option<f64>,
     pub saved_usd: f64,
+    /// `cost_usd + saved_usd`: the spend had no request been served from
+    /// the response cache. Reruns of the same workload land on the same
+    /// figure, so this is the fair cost to compare arms on.
+    pub uncached_cost_usd: f64,
+    pub uncached_cost_per_request: Option<f64>,
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub tokens_in_per_request: Option<f64>,
@@ -341,6 +346,8 @@ pub struct Deltas {
     pub requests: Option<Delta>,
     pub cost_usd: Option<Delta>,
     pub cost_per_request: Option<Delta>,
+    pub uncached_cost_usd: Option<Delta>,
+    pub uncached_cost_per_request: Option<Delta>,
     pub tokens_in: Option<Delta>,
     pub tokens_out: Option<Delta>,
     pub tokens_in_per_request: Option<Delta>,
@@ -360,6 +367,11 @@ impl Deltas {
             requests: Some(Delta::between(f(a.requests), f(b.requests))),
             cost_usd: Some(Delta::between(a.cost_usd, b.cost_usd)),
             cost_per_request: Delta::opt(a.cost_per_request, b.cost_per_request),
+            uncached_cost_usd: Some(Delta::between(a.uncached_cost_usd, b.uncached_cost_usd)),
+            uncached_cost_per_request: Delta::opt(
+                a.uncached_cost_per_request,
+                b.uncached_cost_per_request,
+            ),
             tokens_in: Some(Delta::between(f(a.tokens_in), f(b.tokens_in))),
             tokens_out: Some(Delta::between(f(a.tokens_out), f(b.tokens_out))),
             tokens_in_per_request: Delta::opt(a.tokens_in_per_request, b.tokens_in_per_request),
@@ -620,6 +632,8 @@ async fn arm_metrics(
         cost_usd: totals.cost_usd,
         cost_per_request: per_request(totals.cost_usd),
         saved_usd: totals.saved_usd,
+        uncached_cost_usd: totals.uncached_cost_usd,
+        uncached_cost_per_request: per_request(totals.uncached_cost_usd),
         tokens_in: totals.tokens_in,
         tokens_out: totals.tokens_out,
         tokens_in_per_request: per_request(totals.tokens_in as f64),
@@ -826,6 +840,14 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
     let ms = |v: Option<i64>| fmt_opt(v.map(|v| v as f64), fmt_ms);
     vec![
         // Per-request figures first: they are what an experiment is judged on.
+        // The uncached cost leads so a rerun served from cache doesn't look
+        // cheaper than the run that paid for it.
+        MetricRow {
+            label: "Uncached cost per request".into(),
+            a: fmt_opt(a.uncached_cost_per_request, money),
+            b: fmt_opt(b.uncached_cost_per_request, money),
+            delta: fmt_delta(&d.uncached_cost_per_request, money),
+        },
         MetricRow {
             label: "Cost per request".into(),
             a: fmt_opt(a.cost_per_request, money),
@@ -900,6 +922,12 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
             a: a.requests.to_string(),
             b: b.requests.to_string(),
             delta: fmt_delta(&d.requests, fmt_count),
+        },
+        MetricRow {
+            label: "Uncached total cost".into(),
+            a: money(a.uncached_cost_usd),
+            b: money(b.uncached_cost_usd),
+            delta: fmt_delta(&d.uncached_cost_usd, money),
         },
         MetricRow {
             label: "Total cost".into(),
@@ -980,6 +1008,7 @@ fn chart_json(c: &Comparison) -> (String, String, String) {
             "label": m.value,
             "requests": m.requests,
             "cost_per_request": m.cost_per_request,
+            "uncached_cost_per_request": m.uncached_cost_per_request,
             "tokens_in_per_request": m.tokens_in_per_request,
             "tokens_out_per_request": m.tokens_out_per_request,
             "mean_ms": m.latency.mean_ms,
@@ -992,6 +1021,7 @@ fn chart_json(c: &Comparison) -> (String, String, String) {
             "series": m.by_day.iter().map(|row| serde_json::json!({
                 "day": row.key,
                 "cost_usd": row.totals.cost_usd,
+                "uncached_cost_usd": row.totals.uncached_cost_usd,
             })).collect::<Vec<_>>(),
         })
     };

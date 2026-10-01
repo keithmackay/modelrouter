@@ -9,13 +9,14 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>User</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
+                <th>User</th><th>Uncached (USD)</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
             </tr>
         </thead>
         <tbody>
         {% for row in by_user_rows %}
             <tr>
                 <td>{{ row.name }}</td>
+                <td>{{ row.uncached_cost_usd | money }}</td>
                 <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.tokens_in }}</td>
                 <td>{{ row.tokens_out }}</td>
@@ -36,13 +37,14 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>Model</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
+                <th>Model</th><th>Uncached (USD)</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
             </tr>
         </thead>
         <tbody>
         {% for row in by_model_rows %}
             <tr>
                 <td>{{ row.model }}</td>
+                <td>{{ row.uncached_cost_usd | money }}</td>
                 <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.tokens_in }}</td>
                 <td>{{ row.tokens_out }}</td>
@@ -63,13 +65,14 @@
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
         <thead>
             <tr style="font-size:0.75rem;text-transform:uppercase;color:#777;">
-                <th>Project</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
+                <th>Project</th><th>Uncached (USD)</th><th>Cost (USD)</th><th>Tokens Out (Completions)</th><th>Tokens In (Prompts)</th><th>Requests</th>
             </tr>
         </thead>
         <tbody>
         {% for row in by_project_rows %}
             <tr>
                 <td>{{ row.project }}</td>
+                <td>{{ row.uncached_cost_usd | money }}</td>
                 <td>{{ row.cost_usd | money }}</td>
                 <td>{{ row.tokens_in }}</td>
                 <td>{{ row.tokens_out }}</td>

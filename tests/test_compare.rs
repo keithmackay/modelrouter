@@ -243,7 +243,13 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
     .unwrap();
 }
 
-async fn seed_cache_hit(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64, i64)) {
+/// A response-cache hit; `avoided` is what the call would have cost.
+async fn seed_cache_hit(
+    db: &Arc<dyn DatabaseProvider>,
+    s: &Seed<'_>,
+    tokens: (i64, i64),
+    avoided: f64,
+) {
     CostRepository::create_cache_hit(
         &**db,
         NewCostLedgerEntry {
@@ -254,7 +260,7 @@ async fn seed_cache_hit(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i
             project: None,
             tokens_in: tokens.0,
             tokens_out: tokens.1,
-            cost_usd: 0.0,
+            cost_usd: avoided,
             api_key_id: None,
             attribution_correlation_id: Some(s.run.to_string()),
             attribution_tags: s.tags.to_string(),
@@ -468,6 +474,7 @@ async fn provider_dimension_matches_the_expected_document() {
             "value": "p1", "label": "provider=p1",
             "requests": 4,
             "cost_usd": 2.0, "cost_per_request": 0.5, "saved_usd": 0.0,
+            "uncached_cost_usd": 2.0, "uncached_cost_per_request": 0.5,
             "tokens_in": 40, "tokens_out": 80,
             "tokens_in_per_request": 10.0, "tokens_out_per_request": 20.0,
             "cache_hits": 0, "hit_rate": 0.0,
@@ -476,13 +483,15 @@ async fn provider_dimension_matches_the_expected_document() {
             "ttft": { "samples": 0, "mean_ms": null, "p50_ms": null, "p95_ms": null },
             "attempts_tracked": 0, "attempts": 0, "retried_requests": 0,
             "unpriced": true, "unpriced_models": ["m1"],
-            "by_day": [{ "key": day, "cost_usd": 2.0, "saved_usd": 0.0, "tokens_in": 40,
+            "by_day": [{ "key": day, "cost_usd": 2.0, "saved_usd": 0.0,
+                         "uncached_cost_usd": 2.0, "tokens_in": 40,
                          "tokens_out": 80, "requests": 4, "cache_hits": 0 }]
         },
         "b": {
             "value": "p2", "label": "provider=p2",
             "requests": 1,
             "cost_usd": 0.25, "cost_per_request": 0.25, "saved_usd": 0.0,
+            "uncached_cost_usd": 0.25, "uncached_cost_per_request": 0.25,
             "tokens_in": 40, "tokens_out": 80,
             "tokens_in_per_request": 40.0, "tokens_out_per_request": 80.0,
             "cache_hits": 0, "hit_rate": 0.0,
@@ -491,13 +500,16 @@ async fn provider_dimension_matches_the_expected_document() {
             "ttft": { "samples": 0, "mean_ms": null, "p50_ms": null, "p95_ms": null },
             "attempts_tracked": 0, "attempts": 0, "retried_requests": 0,
             "unpriced": true, "unpriced_models": ["m2"],
-            "by_day": [{ "key": day, "cost_usd": 0.25, "saved_usd": 0.0, "tokens_in": 40,
+            "by_day": [{ "key": day, "cost_usd": 0.25, "saved_usd": 0.0,
+                         "uncached_cost_usd": 0.25, "tokens_in": 40,
                          "tokens_out": 80, "requests": 1, "cache_hits": 0 }]
         },
         "delta": {
             "requests": { "abs": -3.0, "pct": -75.0 },
             "cost_usd": { "abs": -1.75, "pct": -87.5 },
             "cost_per_request": { "abs": -0.25, "pct": -50.0 },
+            "uncached_cost_usd": { "abs": -1.75, "pct": -87.5 },
+            "uncached_cost_per_request": { "abs": -0.25, "pct": -50.0 },
             "tokens_in": { "abs": 0.0, "pct": 0.0 },
             "tokens_out": { "abs": 0.0, "pct": 0.0 },
             "tokens_in_per_request": { "abs": 30.0, "pct": 300.0 },
@@ -696,13 +708,79 @@ async fn cache_hits_at_zero_cost_are_not_unpriced() {
     let (server, db, settings) = build_app().await;
     let a = Seed { model: "mock-model", provider: "mock", run: "run-a", tags: r#"{"arm":"a"}"#, variant: None };
     let b = Seed { model: "mock-model", provider: "mock", run: "run-b", tags: r#"{"arm":"b"}"#, variant: None };
-    seed_cache_hit(&db, &a, (10, 20)).await;
+    seed_cache_hit(&db, &a, (10, 20), 0.0).await;
     seed_ledger(&db, &b, (10, 20), 0.03).await;
 
     let (status, body) = compare(&server, &settings, "dimension=tag&key=arm&a=a&b=b&window=all").await;
     assert_eq!(status, 200, "{}", body);
     assert_eq!(body["a"]["cache_hits"], 1);
     assert_eq!(body["a"]["unpriced"], false);
+}
+
+#[tokio::test]
+async fn a_rerun_served_from_cache_compares_at_its_uncached_cost() {
+    // Arm a paid for two calls; arm b reran the same two and one came from
+    // cache. Uncached figures match, actual spend does not.
+    let (server, db, settings) = build_app().await;
+    let a = Seed {
+        model: "mock-model",
+        provider: "mock",
+        run: "run-a",
+        tags: r#"{"arm":"a"}"#,
+        variant: None,
+    };
+    let b = Seed {
+        model: "mock-model",
+        provider: "mock",
+        run: "run-b",
+        tags: r#"{"arm":"b"}"#,
+        variant: None,
+    };
+    seed_ledger(&db, &a, (10, 20), 0.25).await;
+    seed_ledger(&db, &a, (10, 20), 0.75).await;
+    seed_ledger(&db, &b, (10, 20), 0.25).await;
+    seed_cache_hit(&db, &b, (10, 20), 0.75).await;
+
+    let (status, body) = compare(
+        &server,
+        &settings,
+        "dimension=tag&key=arm&a=a&b=b&window=all",
+    )
+    .await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["a"]["cost_usd"], 1.0);
+    assert_eq!(body["b"]["cost_usd"], 0.25);
+    assert_eq!(body["b"]["saved_usd"], 0.75);
+    assert_eq!(body["a"]["uncached_cost_usd"], 1.0);
+    assert_eq!(body["b"]["uncached_cost_usd"], 1.0);
+    assert_eq!(body["b"]["uncached_cost_per_request"], 0.5);
+    assert_eq!(body["b"]["by_day"][0]["uncached_cost_usd"], 1.0);
+    assert_eq!(
+        body["delta"]["uncached_cost_usd"],
+        json!({ "abs": 0.0, "pct": 0.0 })
+    );
+    assert_eq!(
+        body["delta"]["uncached_cost_per_request"],
+        json!({ "abs": 0.0, "pct": 0.0 })
+    );
+    assert_eq!(
+        body["delta"]["cost_usd"],
+        json!({ "abs": -0.75, "pct": -75.0 })
+    );
+
+    let panels = server
+        .get("/admin/compare/panels")
+        .add_raw_query_param("dimension=tag&key=arm&a=a&b=b&window=all")
+        .add_header(session_cookie(&settings).0, session_cookie(&settings).1)
+        .await;
+    assert_eq!(panels.status_code(), 200, "{}", panels.text());
+    let html = panels.text();
+    assert!(html.contains("Uncached cost per request"), "{html}");
+    assert!(html.contains("Uncached total cost"), "{html}");
+    assert!(
+        html.contains("uncached_cost_per_request"),
+        "chart data carries the uncached bar: {html}"
+    );
 }
 
 #[tokio::test]

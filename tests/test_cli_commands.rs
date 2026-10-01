@@ -1322,7 +1322,7 @@ async fn report_cost_with_data() {
     // Insert cost ledger entries
     sqlx::query(
         "INSERT INTO cost_ledger (user_id, model, provider, project, tokens_in, tokens_out, cost_usd, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(user_id)
     .bind("gpt-4")
@@ -1331,6 +1331,9 @@ async fn report_cost_with_data() {
     .bind(100)
     .bind(200)
     .bind(0.05)
+    // RFC 3339, as the router writes it. SQLite's datetime('now') sorts
+    // before the window start on the first day of a month.
+    .bind(chrono::Utc::now().to_rfc3339())
     .execute(&pool)
     .await.expect("insert cost");
 
@@ -1764,9 +1767,15 @@ async fn report_usage_detail_renders_rows_in_every_format() {
     );
     assert!(ok, "usage csv failed: {err}");
     let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(lines[0], "bucket,user,project,model,tokens_in,tokens_out,cost_usd");
+    assert_eq!(
+        lines[0],
+        "bucket,user,project,model,tokens_in,tokens_out,cost_usd,saved_usd,uncached_cost_usd"
+    );
     assert_eq!(lines.len(), 5, "header + 4 rows: {out}");
-    assert!(out.contains("2024-03,alice,proj-a,gpt-4o,1000,200,1.25"), "{out}");
+    assert!(
+        out.contains("2024-03,alice,proj-a,gpt-4o,1000,200,1.25,0.00,1.25"),
+        "{out}"
+    );
 
     // Table: per-user subtotals and a grand total.
     let (ok, out, err) = run_cli(
@@ -1796,7 +1805,51 @@ async fn report_usage_total_and_subtotal_over_data() {
         &["report", "usage", "--total", "--alltime", "--global", "--format", "csv"],
     );
     assert!(ok, "{err}");
-    assert!(out.contains(",200,40,1.00"), "summed totals: {out}");
+    assert!(
+        out.contains(",200,40,1.00,0.00,1.00"),
+        "summed totals: {out}"
+    );
+
+    // A response-cache hit adds nothing to spend but counts at full price
+    // uncached.
+    sqlx::query(
+        "INSERT INTO cost_ledger (user_id, model, provider, project, tokens_in, tokens_out, \
+         cost_usd, saved_usd, cache_hit, created_at) \
+         VALUES ((SELECT id FROM users WHERE name = 'alice'), 'gpt-4o', 'openai', 'proj-a', \
+         100, 20, 0.0, 0.50, 1, '2023-08-02T00:00:00+00:00')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert cache hit");
+    let (ok, out, err) = run_cli(
+        &config,
+        &[
+            "report",
+            "usage",
+            "--total",
+            "--alltime",
+            "--global",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(ok, "{err}");
+    let rows: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(rows[0]["cost_usd"], 1.0, "{out}");
+    assert_eq!(rows[0]["saved_usd"], 0.5, "{out}");
+    assert_eq!(rows[0]["uncached_cost_usd"], 1.5, "{out}");
+    let (ok, out, err) = run_cli(
+        &config,
+        &[
+            "report", "cost", "--user", "alice", "--window", "alltime", "--format", "csv",
+        ],
+    );
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("Uncached (USD),Cost (USD),Saved (USD)"),
+        "{out}"
+    );
+    assert!(out.contains(",1.50,1.00,0.50,"), "{out}");
 
     // --subtotal --annual groups per year+user+project.
     let (ok, out, err) = run_cli(

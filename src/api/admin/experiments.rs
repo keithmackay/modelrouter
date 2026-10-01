@@ -740,6 +740,9 @@ pub struct VariantModelMetrics {
     pub requests: i64,
     pub cost_usd: f64,
     pub saved_usd: f64,
+    /// `cost_usd + saved_usd`: the spend with no response cache, so reruns
+    /// served from cache compare as first runs.
+    pub uncached_cost_usd: f64,
     pub tokens: TokenTotals,
     pub estimated_rows: i64,
     /// No pricing entry, so `cost_usd` was recorded as zero.
@@ -751,6 +754,7 @@ pub struct VariantModelMetrics {
 pub struct PerRunFigures {
     pub turns: f64,
     pub cost_usd: f64,
+    pub uncached_cost_usd: f64,
     pub tokens: f64,
     pub span_secs: f64,
 }
@@ -759,6 +763,7 @@ pub struct PerRunFigures {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct PerRequestFigures {
     pub cost_usd: f64,
+    pub uncached_cost_usd: f64,
     pub tokens_in: f64,
     pub tokens_out: f64,
 }
@@ -785,6 +790,7 @@ pub struct VariantResults {
     pub turns: i64,
     pub cost_usd: f64,
     pub saved_usd: f64,
+    pub uncached_cost_usd: f64,
     pub tokens: TokenTotals,
     /// Rows whose token counts were estimated locally rather than reported.
     pub estimated_rows: i64,
@@ -830,6 +836,7 @@ impl VariantResults {
             turns: 0,
             cost_usd: 0.0,
             saved_usd: 0.0,
+            uncached_cost_usd: 0.0,
             tokens: TokenTotals::default(),
             estimated_rows: 0,
             failures: 0,
@@ -856,6 +863,7 @@ impl VariantResults {
             PerRunFigures {
                 turns: self.turns as f64 / n,
                 cost_usd: self.cost_usd / n,
+                uncached_cost_usd: self.uncached_cost_usd / n,
                 tokens: self.tokens.total as f64 / n,
                 span_secs: self.span_secs / n,
             }
@@ -864,6 +872,7 @@ impl VariantResults {
             let n = self.requests as f64;
             PerRequestFigures {
                 cost_usd: self.cost_usd / n,
+                uncached_cost_usd: self.uncached_cost_usd / n,
                 tokens_in: self.tokens.prompt as f64 / n,
                 tokens_out: self.tokens.completion as f64 / n,
             }
@@ -884,6 +893,7 @@ pub struct ExperimentTotals {
     pub turns: i64,
     pub cost_usd: f64,
     pub saved_usd: f64,
+    pub uncached_cost_usd: f64,
     pub tokens: TokenTotals,
     pub estimated_rows: i64,
     pub failures: i64,
@@ -938,6 +948,7 @@ pub struct RunResult {
     pub turns: i64,
     pub cost_usd: f64,
     pub saved_usd: f64,
+    pub uncached_cost_usd: f64,
     pub tokens: TokenTotals,
     pub estimated_rows: i64,
     pub failures: i64,
@@ -1138,6 +1149,7 @@ pub async fn build_results(
         v.requests += t.requests;
         v.cost_usd += t.cost_usd;
         v.saved_usd += t.saved_usd;
+        v.uncached_cost_usd += t.cost_usd + t.saved_usd;
         v.tokens.add(TokenTotals::new(t.tokens_in, t.tokens_out));
         v.estimated_rows += t.estimated_rows;
     }
@@ -1152,6 +1164,7 @@ pub async fn build_results(
             requests: m.requests,
             cost_usd: m.cost_usd,
             saved_usd: m.saved_usd,
+            uncached_cost_usd: m.cost_usd + m.saved_usd,
             tokens: TokenTotals::new(m.tokens_in, m.tokens_out),
             estimated_rows: m.estimated_rows,
             unpriced,
@@ -1227,6 +1240,7 @@ pub async fn build_results(
         totals.turns += v.turns;
         totals.cost_usd += v.cost_usd;
         totals.saved_usd += v.saved_usd;
+        totals.uncached_cost_usd += v.uncached_cost_usd;
         totals.tokens.add(v.tokens);
         totals.estimated_rows += v.estimated_rows;
         totals.failures += v.failures;
@@ -1251,6 +1265,7 @@ pub async fn build_results(
         turns: run.requests,
         cost_usd: row.map(|r| r.cost_usd).unwrap_or(0.0),
         saved_usd: row.map(|r| r.saved_usd).unwrap_or(0.0),
+        uncached_cost_usd: row.map(|r| r.cost_usd + r.saved_usd).unwrap_or(0.0),
         tokens: row
             .map(|r| TokenTotals::new(r.tokens_in, r.tokens_out))
             .unwrap_or_default(),
@@ -1694,6 +1709,7 @@ struct ModelRowView {
     requests: i64,
     cost_usd: f64,
     saved_usd: f64,
+    uncached_cost_usd: f64,
     tokens_in: i64,
     tokens_out: i64,
     estimated_rows: i64,
@@ -1710,6 +1726,8 @@ struct RunRowView {
     requests: i64,
     unbound_requests: i64,
     cost_usd: f64,
+    saved_usd: f64,
+    uncached_cost_usd: f64,
     span: String,
     latency: String,
     failures: i64,
@@ -1747,6 +1765,7 @@ fn variant_card(exp: &Experiment, v: &VariantResults) -> VariantCardView {
         MetricLine { label: "Mixed runs", value: v.mixed_runs.to_string() },
         MetricLine { label: "Requests", value: v.requests.to_string() },
         MetricLine { label: "Unbound requests", value: v.unbound_requests.to_string() },
+        MetricLine { label: "Uncached cost", value: money(v.uncached_cost_usd) },
         MetricLine { label: "Cost", value: money(v.cost_usd) },
         MetricLine { label: "Saved", value: money(v.saved_usd) },
         MetricLine {
@@ -1780,8 +1799,9 @@ fn variant_card(exp: &Experiment, v: &VariantResults) -> VariantCardView {
                 .per_run
                 .map(|p| {
                     format!(
-                        "{:.1} turns · {} · {:.0} tokens · {}",
+                        "{:.1} turns · {} uncached ({} paid) · {:.0} tokens · {}",
                         p.turns,
+                        money(p.uncached_cost_usd),
                         money(p.cost_usd),
                         p.tokens,
                         fmt_secs(p.span_secs)
@@ -1826,6 +1846,8 @@ fn run_row(r: &RunResult, names: &HashMap<i64, String>) -> RunRowView {
         requests: r.requests,
         unbound_requests: r.unbound_requests,
         cost_usd: r.cost_usd,
+        saved_usd: r.saved_usd,
+        uncached_cost_usd: r.uncached_cost_usd,
         span: fmt_secs(r.span_secs),
         latency: r
             .latency
@@ -1904,6 +1926,7 @@ pub async fn get_experiment_panels(
                 requests: m.requests,
                 cost_usd: m.cost_usd,
                 saved_usd: m.saved_usd,
+                uncached_cost_usd: m.uncached_cost_usd,
                 tokens_in: m.tokens.prompt,
                 tokens_out: m.tokens.completion,
                 estimated_rows: m.estimated_rows,
@@ -1942,6 +1965,7 @@ pub async fn get_experiment_panels(
                 unbound_requests => totals.unbound_requests,
                 cost => money(totals.cost_usd),
                 saved => money(totals.saved_usd),
+                uncached_cost => money(totals.uncached_cost_usd),
                 tokens => totals.tokens.total,
                 failures => totals.failures,
                 latency_samples => totals.latency_samples,

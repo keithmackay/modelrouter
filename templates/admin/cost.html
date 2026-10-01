@@ -80,6 +80,7 @@
             <th>Group</th>
             <th>Project</th>
             <th>Key</th>
+            <th title="Cost had nothing come from the response cache">Uncached (USD)</th>
             <th>Cost (USD)</th>
             <th>Requests</th>
             <th>Tokens In (Prompts)</th>
@@ -97,6 +98,7 @@
             <td>{{ row.groups }}</td>
             <td>{{ row.project }}</td>
             <td>{{ row.key }}</td>
+            <td>{{ row.uncached_cost_usd | money }}</td>
             <td>{{ row.total_cost_usd | money }}</td>
             <td>{{ row.request_count }}</td>
             <td>{{ row.total_tokens_out }}</td>
@@ -105,7 +107,7 @@
             <td>{{ row.cache_saved_usd | money }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="12" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
+        <tr><td colspan="13" style="text-align:center; color:#777; padding: 2rem;">No data for selected filters.</td></tr>
         {% endfor %}
     </tbody>
 </table>

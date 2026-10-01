@@ -587,6 +587,8 @@ mod seed {
         pub cost: f64,
         pub tokens: (i64, i64),
         pub estimated: bool,
+        /// Served from the response cache: `cost` is recorded as saved.
+        pub cache_hit: bool,
         /// RFC3339 `created_at` to pin the row to.
         pub at: &'a str,
     }
@@ -601,6 +603,7 @@ mod seed {
                 cost: 0.01,
                 tokens: (100, 50),
                 estimated: false,
+                cache_hit: false,
                 at,
             }
         }
@@ -608,7 +611,12 @@ mod seed {
 
     /// One ledger row, pinned to `row.at`. Returns its id.
     pub async fn ledger(h: &Harness, experiment: i64, row: Row<'_>) -> i64 {
-        let entry = CostRepository::create(
+        let write = if row.cache_hit {
+            CostRepository::create_cache_hit
+        } else {
+            CostRepository::create
+        };
+        let entry = write(
             &*h.db,
             NewCostLedgerEntry {
                 user_id: row.user,
@@ -898,6 +906,72 @@ async fn results_aggregate_two_variants_over_two_runs_each() {
 
 /// A run seen under two variants is flagged, counted once, attributed at run
 /// level to its earliest variant, and split at request level.
+#[tokio::test]
+async fn a_rerun_from_cache_reports_the_same_uncached_cost() {
+    let h = build_server().await;
+    let id = create(&h, &body("r")).await.json::<Value>()["id"]
+        .as_i64()
+        .unwrap();
+    use seed::{Row, ALICE};
+
+    // control paid for both turns; candidate reran them and the second came
+    // from the response cache.
+    seed::ledger(
+        &h,
+        id,
+        Row {
+            cost: 0.01,
+            ..Row::new(ALICE, "c1", Some("control"), T0)
+        },
+    )
+    .await;
+    seed::ledger(
+        &h,
+        id,
+        Row {
+            cost: 0.03,
+            ..Row::new(ALICE, "c1", Some("control"), T1)
+        },
+    )
+    .await;
+    seed::ledger(
+        &h,
+        id,
+        Row {
+            cost: 0.01,
+            ..Row::new(ALICE, "k1", Some("candidate"), T2)
+        },
+    )
+    .await;
+    seed::ledger(
+        &h,
+        id,
+        Row {
+            cost: 0.03,
+            cache_hit: true,
+            ..Row::new(ALICE, "k1", Some("candidate"), T3)
+        },
+    )
+    .await;
+
+    let doc = results(&h, id).await;
+    let control = variant(&doc, "control");
+    let candidate = variant(&doc, "candidate");
+    assert!(approx(&control["uncached_cost_usd"], 0.04));
+    assert!(approx(&candidate["uncached_cost_usd"], 0.04));
+    assert!(approx(&candidate["cost_usd"], 0.01));
+    assert!(approx(&candidate["saved_usd"], 0.03));
+    assert!(approx(&candidate["per_run"]["uncached_cost_usd"], 0.04));
+    assert!(approx(&candidate["per_request"]["uncached_cost_usd"], 0.02));
+    assert!(approx(&candidate["models"][0]["uncached_cost_usd"], 0.04));
+    assert!(approx(&doc["totals"]["uncached_cost_usd"], 0.08));
+    assert!(approx(&doc["totals"]["cost_usd"], 0.05));
+    let k1 = run(&doc, ALICE, "k1");
+    assert!(approx(&k1["uncached_cost_usd"], 0.04));
+    assert!(approx(&k1["cost_usd"], 0.01));
+    assert!(approx(&run(&doc, ALICE, "c1")["uncached_cost_usd"], 0.04));
+}
+
 #[tokio::test]
 async fn a_mixed_run_is_flagged_and_split_by_level() {
     let h = build_server().await;
