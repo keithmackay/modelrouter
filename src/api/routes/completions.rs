@@ -329,6 +329,7 @@ async fn chat_completions_inner(
                 experiment_id,
                 experiment_variant,
                 cache_key,
+                cache_directives: cache_directives.clone(),
             },
         );
 
@@ -433,7 +434,7 @@ async fn chat_completions_inner(
     if let Some(key) = cache_key {
         state
             .response_cache
-            .put_completion(&key, &canonical_model, &result, cost)
+            .put_completion(&key, &canonical_model, &result, cost, &cache_directives)
             .await;
     }
 
@@ -1322,6 +1323,8 @@ struct StreamLogCtx {
     /// Response-cache key when the request is cacheable; a stream that
     /// completes cleanly is stored under it.
     cache_key: Option<String>,
+    /// The caller's cache directives; they set the stored entry's TTL.
+    cache_directives: crate::router::cache::CacheDirectives,
 }
 
 /// Usage as the provider reported it inside a streamed chunk (OpenAI shape:
@@ -1526,7 +1529,13 @@ impl StreamLogger {
             );
             ctx.state
                 .response_cache
-                .put_completion(&key, &ctx.canonical_model, &result, cost)
+                .put_completion(
+                    &key,
+                    &ctx.canonical_model,
+                    &result,
+                    cost,
+                    &ctx.cache_directives,
+                )
                 .await;
         });
     }

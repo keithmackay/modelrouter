@@ -2,10 +2,10 @@ mod common;
 
 use modelrouter::config::schema::CacheConfig;
 use modelrouter::providers::adapter::CompletionResult;
-use modelrouter::router::cache::store::{CacheStore, CachedEntry, MemoryStore};
+use modelrouter::router::cache::store::{CacheStore, CachedEntry, EntryTtl, MemoryStore};
 use modelrouter::router::cache::{
-    completion_cache_key, make_cache_key, search_cache_key, CachePolicy, CachePolicyUpdate,
-    ResponseCache,
+    completion_cache_key, make_cache_key, search_cache_key, CacheDirectives, CachePolicy,
+    CachePolicyUpdate, ResponseCache,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -43,7 +43,13 @@ async fn cache_miss_returns_none() {
 async fn cache_hit_returns_value() {
     let cache = enabled_cache(100, 60);
     cache
-        .put_completion("key-1", "gpt-4o", &sample_result("cached!"), 0.02)
+        .put_completion(
+            "key-1",
+            "gpt-4o",
+            &sample_result("cached!"),
+            0.02,
+            &Default::default(),
+        )
         .await;
     let hit = cache.get_completion("key-1", "gpt-4o").await.unwrap();
     assert_eq!(hit.content, "cached!");
@@ -54,7 +60,13 @@ async fn cache_hit_returns_value() {
 async fn stats_track_hits_misses_and_savings() {
     let cache = enabled_cache(100, 60);
     cache
-        .put_completion("k", "gpt-4o", &sample_result("hi"), 0.25)
+        .put_completion(
+            "k",
+            "gpt-4o",
+            &sample_result("hi"),
+            0.25,
+            &Default::default(),
+        )
         .await;
     cache.get_completion("k", "gpt-4o").await.unwrap();
     assert!(cache.get_completion("missing", "gpt-4o").await.is_none());
@@ -86,7 +98,9 @@ fn entry(model: &str) -> CachedEntry {
 #[tokio::test]
 async fn memory_store_round_trips_and_counts_entries() {
     let store = MemoryStore::new(&CacheConfig::default());
-    store.put("a", entry("m"), Duration::from_secs(60)).await;
+    store
+        .put("a", entry("m"), EntryTtl::Finite(Duration::from_secs(60)))
+        .await;
     assert!(store.get("a").await.is_some());
     assert_eq!(store.entry_count().await, 1);
     assert_eq!(store.backend_name(), "memory");
@@ -97,10 +111,73 @@ async fn memory_store_round_trips_and_counts_entries() {
 async fn memory_store_honours_ttl() {
     let store = MemoryStore::new(&CacheConfig::default());
     // Sub-second TTLs are clamped to 1s, so this is the shortest observable TTL.
-    store.put("a", entry("m"), Duration::from_secs(1)).await;
+    store
+        .put("a", entry("m"), EntryTtl::Finite(Duration::from_secs(1)))
+        .await;
     assert!(store.get("a").await.is_some());
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(store.get("a").await.is_none(), "entry should expire");
+}
+
+fn ttl_policy(max_ttl_seconds: u64) -> CachePolicy {
+    CachePolicy::from_config(&CacheConfig {
+        enabled: true,
+        ttl_seconds: 600,
+        max_ttl_seconds,
+        ..Default::default()
+    })
+}
+
+fn ttl_directives(ttl: Option<EntryTtl>) -> CacheDirectives {
+    CacheDirectives {
+        ttl,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn requested_ttl_is_capped_by_the_operator_maximum() {
+    let finite = |s| EntryTtl::Finite(Duration::from_secs(s));
+    let capped = ttl_policy(3600);
+    assert_eq!(
+        capped.entry_ttl("completion", &ttl_directives(None)),
+        finite(600),
+        "no header keeps the class default"
+    );
+    assert_eq!(
+        capped.entry_ttl("search", &ttl_directives(None)),
+        finite(900)
+    );
+    assert_eq!(
+        capped.entry_ttl("completion", &ttl_directives(Some(finite(60)))),
+        finite(60)
+    );
+    assert_eq!(
+        capped.entry_ttl("completion", &ttl_directives(Some(finite(7200)))),
+        finite(3600)
+    );
+    assert_eq!(
+        capped.entry_ttl("completion", &ttl_directives(Some(EntryTtl::Unlimited))),
+        finite(3600),
+        "unlimited is capped too"
+    );
+
+    let uncapped = ttl_policy(0);
+    assert_eq!(
+        uncapped.entry_ttl("completion", &ttl_directives(Some(EntryTtl::Unlimited))),
+        EntryTtl::Unlimited
+    );
+    assert_eq!(
+        uncapped.entry_ttl("search", &ttl_directives(Some(finite(7200)))),
+        finite(7200)
+    );
+}
+
+#[test]
+fn max_ttl_defaults_to_one_day() {
+    assert_eq!(CacheConfig::default().max_ttl_seconds, 86_400);
+    let parsed: CacheConfig = toml::from_str("enabled = true").unwrap();
+    assert_eq!(parsed.max_ttl_seconds, 86_400);
 }
 
 #[tokio::test]
@@ -108,14 +185,26 @@ async fn memory_store_purges_by_key_model_and_all() {
     let store = MemoryStore::new(&CacheConfig::default());
     let fp = modelrouter::router::cache::model_fingerprint("gpt-4o");
     store
-        .put(&format!("completion:{}:aaa", fp), entry("gpt-4o"), Duration::from_secs(60))
+        .put(
+            &format!("completion:{}:aaa", fp),
+            entry("gpt-4o"),
+            EntryTtl::Finite(Duration::from_secs(60)),
+        )
         .await;
     store
-        .put(&format!("completion:{}:bbb", fp), entry("gpt-4o"), Duration::from_secs(60))
+        .put(
+            &format!("completion:{}:bbb", fp),
+            entry("gpt-4o"),
+            EntryTtl::Finite(Duration::from_secs(60)),
+        )
         .await;
     let other_fp = modelrouter::router::cache::model_fingerprint("claude");
     store
-        .put(&format!("completion:{}:ccc", other_fp), entry("claude"), Duration::from_secs(60))
+        .put(
+            &format!("completion:{}:ccc", other_fp),
+            entry("claude"),
+            EntryTtl::Finite(Duration::from_secs(60)),
+        )
         .await;
 
     assert!(store.purge_key(&format!("completion:{}:aaa", fp)).await);
@@ -131,8 +220,24 @@ async fn cache_purge_by_model_leaves_other_models() {
     let cache = enabled_cache(100, 60);
     let gpt_key = completion_cache_key("gpt-4o", &json!({"messages": []}));
     let claude_key = completion_cache_key("claude-opus", &json!({"messages": []}));
-    cache.put_completion(&gpt_key, "gpt-4o", &sample_result("a"), 0.0).await;
-    cache.put_completion(&claude_key, "claude-opus", &sample_result("b"), 0.0).await;
+    cache
+        .put_completion(
+            &gpt_key,
+            "gpt-4o",
+            &sample_result("a"),
+            0.0,
+            &Default::default(),
+        )
+        .await;
+    cache
+        .put_completion(
+            &claude_key,
+            "claude-opus",
+            &sample_result("b"),
+            0.0,
+            &Default::default(),
+        )
+        .await;
 
     assert_eq!(cache.purge_model("gpt-4o").await, 1);
     assert!(cache.get_completion(&gpt_key, "gpt-4o").await.is_none());
@@ -383,6 +488,15 @@ async fn test_app_with_cache_config<
     adapter: A,
     cache_config: CacheConfig,
 ) -> (TestServer, Arc<dyn DatabaseProvider>, Arc<ResponseCache>) {
+    test_app_with_response_cache(adapter, Arc::new(ResponseCache::new(&cache_config))).await
+}
+
+async fn test_app_with_response_cache<
+    A: modelrouter::providers::adapter::ProviderAdapter + 'static,
+>(
+    adapter: A,
+    response_cache: Arc<ResponseCache>,
+) -> (TestServer, Arc<dyn DatabaseProvider>, Arc<ResponseCache>) {
     let db = common::in_memory_db().await;
     db.create(NewUser {
         name: "test-user".to_string(),
@@ -408,7 +522,6 @@ async fn test_app_with_cache_config<
 
     let settings = Arc::new(Settings::default());
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
-    let response_cache = Arc::new(ResponseCache::new(&cache_config));
 
     let state = AppState {
         settings: settings.clone(),
@@ -1036,4 +1149,142 @@ async fn operator_can_disable_header_opt_in() {
     deterministic["temperature"] = json!(0.0);
     let bypassed = post_with_mode(&server, &deterministic, "bypass").await;
     assert_eq!(cache_outcome(&bypassed).as_deref(), Some("BYPASS"));
+}
+
+// ── Per-request TTL (`x-modelrouter-cache-ttl`) ─────────────────────────────
+
+/// A memory store that records the TTL of every write.
+struct TtlRecordingStore {
+    inner: MemoryStore,
+    ttls: std::sync::Mutex<Vec<EntryTtl>>,
+}
+
+#[async_trait::async_trait]
+impl CacheStore for TtlRecordingStore {
+    async fn get(&self, key: &str) -> Option<CachedEntry> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, entry: CachedEntry, ttl: EntryTtl) {
+        self.ttls.lock().unwrap().push(ttl);
+        self.inner.put(key, entry, ttl).await
+    }
+    async fn purge_key(&self, key: &str) -> bool {
+        self.inner.purge_key(key).await
+    }
+    async fn purge_model(&self, model_fp: &str) -> u64 {
+        self.inner.purge_model(model_fp).await
+    }
+    async fn purge_all(&self) -> u64 {
+        self.inner.purge_all().await
+    }
+    async fn entry_count(&self) -> u64 {
+        self.inner.entry_count().await
+    }
+    fn backend_name(&self) -> &'static str {
+        "recording"
+    }
+}
+
+async fn ttl_app<A: modelrouter::providers::adapter::ProviderAdapter + 'static>(
+    adapter: A,
+    max_ttl_seconds: u64,
+) -> (TestServer, Arc<ResponseCache>, Arc<TtlRecordingStore>) {
+    let config = CacheConfig {
+        enabled: true,
+        max_entries: 10,
+        ttl_seconds: 60,
+        max_ttl_seconds,
+        ..Default::default()
+    };
+    let store = Arc::new(TtlRecordingStore {
+        inner: MemoryStore::new(&config),
+        ttls: Default::default(),
+    });
+    let cache = Arc::new(ResponseCache::with_store(
+        store.clone(),
+        CachePolicy::from_config(&config),
+    ));
+    let (server, _db, cache) = test_app_with_response_cache(adapter, cache).await;
+    (server, cache, store)
+}
+
+async fn post_with_ttl(
+    server: &TestServer,
+    body: &serde_json::Value,
+    ttl: &'static str,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-ttl"),
+            axum::http::HeaderValue::from_static(ttl),
+        )
+        .json(body)
+        .await
+}
+
+fn prompt(n: u32) -> serde_json::Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("question {n}")}],
+        "temperature": 0.0
+    })
+}
+
+#[tokio::test]
+async fn ttl_header_sets_the_entry_ttl_within_the_cap() {
+    let finite = |s| EntryTtl::Finite(Duration::from_secs(s));
+    let (server, _cache, store) = ttl_app(VersionedAdapter::default(), 3600).await;
+
+    post_completion(&server, &prompt(1)).await;
+    post_with_ttl(&server, &prompt(2), "120").await;
+    post_with_ttl(&server, &prompt(3), "999999").await;
+    post_with_ttl(&server, &prompt(4), "0").await;
+
+    assert_eq!(
+        *store.ttls.lock().unwrap(),
+        [finite(60), finite(120), finite(3600), finite(3600)],
+        "class default, as asked, capped, unlimited capped"
+    );
+}
+
+#[tokio::test]
+async fn unlimited_ttl_is_stored_without_expiry_when_the_cap_allows_it() {
+    let adapter = VersionedAdapter::default();
+    let (server, _cache, store) = ttl_app(adapter.clone(), 0).await;
+
+    let first = post_with_ttl(&server, &prompt(1), "0").await;
+    assert_eq!(cache_outcome(&first).as_deref(), Some("MISS"));
+    assert_eq!(*store.ttls.lock().unwrap(), [EntryTtl::Unlimited]);
+
+    let hit = post_completion(&server, &prompt(1)).await;
+    assert_eq!(cache_outcome(&hit).as_deref(), Some("HIT"));
+    assert_eq!(content_of(&hit), "answer 1");
+}
+
+#[tokio::test]
+async fn ttl_header_applies_to_a_streamed_store() {
+    let (server, cache, store) = ttl_app(StreamingAdapter::default(), 3600).await;
+    let resp = post_with_ttl(&server, &ask(true), "90").await;
+    let _ = resp.text();
+    wait_for_stores(&cache, 1).await;
+    assert_eq!(
+        *store.ttls.lock().unwrap(),
+        [EntryTtl::Finite(Duration::from_secs(90))]
+    );
+}
+
+#[tokio::test]
+async fn malformed_ttl_header_is_a_400() {
+    let adapter = VersionedAdapter::default();
+    let (server, _cache, store) = ttl_app(adapter.clone(), 3600).await;
+    let resp = post_with_ttl(&server, &prompt(1), "forever").await;
+    assert_eq!(resp.status_code(), 400);
+    assert!(resp.text().contains("x-modelrouter-cache-ttl"));
+    assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(store.ttls.lock().unwrap().is_empty());
 }

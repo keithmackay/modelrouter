@@ -8,9 +8,21 @@
 
 use axum::http::HeaderMap;
 
+use super::store::EntryTtl;
+
 /// Request header selecting the cache mode (`use`, `bypass`, `refresh`). The
 /// response carries the outcome under the same name.
 pub const MODE_HEADER: &str = "x-modelrouter-cache";
+
+/// Request header setting the TTL of the entry this request stores, in whole
+/// seconds; `0` asks for an entry that never expires. Capped by
+/// `cache.max_ttl_seconds`.
+pub const TTL_HEADER: &str = "x-modelrouter-cache-ttl";
+
+/// Largest TTL a caller can write, ten years. Anything longer is a request
+/// for "forever", which is spelled `0`; refusing it keeps absurd values away
+/// from the store's expiry arithmetic.
+const MAX_REQUESTED_TTL_SECS: u64 = 10 * 365 * 24 * 3600;
 
 /// What the caller asked the cache to do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -31,6 +43,9 @@ pub enum CacheMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheDirectives {
     pub mode: CacheMode,
+    /// TTL for an entry this request stores, before the operator's cap.
+    /// `None` keeps the class default.
+    pub ttl: Option<EntryTtl>,
 }
 
 impl CacheDirectives {
@@ -48,7 +63,19 @@ impl CacheDirectives {
                 ))
             }
         };
-        Ok(Self { mode })
+        let ttl = match header_str(headers, TTL_HEADER)? {
+            None => None,
+            Some(v) => match v.parse::<u64>() {
+                Ok(secs) if secs <= MAX_REQUESTED_TTL_SECS => Some(EntryTtl::from_secs(secs)),
+                _ => {
+                    return Err(format!(
+                        "{TTL_HEADER} must be a whole number of seconds up to \
+                         {MAX_REQUESTED_TTL_SECS}, or 0 for no expiry (got {v:?})"
+                    ))
+                }
+            },
+        };
+        Ok(Self { mode, ttl })
     }
 }
 
@@ -128,9 +155,43 @@ mod tests {
     use axum::http::HeaderValue;
 
     fn directives(value: &str) -> Result<CacheDirectives, String> {
+        with_header(MODE_HEADER, value)
+    }
+
+    fn with_header(name: &'static str, value: &str) -> Result<CacheDirectives, String> {
         let mut headers = HeaderMap::new();
-        headers.insert(MODE_HEADER, HeaderValue::from_str(value).unwrap());
+        headers.insert(name, HeaderValue::from_str(value).unwrap());
         CacheDirectives::from_headers(&headers)
+    }
+
+    #[test]
+    fn ttl_header_parses_seconds_and_zero_as_unlimited() {
+        use std::time::Duration;
+        assert_eq!(
+            CacheDirectives::from_headers(&HeaderMap::new())
+                .unwrap()
+                .ttl,
+            None
+        );
+        assert_eq!(
+            with_header(TTL_HEADER, " 90 ").unwrap().ttl,
+            Some(EntryTtl::Finite(Duration::from_secs(90)))
+        );
+        assert_eq!(
+            with_header(TTL_HEADER, "0").unwrap().ttl,
+            Some(EntryTtl::Unlimited)
+        );
+        assert_eq!(with_header(TTL_HEADER, "").unwrap().ttl, None);
+        assert!(with_header(TTL_HEADER, &MAX_REQUESTED_TTL_SECS.to_string()).is_ok());
+    }
+
+    #[test]
+    fn malformed_ttl_is_rejected() {
+        let too_long = (MAX_REQUESTED_TTL_SECS + 1).to_string();
+        for bad in ["-1", "1.5", "an hour", too_long.as_str()] {
+            let err = with_header(TTL_HEADER, bad).unwrap_err();
+            assert!(err.contains("0 for no expiry"), "{bad}: {err}");
+        }
     }
 
     #[test]

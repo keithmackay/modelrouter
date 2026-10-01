@@ -86,6 +86,11 @@ pub struct CacheConfig {
     /// `bypass` only narrows caching and is honoured either way.
     #[serde(default = "default_true")]
     pub allow_header_opt_in: bool,
+    /// Upper bound on the TTL a caller may request with
+    /// `x-modelrouter-cache-ttl`. `0` lifts the bound, so callers may store
+    /// entries that never expire.
+    #[serde(default = "default_cache_max_ttl")]
+    pub max_ttl_seconds: u64,
 }
 
 impl Default for CacheConfig {
@@ -100,6 +105,7 @@ impl Default for CacheConfig {
             completions: CompletionCachePolicy::default(),
             search: SearchCachePolicy::default(),
             allow_header_opt_in: true,
+            max_ttl_seconds: default_cache_max_ttl(),
         }
     }
 }
@@ -157,6 +163,7 @@ impl Default for SearchCachePolicy {
 
 fn default_cache_max_entries() -> u64 { 1000 }
 fn default_cache_ttl() -> u64 { 3600 }
+fn default_cache_max_ttl() -> u64 { 86_400 }
 fn default_cache_backend() -> String { "memory".to_string() }
 fn default_cache_namespace() -> String { "modelrouter".to_string() }
 fn default_assumed_temperature() -> f64 { 1.0 }

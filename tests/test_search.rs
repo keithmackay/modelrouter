@@ -595,6 +595,35 @@ async fn search_use_mode_cannot_enable_a_disabled_cache() {
     }
 }
 
+#[tokio::test]
+async fn search_ttl_header_sets_the_entry_lifetime() {
+    let (server, _db) =
+        test_app_with_pricing_and_cache(search_pricing(), enabled_cache_config()).await;
+    let query = serde_json::json!({ "query": "short lived" });
+    let first = server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-modelrouter-cache-ttl"),
+            axum::http::HeaderValue::from_static("1"),
+        )
+        .json(&query)
+        .await;
+    assert_eq!(first.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+    let hit = post_search(&server, query.clone()).await;
+    assert_eq!(hit.headers().get("x-modelrouter-cache").unwrap(), "HIT");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let expired = post_search(&server, query).await;
+    assert_eq!(
+        expired.headers().get("x-modelrouter-cache").unwrap(),
+        "MISS"
+    );
+}
+
 // ── Search engine fallback chains (issue #42) ────────────────────────────────
 
 /// Build a test app with a custom search registry and fallback chain config.

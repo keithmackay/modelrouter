@@ -340,6 +340,7 @@ async fn anthropic_messages_inner(
         });
         let cache_state = state.clone();
         let cache_model = canonical_model.clone();
+        let stream_directives = cache_directives.clone();
         let byte_stream = upstream_resp.bytes_stream().map(move |chunk| {
             match &chunk {
                 Ok(bytes) => {
@@ -347,7 +348,13 @@ async fn anthropic_messages_inner(
                         cap.feed(bytes);
                         if cap.is_done() {
                             if let Some((key, cap)) = capture.take() {
-                                store_streamed_message(&cache_state, key, &cache_model, cap);
+                                store_streamed_message(
+                                    &cache_state,
+                                    key,
+                                    &cache_model,
+                                    cap,
+                                    stream_directives.clone(),
+                                );
                             }
                         }
                     }
@@ -467,7 +474,13 @@ async fn anthropic_messages_inner(
     if let Some(ref key) = cache_key {
         state
             .response_cache
-            .put_message(key, &canonical_model, resp_json.clone(), cost)
+            .put_message(
+                key,
+                &canonical_model,
+                resp_json.clone(),
+                cost,
+                &cache_directives,
+            )
             .await;
     }
 
@@ -593,6 +606,7 @@ fn store_streamed_message(
     key: String,
     canonical_model: &str,
     capture: crate::router::cache::stream::MessagesStreamCapture,
+    directives: crate::router::cache::CacheDirectives,
 ) {
     let Some(message) = capture.finish() else {
         return;
@@ -610,7 +624,7 @@ fn store_streamed_message(
     tokio::spawn(async move {
         state
             .response_cache
-            .put_message(&key, &model, message, cost)
+            .put_message(&key, &model, message, cost, &directives)
             .await;
     });
 }

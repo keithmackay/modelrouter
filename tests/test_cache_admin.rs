@@ -109,6 +109,7 @@ async fn stats_reports_live_and_ledger_views() {
             "gpt-4o",
             &modelrouter::providers::adapter::CompletionResult::default(),
             0.5,
+            &Default::default(),
         )
         .await;
     cache.get_completion("completion:x:y", "gpt-4o").await.unwrap();
@@ -171,6 +172,7 @@ async fn purge_all_empties_the_cache() {
                 "gpt-4o",
                 &modelrouter::providers::adapter::CompletionResult::default(),
                 0.0,
+                &Default::default(),
             )
             .await;
     }
@@ -199,6 +201,7 @@ async fn purge_by_model_only_removes_that_model() {
                 model,
                 &modelrouter::providers::adapter::CompletionResult::default(),
                 0.0,
+                &Default::default(),
             )
             .await;
     }

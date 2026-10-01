@@ -560,7 +560,13 @@ async fn search_inner(
     if let Some(key) = cache_key {
         state
             .response_cache
-            .put_search(&key, &serving_pseudo_model, payload.clone(), cost)
+            .put_search(
+                &key,
+                &serving_pseudo_model,
+                payload.clone(),
+                cost,
+                &cache_directives,
+            )
             .await;
     }
 
