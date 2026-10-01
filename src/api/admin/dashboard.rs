@@ -1623,9 +1623,16 @@ pub async fn get_cost(
         })
         .collect();
 
-    let cache_total = CostRepository::cache_summary_since(&*state.db, filter_model, &window_since)
-        .await
-        .unwrap_or_default();
+    // Summed from the filtered rows so the headline matches the table.
+    let cache_total = cache_by_row.values().fold(
+        crate::db::repositories::costs::CacheUsageSummary::default(),
+        |mut acc, c| {
+            acc.hits += c.hits;
+            acc.requests += c.requests;
+            acc.saved_usd += c.saved_usd;
+            acc
+        },
+    );
 
     let rows: Vec<minijinja::Value> = raw_rows
         .into_iter()

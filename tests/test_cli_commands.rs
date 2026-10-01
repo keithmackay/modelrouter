@@ -1351,6 +1351,40 @@ async fn report_cost_with_data() {
     let (ok, out, _err) = run_cli(&config, &["report", "cost", "--format", "csv"]);
     assert!(ok);
     assert!(out.contains(','));
+    // Seeded 100 prompt tokens and 200 completion tokens: each lands under
+    // its own header.
+    assert!(
+        out.contains("Requests,Tokens In (Prompts),Tokens Out (Completions)"),
+        "{out}"
+    );
+    assert!(out.contains(",0.05,0.05,0.00,1,100,200"), "{out}");
+
+    // report usage table: the token headers follow the column order.
+    let (ok, out, _err) = run_cli(
+        &config,
+        &[
+            "report",
+            "usage",
+            "--detail",
+            "--alltime",
+            "--user",
+            "alice",
+        ],
+    );
+    assert!(ok);
+    let header = out
+        .lines()
+        .find(|l| l.starts_with("User"))
+        .expect("usage header");
+    assert!(
+        header.find("Tokens In").unwrap() < header.find("Tokens Out").unwrap(),
+        "{header}"
+    );
+    let row = out
+        .lines()
+        .find(|l| l.starts_with("alice"))
+        .expect("usage row");
+    assert!(row.find("100").unwrap() < row.find("200").unwrap(), "{row}");
 }
 
 #[test]

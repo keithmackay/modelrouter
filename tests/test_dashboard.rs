@@ -2246,13 +2246,122 @@ async fn reports_panels_list_uncached_spend_by_user_model_and_project() {
         3,
         "{body}"
     );
+    // 20 prompt and 10 completion tokens per table, under matching headers.
+    assert_eq!(
+        body.matches("<th>Tokens In (Prompts)</th><th>Tokens Out (Completions)</th>")
+            .count(),
+        3,
+        "{body}"
+    );
     // Each table lists uncached $0.50 then paid $0.25: the cache hit counts
     // at full price in the first column and free in the second.
     for name in ["rerun-user", "test-model", "proj-a"] {
         let row = format!(
-            "<td>{name}</td>\n                <td>$0.5000</td>\n                <td>$0.2500</td>"
+            "<td>{name}</td>\n                <td>$0.5000</td>\n                <td>$0.2500</td>\n                <td>20</td>\n                <td>10</td>"
         );
         assert!(body.contains(&row), "missing {name} row in {body}");
+    }
+}
+
+/// The text of the first element after `label` that opens with `open`.
+fn text_after(body: &str, label: &str, open: &str) -> String {
+    let rest = &body[body
+        .find(label)
+        .unwrap_or_else(|| panic!("no {label} in {body}"))..];
+    let start = rest.find(open).unwrap() + open.len();
+    rest[start..start + rest[start..].find('<').unwrap()].to_string()
+}
+
+#[tokio::test]
+async fn cost_page_headline_and_token_columns_follow_the_filters() {
+    use modelrouter::db::models::{NewCostLedgerEntry, NewUser};
+    use modelrouter::db::repositories::costs::CostRepository;
+    use modelrouter::db::repositories::users::UserRepository;
+
+    let raw_db = common::in_memory_db().await;
+    let ann = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "ann".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+    let bob = UserRepository::create(
+        &raw_db,
+        NewUser {
+            name: "bob".to_string(),
+            email: None,
+        },
+    )
+    .await
+    .unwrap();
+    let entry = |user_id, project: &str, cost_usd| NewCostLedgerEntry {
+        user_id,
+        prompt_id: None,
+        model: "test-model".to_string(),
+        provider: "test".to_string(),
+        project: Some(project.to_string()),
+        tokens_in: 300,
+        tokens_out: 7,
+        cost_usd,
+        api_key_id: None,
+        attribution_correlation_id: None,
+        attribution_tags: "{}".to_string(),
+        experiment_id: None,
+        experiment_variant: None,
+        tokens_estimated: false,
+    };
+    CostRepository::create(&raw_db, entry(ann.id, "proj-a", 0.25))
+        .await
+        .unwrap();
+    CostRepository::create_cache_hit(&raw_db, entry(ann.id, "proj-a", 0.25))
+        .await
+        .unwrap();
+    CostRepository::create_cache_hit(&raw_db, entry(bob.id, "proj-b", 4.0))
+        .await
+        .unwrap();
+    CostRepository::create_cache_hit(&raw_db, entry(bob.id, "proj-b", 4.0))
+        .await
+        .unwrap();
+
+    let settings = Arc::new(Settings::default());
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(Arc::new(raw_db), settings).await;
+    let cookie = session_cookie(&token);
+
+    // (filter, saved headline, "hits of requests" headline)
+    let cases = [
+        (None, "$8.25", "3 of 4"),
+        (Some(("user", "ann")), "$0.2500", "1 of 2"),
+        (Some(("project", "proj-b")), "$8.00", "2 of 2"),
+    ];
+    for (filter, saved, hits) in cases {
+        let mut req = server
+            .get("/admin/cost")
+            .add_query_param("window", "alltime");
+        if let Some((k, v)) = filter {
+            req = req.add_query_param(k, v);
+        }
+        let body = req
+            .add_header(cookie.0.clone(), cookie.1.clone())
+            .await
+            .text();
+        assert_eq!(
+            text_after(&body, "Saved by cache</div>", "stat-value\">"),
+            saved,
+            "{filter:?}"
+        );
+        let rate = text_after(&body, "Cache hit rate</div>", "color:#777;\">");
+        assert!(rate.starts_with(hits), "{filter:?}: {rate}");
+        if filter.is_some_and(|(k, _)| k == "project") {
+            // Requests, then 600 prompt tokens, then 14 completion tokens.
+            assert!(
+                body.contains("<td>2</td>\n            <td>600</td>\n            <td>14</td>"),
+                "{body}"
+            );
+        }
     }
 }
 
