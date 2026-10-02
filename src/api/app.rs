@@ -7,6 +7,7 @@ use crate::{
     config::Settings,
     db::repositories::{
         admin_users::AdminUserRepository, aliases::AliasRepository, api_keys::ApiKeyRepository,
+        learned_capabilities::LearnedCapabilityRepository,
         app_settings::AppSettingsRepository,
         audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, experiments::ExperimentRepository,
@@ -26,6 +27,7 @@ pub trait DatabaseProvider:
     UserRepository
     + AppSettingsRepository
     + AliasRepository
+    + LearnedCapabilityRepository
     + AdminUserRepository
     + SessionRepository
     + PromptRepository
@@ -52,6 +54,7 @@ impl<T> DatabaseProvider for T where
     T: UserRepository
         + AppSettingsRepository
         + AliasRepository
+        + LearnedCapabilityRepository
         + AdminUserRepository
         + SessionRepository
         + PromptRepository
@@ -208,6 +211,15 @@ pub fn build_router(state: AppState) -> axum::Router {
             "/admin/api/aliases/:alias",
             axum::routing::put(crate::api::admin::aliases::upsert_alias_api)
                 .delete(crate::api::admin::aliases::delete_alias_api),
+        )
+        // Model capabilities learned from provider rejections
+        .route(
+            "/admin/api/model-capabilities/learned",
+            get(crate::api::admin::learned_capabilities::list_learned_capabilities_api),
+        )
+        .route(
+            "/admin/api/model-capabilities/learned/:model",
+            delete(crate::api::admin::learned_capabilities::delete_learned_capability_api),
         )
         // Controlled experiments (spec §7a)
         .route(

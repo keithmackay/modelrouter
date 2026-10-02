@@ -16,6 +16,9 @@ commit; `git log v0.1.0..` has the detail.
 
 **Fixes**
 - The Anthropic adapter no longer drops an SSE event whose line is split across two network reads; streamed content and usage survive any chunking.
+- `temperature` is no longer forwarded to Claude Opus 5.5, Sonnet 5.5, Opus 4.7 or 4.8, all of which reject it with a 400. The built-in temperature table now matches by model family, so point releases (`claude-opus-5-5`) and `@version` pins inherit their family's entry, and capability lookup strips every provider segment (`vertex/anthropic/claude-opus-5-5` reaches the same entry as `claude-opus-5-5`). Sonnet 5.5 is also listed as thinking by default, accepting effort, and unable to disable thinking.
+- The router learns a model's `temperature` rejection. When a provider answers a request with a 400 that names `temperature`, the router retries it once without the parameter, records the exact model id (version included) in the new `learned_model_capabilities` table, logs one warning, and never sends `temperature` to that model again, across restarts. `GET /admin/api/model-capabilities/learned` lists entries with when they were learned, the error that taught them and how many requests each has changed since start; `DELETE /admin/api/model-capabilities/learned/:model` clears one. A `[[model_capabilities]]` config entry outranks a learned entry, which outranks the built-in table. Other 400s teach nothing.
+- Built-in pricing for Claude Opus 5.5 ($4 / $20 per MTok, cache read $0.20, cache write $5) and Sonnet 5.5 ($2 / $10, cache read $0.20, cache write $2.50); Haiku 4.5 corrected from $0.80 / $4 to its $1 / $5 list price.
 
 ### Week of 2026-09-21
 
