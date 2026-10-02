@@ -122,9 +122,10 @@ async fn responses_inner(
     // same aliases through the same router, so it reaches the same models that
     // reject `temperature` and would 400 for the same reason.
     let temperature = body["temperature"].as_f64().filter(|_| {
-        crate::router::model_capabilities::supports_temperature(
+        crate::router::model_capabilities::temperature_allowed(
             &canonical_model,
             &state.settings.model_capabilities,
+            state.router.learned_capabilities(),
         )
     });
 
@@ -165,7 +166,24 @@ async fn responses_inner(
         .provider_registry
         .get(&provider_name)
         .map_err(ApiError::ProviderError)?;
-    let result = adapter.complete(&norm_req).await.map_err(|e| {
+    let first_try = adapter.complete(&norm_req).await;
+    let result = match first_try {
+        Err(e) => match crate::router::model_capabilities::temperature_rejection_retry(&norm_req, &e) {
+            Some(retry) => {
+                crate::router::learned_capabilities::record_temperature_rejection(
+                    state.router.learned_capabilities(),
+                    &*state.db,
+                    &norm_req.model,
+                    &e,
+                )
+                .await;
+                adapter.complete(&retry).await
+            }
+            None => Err(e),
+        },
+        ok => ok,
+    };
+    let result = result.map_err(|e| {
         state
             .circuit_breaker
             .record_provider_failure(&provider_name, &e);

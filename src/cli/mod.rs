@@ -510,6 +510,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                     tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
                 }
                 state.router.update_db_aliases(db_aliases);
+                crate::api::admin::learned_capabilities::load_learned_capabilities(
+                    &state.router,
+                    &*state.db,
+                )
+                .await;
                 let availability =
                     crate::api::admin::aliases::build_availability_map(&state.db).await;
                 if !availability.is_empty() {

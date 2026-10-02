@@ -551,6 +551,18 @@ pub struct ModelAlias {
     pub updated_at: String,
 }
 
+/// A capability the router learned from a provider rejecting a parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LearnedModelCapability {
+    /// Exact routed model id: provider segments stripped, lowercased, any
+    /// `@version` kept.
+    pub model: String,
+    pub supports_temperature: bool,
+    /// The provider error that taught it.
+    pub error: String,
+    pub learned_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewModelAlias {
     pub alias: String,
