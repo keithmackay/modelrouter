@@ -18,14 +18,22 @@
 //! know whether the resolved model accepts the parameter, and it strips the
 //! ones the model would reject.
 //!
-//! Defaults below are empirically probed, not inferred from version numbers.
-//! Operators override them from config without waiting on a release:
+//! Defaults below are probed or taken from the provider's published model
+//! documentation. The temperature table matches by model family, so a point
+//! release (`claude-opus-5-5`) or a version pin (`claude-opus-5@20260101`)
+//! inherits its family's entry. Operators override any entry from config
+//! without waiting on a release:
 //!
 //! ```toml
 //! [[model_capabilities]]
 //! model = "claude-opus-6"
 //! supports_temperature = false
 //! ```
+//!
+//! A model the table does not know yet degrades gracefully: when a provider
+//! rejects a request because of its `temperature`, the router retries the call
+//! once without it and records the model, durably, in
+//! [`crate::router::learned_capabilities`] ([`temperature_rejection_retry`]).
 
 use crate::config::schema::ModelCapabilityEntry;
 
@@ -35,9 +43,20 @@ use crate::config::schema::ModelCapabilityEntry;
 ///
 /// Keys are normalized model names (provider prefix stripped, lowercased) —
 /// see [`normalize_model_key`].
+///
+/// Entries name a model *family*: an entry also covers every id that extends it
+/// with a `-` suffix (see [`family_matches`]), so `claude-opus-5` covers
+/// `claude-opus-5-5`. The point releases are still listed so the table states
+/// what was verified.
 const TEMPERATURE_UNSUPPORTED: &[&str] = &[
     "claude-opus-5",
+    "claude-opus-5-5",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    // Sampling parameters were removed from Opus 4.7 and 4.8 as well
+    // (documented; the request is a 400).
+    "claude-opus-4-7",
+    "claude-opus-4-8",
     // Both Fable 5 generations reject `temperature` (Vertex 400
     // "`temperature` is deprecated for this model"). claude-fable-5 was
     // missing from this list while its sibling was present — that single gap
@@ -53,12 +72,48 @@ const TEMPERATURE_UNSUPPORTED: &[&str] = &[
 /// `claude-opus-5`) and lowercases, matching how
 /// [`crate::router::cost::CostCalculator`] keys its pricing table so operators
 /// write the same model string in both config blocks.
+///
+/// Every leading segment is stripped, not just the first: a routed target such
+/// as `vertex/anthropic/claude-opus-5-5` names the provider *and* the publisher,
+/// and must reach the same entry as the bare `claude-opus-5-5`.
 fn normalize_model_key(model: &str) -> String {
-    let key = match model.find('/') {
+    let key = match model.rfind('/') {
         Some(pos) => &model[pos + 1..],
         None => model,
     };
     key.to_lowercase()
+}
+
+/// Whether `key` is `family` itself or a release of it (`family-…`).
+///
+/// The `-` boundary keeps `claude-opus-5` from matching `claude-opus-50`.
+fn family_matches(key: &str, family: &str) -> bool {
+    key == family
+        || (key.len() > family.len() && key.starts_with(family) && key.as_bytes()[family.len()] == b'-')
+}
+
+/// Whether `err` is a provider rejecting the request because of `temperature`:
+/// a 4xx request error whose message names the parameter.
+fn is_temperature_rejection(err: &anyhow::Error) -> bool {
+    use crate::router::retry::RetryableError;
+    matches!(RetryableError::classify_error(err), RetryableError::ClientError(_))
+        && err.to_string().to_lowercase().contains("temperature")
+}
+
+/// The request to retry when a provider rejected `req` because of its
+/// `temperature`: the same request without it. `None` when the failure is
+/// anything else, or `req` carried no temperature. The caller records the
+/// rejection ([`crate::router::learned_capabilities`]) so it is paid once.
+pub fn temperature_rejection_retry(
+    req: &crate::providers::adapter::NormalizedRequest,
+    err: &anyhow::Error,
+) -> Option<crate::providers::adapter::NormalizedRequest> {
+    if req.temperature.is_none() || !is_temperature_rejection(err) {
+        return None;
+    }
+    let mut retry = req.clone();
+    retry.temperature = None;
+    Some(retry)
 }
 
 /// Drop a Vertex-style `@YYYYMMDD` version suffix, if present.
@@ -79,34 +134,59 @@ fn strip_version(key: &str) -> &str {
 ///
 /// A config entry for the model wins over the built-in table, so an operator
 /// can both *add* a model the build doesn't know about and *retract* a built-in
-/// entry once a provider restores support. Unknown models are assumed to
-/// support it: the router must not silently drop parameters it has no evidence
-/// are unwelcome.
+/// entry once a provider restores support. Next comes a model a provider has
+/// rejected the parameter for in this process, then the built-in family table.
+/// Unknown models are assumed to support it: the router must not silently drop
+/// parameters it has no evidence are unwelcome.
 ///
 /// Lookup tries the fully qualified name before the version-stripped one, so a
 /// version-pinned entry overrides a family-wide one rather than the reverse.
 pub fn supports_temperature(model: &str, overrides: &[ModelCapabilityEntry]) -> bool {
+    temperature_override(model, overrides).unwrap_or_else(|| table_supports_temperature(model))
+}
+
+/// [`supports_temperature`] with learned entries between config and the
+/// built-in table: config override, then a learned rejection of this exact
+/// model, then the family table.
+pub fn temperature_allowed(
+    model: &str,
+    overrides: &[ModelCapabilityEntry],
+    learned: &crate::router::learned_capabilities::LearnedCapabilities,
+) -> bool {
+    if let Some(configured) = temperature_override(model, overrides) {
+        return configured;
+    }
+    if let Some(supported) = learned.temperature(model) {
+        return supported;
+    }
+    table_supports_temperature(model)
+}
+
+fn temperature_override(model: &str, overrides: &[ModelCapabilityEntry]) -> Option<bool> {
     let key = normalize_model_key(model);
     let base = strip_version(&key);
-
     let mut candidates = vec![key.as_str()];
     if base != key {
         candidates.push(base);
     }
-
     for candidate in &candidates {
         for entry in overrides {
             if normalize_model_key(&entry.model) == *candidate {
                 if let Some(supported) = entry.supports_temperature {
-                    return supported;
+                    return Some(supported);
                 }
             }
         }
     }
+    None
+}
 
-    !candidates
+fn table_supports_temperature(model: &str) -> bool {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    !TEMPERATURE_UNSUPPORTED
         .iter()
-        .any(|c| TEMPERATURE_UNSUPPORTED.contains(c))
+        .any(|family| family_matches(base, family))
 }
 
 // ── Reasoning (thinking / effort) controls ──────────────────────────────────
@@ -133,6 +213,7 @@ pub fn supports_temperature(model: &str, overrides: &[ModelCapabilityEntry]) -> 
 /// Models that reason when the request carries no `thinking` field.
 const THINKS_BY_DEFAULT: &[&str] = &[
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-opus-5-5",
     "claude-fable-5",
@@ -145,6 +226,9 @@ const THINKS_BY_DEFAULT: &[&str] = &[
 /// `thinking: {type: "disabled"}` is a 400.
 const THINKING_ALWAYS_ON: &[&str] = &[
     "claude-opus-5-5",
+    // Sonnet 5.5 rejects `{type: "disabled"}`; its only thinking-off form is a
+    // different `thinking` type, so the lowest effort is the portable lever.
+    "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-fable-5-1",
     "claude-mythos-5",
@@ -159,6 +243,7 @@ const EFFORT_SUPPORTED: &[&str] = &[
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-opus-5-5",
     "claude-fable-5",
@@ -309,6 +394,81 @@ mod tests {
     /// honours `temperature` — the reason this is a per-model table and not a
     /// per-provider switch.
     #[test]
+    fn point_releases_pins_and_multi_segment_names_inherit_the_family_entry() {
+        // The exact routed strings a tier alias resolves to.
+        assert!(!supports_temperature("vertex/anthropic/claude-opus-5-5", &[]));
+        assert!(!supports_temperature("vertex/anthropic/claude-sonnet-5-5", &[]));
+        assert!(!supports_temperature("anthropic/claude-opus-5-5", &[]));
+        // A future point release and a version pin of a listed family.
+        assert!(!supports_temperature("vertex/anthropic/claude-sonnet-5-7", &[]));
+        assert!(!supports_temperature("claude-opus-5-5@20261001", &[]));
+        assert!(!supports_temperature("claude-opus-4-8", &[]));
+        // The family boundary is a `-`, not any shared prefix.
+        assert!(supports_temperature("claude-opus-50", &[]));
+        assert!(supports_temperature("vertex/anthropic/claude-haiku-4-5@20251001", &[]));
+        assert!(supports_temperature("claude-opus-4-6", &[]));
+    }
+
+    #[test]
+    fn config_override_beats_the_family_table_for_a_point_release() {
+        let overrides = vec![entry("claude-sonnet-5-5", Some(true))];
+        assert!(supports_temperature("vertex/anthropic/claude-sonnet-5-5", &overrides));
+        assert!(!supports_temperature("vertex/anthropic/claude-sonnet-5", &overrides));
+    }
+
+    fn request_with_temperature(model: &str) -> crate::providers::adapter::NormalizedRequest {
+        crate::providers::adapter::NormalizedRequest {
+            model: model.to_string(),
+            temperature: Some(0.3),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_temperature_rejection_yields_a_retry_without_it() {
+        let model = "vertex/acme/model-x@v1";
+        let err = anyhow::anyhow!(
+            "Vertex returned 400 Bad Request: {{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"`temperature` is deprecated for this model.\"}}}}"
+        );
+        let retry = temperature_rejection_retry(&request_with_temperature(model), &err)
+            .expect("a temperature rejection is retried");
+        assert_eq!(retry.temperature, None);
+        assert_eq!(retry.model, model);
+    }
+
+    #[test]
+    fn other_failures_are_not_retried() {
+        let model = "vertex/acme/model-x@v1";
+        let unrelated = anyhow::anyhow!("Vertex returned 400 Bad Request: max_tokens too large");
+        assert!(temperature_rejection_retry(&request_with_temperature(model), &unrelated).is_none());
+        let server = anyhow::anyhow!("Vertex returned 503 Service Unavailable: temperature of the datacenter");
+        assert!(temperature_rejection_retry(&request_with_temperature(model), &server).is_none());
+        let rejection = anyhow::anyhow!("Vertex returned 400 Bad Request: `temperature` is deprecated");
+        let no_temperature = crate::providers::adapter::NormalizedRequest {
+            model: model.to_string(),
+            ..Default::default()
+        };
+        assert!(temperature_rejection_retry(&no_temperature, &rejection).is_none());
+    }
+
+    #[test]
+    fn precedence_is_config_then_learned_then_table() {
+        use crate::router::learned_capabilities::LearnedCapabilities;
+        let learned = LearnedCapabilities::default();
+        let model = "vertex/acme/model-x@v1";
+        assert!(temperature_allowed(model, &[], &learned));
+        learned.learn_temperature_rejected(model, "rejected");
+        assert!(!temperature_allowed(model, &[], &learned));
+        // Another snapshot of the same model is unaffected.
+        assert!(temperature_allowed("vertex/acme/model-x@v2", &[], &learned));
+        // Config wins over the learned entry.
+        let overrides = vec![entry("model-x@v1", Some(true))];
+        assert!(temperature_allowed(model, &overrides, &learned));
+        // The table still answers for models nothing was learned about.
+        assert!(!temperature_allowed("vertex/anthropic/claude-opus-5-5", &[], &learned));
+    }
+
+    #[test]
     fn same_provider_older_model_keeps_temperature() {
         assert!(supports_temperature("claude-haiku-4-5", &[]));
         assert!(supports_temperature("anthropic/claude-haiku-4-5", &[]));
@@ -400,6 +560,18 @@ mod tests {
     fn none_falls_back_to_low_effort_where_thinking_is_always_on() {
         assert_eq!(resolve_reasoning("claude-fable-5-1", Some("none"), &[]), eff("low"));
         assert_eq!(resolve_reasoning("claude-opus-5-5", Some("none"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("anthropic/claude-sonnet-5-5", Some("none"), &[]), eff("low"));
+    }
+
+    #[test]
+    fn sonnet_5_5_rejects_temperature_and_accepts_effort() {
+        assert!(!supports_temperature("claude-sonnet-5-5", &[]));
+        assert!(!supports_temperature("anthropic/claude-sonnet-5-5", &[]));
+        assert_eq!(resolve_reasoning("anthropic/claude-sonnet-5-5", Some("high"), &[]), eff("high"));
+        let caps = thinking_capabilities("claude-sonnet-5-5", &[]);
+        assert!(caps.thinks_by_default);
+        assert!(!caps.can_disable_thinking);
+        assert!(caps.supports_effort);
     }
 
     /// Older models don't think unless asked and reject both fields.

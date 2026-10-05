@@ -276,7 +276,7 @@ async fn chat_completions_inner(
     }
 
     let norm_req =
-        build_normalized_request(&body, canonical_model.clone(), &model, &state.settings.model_capabilities);
+        build_normalized_request(&body, canonical_model.clone(), &model, &state.settings.model_capabilities, state.router.learned_capabilities());
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -291,7 +291,25 @@ async fn chat_completions_inner(
             .provider_registry
             .get(&provider_name)
             .map_err(ApiError::ProviderError)?;
-        let sse_stream = adapter.stream(&norm_req).await.map_err(|e| {
+        note_learned_temperature_strip(&state, &body, &norm_req);
+        let first_try = adapter.stream(&norm_req).await;
+        let stream_result = match first_try {
+            Err(e) => match crate::router::model_capabilities::temperature_rejection_retry(&norm_req, &e) {
+                Some(retry) => {
+                    crate::router::learned_capabilities::record_temperature_rejection(
+                        state.router.learned_capabilities(),
+                        &*state.db,
+                        &norm_req.model,
+                        &e,
+                    )
+                    .await;
+                    adapter.stream(&retry).await
+                }
+                None => Err(e),
+            },
+            ok => ok,
+        };
+        let sse_stream = stream_result.map_err(|e| {
             state
                 .circuit_breaker
                 .record_provider_failure(&provider_name, &e);
@@ -707,6 +725,7 @@ async fn try_serve_cached_completion(
         canonical_model.to_string(),
         request_model,
         &state.settings.model_capabilities,
+        state.router.learned_capabilities(),
     );
     let settings = match state.provider_registry.get(provider_name) {
         Ok(adapter) => completion_settings(adapter.effective_settings(&norm_req), &norm_req, body),
@@ -840,9 +859,29 @@ async fn complete_with_retry_and_fallback(
                     current_model.clone(),
                     requested_model,
                     &state.settings.model_capabilities,
+                    state.router.learned_capabilities(),
                 );
+                note_learned_temperature_strip(state, body, &req);
                 let adapter = adapter.clone();
-                async move { adapter.complete(&req).await }.instrument(tracing::info_span!(
+                let router = state.router.clone();
+                let db = state.db.clone();
+                async move {
+                    let learned = router.learned_capabilities();
+                    match adapter.complete(&req).await {
+                        Err(e) => match crate::router::model_capabilities::temperature_rejection_retry(&req, &e) {
+                            Some(retry) => {
+                                crate::router::learned_capabilities::record_temperature_rejection(
+                                    learned, &*db, &req.model, &e,
+                                )
+                                .await;
+                                adapter.complete(&retry).await
+                            }
+                            None => Err(e),
+                        },
+                        ok => ok,
+                    }
+                }
+                .instrument(tracing::info_span!(
                     "modelrouter.provider_call",
                     "provider.name" = current_provider.as_str()
                 ))
@@ -857,6 +896,7 @@ async fn complete_with_retry_and_fallback(
                     current_model.clone(),
                     requested_model,
                     &state.settings.model_capabilities,
+                    state.router.learned_capabilities(),
                 );
                 let settings = completion_settings(adapter.effective_settings(&req), &req, body);
                 break (r, provider_ms, settings);
@@ -1834,11 +1874,28 @@ fn insert_before_done(chunk: &[u8], event: &str) -> bytes::Bytes {
     bytes::Bytes::from(out)
 }
 
+/// Count a dispatch whose `temperature` was removed because of a learned
+/// entry (the admin API reports the count per model).
+fn note_learned_temperature_strip(
+    state: &AppState,
+    body: &Value,
+    req: &crate::providers::adapter::NormalizedRequest,
+) {
+    let learned = state.router.learned_capabilities();
+    if body["temperature"].is_number()
+        && req.temperature.is_none()
+        && learned.temperature(&req.model) == Some(false)
+    {
+        learned.note_stripped(&req.model);
+    }
+}
+
 fn build_normalized_request(
     body: &Value,
     model: String,
     requested_model: &str,
     capabilities: &[crate::config::schema::ModelCapabilityEntry],
+    learned: &crate::router::learned_capabilities::LearnedCapabilities,
 ) -> crate::providers::adapter::NormalizedRequest {
     // Drop sampling parameters the resolved model rejects. Callers address a
     // routing alias and cannot know what it resolves to, so forwarding
@@ -1848,7 +1905,7 @@ fn build_normalized_request(
     // covers every provider from one place.
     let temperature = body["temperature"].as_f64().filter(|_| {
         let supported =
-            crate::router::model_capabilities::supports_temperature(&model, capabilities);
+            crate::router::model_capabilities::temperature_allowed(&model, capabilities, learned);
         if !supported {
             tracing::debug!(
                 model = model.as_str(),
@@ -2243,7 +2300,7 @@ mod tools_request_tests {
             "tools": [{"type": "function", "function": {"name": "f"}}],
             "tool_choice": "auto",
         });
-        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default());
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         assert_eq!(req.tool_choice, Some(json!("auto")));
     }
@@ -2254,12 +2311,12 @@ mod tools_request_tests {
             "messages": [],
             "tool_choice": "none",
         });
-        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default());
         assert!(req.tools.is_none());
         assert!(req.tool_choice.is_none());
 
         let body = json!({"messages": [], "tools": []});
-        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default());
         assert!(req.tools.is_none());
     }
 
@@ -2272,6 +2329,7 @@ mod tools_request_tests {
             "anthropic/claude-sonnet-5".to_string(),
             "balanced",
             &[],
+            &Default::default(),
         );
         let r = req.reasoning.expect("reasoning control resolved");
         assert!(r.disable_thinking);
@@ -2282,6 +2340,7 @@ mod tools_request_tests {
             "anthropic/claude-haiku-4-5".to_string(),
             "fast",
             &[],
+            &Default::default(),
         );
         assert!(req.reasoning.is_none());
     }
@@ -2294,6 +2353,7 @@ mod tools_request_tests {
             "anthropic/claude-sonnet-5".to_string(),
             "balanced",
             &[],
+            &Default::default(),
         );
         assert!(req.reasoning.is_none());
     }

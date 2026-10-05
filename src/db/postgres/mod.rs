@@ -1,6 +1,7 @@
 #![cfg(feature = "postgres")]
 
 mod aliases;
+mod learned_capabilities;
 mod groups;
 mod users;
 mod admin_users;
