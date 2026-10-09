@@ -25,6 +25,12 @@ pub struct CallCost {
     /// `saved_usd`. Equal across reruns of the same work, so runs compare as
     /// if each were the first.
     pub uncached_cost_usd: f64,
+    /// What this call costs with no caching at all: no response cache and no
+    /// provider prompt cache, every prompt token at the standard input rate.
+    /// Equals `uncached_cost_usd` when the call had no prompt-cache activity.
+    /// Cache writes are priced above the input rate, so a call that only wrote
+    /// to the prompt cache costs more than this figure.
+    pub no_cache_cost_usd: f64,
 }
 
 impl CallCost {
@@ -35,6 +41,7 @@ impl CallCost {
             cache_hit: false,
             saved_usd: None,
             uncached_cost_usd: cost_usd,
+            no_cache_cost_usd: cost_usd,
         }
     }
 
@@ -45,15 +52,23 @@ impl CallCost {
             cache_hit: true,
             saved_usd: Some(avoided),
             uncached_cost_usd: avoided,
+            no_cache_cost_usd: avoided,
         }
     }
 
+    /// Set the no-caching figure, for a call whose prompt-cache tokens are known.
+    pub fn with_no_cache_cost(mut self, no_cache_cost_usd: f64) -> Self {
+        self.no_cache_cost_usd = no_cache_cost_usd;
+        self
+    }
+
     /// Write the cost fields into an OpenAI-shaped `usage` object
-    /// (`cost_usd` and `uncached_cost_usd` always; `cache_hit`/`saved_usd`
-    /// only on a hit).
+    /// (`cost_usd`, `uncached_cost_usd` and `no_cache_cost_usd` always;
+    /// `cache_hit`/`saved_usd` only on a hit).
     pub fn write_into(&self, usage: &mut Value) {
         usage["cost_usd"] = serde_json::json!(self.cost_usd);
         usage["uncached_cost_usd"] = serde_json::json!(self.uncached_cost_usd);
+        usage["no_cache_cost_usd"] = serde_json::json!(self.no_cache_cost_usd);
         if self.cache_hit {
             usage["cache_hit"] = Value::Bool(true);
         }
@@ -183,6 +198,7 @@ mod tests {
         assert_eq!(v["cost"]["cache_hit"], false);
         assert!(v["cost"].get("saved_usd").is_none());
         assert_eq!(v["cost"]["uncached_cost_usd"].as_f64(), Some(0.5));
+        assert_eq!(v["cost"]["no_cache_cost_usd"].as_f64(), Some(0.5));
         assert_eq!(v["timing"]["provider_ms"], 9);
         assert!(v["timing"]["ttft_ms"].is_null());
         assert!(v.get("results").is_none(), "results is search-only");
@@ -208,7 +224,7 @@ mod tests {
         CallCost::spent(1.0).write_into(&mut usage);
         assert_eq!(
             usage,
-            serde_json::json!({"cost_usd": 1.0, "uncached_cost_usd": 1.0})
+            serde_json::json!({"cost_usd": 1.0, "uncached_cost_usd": 1.0, "no_cache_cost_usd": 1.0})
         );
         let mut usage = serde_json::json!({});
         CallCost::cache_hit(2.0).write_into(&mut usage);
@@ -217,10 +233,22 @@ mod tests {
             serde_json::json!({
                 "cost_usd": 0.0,
                 "uncached_cost_usd": 2.0,
+                "no_cache_cost_usd": 2.0,
                 "cache_hit": true,
                 "saved_usd": 2.0
             })
         );
+    }
+
+    #[test]
+    fn no_cache_cost_is_reported_beside_the_charged_cost() {
+        let v = serde_json::to_value(CallCost::spent(0.3).with_no_cache_cost(1.1)).unwrap();
+        assert_eq!(v["cost_usd"].as_f64(), Some(0.3));
+        assert_eq!(v["uncached_cost_usd"].as_f64(), Some(0.3));
+        assert_eq!(v["no_cache_cost_usd"].as_f64(), Some(1.1));
+        let hit = serde_json::to_value(CallCost::cache_hit(0.3).with_no_cache_cost(1.1)).unwrap();
+        assert_eq!(hit["uncached_cost_usd"].as_f64(), Some(0.3));
+        assert_eq!(hit["no_cache_cost_usd"].as_f64(), Some(1.1));
     }
 
     #[test]

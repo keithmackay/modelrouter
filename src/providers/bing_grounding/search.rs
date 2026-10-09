@@ -49,7 +49,10 @@ use std::sync::Arc;
 use crate::config::schema::ProviderConfig;
 use crate::providers::azure_credentials::AzureAuth as FoundryAuth;
 use crate::providers::azure_entra::{TokenProvider, FOUNDRY_PROJECT_SCOPE};
-use crate::providers::search::{SearchAdapter, SearchRequest, SearchResponse, SearchResultItem};
+use crate::providers::search::{
+    SearchAdapter, SearchAnswer, SearchRequest, SearchResponse, SearchResultItem,
+    MAX_FOLLOW_UP_QUERIES,
+};
 
 /// Path of the GA ("v1") Responses surface on a Foundry project endpoint.
 ///
@@ -75,6 +78,11 @@ const MAX_COUNT: u32 = 50;
 /// Longest snippet kept when a citation carries no span indices to slice with.
 const MAX_SNIPPET_CHARS: usize = 400;
 
+/// Longest answer text returned when the caller asks for it. Bounds what one
+/// search can put on the wire; a grounded answer from a 10-50 citation call is
+/// normally far shorter.
+const MAX_ANSWER_CHARS: usize = 16_000;
+
 /// Below this, the timeout is likely a copy of the router-wide default rather
 /// than a considered value: this call embeds a model generation *and* a Bing
 /// round trip, so it behaves like a completion, not like a search API.
@@ -88,6 +96,23 @@ const RECOMMENDED_TIMEOUT_SECS: u64 = 300;
 const EXTRACTION_INSTRUCTION: &str = "Search the web and report what you find for the query below. \
 Use only information retrieved from the web tool, never prior knowledge, and cite every source. \
 For each relevant source, state in one or two sentences what it says about the query.\n\nQuery: ";
+
+/// Default `instructions` when the caller asks for the answer but sends no
+/// instructions of its own: the generated text is then part of the response,
+/// so the model is asked to answer the question.
+const ANSWER_INSTRUCTION: &str = "Search the web and answer the question in the input. \
+Say plainly where the retrieved pages do not answer part of the question.";
+
+/// Always appended to the answer-mode instructions, whoever wrote them: caller
+/// instructions shape the research, they cannot turn it into an ungrounded
+/// answer.
+const GROUNDING_RULE: &str = "Use only information retrieved from the web tool, never prior \
+knowledge, and cite the source of every claim.";
+
+/// Marker of the one line the router parses follow-up queries from. Fixed by
+/// the router rather than left to caller instructions, so the parse never
+/// depends on how a caller phrased its prompt.
+const FOLLOW_UP_MARKER: &str = "FOLLOW_UP_QUERIES:";
 
 pub struct BingGroundingAdapter {
     endpoint: String,
@@ -237,7 +262,7 @@ impl BingGroundingAdapter {
         }
 
         let tool_type = self.tool_type();
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "input": format!("{EXTRACTION_INSTRUCTION}{}", req.query),
             // Without this the model is free to answer from parametric memory
@@ -248,8 +273,74 @@ impl BingGroundingAdapter {
                 "type": tool_type,
                 tool_type: {"search_configurations": [search_config]},
             }],
-        })
+        });
+        if req.include_answer {
+            let (instructions, input) = answer_mode_prompt(req);
+            body["instructions"] = serde_json::json!(instructions);
+            body["input"] = serde_json::json!(input);
+        }
+        body
     }
+}
+
+/// `instructions` and `input` for an answer-mode request: the caller's
+/// instructions (or the default), the router's grounding rule, and the
+/// follow-up line format when follow-ups were asked for.
+fn answer_mode_prompt(req: &SearchRequest) -> (String, String) {
+    let mut instructions = req
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+        .unwrap_or(ANSWER_INSTRUCTION)
+        .to_string();
+    instructions.push_str("\n\n");
+    instructions.push_str(GROUNDING_RULE);
+    let follow_ups = req.max_follow_up_queries.min(MAX_FOLLOW_UP_QUERIES);
+    if follow_ups > 0 {
+        instructions.push_str(&format!(
+            "\n\nEnd your reply with one final line that starts with {FOLLOW_UP_MARKER} followed \
+             by a JSON array of at most {follow_ups} web search queries that would find what the \
+             retrieved pages did not answer. Write [] if nothing is left to search."
+        ));
+    }
+    let mut input = format!("Question: {}", req.query);
+    if let Some(context) = req.context.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        input.push_str("\n\nContext:\n");
+        input.push_str(context);
+    }
+    (instructions, input)
+}
+
+/// Split the follow-up line off the answer text. Returns the text without
+/// it and the parsed queries, deduped and capped at `max`. A missing or
+/// malformed line yields no queries and leaves the text unchanged: follow-ups
+/// are guidance, and their absence is not an error.
+fn split_follow_ups(text: &str, max: u32) -> (String, Vec<String>) {
+    let Some(pos) = text.rfind(FOLLOW_UP_MARKER) else {
+        return (text.to_string(), Vec::new());
+    };
+    let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    if !text[line_start..pos].trim().is_empty() {
+        // The marker sits mid-line: prose quoting it, not the format line.
+        return (text.to_string(), Vec::new());
+    }
+    let tail = text[pos + FOLLOW_UP_MARKER.len()..].trim();
+    let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(tail) else {
+        tracing::warn!(
+            tail_chars = tail.chars().count(),
+            "bing_grounding: follow-up line is not a JSON array; returning no follow-up queries"
+        );
+        return (text.to_string(), Vec::new());
+    };
+    let mut queries: Vec<String> = Vec::new();
+    for q in parsed.iter().filter_map(|v| v.as_str()).map(str::trim) {
+        if !q.is_empty() && !queries.iter().any(|seen| seen.eq_ignore_ascii_case(q)) {
+            queries.push(q.to_string());
+        }
+    }
+    queries.truncate(max.min(MAX_FOLLOW_UP_QUERIES) as usize);
+    (text[..line_start].trim_end().to_string(), queries)
 }
 
 /// Take `chars[from..to]` with every index clamped to the string's length.
@@ -386,6 +477,47 @@ pub fn parse_responses_payload(
     Ok(items)
 }
 
+/// The generated answer and the Bing query URLs from one Responses payload.
+///
+/// Only called once `parse_responses_payload` has accepted the payload, so the
+/// answer is never returned without citations beside it. `None` when the
+/// payload carries no message text.
+pub fn parse_grounded_answer(v: &serde_json::Value, max_follow_up_queries: u32) -> Option<SearchAnswer> {
+    let output = v["output"].as_array().map_or(&[][..], |a| a);
+    let mut text = String::new();
+    let mut query_urls: Vec<String> = Vec::new();
+    for item in output {
+        if let Some(content) = item["content"].as_array() {
+            for part in content {
+                if let Some(t) = part["text"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(t);
+                }
+            }
+        } else if let Some(url) = item["url"].as_str().filter(|u| !u.is_empty()) {
+            // Verbatim, like the citation URLs: see the module header.
+            if !query_urls.iter().any(|u| u == url) {
+                query_urls.push(url.to_string());
+            }
+        }
+    }
+    let (text, follow_up_queries) = if max_follow_up_queries > 0 {
+        split_follow_ups(&text, max_follow_up_queries)
+    } else {
+        (text, Vec::new())
+    };
+    if text.is_empty() && follow_up_queries.is_empty() {
+        return None;
+    }
+    Some(SearchAnswer {
+        text: truncate_chars(&text, MAX_ANSWER_CHARS),
+        query_urls,
+        follow_up_queries,
+    })
+}
+
 #[async_trait::async_trait]
 impl SearchAdapter for BingGroundingAdapter {
     fn credential_report(&self) -> Option<crate::providers::credentials::CredentialReport> {
@@ -437,8 +569,15 @@ impl SearchAdapter for BingGroundingAdapter {
             .context("Failed to parse bing_grounding Responses payload")?;
 
         let items = parse_responses_payload(&payload, req)?;
+        let answer = if req.include_answer {
+            parse_grounded_answer(&payload, req.max_follow_up_queries)
+        } else {
+            None
+        };
         tracing::info!(
             citations = items.len(),
+            answer_chars = answer.as_ref().map(|a| a.text.chars().count()),
+            follow_up_queries = answer.as_ref().map(|a| a.follow_up_queries.len()),
             elapsed_ms = started.elapsed().as_millis() as u64,
             tool = self.tool_type(),
             "bing_grounding: normalised citations into search results"
@@ -447,6 +586,7 @@ impl SearchAdapter for BingGroundingAdapter {
         Ok(SearchResponse {
             results: items,
             engine: "bing_grounding".to_string(),
+            answer,
         })
     }
 }

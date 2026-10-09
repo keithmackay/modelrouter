@@ -86,6 +86,13 @@ pub struct CacheConfig {
     /// `bypass` only narrows caching and is honoured either way.
     #[serde(default = "default_true")]
     pub allow_header_opt_in: bool,
+    /// Cache only requests that ask for it with `x-modelrouter-cache: use`
+    /// (or `refresh`, which stores without a lookup). A request without the
+    /// header is never looked up or stored, whatever its default eligibility,
+    /// so a caller that forgets the header is not cached. Requires
+    /// `allow_header_opt_in`.
+    #[serde(default)]
+    pub require_opt_in: bool,
     /// Upper bound on the TTL a caller may request with
     /// `x-modelrouter-cache-ttl`. `0` lifts the bound, so callers may store
     /// entries that never expire.
@@ -95,6 +102,19 @@ pub struct CacheConfig {
     /// `x-modelrouter-cache-namespace`.
     #[serde(default)]
     pub namespaces: HashMap<String, NamespaceCacheConfig>,
+}
+
+impl CacheConfig {
+    /// Refuse settings that contradict each other.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.require_opt_in && !self.allow_header_opt_in {
+            anyhow::bail!(
+                "cache.require_opt_in = true needs cache.allow_header_opt_in = true: \
+                 with opt-in refused, nothing could ever be cached. Refusing to start."
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for CacheConfig {
@@ -109,6 +129,7 @@ impl Default for CacheConfig {
             completions: CompletionCachePolicy::default(),
             search: SearchCachePolicy::default(),
             allow_header_opt_in: true,
+            require_opt_in: false,
             max_ttl_seconds: default_cache_max_ttl(),
             namespaces: HashMap::new(),
         }
@@ -333,6 +354,174 @@ pub struct Settings {
     pub health: HealthConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub gateway: GatewayConfig,
+}
+
+/// `[gateway]` — API (gateway) key management.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub bootstrap: Option<GatewayBootstrapConfig>,
+}
+
+/// `[gateway.bootstrap]` — idempotent creation of one user and one API key at
+/// startup, so a fresh install can serve a client whose key was provisioned
+/// outside the router (e.g. by a secret store) with no manual CLI step.
+///
+/// Give exactly one of `key` (the raw key the client presents) or `key_hash`
+/// (its SHA-256, lowercase hex). The user is created if absent and the key is
+/// added if no key with that hash exists. Nothing is ever disabled, re-enabled
+/// or overwritten: a key an operator disabled stays disabled, and rotating the
+/// configured key adds the new one while the old one stays valid until
+/// disabled (`modelrouter key disable`). Env: `MODELROUTER_GATEWAY__BOOTSTRAP__USER`,
+/// `..._KEY`, `..._KEY_HASH`, `..._LABEL`.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct GatewayBootstrapConfig {
+    pub user: String,
+    #[serde(default, skip_serializing)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub key_hash: Option<String>,
+    #[serde(default = "default_gateway_bootstrap_label")]
+    pub label: String,
+}
+
+fn default_gateway_bootstrap_label() -> String {
+    "bootstrap".to_string()
+}
+
+impl std::fmt::Debug for GatewayBootstrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayBootstrapConfig")
+            .field("user", &self.user)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .field("key_hash", &self.key_hash)
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl GatewayBootstrapConfig {
+    /// The SHA-256 the key is stored and looked up by. Fails loudly unless
+    /// exactly one well-formed source is given.
+    pub fn resolved_hash(&self) -> anyhow::Result<String> {
+        if self.user.trim().is_empty() {
+            anyhow::bail!("gateway.bootstrap.user is empty. Refusing to start.");
+        }
+        match (self.key.as_deref(), self.key_hash.as_deref()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "gateway.bootstrap sets both key and key_hash; set exactly one. Refusing to start."
+            ),
+            (None, None) => anyhow::bail!(
+                "gateway.bootstrap sets neither key nor key_hash; set exactly one. Refusing to start."
+            ),
+            (Some(key), None) => {
+                if key.trim().is_empty() {
+                    anyhow::bail!("gateway.bootstrap.key is empty. Refusing to start.");
+                }
+                Ok(crate::api::auth::hash_token(key))
+            }
+            (None, Some(hash)) => {
+                if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    anyhow::bail!(
+                        "gateway.bootstrap.key_hash is not a SHA-256 in lowercase hex \
+                         (64 characters, 0-9a-f). Refusing to start."
+                    );
+                }
+                Ok(hash.to_string())
+            }
+        }
+    }
+
+    /// Create the user if absent, then the key if no key has its hash.
+    /// A hash already held by a different user fails loudly.
+    pub async fn apply(
+        &self,
+        db: &dyn crate::api::app::DatabaseProvider,
+    ) -> anyhow::Result<()> {
+        use crate::db::repositories::api_keys::ApiKeyRepository;
+        use crate::db::repositories::users::UserRepository;
+
+        let key_hash = self.resolved_hash()?;
+        let user = match UserRepository::find_by_name(db, &self.user).await? {
+            Some(user) => user,
+            None => {
+                let user = UserRepository::create(
+                    db,
+                    crate::db::models::NewUser { name: self.user.clone(), email: None },
+                )
+                .await?;
+                tracing::info!(user = %user.name, "gateway bootstrap: created user");
+                user
+            }
+        };
+        if !user.enabled {
+            tracing::warn!(
+                user = %user.name,
+                "gateway bootstrap: user is disabled; leaving it disabled, so its keys are refused"
+            );
+        }
+
+        let existing = ApiKeyRepository::list_all_api_keys(db)
+            .await?
+            .into_iter()
+            .find(|k| k.key_hash == key_hash);
+        match existing {
+            Some(k) if k.user_id != user.id => anyhow::bail!(
+                "gateway.bootstrap: the configured key already belongs to another user \
+                 (user id {}), not '{}'. Refusing to start.",
+                k.user_id,
+                user.name
+            ),
+            Some(k) if !k.enabled => tracing::warn!(
+                user = %user.name,
+                key_id = k.id,
+                "gateway bootstrap: configured key exists but is disabled; leaving it disabled"
+            ),
+            Some(k) => tracing::info!(
+                user = %user.name,
+                key_id = k.id,
+                "gateway bootstrap: key already exists, skipping"
+            ),
+            None => {
+                let k = ApiKeyRepository::create_api_key(
+                    db,
+                    crate::db::models::NewApiKey {
+                        user_id: user.id,
+                        key_hash,
+                        label: Some(self.label.clone()),
+                        expires_at: None,
+                        project: None,
+                        session_window_secs: None,
+                    },
+                )
+                .await?;
+                tracing::info!(user = %user.name, key_id = k.id, "gateway bootstrap: created key");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[logging]` — how log lines are written to stdout.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LoggingConfig {
+    /// `text` (default) or `json`. With `json`, every line is one JSON object
+    /// with the event's fields at the top level, for log collectors that
+    /// index by field. Env: `MODELROUTER_LOGGING__FORMAT`.
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -973,6 +1162,20 @@ pub struct ProviderConfig {
     /// error handling (see #97).
     #[serde(default = "default_true")]
     pub generic_chat: bool,
+    /// Anthropic prompt caching: whether Claude requests (direct Anthropic
+    /// and Claude on Vertex) get automatic `cache_control` breakpoints on the
+    /// system prompt and on a multi-turn conversation's tail. Defaults to
+    /// true. Caller-supplied markers are honoured either way.
+    #[serde(default = "default_true")]
+    pub prompt_caching: bool,
+    /// `foundry` only: deployments of Anthropic Claude models. Foundry serves
+    /// Claude over the Anthropic Messages API (`{resource}/anthropic/v1/messages`),
+    /// not the OpenAI-shaped surfaces, so requests for these deployments are
+    /// translated like the direct `anthropic` provider's (tools, thinking,
+    /// prompt caching, streaming) and sent there with the same credential.
+    /// Every other deployment stays on the endpoint's OpenAI-shaped surface.
+    #[serde(default)]
+    pub anthropic_deployments: Vec<String>,
 }
 
 impl Default for ProviderConfig {
@@ -1006,6 +1209,8 @@ impl Default for ProviderConfig {
             custom_search: false,
             custom_search_instance: None,
             generic_chat: true,
+            prompt_caching: true,
+            anthropic_deployments: Vec::new(),
         }
     }
 }

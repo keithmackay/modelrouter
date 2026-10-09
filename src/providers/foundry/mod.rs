@@ -23,6 +23,7 @@
 pub mod adapter;
 pub mod auth;
 pub mod catalog;
+pub mod claude;
 pub mod embed;
 pub mod endpoint;
 

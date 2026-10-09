@@ -21,6 +21,8 @@ pub struct RequestRouter {
     db_aliases: Arc<ArcSwap<HashMap<String, String>>>,
     /// Models and providers an operator has taken out of rotation (issue #5).
     availability: Arc<ArcSwap<AvailabilityMap>>,
+    /// Capabilities learned from provider rejections, loaded from the DB.
+    learned: Arc<crate::router::learned_capabilities::LearnedCapabilities>,
 }
 
 impl RequestRouter {
@@ -29,7 +31,13 @@ impl RequestRouter {
             settings,
             db_aliases: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             availability: Arc::new(ArcSwap::from_pointee(AvailabilityMap::default())),
+            learned: Arc::default(),
         }
+    }
+
+    /// Capabilities learned from provider rejections.
+    pub fn learned_capabilities(&self) -> &crate::router::learned_capabilities::LearnedCapabilities {
+        &self.learned
     }
 
     /// Replace the live DB alias map (called after DB model writes).

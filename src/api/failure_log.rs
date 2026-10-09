@@ -120,7 +120,8 @@ fn stage_for(err: &ApiError) -> FailureStage {
         ApiError::PolicyDenied { .. }
         | ApiError::Unauthorized
         | ApiError::Forbidden
-        | ApiError::Disabled(_) => FailureStage::Policy,
+        | ApiError::Disabled(_)
+        | ApiError::Refused { .. } => FailureStage::Policy,
         ApiError::InvalidRequest(_) => FailureStage::Request,
         ApiError::ProviderError(e) => {
             let msg = e.to_string().to_lowercase();
@@ -151,6 +152,7 @@ fn status_for(err: &ApiError) -> i64 {
         ApiError::ProviderError(_) => 502,
         ApiError::InvalidRequest(_) => 400,
         ApiError::PolicyDenied { status, .. } => *status as i64,
+        ApiError::Refused { status, .. } => *status as i64,
         ApiError::Internal => 500,
     }
 }

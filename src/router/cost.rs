@@ -72,9 +72,22 @@ impl CostCalculator {
             "claude-sonnet-4-6".to_string(),
             ModelPricing::simple(3.0, 15.0),
         );
+        // Claude Opus 5.5 / Sonnet 5.5 / Haiku 4.5 — first-party list prices,
+        // checked 2026-10-02. Opus 5.5 cache reads are 0.05x input, not the
+        // default 0.1x, so its cache rates are explicit. Vertex AI's global
+        // endpoint lists the same rates; its regional endpoints list ~10% higher.
+        // Reference: https://platform.claude.com/docs/en/about-claude/pricing
+        pricing.insert(
+            "claude-opus-5-5".to_string(),
+            ModelPricing::with_cache(4.0, 20.0, 0.20, 5.0),
+        );
+        pricing.insert(
+            "claude-sonnet-5-5".to_string(),
+            ModelPricing::with_cache(2.0, 10.0, 0.20, 2.50),
+        );
         pricing.insert(
             "claude-haiku-4-5".to_string(),
-            ModelPricing::simple(0.80, 4.0),
+            ModelPricing::simple(1.0, 5.0),
         );
         pricing.insert(
             "claude-3-5-sonnet-20241022".to_string(),
@@ -207,7 +220,7 @@ impl CostCalculator {
         );
         pricing.insert(
             "claude-haiku-4-5@20251001".to_string(),
-            ModelPricing::simple(0.80, 4.0),
+            ModelPricing::simple(1.0, 5.0),
         );
         // Unknown models cost 0 (Ollama etc.) and are reported once as unpriced.
         Self {
@@ -301,6 +314,23 @@ impl CostCalculator {
         }
     }
 
+    /// Cost of the same request with no prompt cache: the cache-read and
+    /// cache-write tokens priced at the standard input rate. Arguments are as
+    /// for `calculate_with_cache` (`prompt_tokens` is the non-cached share).
+    pub fn calculate_no_cache(
+        &self,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+    ) -> f64 {
+        let whole_prompt = prompt_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens);
+        self.calculate(model, whole_prompt, completion_tokens)
+    }
+
     /// Record that `model` was costed without a pricing entry. Logs a warning
     /// the first time each model is seen, so a missing price shows up in the
     /// logs rather than passing as a silent zero in the cost ledger. Returns
@@ -364,6 +394,21 @@ mod tests {
     }
 
     #[test]
+    fn no_cache_cost_prices_cached_prompt_tokens_at_the_input_rate() {
+        let calc = CostCalculator::default();
+        // claude-sonnet-5-5: $2/M input, $10/M output, $0.20/M cache read, $2.50/M cache write.
+        let actual = calc.calculate_with_cache("anthropic/claude-sonnet-5-5", 1_000_000, 100_000, 4_000_000, 500_000);
+        let no_cache = calc.calculate_no_cache("anthropic/claude-sonnet-5-5", 1_000_000, 100_000, 4_000_000, 500_000);
+        assert!((actual - (2.0 + 1.0 + 0.8 + 1.25)).abs() < 1e-9, "actual: {actual}");
+        assert!((no_cache - (5.5 * 2.0 + 1.0)).abs() < 1e-9, "no cache: {no_cache}");
+        // No cache activity: the two figures agree.
+        assert_eq!(
+            calc.calculate_with_cache("claude-sonnet-5-5", 1000, 10, 0, 0),
+            calc.calculate_no_cache("claude-sonnet-5-5", 1000, 10, 0, 0)
+        );
+    }
+
+    #[test]
     fn has_price_normalises_prefix_and_case() {
         let calc = CostCalculator::default();
         assert!(calc.has_price("gpt-4o"));
@@ -408,7 +453,32 @@ mod tests {
         // must resolve to it.
         assert!(calc.has_price("vertex/anthropic/claude-haiku-4-5"));
         let cost = calc.calculate("vertex/anthropic/claude-haiku-4-5", 1_000_000, 0);
-        assert!((cost - 0.80).abs() < 0.001, "vertex haiku input: {cost}");
+        assert!((cost - 1.0).abs() < 0.001, "vertex haiku input: {cost}");
+    }
+
+    #[test]
+    fn builtin_opus_and_sonnet_5_5_price_unpinned_vertex_targets() {
+        let calc = CostCalculator::default();
+        // Both are served on Vertex under the bare id, with no `@version` pin.
+        for (model, input, output, cache_read, cache_write) in [
+            ("vertex/anthropic/claude-opus-5-5", 4.0, 20.0, 0.20, 5.0),
+            ("vertex/anthropic/claude-sonnet-5-5", 2.0, 10.0, 0.20, 2.50),
+        ] {
+            assert!(calc.has_price(model), "{model} must be priced");
+            let cost = calc.calculate_with_cache(model, 1_000_000, 1_000_000, 0, 0);
+            assert!((cost - (input + output)).abs() < 0.001, "{model} in+out: {cost}");
+            let cost = calc.calculate_with_cache(model, 0, 0, 1_000_000, 0);
+            assert!((cost - cache_read).abs() < 0.001, "{model} cache read: {cost}");
+            let cost = calc.calculate_with_cache(model, 0, 0, 0, 1_000_000);
+            assert!((cost - cache_write).abs() < 0.001, "{model} cache write: {cost}");
+        }
+    }
+
+    #[test]
+    fn builtin_haiku_4_5_pinned_vertex_target_uses_list_price() {
+        let calc = CostCalculator::default();
+        let cost = calc.calculate("vertex/anthropic/claude-haiku-4-5@20251001", 1_000_000, 1_000_000);
+        assert!((cost - 6.0).abs() < 0.001, "pinned haiku in+out: {cost}");
     }
 
     #[test]

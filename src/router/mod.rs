@@ -8,6 +8,7 @@ pub mod complexity;
 pub mod cost;
 pub mod engine;
 pub mod experiments;
+pub mod learned_capabilities;
 pub mod fallback;
 pub mod load_balancer;
 pub mod model_capabilities;

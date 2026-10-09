@@ -480,8 +480,14 @@ async fn provider_views(state: &AppState) -> anyhow::Result<Vec<serde_json::Valu
         .into_iter()
         .map(|name| {
             let row = states.iter().find(|s| s.provider == name);
+            // Where the provider's requests go, so a caller can check every
+            // configured endpoint against its own allow-list. Never the key.
+            let cfg = state.settings.providers.get(&name);
             serde_json::json!({
                 "provider": name,
+                "api_base": cfg.and_then(|c| c.api_base.clone()),
+                "region": cfg.and_then(|c| c.region.clone()),
+                "project": cfg.and_then(|c| c.project.clone()),
                 "enabled": row.map(|r| r.enabled).unwrap_or(true),
                 "disabled_reason": row.and_then(|r| r.disabled_reason.clone()),
                 "disabled_by": row.and_then(|r| r.disabled_by.clone()),

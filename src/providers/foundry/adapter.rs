@@ -53,6 +53,7 @@ use crate::providers::adapter::{
 };
 use crate::providers::azure_entra::TokenProvider;
 use crate::providers::foundry::auth::FoundryAuth;
+use crate::providers::foundry::claude::FoundryClaude;
 use crate::providers::foundry::endpoint::FoundryEndpoint;
 use std::sync::Arc;
 
@@ -66,18 +67,17 @@ pub struct FoundryAdapter {
     /// Per-tier ceilings from `[tier_timeouts]`, applied per request like the
     /// other chat adapters (previously ignored: one flat client timeout).
     tier_timeouts: TierTimeoutsConfig,
+    /// `anthropic_deployments`, served over the Messages surface.
+    claude: Option<FoundryClaude>,
 }
 
 impl FoundryAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        let auth = FoundryAuth::entra_by_default(
-            "foundry",
-            config,
-            endpoint.scope(),
-            std::time::Duration::from_secs(config.timeout_secs.max(1)),
-        )?;
-        Self::build(endpoint, auth, config)
+        let timeout = std::time::Duration::from_secs(config.timeout_secs.max(1));
+        let auth = FoundryAuth::entra_by_default("foundry", config, endpoint.scope(), timeout)?;
+        let claude = FoundryClaude::from_config(config, &endpoint, timeout)?;
+        Self::build(endpoint, auth, claude, config)
     }
 
     /// Test hook: build with a caller-supplied token source, bypassing the
@@ -87,12 +87,16 @@ impl FoundryAdapter {
         token_provider: Arc<dyn TokenProvider>,
     ) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        Self::build(endpoint, FoundryAuth::Entra(token_provider), config)
+        let claude = (!config.anthropic_deployments.is_empty()).then(|| {
+            FoundryClaude::with_auth(config, &endpoint, FoundryAuth::Entra(token_provider.clone()))
+        });
+        Self::build(endpoint, FoundryAuth::Entra(token_provider), claude, config)
     }
 
     fn build(
         endpoint: FoundryEndpoint,
         auth: FoundryAuth,
+        claude: Option<FoundryClaude>,
         config: &ProviderConfig,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -114,6 +118,7 @@ impl FoundryAdapter {
             client,
             default_timeout_secs: config.timeout_secs,
             tier_timeouts: TierTimeoutsConfig::default(),
+            claude,
         })
     }
 
@@ -135,6 +140,11 @@ impl FoundryAdapter {
 
     pub fn endpoint(&self) -> &FoundryEndpoint {
         &self.endpoint
+    }
+
+    /// The Messages surface, when `model` is a configured Claude deployment.
+    fn claude_for(&self, model: &str) -> Option<&FoundryClaude> {
+        self.claude.as_ref().filter(|c| c.serves(model))
     }
 
     pub(crate) fn auth(&self) -> &FoundryAuth {
@@ -267,8 +277,24 @@ impl ProviderAdapter for FoundryAdapter {
         self.auth.credential_report()
     }
 
+    /// Claude deployments take tools natively (translated like the direct
+    /// `anthropic` provider); the OpenAI-shaped surfaces are not wired for
+    /// tools, so the gate refuses them there rather than dropping them.
+    fn supports_tools(&self, model: &str) -> bool {
+        self.claude_for(model).is_some()
+    }
+
     /// Settings forwarded as normalized; the timeout is the configured ceiling.
+    /// Claude deployments always send `max_tokens` and the reasoning control.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        if self.claude_for(&req.model).is_some() {
+            return EffectiveSettings {
+                reasoning: req.reasoning,
+                temperature: req.temperature,
+                max_tokens: Some(req.max_tokens.unwrap_or(crate::providers::anthropic::DEFAULT_MAX_TOKENS)),
+                timeout_secs: Some(self.request_timeout(req).as_secs()),
+            };
+        }
         EffectiveSettings {
             reasoning: None,
             temperature: req.temperature,
@@ -278,6 +304,9 @@ impl ProviderAdapter for FoundryAdapter {
     }
 
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
+        if let Some(claude) = self.claude_for(&req.model) {
+            return claude.complete(&self.client, req, self.request_timeout(req)).await;
+        }
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, false);
         tracing::debug!(
@@ -333,6 +362,9 @@ impl ProviderAdapter for FoundryAdapter {
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
+        if let Some(claude) = self.claude_for(&req.model) {
+            return claude.stream(&self.client, req, self.request_timeout(req)).await;
+        }
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, true);
         tracing::debug!(

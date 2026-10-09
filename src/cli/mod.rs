@@ -195,6 +195,12 @@ async fn shutdown_signal() {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    run_with_extensions(cli, crate::extensions::Extensions::default()).await
+}
+
+/// [`run`], with request extensions a wrapper binary links in. `serve` starts
+/// them before listening and refuses to start if one fails to.
+pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extensions) -> Result<()> {
     match cli.command {
         Commands::Init => {
             println!("modelrouter v{}", env!("CARGO_PKG_VERSION"));
@@ -261,27 +267,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Initialise tracing subscriber. The otel feature provides a richer layered
             // subscriber; without it we install a basic fmt subscriber.
             #[cfg(not(feature = "otel"))]
-            {
-                tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                    )
-                    .try_init()
-                    .ok();
-            }
+            crate::logging::init(settings.logging.format);
             #[cfg(feature = "otel")]
             let _telemetry_guard = {
                 if settings.telemetry.enabled {
-                    Some(crate::telemetry::init_telemetry(&settings.telemetry)?)
+                    Some(crate::telemetry::init_telemetry(&settings.telemetry, settings.logging.format)?)
                 } else {
-                    tracing_subscriber::fmt()
-                        .with_env_filter(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                        )
-                        .try_init()
-                        .ok();
+                    crate::logging::init(settings.logging.format);
                     None
                 }
             };
@@ -317,6 +309,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             // Bootstrap admin account from config if specified (issue #43).
             if let Some(ref bootstrap) = settings.admin.bootstrap {
+                bootstrap.apply(&*db).await?;
+            }
+            if let Some(ref bootstrap) = settings.gateway.bootstrap {
                 bootstrap.apply(&*db).await?;
             }
 
@@ -510,6 +505,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                     tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
                 }
                 state.router.update_db_aliases(db_aliases);
+                crate::api::admin::learned_capabilities::load_learned_capabilities(
+                    &state.router,
+                    &*state.db,
+                )
+                .await;
                 let availability =
                     crate::api::admin::aliases::build_availability_map(&state.db).await;
                 if !availability.is_empty() {
@@ -609,7 +609,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 });
             }
 
-            let app = crate::api::app::build_router(state);
+            extensions
+                .start(crate::extensions::StartContext { pool: state.pool.clone() })
+                .await?;
+            if !extensions.is_empty() {
+                let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
+                tracing::info!(extensions = ?names, "request extensions loaded");
+            }
+            let app = crate::api::app::build_router_with_extensions(state, extensions);
 
             // Flag > config > built-in default. The config defaults already
             // supply 127.0.0.1:8080 when the section is absent.

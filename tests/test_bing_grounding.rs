@@ -228,6 +228,7 @@ fn req(query: &str, max_results: Option<u32>) -> SearchRequest {
     SearchRequest {
         query: query.to_string(),
         max_results,
+        ..Default::default()
     }
 }
 
@@ -472,6 +473,178 @@ async fn a_response_without_citations_is_an_error_not_an_empty_result() {
     let err = adapter.search(&req("anything", None)).await.unwrap_err().to_string();
     assert!(err.contains("no web citations"), "{err}");
     assert!(!err.contains("42"), "the error must not carry ungrounded prose: {err}");
+}
+
+// ── include_answer: the generated answer beside the citations ──────────────
+
+fn answer_req(query: &str) -> SearchRequest {
+    SearchRequest {
+        query: query.to_string(),
+        max_results: Some(5),
+        include_answer: true,
+        ..Default::default()
+    }
+}
+
+fn urls(r: &modelrouter::providers::search::SearchResponse) -> Vec<String> {
+    r.results.iter().map(|i| i.url.clone()).collect()
+}
+
+/// Asked for, the answer comes back with the message text and the Bing query
+/// URL verbatim, and the citations are exactly what a citations-only call
+/// returns.
+#[tokio::test]
+async fn include_answer_returns_the_answer_text_and_query_urls_verbatim() {
+    let (foundry_base, foundry) = spawn_foundry(StatusCode::OK, grounded_payload()).await;
+    let adapter = static_adapter(&base_config(&foundry_base));
+
+    let with = adapter.search(&answer_req("euler's identity")).await.unwrap();
+    let without = adapter.search(&req("euler's identity", Some(5))).await.unwrap();
+
+    assert_eq!(urls(&with), urls(&without));
+    assert!(without.answer.is_none(), "no answer unless asked for");
+    let answer = with.answer.expect("answer requested and present in the payload");
+    assert_eq!(
+        answer.text,
+        "Euler's identity links five constants. It is called a beautiful result."
+    );
+    assert_eq!(
+        answer.query_urls,
+        vec!["https://www.bing.com/search?q=euler%27s+identity".to_string()],
+        "query URL must not be rewritten"
+    );
+    assert!(answer.follow_up_queries.is_empty(), "none asked for");
+
+    // Answer mode moves the instruction into `instructions` and keeps the
+    // grounding rule; the plain request is byte-for-byte the old shape.
+    let foundry = foundry.lock().unwrap();
+    let answer_body = &foundry.bodies[0];
+    let instructions = answer_body["instructions"].as_str().unwrap();
+    assert!(instructions.contains("answer the question in the input"), "{instructions}");
+    assert!(instructions.contains("never prior knowledge"), "{instructions}");
+    assert!(!instructions.contains("FOLLOW_UP_QUERIES"), "{instructions}");
+    assert_eq!(answer_body["input"], "Question: euler's identity");
+    assert_eq!(answer_body["tool_choice"], "required");
+    let plain_body = &foundry.bodies[1];
+    assert!(plain_body.get("instructions").is_none());
+    assert!(plain_body["input"].as_str().unwrap().ends_with("Query: euler's identity"));
+}
+
+/// Caller instructions replace the default, the grounding rule survives them,
+/// context follows the question, and the follow-up line is parsed off the
+/// answer.
+#[tokio::test]
+async fn research_mode_sends_caller_instructions_and_parses_follow_up_queries() {
+    let mut payload = grounded_payload();
+    payload["output"][1]["content"][0]["text"] = json!(
+        "Euler's identity links five constants. It is called a beautiful result.\n\
+         FOLLOW_UP_QUERIES: [\"euler identity proof\", \"Euler Identity Proof\", \"  \", \"history of e^(i pi)\", \"extra\"]"
+    );
+    let (foundry_base, foundry) = spawn_foundry(StatusCode::OK, payload).await;
+    let adapter = static_adapter(&base_config(&foundry_base));
+
+    let resp = adapter
+        .search(&SearchRequest {
+            instructions: Some("You are a careful analyst. Prefer primary sources.".to_string()),
+            context: Some("Subject: mathematics".to_string()),
+            max_follow_up_queries: 2,
+            ..answer_req("euler's identity")
+        })
+        .await
+        .unwrap();
+
+    let answer = resp.answer.unwrap();
+    assert_eq!(
+        answer.follow_up_queries,
+        vec!["euler identity proof".to_string(), "history of e^(i pi)".to_string()],
+        "deduped case-insensitively, blanks dropped, capped at the requested count"
+    );
+    assert_eq!(
+        answer.text,
+        "Euler's identity links five constants. It is called a beautiful result.",
+        "the follow-up line is not part of the answer"
+    );
+    assert_eq!(resp.results.len(), 2, "citations unaffected by the follow-up line");
+
+    let foundry = foundry.lock().unwrap();
+    let instructions = foundry.bodies[0]["instructions"].as_str().unwrap();
+    assert!(instructions.starts_with("You are a careful analyst."), "{instructions}");
+    assert!(!instructions.contains("answer the question in the input"), "default replaced");
+    assert!(instructions.contains("never prior knowledge"), "grounding rule always appended");
+    assert!(instructions.contains("FOLLOW_UP_QUERIES: followed by a JSON array of at most 2"), "{instructions}");
+    assert_eq!(
+        foundry.bodies[0]["input"],
+        "Question: euler's identity\n\nContext:\nSubject: mathematics"
+    );
+}
+
+/// Asking for the answer does not relax the grounding rule: no citations is
+/// still an error, and the ungrounded text still does not travel.
+#[tokio::test]
+async fn include_answer_still_refuses_an_ungrounded_response() {
+    let payload = json!({
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Probably 42.\nFOLLOW_UP_QUERIES: [\"q\"]", "annotations": []}]
+        }]
+    });
+    let (foundry_base, _) = spawn_foundry(StatusCode::OK, payload).await;
+    let adapter = static_adapter(&base_config(&foundry_base));
+
+    let err = adapter
+        .search(&SearchRequest { max_follow_up_queries: 3, ..answer_req("anything") })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no web citations"), "{err}");
+    assert!(!err.contains("42"), "{err}");
+}
+
+#[test]
+fn parse_grounded_answer_joins_message_parts_and_dedupes_query_urls() {
+    use modelrouter::providers::bing_grounding::search::parse_grounded_answer;
+    let payload = json!({"output": [
+        {"type": "bing_grounding_call", "url": "https://www.bing.com/search?q=a"},
+        {"type": "bing_grounding_call", "url": "https://www.bing.com/search?q=a"},
+        {"type": "bing_grounding_call", "url": "https://www.bing.com/search?q=b"},
+        {"type": "message", "content": [
+            {"type": "output_text", "text": " First part. "},
+            {"type": "output_text", "text": ""},
+            {"type": "output_text", "text": "Second part."}
+        ]}
+    ]});
+    let answer = parse_grounded_answer(&payload, 0).unwrap();
+    assert_eq!(answer.text, "First part.\n\nSecond part.");
+    assert_eq!(answer.query_urls.len(), 2);
+
+    assert!(
+        parse_grounded_answer(&json!({"output": [{"type": "bing_grounding_call", "url": "u"}]}), 0)
+            .is_none(),
+        "no message text, no answer"
+    );
+}
+
+#[test]
+fn a_missing_or_malformed_follow_up_line_yields_no_queries_and_keeps_the_text() {
+    use modelrouter::providers::bing_grounding::search::parse_grounded_answer;
+    let with_text = |text: &str| json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]});
+
+    for text in [
+        "An answer with no follow-up line.",
+        "An answer.\nFOLLOW_UP_QUERIES: not json",
+        "Prose that mentions FOLLOW_UP_QUERIES: [\"x\"] mid-line.",
+    ] {
+        let answer = parse_grounded_answer(&with_text(text), 3).unwrap();
+        assert!(answer.follow_up_queries.is_empty(), "{text}");
+        assert_eq!(answer.text, text, "text untouched when the line does not parse");
+    }
+
+    // Requested 0: the line is not parsed even when present.
+    let text = "Answer.\nFOLLOW_UP_QUERIES: [\"x\"]";
+    let answer = parse_grounded_answer(&with_text(text), 0).unwrap();
+    assert!(answer.follow_up_queries.is_empty());
+    assert_eq!(answer.text, text);
 }
 
 #[tokio::test]

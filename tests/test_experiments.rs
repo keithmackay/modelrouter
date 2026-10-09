@@ -783,14 +783,16 @@ async fn bound_request_is_not_served_from_cache() {
     // match; the binding still goes to the provider.
     let bound = complete(&h, TOKEN_A, Some(&format!("{id}:control")), &body).await;
     assert_eq!(bound.status_code(), 200, "{}", bound.text());
-    assert_eq!(bound.header("x-modelrouter-cache"), "MISS");
+    // A bound request never involves the cache: no cache header (`MISS` means
+    // "looked up and not found").
+    assert!(bound.headers().get("x-modelrouter-cache").is_none());
     assert_eq!(h.calls().len(), 2);
 
     // Nor does the bound response feed the cache: the next unbound call is
     // served from the entry the first call wrote, and a bound repeat misses
     // again.
     let again = complete(&h, TOKEN_A, Some(&format!("{id}:control")), &body).await;
-    assert_eq!(again.header("x-modelrouter-cache"), "MISS");
+    assert!(again.headers().get("x-modelrouter-cache").is_none());
     assert_eq!(h.calls().len(), 3);
 }
 

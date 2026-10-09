@@ -858,6 +858,7 @@ mod search_tests {
         SearchRequest {
             query: query.to_string(),
             max_results,
+            ..Default::default()
         }
     }
 
