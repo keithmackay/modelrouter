@@ -8,7 +8,12 @@
 //! (1) and (2) are merged into the router's DB alias map, which
 //! [`crate::router::engine::RequestRouter::resolve`] consults before config.
 //! Every write refreshes that live map, so changes take effect for the next
-//! request without a restart, and is recorded in the audit log.
+//! request without a restart, and is recorded in the audit log. The alias
+//! tick reloads it every minute too, so replicas sharing a database converge.
+//!
+//! These are the *global* aliases. A scoped alias override
+//! (`api::admin::scoped_aliases`) maps an alias for requests carrying one
+//! attribution tag, and is consulted before them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,6 +56,50 @@ pub async fn build_db_alias_map(db: &Arc<dyn DatabaseProvider>) -> HashMap<Strin
         }
     }
     map
+}
+
+/// Load the global aliases into a freshly started router. Database aliases
+/// are authoritative over `routing.model_aliases`: a runtime write survives a
+/// restart and keeps winning over the config's alias of the same name, so the
+/// global mapping has one source. Only `routing.config_aliases_win_at_start`
+/// (default off) reverses that, by deleting the shadowing rows first.
+pub async fn load_aliases_at_start(
+    db: &Arc<dyn DatabaseProvider>,
+    router: &crate::router::engine::RequestRouter,
+    routing: &crate::config::schema::RoutingConfig,
+) {
+    if routing.config_aliases_win_at_start {
+        match drop_db_aliases_shadowing_config(db, &routing.model_aliases).await {
+            Ok(dropped) if !dropped.is_empty() => tracing::info!(
+                aliases = ?dropped,
+                "config aliases win at start: dropped the database aliases that shadowed them"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not drop database aliases that shadow config aliases"),
+        }
+    }
+    let db_aliases = build_db_alias_map(db).await;
+    if !db_aliases.is_empty() {
+        tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
+    }
+    router.update_db_aliases(db_aliases);
+}
+
+/// Delete runtime-managed aliases that shadow an alias the config defines
+/// (`routing.config_aliases_win_at_start`). Returns the deleted names, sorted.
+/// Model-row aliases are not runtime-managed and are left alone.
+pub async fn drop_db_aliases_shadowing_config(
+    db: &Arc<dyn DatabaseProvider>,
+    config_aliases: &HashMap<String, String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut dropped = Vec::new();
+    for row in db.list_aliases().await? {
+        if config_aliases.contains_key(&row.alias) && db.delete_alias(&row.alias).await? {
+            dropped.push(row.alias);
+        }
+    }
+    dropped.sort();
+    Ok(dropped)
 }
 
 /// Reload the DB alias map into the live router. Call after any alias or model write.

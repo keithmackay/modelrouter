@@ -288,6 +288,7 @@ impl SearchAdapter for VertexSearchAdapter {
         Ok(SearchResponse {
             results: items,
             engine: "vertex".to_string(),
+            answer: None,
         })
     }
 }

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::db::models::{ModelAlias, NewModelAlias};
+use crate::db::models::{ModelAlias, NewModelAlias, NewScopedAlias, ScopedAlias};
 use crate::db::repositories::aliases::AliasRepository;
 use super::{SqliteDb, now_utc};
 
@@ -26,6 +26,38 @@ impl From<AliasRow> for ModelAlias {
 }
 
 const SELECT_COLS: &str = "alias, target, created_by, created_at, updated_at";
+
+#[derive(sqlx::FromRow)]
+struct ScopedAliasRow {
+    tag_key: String,
+    tag_value: String,
+    alias: String,
+    target: String,
+    provider: String,
+    model: String,
+    expires_at: i64,
+    created_by: Option<String>,
+    created_at: String,
+}
+
+impl From<ScopedAliasRow> for ScopedAlias {
+    fn from(r: ScopedAliasRow) -> Self {
+        ScopedAlias {
+            tag_key: r.tag_key,
+            tag_value: r.tag_value,
+            alias: r.alias,
+            target: r.target,
+            provider: r.provider,
+            model: r.model,
+            expires_at: r.expires_at,
+            created_by: r.created_by,
+            created_at: r.created_at,
+        }
+    }
+}
+
+const SCOPED_COLS: &str =
+    "tag_key, tag_value, alias, target, provider, model, expires_at, created_by, created_at";
 
 #[async_trait]
 impl AliasRepository for SqliteDb {
@@ -78,6 +110,76 @@ impl AliasRepository for SqliteDb {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_scoped_aliases(&self) -> anyhow::Result<Vec<ScopedAlias>> {
+        let rows = sqlx::query_as::<_, ScopedAliasRow>(&format!(
+            "SELECT {SCOPED_COLS} FROM scoped_aliases ORDER BY tag_key, tag_value, alias"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(ScopedAlias::from).collect())
+    }
+
+    async fn replace_scoped_aliases(
+        &self,
+        tag_key: &str,
+        tag_value: &str,
+        aliases: &[NewScopedAlias],
+        expires_at: i64,
+        created_by: Option<&str>,
+    ) -> anyhow::Result<Vec<ScopedAlias>> {
+        let now = now_utc();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM scoped_aliases WHERE tag_key = ? AND tag_value = ?")
+            .bind(tag_key)
+            .bind(tag_value)
+            .execute(&mut *tx)
+            .await?;
+        for entry in aliases {
+            sqlx::query(
+                "INSERT INTO scoped_aliases \
+                 (tag_key, tag_value, alias, target, provider, model, expires_at, created_by, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(tag_key)
+            .bind(tag_value)
+            .bind(&entry.alias)
+            .bind(&entry.target)
+            .bind(&entry.provider)
+            .bind(&entry.model)
+            .bind(expires_at)
+            .bind(created_by)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let rows = sqlx::query_as::<_, ScopedAliasRow>(&format!(
+            "SELECT {SCOPED_COLS} FROM scoped_aliases WHERE tag_key = ? AND tag_value = ? ORDER BY alias"
+        ))
+        .bind(tag_key)
+        .bind(tag_value)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().map(ScopedAlias::from).collect())
+    }
+
+    async fn delete_expired_scoped_aliases(&self, now_epoch: i64) -> anyhow::Result<Vec<ScopedAlias>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, ScopedAliasRow>(&format!(
+            "SELECT {SCOPED_COLS} FROM scoped_aliases WHERE expires_at != 0 AND expires_at <= ? \
+             ORDER BY tag_key, tag_value, alias"
+        ))
+        .bind(now_epoch)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM scoped_aliases WHERE expires_at != 0 AND expires_at <= ?")
+            .bind(now_epoch)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().map(ScopedAlias::from).collect())
     }
 }
 
@@ -133,5 +235,48 @@ mod tests {
         let list = db.list_aliases().await.unwrap();
         assert_eq!(list[0].alias, "alpha");
         assert_eq!(list[1].alias, "zeta");
+    }
+
+    fn pin(alias: &str, model: &str) -> NewScopedAlias {
+        NewScopedAlias {
+            alias: alias.to_string(),
+            target: format!("mock/{model}"),
+            provider: "mock".to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_a_scope_swaps_its_whole_set_and_leaves_others() {
+        let db = test_db().await;
+        db.replace_scoped_aliases("tenant", "t1", &[pin("fast", "a"), pin("deep", "b")], 0, Some("tester"))
+            .await
+            .unwrap();
+        db.replace_scoped_aliases("tenant", "t2", &[pin("deep", "c")], 0, None).await.unwrap();
+        let rows = db.replace_scoped_aliases("tenant", "t1", &[pin("deep", "d")], 99, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].model.as_str(), rows[0].expires_at), ("d", 99));
+
+        let all = db.list_scoped_aliases().await.unwrap();
+        let keys: Vec<(&str, &str, &str)> =
+            all.iter().map(|r| (r.tag_value.as_str(), r.alias.as_str(), r.model.as_str())).collect();
+        assert_eq!(keys, [("t1", "deep", "d"), ("t2", "deep", "c")]);
+
+        // An empty set clears the scope.
+        assert!(db.replace_scoped_aliases("tenant", "t1", &[], 0, None).await.unwrap().is_empty());
+        assert_eq!(db.list_scoped_aliases().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_expired_overrides_keeps_live_and_never_expiring_ones() {
+        let db = test_db().await;
+        db.replace_scoped_aliases("tenant", "old", &[pin("deep", "a")], 100, None).await.unwrap();
+        db.replace_scoped_aliases("tenant", "live", &[pin("deep", "b")], 300, None).await.unwrap();
+        db.replace_scoped_aliases("tenant", "forever", &[pin("deep", "c")], 0, None).await.unwrap();
+        let gone = db.delete_expired_scoped_aliases(200).await.unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].tag_value, "old");
+        let left: Vec<String> = db.list_scoped_aliases().await.unwrap().into_iter().map(|r| r.tag_value).collect();
+        assert_eq!(left, ["forever", "live"]);
     }
 }

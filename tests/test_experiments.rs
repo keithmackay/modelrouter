@@ -783,14 +783,16 @@ async fn bound_request_is_not_served_from_cache() {
     // match; the binding still goes to the provider.
     let bound = complete(&h, TOKEN_A, Some(&format!("{id}:control")), &body).await;
     assert_eq!(bound.status_code(), 200, "{}", bound.text());
-    assert_eq!(bound.header("x-modelrouter-cache"), "MISS");
+    // A bound request never involves the cache: no cache header (`MISS` means
+    // "looked up and not found").
+    assert!(bound.headers().get("x-modelrouter-cache").is_none());
     assert_eq!(h.calls().len(), 2);
 
     // Nor does the bound response feed the cache: the next unbound call is
     // served from the entry the first call wrote, and a bound repeat misses
     // again.
     let again = complete(&h, TOKEN_A, Some(&format!("{id}:control")), &body).await;
-    assert_eq!(again.header("x-modelrouter-cache"), "MISS");
+    assert!(again.headers().get("x-modelrouter-cache").is_none());
     assert_eq!(h.calls().len(), 3);
 }
 
@@ -1233,4 +1235,77 @@ async fn retaining_binding_never_opens_the_callback_egress() {
     assert!(row.messages.contains("plan the week"));
     assert_eq!(row.response.as_deref(), Some("answer from model-b"));
     assert!(h.events().is_empty(), "{:?}", h.events().len());
+}
+
+// ── Scoped alias overrides ────────────────────────────────────────────────────
+
+fn tagged_body(model: &str, run: &str, tags: Value) -> Value {
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "plan the week"}],
+        "attribution": { "correlation_id": run, "tags": tags },
+    })
+}
+
+fn scope_row(value: &str, alias: &str, model: &str, expires_at: i64) -> modelrouter::db::models::ScopedAlias {
+    modelrouter::db::models::ScopedAlias {
+        tag_key: "tenant".into(),
+        tag_value: value.into(),
+        alias: alias.into(),
+        target: format!("mock/{model}"),
+        provider: "mock".into(),
+        model: model.into(),
+        expires_at,
+        created_by: None,
+        created_at: String::new(),
+    }
+}
+
+/// Callers send the same alias; a scope for their tag routes it to a
+/// different model, everyone else keeps the global alias, and the ledger
+/// records what actually answered for each.
+#[tokio::test]
+async fn a_scoped_override_routes_only_requests_carrying_its_tag() {
+    let h = build_app(Options::default()).await;
+    h.router.scoped_aliases().store(&[scope_row("t1", "planner", "model-b", 0)]);
+
+    let ok = |r: axum_test::TestResponse| assert_eq!(r.status_code(), 200, "{}", r.text());
+    ok(complete(&h, TOKEN_A, None, &tagged_body("planner", "run-t1", json!({"tenant": "t1"}))).await);
+    ok(complete(&h, TOKEN_A, None, &tagged_body("planner", "run-t2", json!({"tenant": "t2"}))).await);
+    ok(complete(&h, TOKEN_A, None, &chat_body("planner", "run-none")).await);
+    assert_eq!(h.calls(), vec!["model-b", "model-a", "model-a"]);
+
+    for run in ["run-t1", "run-t2", "run-none"] {
+        h.wait_for_run(1, run).await;
+    }
+    let prompt = h.prompt_for_run("run-t1").await;
+    assert_eq!(prompt.request_model, "planner");
+    assert_eq!(prompt.routed_model, "model-b");
+}
+
+#[tokio::test]
+async fn an_expired_scoped_override_no_longer_routes() {
+    let h = build_app(Options::default()).await;
+    h.router.scoped_aliases().store(&[scope_row("t1", "planner", "model-b", 1)]);
+    let resp = complete(&h, TOKEN_A, None, &tagged_body("planner", "run-old", json!({"tenant": "t1"}))).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(h.calls(), vec!["model-a"]);
+}
+
+/// Resolution order: an experiment variant's overlay, then a scoped override,
+/// then the global alias.
+#[tokio::test]
+async fn an_experiment_overlay_beats_a_scoped_override() {
+    let h = build_app(Options::default()).await;
+    let id = h.seed_experiment(vec![], false).await;
+    h.router.scoped_aliases().store(&[scope_row("t1", "planner", "model-c", 0)]);
+    let body = tagged_body("planner", "run-bound", json!({"tenant": "t1"}));
+
+    // The candidate's overlay maps `planner`: the overlay wins.
+    let resp = complete(&h, TOKEN_A, Some(&format!("{id}:candidate")), &body).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    // The control overlay maps nothing: the scope applies.
+    let resp = complete(&h, TOKEN_A, Some(&format!("{id}:control")), &body).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    assert_eq!(h.calls(), vec!["model-b", "model-c"]);
 }

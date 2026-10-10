@@ -89,6 +89,7 @@ impl SearchAdapter for TavilyAdapter {
                 })
                 .collect(),
             engine: "tavily".to_string(),
+            answer: None,
         })
     }
 }

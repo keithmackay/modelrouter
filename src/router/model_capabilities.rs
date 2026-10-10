@@ -18,14 +18,22 @@
 //! know whether the resolved model accepts the parameter, and it strips the
 //! ones the model would reject.
 //!
-//! Defaults below are empirically probed, not inferred from version numbers.
-//! Operators override them from config without waiting on a release:
+//! Defaults below are probed or taken from the provider's published model
+//! documentation. The temperature table matches by model family, so a point
+//! release (`claude-opus-5-5`) or a version pin (`claude-opus-5@20260101`)
+//! inherits its family's entry. Operators override any entry from config
+//! without waiting on a release:
 //!
 //! ```toml
 //! [[model_capabilities]]
 //! model = "claude-opus-6"
 //! supports_temperature = false
 //! ```
+//!
+//! A model the table does not know yet degrades gracefully: when a provider
+//! rejects a request because of its `temperature`, the router retries the call
+//! once without it and records the model, durably, in
+//! [`crate::router::learned_capabilities`] ([`temperature_rejection_retry`]).
 
 use crate::config::schema::ModelCapabilityEntry;
 
@@ -35,9 +43,20 @@ use crate::config::schema::ModelCapabilityEntry;
 ///
 /// Keys are normalized model names (provider prefix stripped, lowercased) —
 /// see [`normalize_model_key`].
+///
+/// Entries name a model *family*: an entry also covers every id that extends it
+/// with a `-` suffix (see [`family_matches`]), so `claude-opus-5` covers
+/// `claude-opus-5-5`. The point releases are still listed so the table states
+/// what was verified.
 const TEMPERATURE_UNSUPPORTED: &[&str] = &[
     "claude-opus-5",
+    "claude-opus-5-5",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    // Sampling parameters were removed from Opus 4.7 and 4.8 as well
+    // (documented; the request is a 400).
+    "claude-opus-4-7",
+    "claude-opus-4-8",
     // Both Fable 5 generations reject `temperature` (Vertex 400
     // "`temperature` is deprecated for this model"). claude-fable-5 was
     // missing from this list while its sibling was present — that single gap
@@ -53,12 +72,48 @@ const TEMPERATURE_UNSUPPORTED: &[&str] = &[
 /// `claude-opus-5`) and lowercases, matching how
 /// [`crate::router::cost::CostCalculator`] keys its pricing table so operators
 /// write the same model string in both config blocks.
+///
+/// Every leading segment is stripped, not just the first: a routed target such
+/// as `vertex/anthropic/claude-opus-5-5` names the provider *and* the publisher,
+/// and must reach the same entry as the bare `claude-opus-5-5`.
 fn normalize_model_key(model: &str) -> String {
-    let key = match model.find('/') {
+    let key = match model.rfind('/') {
         Some(pos) => &model[pos + 1..],
         None => model,
     };
     key.to_lowercase()
+}
+
+/// Whether `key` is `family` itself or a release of it (`family-…`).
+///
+/// The `-` boundary keeps `claude-opus-5` from matching `claude-opus-50`.
+fn family_matches(key: &str, family: &str) -> bool {
+    key == family
+        || (key.len() > family.len() && key.starts_with(family) && key.as_bytes()[family.len()] == b'-')
+}
+
+/// Whether `err` is a provider rejecting the request because of `temperature`:
+/// a 4xx request error whose message names the parameter.
+fn is_temperature_rejection(err: &anyhow::Error) -> bool {
+    use crate::router::retry::RetryableError;
+    matches!(RetryableError::classify_error(err), RetryableError::ClientError(_))
+        && err.to_string().to_lowercase().contains("temperature")
+}
+
+/// The request to retry when a provider rejected `req` because of its
+/// `temperature`: the same request without it. `None` when the failure is
+/// anything else, or `req` carried no temperature. The caller records the
+/// rejection ([`crate::router::learned_capabilities`]) so it is paid once.
+pub fn temperature_rejection_retry(
+    req: &crate::providers::adapter::NormalizedRequest,
+    err: &anyhow::Error,
+) -> Option<crate::providers::adapter::NormalizedRequest> {
+    if req.temperature.is_none() || !is_temperature_rejection(err) {
+        return None;
+    }
+    let mut retry = req.clone();
+    retry.temperature = None;
+    Some(retry)
 }
 
 /// Drop a Vertex-style `@YYYYMMDD` version suffix, if present.
@@ -79,34 +134,136 @@ fn strip_version(key: &str) -> &str {
 ///
 /// A config entry for the model wins over the built-in table, so an operator
 /// can both *add* a model the build doesn't know about and *retract* a built-in
-/// entry once a provider restores support. Unknown models are assumed to
-/// support it: the router must not silently drop parameters it has no evidence
-/// are unwelcome.
+/// entry once a provider restores support. Next comes a model a provider has
+/// rejected the parameter for in this process, then the built-in family table.
+/// Unknown models are assumed to support it: the router must not silently drop
+/// parameters it has no evidence are unwelcome.
 ///
 /// Lookup tries the fully qualified name before the version-stripped one, so a
 /// version-pinned entry overrides a family-wide one rather than the reverse.
 pub fn supports_temperature(model: &str, overrides: &[ModelCapabilityEntry]) -> bool {
+    temperature_override(model, overrides).unwrap_or_else(|| table_supports_temperature(model))
+}
+
+/// [`supports_temperature`] with learned entries between config and the
+/// built-in table: config override, then a learned rejection of this exact
+/// model, then the family table.
+pub fn temperature_allowed(
+    model: &str,
+    overrides: &[ModelCapabilityEntry],
+    learned: &crate::router::learned_capabilities::LearnedCapabilities,
+) -> bool {
+    if let Some(configured) = temperature_override(model, overrides) {
+        return configured;
+    }
+    if let Some(supported) = learned.temperature(model) {
+        return supported;
+    }
+    table_supports_temperature(model)
+}
+
+fn temperature_override(model: &str, overrides: &[ModelCapabilityEntry]) -> Option<bool> {
     let key = normalize_model_key(model);
     let base = strip_version(&key);
-
     let mut candidates = vec![key.as_str()];
     if base != key {
         candidates.push(base);
     }
-
     for candidate in &candidates {
         for entry in overrides {
             if normalize_model_key(&entry.model) == *candidate {
                 if let Some(supported) = entry.supports_temperature {
-                    return supported;
+                    return Some(supported);
                 }
             }
         }
     }
+    None
+}
 
-    !candidates
+fn table_supports_temperature(model: &str) -> bool {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    !TEMPERATURE_UNSUPPORTED
         .iter()
-        .any(|c| TEMPERATURE_UNSUPPORTED.contains(c))
+        .any(|family| family_matches(base, family))
+}
+
+// ── Output ceilings ──────────────────────────────────────────────────────────
+//
+// A caller addressing an alias sizes `max_tokens` for the largest model the
+// alias might reach; a provider rejects a value above the resolved model's
+// completion ceiling outright ("max_tokens is too large: 128000. This model
+// supports at most 32768 completion tokens"). The router knows the resolved
+// model, so it clamps. Keyed like the temperature table (family match,
+// provider prefix and `@version` ignored) and overridable from config with
+// `max_output_tokens`.
+
+/// Completion-token ceilings by model family, from the providers' published
+/// model documentation.
+const MAX_OUTPUT_TOKENS: &[(&str, u32)] = &[
+    ("gpt-4.1", 32768),
+    ("gpt-4o", 16384),
+    ("gpt-5", 128000),
+    ("gpt-5.1", 128000),
+    ("gpt-5.2", 128000),
+    ("gpt-5.3", 128000),
+    ("gpt-5.4", 128000),
+    ("gpt-5.5", 128000),
+    ("gpt-5.6", 128000),
+    ("o1", 100000),
+    ("o3", 100000),
+    ("o4", 100000),
+];
+
+/// Families that take `max_completion_tokens` and reject `max_tokens` on the
+/// OpenAI-shaped surfaces (the reasoning generations). Every other model keeps
+/// `max_tokens`, which non-OpenAI deployments behind the same surface expect.
+const MAX_COMPLETION_TOKENS_FAMILIES: &[&str] = &["gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6", "gpt-6.1", "o1", "o3", "o4"];
+
+/// Whether `model` takes `max_completion_tokens` instead of `max_tokens`.
+pub fn uses_max_completion_tokens(model: &str) -> bool {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    MAX_COMPLETION_TOKENS_FAMILIES.iter().any(|family| family_matches(base, family))
+}
+
+/// The completion-token ceiling for `model`: a config entry, else the family
+/// table, else none (an unknown model is sent what the caller asked for).
+pub fn max_output_tokens(model: &str, overrides: &[ModelCapabilityEntry]) -> Option<u32> {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    let mut candidates = vec![key.as_str()];
+    if base != key {
+        candidates.push(base);
+    }
+    for candidate in &candidates {
+        for entry in overrides {
+            if normalize_model_key(&entry.model) == *candidate {
+                if let Some(cap) = entry.max_output_tokens {
+                    return Some(cap);
+                }
+            }
+        }
+    }
+    // A dated snapshot (`gpt-4.1-2025-04-14`) is a release of its family, which
+    // `family_matches` covers through the `-` boundary.
+    MAX_OUTPUT_TOKENS
+        .iter()
+        .find(|(family, _)| family_matches(base, family))
+        .map(|(_, cap)| *cap)
+}
+
+/// `requested` lowered to the model's ceiling when it is above it.
+pub fn clamp_max_tokens(model: &str, requested: Option<u32>, overrides: &[ModelCapabilityEntry]) -> Option<u32> {
+    let requested = requested?;
+    match max_output_tokens(model, overrides) {
+        Some(cap) if requested > cap => {
+            tracing::debug!(model, requested, cap, "clamping max_tokens to the model's completion ceiling");
+            Some(cap)
+        }
+        _ => Some(requested),
+    }
 }
 
 // ── Reasoning (thinking / effort) controls ──────────────────────────────────
@@ -133,6 +290,7 @@ pub fn supports_temperature(model: &str, overrides: &[ModelCapabilityEntry]) -> 
 /// Models that reason when the request carries no `thinking` field.
 const THINKS_BY_DEFAULT: &[&str] = &[
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-opus-5-5",
     "claude-fable-5",
@@ -145,6 +303,9 @@ const THINKS_BY_DEFAULT: &[&str] = &[
 /// `thinking: {type: "disabled"}` is a 400.
 const THINKING_ALWAYS_ON: &[&str] = &[
     "claude-opus-5-5",
+    // Sonnet 5.5 rejects `{type: "disabled"}`; its only thinking-off form is a
+    // different `thinking` type, so the lowest effort is the portable lever.
+    "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-fable-5-1",
     "claude-mythos-5",
@@ -159,6 +320,7 @@ const EFFORT_SUPPORTED: &[&str] = &[
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-opus-5-5",
     "claude-fable-5",
@@ -286,6 +448,61 @@ pub fn resolve_reasoning(
 mod tests {
     use super::*;
 
+    // ── max_output_tokens ───────────────────────────────────────────────────
+
+    #[test]
+    fn reasoning_families_take_max_completion_tokens() {
+        for m in ["gpt-5", "gpt-5.5", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol", "o3", "o4-mini", "foundry/o1"] {
+            assert!(uses_max_completion_tokens(m), "{m}");
+        }
+        for m in ["gpt-4.1", "gpt-4o", "DeepSeek-V4-Pro", "Mistral-Large-3", "grok-4.7"] {
+            assert!(!uses_max_completion_tokens(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn gpt_5_and_o_series_have_published_output_ceilings() {
+        assert_eq!(max_output_tokens("gpt-5", &[]), Some(128000));
+        assert_eq!(max_output_tokens("gpt-5.5", &[]), Some(128000));
+        assert_eq!(max_output_tokens("gpt-5.6-sol", &[]), Some(128000));
+        assert_eq!(max_output_tokens("o3", &[]), Some(100000));
+        assert_eq!(max_output_tokens("o4-mini", &[]), Some(100000));
+    }
+
+    #[test]
+    fn gpt_4_1_family_caps_output_at_32768_including_mini_nano_and_pins() {
+        for m in ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "foundry/gpt-4.1", "gpt-4.1-2025-04-14", "GPT-4.1@2025-04-14"] {
+            assert_eq!(max_output_tokens(m, &[]), Some(32768), "{m}");
+        }
+    }
+
+    #[test]
+    fn unknown_models_have_no_output_cap() {
+        assert_eq!(max_output_tokens("some-future-model", &[]), None);
+        assert_eq!(max_output_tokens("claude-opus-5-5", &[]), None);
+        // The `-` boundary: gpt-4.10 is not a gpt-4.1 release.
+        assert_eq!(max_output_tokens("gpt-4.10", &[]), None);
+    }
+
+    #[test]
+    fn a_config_entry_overrides_and_extends_the_output_cap_table() {
+        let raise = ModelCapabilityEntry { model: "gpt-4.1".into(), max_output_tokens: Some(16384), ..Default::default() };
+        let add = ModelCapabilityEntry { model: "my-deployment".into(), max_output_tokens: Some(4096), ..Default::default() };
+        let caps = [raise, add];
+        assert_eq!(max_output_tokens("gpt-4.1", &caps), Some(16384));
+        assert_eq!(max_output_tokens("foundry/my-deployment", &caps), Some(4096));
+        // An entry that only sets another capability leaves the table in force.
+        assert_eq!(max_output_tokens("gpt-4.1-mini", &[entry("gpt-4.1-mini", Some(true))]), Some(32768));
+    }
+
+    #[test]
+    fn clamp_max_tokens_lowers_only_a_request_above_the_cap() {
+        assert_eq!(clamp_max_tokens("gpt-4.1", Some(128000), &[]), Some(32768));
+        assert_eq!(clamp_max_tokens("gpt-4.1", Some(1000), &[]), Some(1000));
+        assert_eq!(clamp_max_tokens("gpt-4.1", None, &[]), None);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", Some(128000), &[]), Some(128000));
+    }
+
     fn entry(model: &str, supports_temperature: Option<bool>) -> ModelCapabilityEntry {
         ModelCapabilityEntry { model: model.to_string(), supports_temperature, ..Default::default() }
     }
@@ -308,6 +525,81 @@ mod tests {
     /// The 4.5 model sits behind the same provider as the 5 family and still
     /// honours `temperature` — the reason this is a per-model table and not a
     /// per-provider switch.
+    #[test]
+    fn point_releases_pins_and_multi_segment_names_inherit_the_family_entry() {
+        // The exact routed strings a tier alias resolves to.
+        assert!(!supports_temperature("vertex/anthropic/claude-opus-5-5", &[]));
+        assert!(!supports_temperature("vertex/anthropic/claude-sonnet-5-5", &[]));
+        assert!(!supports_temperature("anthropic/claude-opus-5-5", &[]));
+        // A future point release and a version pin of a listed family.
+        assert!(!supports_temperature("vertex/anthropic/claude-sonnet-5-7", &[]));
+        assert!(!supports_temperature("claude-opus-5-5@20261001", &[]));
+        assert!(!supports_temperature("claude-opus-4-8", &[]));
+        // The family boundary is a `-`, not any shared prefix.
+        assert!(supports_temperature("claude-opus-50", &[]));
+        assert!(supports_temperature("vertex/anthropic/claude-haiku-4-5@20251001", &[]));
+        assert!(supports_temperature("claude-opus-4-6", &[]));
+    }
+
+    #[test]
+    fn config_override_beats_the_family_table_for_a_point_release() {
+        let overrides = vec![entry("claude-sonnet-5-5", Some(true))];
+        assert!(supports_temperature("vertex/anthropic/claude-sonnet-5-5", &overrides));
+        assert!(!supports_temperature("vertex/anthropic/claude-sonnet-5", &overrides));
+    }
+
+    fn request_with_temperature(model: &str) -> crate::providers::adapter::NormalizedRequest {
+        crate::providers::adapter::NormalizedRequest {
+            model: model.to_string(),
+            temperature: Some(0.3),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_temperature_rejection_yields_a_retry_without_it() {
+        let model = "vertex/acme/model-x@v1";
+        let err = anyhow::anyhow!(
+            "Vertex returned 400 Bad Request: {{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"`temperature` is deprecated for this model.\"}}}}"
+        );
+        let retry = temperature_rejection_retry(&request_with_temperature(model), &err)
+            .expect("a temperature rejection is retried");
+        assert_eq!(retry.temperature, None);
+        assert_eq!(retry.model, model);
+    }
+
+    #[test]
+    fn other_failures_are_not_retried() {
+        let model = "vertex/acme/model-x@v1";
+        let unrelated = anyhow::anyhow!("Vertex returned 400 Bad Request: max_tokens too large");
+        assert!(temperature_rejection_retry(&request_with_temperature(model), &unrelated).is_none());
+        let server = anyhow::anyhow!("Vertex returned 503 Service Unavailable: temperature of the datacenter");
+        assert!(temperature_rejection_retry(&request_with_temperature(model), &server).is_none());
+        let rejection = anyhow::anyhow!("Vertex returned 400 Bad Request: `temperature` is deprecated");
+        let no_temperature = crate::providers::adapter::NormalizedRequest {
+            model: model.to_string(),
+            ..Default::default()
+        };
+        assert!(temperature_rejection_retry(&no_temperature, &rejection).is_none());
+    }
+
+    #[test]
+    fn precedence_is_config_then_learned_then_table() {
+        use crate::router::learned_capabilities::LearnedCapabilities;
+        let learned = LearnedCapabilities::default();
+        let model = "vertex/acme/model-x@v1";
+        assert!(temperature_allowed(model, &[], &learned));
+        learned.learn_temperature_rejected(model, "rejected");
+        assert!(!temperature_allowed(model, &[], &learned));
+        // Another snapshot of the same model is unaffected.
+        assert!(temperature_allowed("vertex/acme/model-x@v2", &[], &learned));
+        // Config wins over the learned entry.
+        let overrides = vec![entry("model-x@v1", Some(true))];
+        assert!(temperature_allowed(model, &overrides, &learned));
+        // The table still answers for models nothing was learned about.
+        assert!(!temperature_allowed("vertex/anthropic/claude-opus-5-5", &[], &learned));
+    }
+
     #[test]
     fn same_provider_older_model_keeps_temperature() {
         assert!(supports_temperature("claude-haiku-4-5", &[]));
@@ -400,6 +692,18 @@ mod tests {
     fn none_falls_back_to_low_effort_where_thinking_is_always_on() {
         assert_eq!(resolve_reasoning("claude-fable-5-1", Some("none"), &[]), eff("low"));
         assert_eq!(resolve_reasoning("claude-opus-5-5", Some("none"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("anthropic/claude-sonnet-5-5", Some("none"), &[]), eff("low"));
+    }
+
+    #[test]
+    fn sonnet_5_5_rejects_temperature_and_accepts_effort() {
+        assert!(!supports_temperature("claude-sonnet-5-5", &[]));
+        assert!(!supports_temperature("anthropic/claude-sonnet-5-5", &[]));
+        assert_eq!(resolve_reasoning("anthropic/claude-sonnet-5-5", Some("high"), &[]), eff("high"));
+        let caps = thinking_capabilities("claude-sonnet-5-5", &[]);
+        assert!(caps.thinks_by_default);
+        assert!(!caps.can_disable_thinking);
+        assert!(caps.supports_effort);
     }
 
     /// Older models don't think unless asked and reject both fields.

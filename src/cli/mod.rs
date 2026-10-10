@@ -195,6 +195,12 @@ async fn shutdown_signal() {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    run_with_extensions(cli, crate::extensions::Extensions::default()).await
+}
+
+/// [`run`], with request extensions a wrapper binary links in. `serve` starts
+/// them before listening and refuses to start if one fails to.
+pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extensions) -> Result<()> {
     match cli.command {
         Commands::Init => {
             println!("modelrouter v{}", env!("CARGO_PKG_VERSION"));
@@ -261,27 +267,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Initialise tracing subscriber. The otel feature provides a richer layered
             // subscriber; without it we install a basic fmt subscriber.
             #[cfg(not(feature = "otel"))]
-            {
-                tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                    )
-                    .try_init()
-                    .ok();
-            }
+            crate::logging::init(settings.logging.format);
             #[cfg(feature = "otel")]
             let _telemetry_guard = {
                 if settings.telemetry.enabled {
-                    Some(crate::telemetry::init_telemetry(&settings.telemetry)?)
+                    Some(crate::telemetry::init_telemetry(&settings.telemetry, settings.logging.format)?)
                 } else {
-                    tracing_subscriber::fmt()
-                        .with_env_filter(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                        )
-                        .try_init()
-                        .ok();
+                    crate::logging::init(settings.logging.format);
                     None
                 }
             };
@@ -317,6 +309,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             // Bootstrap admin account from config if specified (issue #43).
             if let Some(ref bootstrap) = settings.admin.bootstrap {
+                bootstrap.apply(&*db).await?;
+            }
+            if let Some(ref bootstrap) = settings.gateway.bootstrap {
                 bootstrap.apply(&*db).await?;
             }
 
@@ -376,6 +371,23 @@ pub async fn run(cli: Cli) -> Result<()> {
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
             let cost_calc = Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing));
+            #[cfg(feature = "foundry")]
+            if let Some(foundry) = settings.providers.get("foundry") {
+                if !foundry.retail_pricing_regions.is_empty() && !foundry.deployments.is_empty() {
+                    use crate::providers::foundry::retail_pricing;
+                    retail_pricing::spawn_refresh(
+                        cost_calc.clone(),
+                        foundry
+                            .retail_pricing_url
+                            .clone()
+                            .unwrap_or_else(|| retail_pricing::DEFAULT_RETAIL_PRICES_URL.to_string()),
+                        foundry.retail_pricing_regions.clone(),
+                        foundry.deployments.clone(),
+                        foundry.retail_pricing_refresh_hours.unwrap_or(retail_pricing::DEFAULT_REFRESH_HOURS),
+                        settings.providers.get("bing_grounding").map(|p| p.custom_search),
+                    );
+                }
+            }
             let provider_registry = Arc::new(
                 crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
                     settings.providers.clone(),
@@ -504,12 +516,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             // Seed DB model aliases and failover chains into live router/fallback
             {
-                let db_aliases =
-                    crate::api::admin::aliases::build_db_alias_map(&state.db).await;
-                if !db_aliases.is_empty() {
-                    tracing::info!(count = db_aliases.len(), "loaded DB model aliases");
-                }
-                state.router.update_db_aliases(db_aliases);
+                crate::api::admin::aliases::load_aliases_at_start(&state.db, &state.router, &settings.routing).await;
+                crate::api::admin::scoped_aliases::refresh_scoped_aliases(&state).await;
+                crate::api::admin::learned_capabilities::load_learned_capabilities(
+                    &state.router,
+                    &*state.db,
+                )
+                .await;
                 let availability =
                     crate::api::admin::aliases::build_availability_map(&state.db).await;
                 if !availability.is_empty() {
@@ -570,6 +583,26 @@ pub async fn run(cli: Cli) -> Result<()> {
                 });
             }
 
+            // Alias tick: every minute delete expired scoped alias overrides
+            // (audited as actor `system`), then reload the scoped overrides
+            // and the global database aliases, so a write made on another
+            // replica sharing the database reaches this one within a minute.
+            // Expiry is already enforced per request; this is bookkeeping and
+            // convergence. Failures are logged, never fatal.
+            {
+                let tick_state = state.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        let now = chrono::Utc::now().timestamp();
+                        crate::api::admin::scoped_aliases::expire_scoped_aliases(&tick_state, now).await;
+                        crate::api::admin::scoped_aliases::refresh_scoped_aliases(&tick_state).await;
+                        crate::api::admin::aliases::refresh_router_aliases(&tick_state).await;
+                    }
+                });
+            }
+
             // Background sweeper for session affinity TTL eviction
             {
                 let affinity = state.session_affinity.clone();
@@ -609,7 +642,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 });
             }
 
-            let app = crate::api::app::build_router(state);
+            extensions
+                .start(crate::extensions::StartContext { pool: state.pool.clone() })
+                .await?;
+            if !extensions.is_empty() {
+                let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
+                tracing::info!(extensions = ?names, "request extensions loaded");
+            }
+            let app = crate::api::app::build_router_with_extensions(state, extensions);
 
             // Flag > config > built-in default. The config defaults already
             // supply 127.0.0.1:8080 when the section is absent.
@@ -3461,7 +3501,7 @@ mod experiment_cli_tests {
         assert_eq!(
             err.to_string(),
             "variants: variant 'candidate' key 'fast' target 'pool' is a load balancer pool; \
-             an experiment must pin one provider/model"
+             a pinned target must be one provider/model"
         );
         let err = add(&db, &flags("candidate=fast:no-such-model")).await.unwrap_err();
         assert_eq!(

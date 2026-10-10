@@ -11,6 +11,7 @@ pub struct Instruments {
     pub cost_usd:            Counter<f64>,
     pub request_duration_ms: Histogram<f64>,
     pub policy_denied:       Counter<u64>,
+    pub policy_rejected:     Counter<u64>,
     pub hooks_duration_ms:   Histogram<f64>,
 }
 
@@ -42,6 +43,10 @@ pub fn init_instruments(meter: Meter) {
         policy_denied: meter
             .u64_counter("modelrouter.policy.denied")
             .with_description("Requests denied by policy engine")
+            .build(),
+        policy_rejected: meter
+            .u64_counter("modelrouter.policy.rejected")
+            .with_description("Rules a request extension applied (block, redact or monitor)")
             .build(),
         hooks_duration_ms: meter
             .f64_histogram("modelrouter.hooks.duration_ms")
@@ -109,6 +114,19 @@ pub fn record_policy_denied(reason: &str) {
     }
 }
 
+/// One rule a request extension applied; `action` is what it did.
+pub fn record_policy_rejected(extension: &str, rule: &str, category: &str, action: &str, project: &str) {
+    if let Some(i) = get() {
+        i.policy_rejected.add(1, &[
+            KeyValue::new("extension", extension.to_string()),
+            KeyValue::new("rule", rule.to_string()),
+            KeyValue::new("category", category.to_string()),
+            KeyValue::new("action", action.to_string()),
+            KeyValue::new("project", project.to_string()),
+        ]);
+    }
+}
+
 /// hook_type: "pipeline" | "lifecycle"
 pub fn record_hook_duration(hook_name: &str, hook_type: &str, ms: f64) {
     if let Some(i) = get() {
@@ -119,7 +137,7 @@ pub fn record_hook_duration(hook_name: &str, hook_type: &str, ms: f64) {
     }
 }
 
-/// Returns the 7 instrument names this module registers.
+/// Returns the 8 instrument names this module registers.
 /// Used in tests to verify instruments are properly named.
 #[cfg(test)]
 pub const INSTRUMENT_NAMES: &[&str] = &[
@@ -129,5 +147,6 @@ pub const INSTRUMENT_NAMES: &[&str] = &[
     "modelrouter.cost.usd",
     "modelrouter.request.duration_ms",
     "modelrouter.policy.denied",
+    "modelrouter.policy.rejected",
     "modelrouter.hooks.duration_ms",
 ];

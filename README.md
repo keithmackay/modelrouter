@@ -988,10 +988,15 @@ creative sampling replayed.
 
 | Value | Effect | Response header |
 |---|---|---|
-| (absent) | The eligibility rules above decide | `HIT` / `MISS` |
+| (absent) | The eligibility rules above decide | `HIT` / `MISS`, or none when not cached |
 | `use` | Look up and store even when the request is not eligible by default, e.g. a sampled `temperature` | `HIT` / `MISS` |
 | `bypass` | Neither look up nor store | `BYPASS` |
 | `refresh` | Skip the lookup, call the provider, store the fresh answer over the old entry | `REFRESH` |
+
+The response header is a status indicator, not an error. `MISS` means the
+cache was consulted and held no entry; a response the cache was not involved
+in (cache off, request ineligible, or not opted in under `require_opt_in`)
+carries no `x-modelrouter-cache` header at all.
 
 Values are case-insensitive; anything else is a 400. The header never switches
 on a cache or class the operator has disabled, and it never overrides a
@@ -1000,6 +1005,17 @@ widen what is cached, so an operator can refuse them with
 `cache.allow_header_opt_in = false`; the router then treats them as absent.
 `bypass` only narrows and is always honoured. `use` suits clients that rerun
 identical workloads with sampling on and want the first answer replayed.
+
+**Opt-in only.** `cache.require_opt_in = true` turns the default around: a
+request is cached only when it carries `x-modelrouter-cache: use` (lookup and
+store) or `refresh` (store only). A request without the header is neither
+looked up nor stored, however eligible it would otherwise be, and it never
+reads an entry a `use` request stored. Use it when the client decides
+call by call what may be cached, and a call that forgets the header must not
+be. `cache stats` and the stats API report `require_opt_in` and
+`skipped_without_opt_in`, the number of header-less requests it skipped. A
+rising count names a client that is not opting in. It requires
+`allow_header_opt_in = true`; the contradictory pair is refused at start-up.
 
 **Per-request TTL.** `x-modelrouter-cache-ttl: <seconds>` sets how long the
 entry this request stores will live, in place of the class TTL; `0` asks for an
@@ -1112,6 +1128,8 @@ written back to the config file — a restart returns to the configured policy.
 
 Models resolve in this order:
 
+0. For a request bound to an experiment, its variant's overlay; then, for a request whose
+   attribution tags carry a scope's tag, that scope's override (see *Scoped alias overrides*)
 1. Runtime aliases (`model_aliases` table — admin API / dashboard / CLI)
 2. Aliases attached to enabled registered models (the `Alias` column on `/admin/models`)
 3. Alias lookup from `routing.model_aliases` in `config.toml`
@@ -1149,6 +1167,32 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_JWT" \
 Reads require any admin role; writes require `superadmin`. The dashboard equivalent is the
 **Model Aliases** section of `/admin/models`. A target may be a concrete `provider/model`
 or another alias; writes that would create a cycle are rejected with a 400.
+
+#### Scoped alias overrides
+
+A scoped override maps aliases to models for requests carrying one attribution tag, so one
+tenant, project or run can be routed to different models while every caller keeps sending the
+same alias names. A scope is a tag `key=value`; writing a scope replaces its whole set of
+aliases. Targets are pinned when written through the same gate as experiment variants (no
+pool, no default-model substitution, a configured provider, a pricing entry), so a later edit of
+a global alias never changes an override. A pinned request skips the complexity downgrade, load
+balancer, session affinity, response cache and fallback, like an experiment-bound one; the
+ledger records the model that answered and the prompt row keeps the alias that was asked for.
+
+```bash
+curl -X PUT http://localhost:8080/admin/api/scoped-aliases/tenant/acme \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"aliases":{"deep":"anthropic/claude-opus-4-6","fast":"openai/gpt-5-mini"},"expires_at":"2030-01-01T00:00:00Z"}'
+
+curl -H "Authorization: Bearer $ADMIN_JWT" "http://localhost:8080/admin/api/scoped-aliases?tag_key=tenant"
+curl -X DELETE -H "Authorization: Bearer $ADMIN_JWT" http://localhost:8080/admin/api/scoped-aliases/tenant/acme
+```
+
+`expires_at` is an RFC3339 time in the future or `0` for never. An expired override stops
+applying at once; a minute-by-minute tick then deletes it (audited as `system`) and reloads both
+the overrides and the global runtime aliases, so replicas sharing a database converge. When a
+request's tags name several scopes that map the requested alias, the smallest tag key wins.
+Reads require any admin role; writes require `superadmin` and are audited.
 
 #### Strict model resolution
 
@@ -1548,6 +1592,32 @@ to the engine's own default). `engine` is optional; when omitted it falls back
 to `[routing] default_search_engine`, then to the sole configured engine if
 there is exactly one.
 
+`include_answer` is optional (boolean, default `false`). When `true`, a
+grounding engine also returns the text its model wrote around the citations,
+as `answer: {"text": "...", "query_urls": ["..."], "follow_up_queries": ["..."]}`.
+`query_urls` are the search-engine query URLs the provider reported, verbatim
+(Bing's display terms cover them too). The answer is generated, not retrieved:
+use it to decide which cited pages to read or what to search next. It is never
+returned without citations, because a response with no citations is still an
+error. Today only `bing_grounding` produces one; other engines omit `answer`.
+
+Grounded-research mode adds three optional fields, each requiring
+`include_answer: true` (sent without it they are a 400):
+
+- `instructions` (string): replaces the engine's default answer instruction,
+  so a caller can version its research brief alongside its own code. The
+  router always appends its grounding rule (answer only from retrieved pages,
+  cite every claim), so instructions cannot turn the call into an ungrounded
+  answer.
+- `context` (string): appended to the model input after the question.
+- `max_follow_up_queries` (0-10): asks the model for that many follow-up search
+  queries, returned as `answer.follow_up_queries`. The router owns the line
+  format it parses them from and strips that line from `answer.text`. A missing
+  or malformed line yields `[]`, never an error.
+
+`include_answer` and all three fields are part of the response-cache key, so a
+cached answer is never served to a request that asked for something different.
+
 Response:
 
 ```json
@@ -1591,7 +1661,12 @@ Two additive fields; the OpenAI shape is otherwise unchanged:
   `0`, with `usage.cache_hit: true` and `usage.saved_usd` carrying the
   avoided cost. `usage.uncached_cost_usd` is always present: the call's
   cost had it not been served from the cache, equal to `cost_usd` on a live
-  call. `usage.tokens_estimated: true` appears when the provider
+  call. `usage.no_cache_cost_usd` is always present too: the call's cost
+  with no caching at all, neither the response cache nor the provider's
+  prompt cache (every prompt token at the standard input rate). It differs
+  from `uncached_cost_usd` only when the call read from or wrote to the
+  prompt cache; a call that only wrote to it costs more than this figure,
+  since cache writes are priced above the input rate. `usage.tokens_estimated: true` appears when the provider
   reported no usage and the counts (and so the cost) are the router's
   estimate.
 - `x_router` — the full per-call record:
@@ -1624,7 +1699,7 @@ Two additive fields; the OpenAI shape is otherwise unchanged:
 | `settings` | Values actually sent to the provider after router resolution and adapter defaults. `dropped` lists caller parameters the router deliberately did not forward (e.g. `temperature` to a model that rejects it). Search reports `max_results`. |
 | `tokens` | Chat/embeddings only. `prompt` includes provider-cache reads; `reasoning` is `null` when the provider gave no figure; `estimated` mirrors the ledger's `tokens_estimated`. |
 | `results` | Search only: results returned. |
-| `cost` | `cost_usd`, `uncached_cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
+| `cost` | `cost_usd`, `uncached_cost_usd`, `no_cache_cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
 | `timing` | `total_ms` from request receipt; `latency_ms` dispatch to completion including retries and fallback hops (0 on a hit); `provider_ms` for the answering provider call; `ttft_ms` for streams (first byte); `attempts` provider calls made; `fallbacks` hops to another model. |
 
 **Streams.** The router splices one extra `chat.completion.chunk` with

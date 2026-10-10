@@ -262,6 +262,18 @@ timeout_secs = 120
 # [routing.model_aliases]
 # "llama-70b"  = "foundry/Llama-3.3-70B-Instruct"
 # "phi-4"      = "foundry/Phi-4"
+#
+# Claude on Foundry: Foundry serves Anthropic models only over the Anthropic
+# Messages API ({resource}/anthropic/v1/messages), so list those deployments.
+# They are translated like the direct `anthropic` provider (tools, thinking,
+# effort, prompt caching, streaming) and authenticated with the same credential
+# (Entra audience https://ai.azure.com/.default unless `entra_scope` is set;
+# `x-api-key` with `api_key`). Name each deployment after its model id
+# (e.g. claude-opus-5-5) so the built-in temperature/thinking/effort rules and
+# pricing apply; otherwise add [[model_capabilities]] and [[pricing]] entries.
+# anthropic_deployments = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]
+# [routing.model_aliases]
+# "deep" = "foundry/claude-opus-5-5"
 
 # Azure OpenAI (one provider entry per deployment). Key auth (`api_key`) is the
 # default; set `credential_source` (same values as [providers.foundry]) to send
@@ -294,6 +306,23 @@ rotation_overlap_mins = 15
 # name = "bootstrap-admin"
 # role = "superadmin"        # Valid roles: superadmin, admin, viewer
 # password_hash = "$2b$12$..."  # NEVER use plaintext
+
+# ---------------------------------------------------------------------------
+# Gateway Key Bootstrap
+# ---------------------------------------------------------------------------
+# Create one user and one API key at startup if absent, so a client whose key
+# was provisioned elsewhere (a secret store) works on a fresh install with no
+# `user create` step. Set exactly one of `key` (the raw key the client sends)
+# or `key_hash` (its SHA-256, lowercase hex). Idempotent; never disables,
+# re-enables or overwrites a key. Rotating `key` adds the new key and leaves
+# the old one valid until `modelrouter key disable`. A key already held by
+# another user refuses to start. Env: MODELROUTER_GATEWAY__BOOTSTRAP__USER,
+# MODELROUTER_GATEWAY__BOOTSTRAP__KEY (prefer env for the raw key).
+# [gateway.bootstrap]
+# user = "my-service"
+# key = "mr-..."
+# #key_hash = "<sha256 hex>"
+# #label = "bootstrap"
 
 # ---------------------------------------------------------------------------
 # Hooks — lifecycle
@@ -527,6 +556,11 @@ fail_open    = true
 # # `x-modelrouter-cache: use` or `refresh` header. `bypass` is always honoured.
 # allow_header_opt_in = true
 #
+# # Cache only requests that send `x-modelrouter-cache: use` (or `refresh`).
+# # A request without the header is never looked up or stored. Needs
+# # allow_header_opt_in = true.
+# require_opt_in = false
+#
 # # Upper bound on the TTL a caller may request per entry with the
 # # `x-modelrouter-cache-ttl` header (where 0 asks for no expiry). 0 here lifts
 # # the bound. Entries with no expiry on Redis need persistence (AOF/RDB) and a
@@ -579,3 +613,12 @@ fail_open    = true
 # # multiple search engines are configured and the probe should exercise a
 # # specific one regardless of which is the traffic default.
 # #search_probe_engine = "tavily"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Log line format on stdout. "text" (default) is human-readable; "json" writes
+# one JSON object per line with the event's fields (provider, status, ...) at
+# the top level, for log collectors that index by field. RUST_LOG still sets
+# the level. Env: MODELROUTER_LOGGING__FORMAT=json
+#
+# [logging]
+# format = "json"
