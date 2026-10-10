@@ -30,6 +30,17 @@ pub fn supported_engines() -> &'static [&'static str] {
     SUPPORTED_ENGINES
 }
 
+/// Version tag of how `engine` shapes its results, for engines that build
+/// results from model output (and so can change shape without the provider
+/// changing). `None` for engines that return the provider's results as is.
+pub fn result_format(engine: &str) -> Option<&'static str> {
+    match engine {
+        #[cfg(feature = "bing-grounding")]
+        "bing_grounding" => Some(crate::providers::bing_grounding::search::RESULT_FORMAT),
+        _ => None,
+    }
+}
+
 pub struct SearchRegistry {
     adapters: DashMap<String, Arc<dyn SearchAdapter>>,
     configs: HashMap<String, ProviderConfig>,

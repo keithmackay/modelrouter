@@ -480,8 +480,14 @@ async fn provider_views(state: &AppState) -> anyhow::Result<Vec<serde_json::Valu
         .into_iter()
         .map(|name| {
             let row = states.iter().find(|s| s.provider == name);
+            // Where the provider's requests go, so a caller can check every
+            // configured endpoint against its own allow-list. Never the key.
+            let cfg = state.settings.providers.get(&name);
             serde_json::json!({
                 "provider": name,
+                "api_base": cfg.and_then(|c| c.api_base.clone()),
+                "region": cfg.and_then(|c| c.region.clone()),
+                "project": cfg.and_then(|c| c.project.clone()),
                 "enabled": row.map(|r| r.enabled).unwrap_or(true),
                 "disabled_reason": row.and_then(|r| r.disabled_reason.clone()),
                 "disabled_by": row.and_then(|r| r.disabled_by.clone()),
@@ -692,7 +698,8 @@ pub(crate) async fn cached_catalog(
 /// GET /admin/api/models/available — what each configured provider's catalog
 /// actually offers, per-provider degraded, TTL-cached.
 ///
-/// Each model entry is stamped with `priced: bool` (issue: unpriced gateway
+/// Each model entry is stamped with `priced: bool` and `price` (its rates per
+/// million tokens, or null), plus `parameters` (issue: unpriced gateway
 /// models record spend as $0 rather than refusing it — an experiment pinning
 /// a target the catalog lists but `CostCalculator` cannot cost silently
 /// ledgers every call against it as free). Computed fresh per request from
@@ -709,7 +716,79 @@ pub async fn get_available_models(
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
     let mut value = cached_catalog(&state, q.refresh).await;
     stamp_pricing(&mut value, &state.cost_calc);
+    stamp_parameters(&mut value, &|provider, model| model_parameters(&state, provider, model));
     Ok(axum::Json(value))
+}
+
+/// The parameter schema of `model` under `provider`, or `None` when the
+/// provider is not configured.
+fn model_parameters(state: &AppState, provider: &str, model: &str) -> Option<Vec<crate::router::model_parameters::ParameterSpec>> {
+    let adapter = state.provider_registry.get(provider).ok()?;
+    Some(crate::router::model_parameters::parameter_schema(
+        model,
+        adapter.as_ref(),
+        &state.settings.model_capabilities,
+        state.router.learned_capabilities(),
+    ))
+}
+
+/// Add `parameters` (see `router::model_parameters`) to each catalog model,
+/// computed per request like `priced`: learned capabilities change at runtime.
+fn stamp_parameters(
+    value: &mut serde_json::Value,
+    schema_for: &dyn Fn(&str, &str) -> Option<Vec<crate::router::model_parameters::ParameterSpec>>,
+) {
+    let Some(providers) = value.get_mut("providers").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    for provider_entry in providers.values_mut() {
+        let Some(models) = provider_entry.get_mut("models").and_then(|m| m.as_array_mut()) else {
+            continue;
+        };
+        for model in models {
+            let provider = model.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let Some(schema) = schema_for(&provider, &name) else { continue };
+            if let Some(obj) = model.as_object_mut() {
+                obj.insert("parameters".to_string(), serde_json::json!(schema));
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ModelParametersQuery {
+    pub target: String,
+}
+
+/// GET /admin/api/models/parameters?target=<alias or provider/model> — what
+/// the target resolves to now and the parameters that model honours, so a
+/// caller can see a tier alias's parameters without knowing its model.
+pub async fn get_model_parameters(
+    State(state): State<AppState>,
+    _session: AdminSession,
+    axum::extract::Query(q): axum::extract::Query<ModelParametersQuery>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let target = q.target.trim();
+    if target.is_empty() {
+        return Err(ApiError::InvalidRequest("target is required".to_string()));
+    }
+    let res = state.router.resolve_detailed(target);
+    if res.substituted {
+        return Err(ApiError::InvalidRequest(format!(
+            "target '{target}' is not an alias or provider/model and would be substituted with the default model"
+        )));
+    }
+    let parameters = model_parameters(&state, &res.provider, &res.model).ok_or_else(|| {
+        ApiError::InvalidRequest(format!("target '{target}' resolves to unconfigured provider '{}'", res.provider))
+    })?;
+    Ok(axum::Json(serde_json::json!({
+        "target": target,
+        "provider": res.provider,
+        "model": res.model,
+        "price": state.cost_calc.rates(&format!("{}/{}", res.provider, res.model)),
+        "parameters": parameters,
+    })))
 }
 
 /// Walk the aggregated catalog's `providers.<name>.models[]` and add
@@ -728,13 +807,14 @@ fn stamp_pricing(value: &mut serde_json::Value, cost_calc: &crate::router::cost:
         for model in models {
             let provider = model.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let priced = if provider.is_empty() || name.is_empty() {
-                false
+            let rates = if provider.is_empty() || name.is_empty() {
+                None
             } else {
-                cost_calc.has_price(&format!("{provider}/{name}"))
+                cost_calc.rates(&format!("{provider}/{name}"))
             };
             if let Some(obj) = model.as_object_mut() {
-                obj.insert("priced".to_string(), serde_json::Value::Bool(priced));
+                obj.insert("priced".to_string(), serde_json::Value::Bool(rates.is_some()));
+                obj.insert("price".to_string(), rates.unwrap_or(serde_json::Value::Null));
             }
         }
     }
@@ -773,11 +853,79 @@ mod tests {
 
         let models = value["providers"]["vertex"]["models"].as_array().unwrap();
         assert_eq!(models[0]["priced"], serde_json::json!(true));
+        assert!(models[0]["price"]["input_per_million"].as_f64().unwrap() > 0.0);
+        assert!(models[0]["price"]["output_per_million"].as_f64().unwrap() > 0.0);
+        assert!(models[1]["price"].is_null());
         // claude-sonnet-5 is not in the built-in table -- exactly the gap
         // this stamp exists to surface before an experiment create call does.
         assert_eq!(models[1]["priced"], serde_json::json!(false));
         // An unsupported provider has no `models` array; must not panic.
         assert!(value["providers"]["azure"].get("models").is_none());
+    }
+
+    #[test]
+    fn stamp_parameters_adds_each_configured_models_schema() {
+        let mut value = serde_json::json!({
+            "providers": {
+                "foundry": { "supported": true, "models": [ { "provider": "foundry", "name": "o3" } ] },
+                "gone": { "supported": true, "models": [ { "provider": "gone", "name": "m" } ] },
+                "azure": { "supported": false }
+            }
+        });
+        let schema_for = |provider: &str, _model: &str| {
+            (provider == "foundry").then(|| vec![crate::router::model_parameters::ParameterSpec {
+                name: "max_tokens",
+                kind: "integer",
+                minimum: Some(1.0),
+                maximum: Some(100000.0),
+                allowed: None,
+                default: serde_json::Value::Null,
+                description: "Most completion tokens the model may produce",
+            }])
+        };
+
+        stamp_parameters(&mut value, &schema_for);
+
+        assert_eq!(value["providers"]["foundry"]["models"][0]["parameters"][0]["name"], "max_tokens");
+        assert_eq!(value["providers"]["foundry"]["models"][0]["parameters"][0]["maximum"], 100000.0);
+        // An unconfigured provider gets no schema rather than a guessed one.
+        assert!(value["providers"]["gone"]["models"][0].get("parameters").is_none());
+    }
+
+    /// The AKS case: Foundry deployments priced from the Azure Retail Prices
+    /// feed (live prices) carry their rates; a deployment the feed does not
+    /// price is flagged unpriced, so a picker and a preflight can say so.
+    #[test]
+    fn stamp_pricing_reports_live_foundry_prices_and_flags_an_unpriced_deployment() {
+        let cost_calc = CostCalculator::new();
+        cost_calc.replace_live_pricing(&[crate::config::schema::PricingEntry {
+            model: "gpt-5-mini".into(),
+            input_per_million: 0.25,
+            output_per_million: 2.0,
+            cache_read_per_million: Some(0.025),
+            cache_write_per_million: None,
+        }]);
+        let mut value = serde_json::json!({
+            "providers": {
+                "foundry": {
+                    "supported": true,
+                    "models": [
+                        { "provider": "foundry", "name": "gpt-5-mini" },
+                        { "provider": "foundry", "name": "Cohere-command-a-plus-05-2026" }
+                    ]
+                }
+            }
+        });
+
+        stamp_pricing(&mut value, &cost_calc);
+
+        let models = value["providers"]["foundry"]["models"].as_array().unwrap();
+        assert_eq!(models[0]["priced"], true);
+        assert_eq!(models[0]["price"]["input_per_million"], 0.25);
+        assert_eq!(models[0]["price"]["output_per_million"], 2.0);
+        assert_eq!(models[0]["price"]["cache_read_per_million"], 0.025);
+        assert_eq!(models[1]["priced"], false);
+        assert!(models[1]["price"].is_null());
     }
 
     #[test]

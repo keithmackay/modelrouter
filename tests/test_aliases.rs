@@ -838,3 +838,101 @@ async fn dashboard_alias_writes_require_a_superadmin_session() {
         );
     }
 }
+
+// ── routing.config_aliases_win_at_start ───────────────────────────────────────
+
+#[tokio::test]
+async fn config_aliases_win_at_start_drops_only_the_database_aliases_the_config_names() {
+    use modelrouter::api::admin::aliases::{build_db_alias_map, drop_db_aliases_shadowing_config};
+    use modelrouter::db::models::NewModelAlias;
+    use modelrouter::db::repositories::aliases::AliasRepository;
+
+    let db: Arc<dyn DatabaseProvider> = Arc::new(common::in_memory_db().await);
+    for (alias, target) in [("deep", "openai/gpt-4o"), ("fast", "openai/gpt-4o-mini"), ("custom", "openai/o3")] {
+        db.upsert_alias(NewModelAlias { alias: alias.into(), target: target.into(), created_by: None }).await.unwrap();
+    }
+    let config: HashMap<String, String> = [
+        ("deep".to_string(), "foundry/gpt-5.6-sol".to_string()),
+        ("fast".to_string(), "foundry/gpt-5.4-nano".to_string()),
+        ("balanced".to_string(), "foundry/gpt-5.4-mini".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let dropped = drop_db_aliases_shadowing_config(&db, &config).await.unwrap();
+    assert_eq!(dropped, vec!["deep".to_string(), "fast".to_string()]);
+
+    // The alias the config does not define survives; the config now decides deep and fast.
+    let map = build_db_alias_map(&db).await;
+    assert_eq!(map.get("custom").map(String::as_str), Some("openai/o3"));
+    assert!(!map.contains_key("deep") && !map.contains_key("fast"));
+
+    let router = RequestRouter::new(Arc::new({
+        let mut s = Settings::default();
+        s.routing.model_aliases = config;
+        s
+    }));
+    router.update_db_aliases(map);
+    assert_eq!(router.resolve("deep"), ("foundry".to_string(), "gpt-5.6-sol".to_string()));
+}
+
+#[tokio::test]
+async fn config_aliases_win_at_start_is_a_no_op_without_overlap() {
+    use modelrouter::api::admin::aliases::drop_db_aliases_shadowing_config;
+    use modelrouter::db::models::NewModelAlias;
+    use modelrouter::db::repositories::aliases::AliasRepository;
+
+    let db: Arc<dyn DatabaseProvider> = Arc::new(common::in_memory_db().await);
+    db.upsert_alias(NewModelAlias { alias: "custom".into(), target: "openai/o3".into(), created_by: None }).await.unwrap();
+    let dropped = drop_db_aliases_shadowing_config(&db, &HashMap::new()).await.unwrap();
+    assert!(dropped.is_empty());
+    assert!(db.get_alias("custom").await.unwrap().is_some());
+}
+
+#[test]
+fn config_aliases_win_at_start_defaults_off() {
+    assert!(!Settings::default().routing.config_aliases_win_at_start);
+    let parsed: Settings = toml::from_str("[routing]\nconfig_aliases_win_at_start = true\n").unwrap();
+    assert!(parsed.routing.config_aliases_win_at_start);
+}
+
+/// The global mapping has one source: a runtime alias write survives a router
+/// restart and keeps winning over the config alias of the same name (with
+/// `config_aliases_win_at_start` at its default, off).
+#[tokio::test]
+async fn a_database_alias_survives_a_restart_and_wins_over_the_config_alias() {
+    use modelrouter::api::admin::aliases::load_aliases_at_start;
+    use modelrouter::db::models::NewModelAlias;
+    use modelrouter::db::repositories::aliases::AliasRepository;
+
+    let db: Arc<dyn DatabaseProvider> = Arc::new(common::in_memory_db().await);
+    let mut settings = Settings::default();
+    settings.routing.model_aliases.insert("deep".to_string(), "vertex/anthropic/claude-opus-4-5".to_string());
+    settings.routing.model_aliases.insert("fast".to_string(), "vertex/anthropic/claude-haiku-4-5".to_string());
+    let settings = Arc::new(settings);
+
+    // Written at runtime through the admin surface, before the restart.
+    db.upsert_alias(NewModelAlias {
+        alias: "deep".into(),
+        target: "vertex/anthropic/claude-opus-5-5".into(),
+        created_by: Some("operator".into()),
+    })
+    .await
+    .unwrap();
+
+    // A restart: a fresh router loading from the same database and config.
+    let restarted = RequestRouter::new(settings.clone());
+    load_aliases_at_start(&db, &restarted, &settings.routing).await;
+    assert_eq!(restarted.resolve("deep"), ("vertex".to_string(), "anthropic/claude-opus-5-5".to_string()));
+    // A tier the database does not map still follows the config.
+    assert_eq!(restarted.resolve("fast"), ("vertex".to_string(), "anthropic/claude-haiku-4-5".to_string()));
+    assert!(db.get_alias("deep").await.unwrap().is_some());
+
+    // The opt-in reverses it: the config wins and the shadowing row is gone.
+    let mut config_wins = (*settings).clone();
+    config_wins.routing.config_aliases_win_at_start = true;
+    let restarted = RequestRouter::new(Arc::new(config_wins.clone()));
+    load_aliases_at_start(&db, &restarted, &config_wins.routing).await;
+    assert_eq!(restarted.resolve("deep"), ("vertex".to_string(), "anthropic/claude-opus-4-5".to_string()));
+    assert!(db.get_alias("deep").await.unwrap().is_none());
+}

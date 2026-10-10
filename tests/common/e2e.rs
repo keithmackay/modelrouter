@@ -58,6 +58,8 @@ pub struct RouterOptions {
     /// `[server] request_body_limit_mb`. `None` leaves the line out so the
     /// config default applies.
     pub request_body_limit_mb: Option<usize>,
+    /// TOML appended verbatim after the generated sections.
+    pub extra_toml: String,
 }
 
 impl RouterOptions {
@@ -67,7 +69,13 @@ impl RouterOptions {
             cache_enabled: false,
             jwt_secret: None,
             request_body_limit_mb: None,
+            extra_toml: String::new(),
         }
+    }
+
+    pub fn with_extra_toml(mut self, toml: impl Into<String>) -> Self {
+        self.extra_toml.push_str(&toml.into());
+        self
     }
 
     pub fn with_request_body_limit_mb(mut self, mb: usize) -> Self {
@@ -122,6 +130,7 @@ enabled = {cache}
 
 [storage]
 store_prompts = true
+{extra}
 "#,
         port = port,
         db = db_path.display(),
@@ -129,6 +138,7 @@ store_prompts = true
         secret = secret,
         cache = opts.cache_enabled,
         body_limit = body_limit,
+        extra = opts.extra_toml,
     )
 }
 

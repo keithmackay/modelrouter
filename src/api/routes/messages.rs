@@ -150,7 +150,11 @@ async fn anthropic_messages_inner(
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
     let messages_for_complexity = body["messages"].as_array().cloned().unwrap_or_default();
-    let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
+    // A scoped alias override pins the model; otherwise the usual downgrade.
+    let model = state
+        .router
+        .scoped_name(&attribution.tags, &requested_model)
+        .unwrap_or_else(|| state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity));
     let stream = body["stream"].as_bool().unwrap_or(false);
 
     // Policy check

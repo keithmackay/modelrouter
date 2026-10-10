@@ -5,10 +5,14 @@
 //! the unit of work — an engagement, a job, a run. Without that, a consuming app
 //! has to keep its own parallel cost ledger.
 //!
-//! Attribution is metadata only. It never influences routing, provider choice,
-//! pricing or the response-cache key: `"attribution"` is listed in
-//! [`crate::router::cache::VOLATILE_FIELDS`], so two otherwise-identical requests
-//! carrying different attribution share one cache entry.
+//! Attribution is metadata, with one deliberate exception: a **scoped alias
+//! override** ([`crate::router::scoped_aliases`]) keyed on one of the request's
+//! tags pins the alias it names to a model, and such a pinned request skips
+//! the response cache. Otherwise attribution never influences routing,
+//! provider choice, pricing or the response-cache key: `"attribution"` is
+//! listed in [`crate::router::cache::VOLATILE_FIELDS`], so two
+//! otherwise-identical requests carrying different attribution share one
+//! cache entry.
 //!
 //! # Wire format
 //!

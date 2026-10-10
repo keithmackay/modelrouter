@@ -3,6 +3,7 @@ pub mod mock_llm;
 pub mod mock_audio;
 pub mod mock_anthropic;
 pub mod mock_oidc;
+pub mod search_app;
 
 use modelrouter::api::app::DatabaseProvider;
 use modelrouter::api::auth::hash_token;
@@ -132,6 +133,7 @@ impl modelrouter::providers::search::SearchAdapter for MockSearchAdapter {
         Ok(modelrouter::providers::search::SearchResponse {
             results: self.results.clone(),
             engine: "tavily".to_string(),
+            answer: None,
         })
     }
 }
@@ -167,6 +169,7 @@ impl modelrouter::providers::search::SearchAdapter for NamedMockSearchAdapter {
         Ok(modelrouter::providers::search::SearchResponse {
             results: self.results.clone(),
             engine: self.engine_name.clone(),
+            answer: None,
         })
     }
 }
@@ -189,6 +192,7 @@ impl modelrouter::providers::search::SearchAdapter for CallTrackingSearchAdapter
         Ok(modelrouter::providers::search::SearchResponse {
             results: self.results.clone(),
             engine: self.engine_name.clone(),
+            answer: None,
         })
     }
 }

@@ -25,10 +25,18 @@ use crate::providers::embedding::EmbeddingRequest;
 use crate::providers::search::SearchRequest;
 
 /// GET /health — liveness plus (when caching is enabled) cache-backend state.
-pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
+pub async fn health_check(
+    State(state): State<AppState>,
+    extensions: Option<Extension<crate::extensions::Extensions>>,
+) -> Json<Value> {
     let mut body = json!({"status": "ok"});
     if let Some(cache) = cache_block(&state).await {
         body["cache"] = cache;
+    }
+    // Which request extensions this binary runs with, so a caller that
+    // depends on one can refuse to start without it. Absent when there are none.
+    if let Some(Extension(extensions)) = extensions.filter(|Extension(e)| !e.is_empty()) {
+        body["extensions"] = extensions.health();
     }
     Json(body)
 }
@@ -343,6 +351,7 @@ async fn probe_search(state: &AppState) -> CapabilityReport {
     let req = SearchRequest {
         query: "health probe".to_string(),
         max_results: Some(1),
+        ..Default::default()
     };
     let started = Instant::now();
     let report = match adapter.search(&req).await {

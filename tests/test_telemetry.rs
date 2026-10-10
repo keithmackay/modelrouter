@@ -201,7 +201,7 @@ fn telemetry_init_and_shutdown_does_not_panic() {
         .build()
         .expect("failed to build tokio runtime");
 
-    let guard = rt.block_on(async { init_telemetry(&config) });
+    let guard = rt.block_on(async { init_telemetry(&config, modelrouter::config::schema::LogFormat::Json) });
     assert!(guard.is_ok(), "init_telemetry returned error: {:?}", guard.err());
 
     // Drop the guard (flushes pipelines) inside the runtime so spawned tasks can run.

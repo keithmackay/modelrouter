@@ -551,6 +551,61 @@ pub struct ModelAlias {
     pub updated_at: String,
 }
 
+/// One scoped alias override: `alias` resolves to `provider/model` for
+/// requests whose attribution tags carry `tag_key = tag_value`. `target` is
+/// the expression the operator wrote; `provider` and `model` are what it
+/// resolved to when written. `expires_at` is unix seconds, 0 meaning never.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedAlias {
+    pub tag_key: String,
+    pub tag_value: String,
+    pub alias: String,
+    pub target: String,
+    pub provider: String,
+    pub model: String,
+    pub expires_at: i64,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    /// Request parameters the override sets for this alias (validated against
+    /// the pinned model's parameter schema when written); empty for none.
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One alias of a scope being written: the alias, its pinned target and the
+/// parameters it sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewScopedAlias {
+    pub alias: String,
+    pub target: String,
+    pub provider: String,
+    pub model: String,
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A stored `params` column: a JSON object, else (logged) none.
+pub fn parse_scoped_params(raw: &str) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => {
+            tracing::warn!(raw, "scoped alias params are not a JSON object; ignoring them");
+            serde_json::Map::new()
+        }
+    }
+}
+
+/// A capability the router learned from a provider rejecting a parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LearnedModelCapability {
+    /// Exact routed model id: provider segments stripped, lowercased, any
+    /// `@version` kept.
+    pub model: String,
+    pub supports_temperature: bool,
+    /// The provider error that taught it.
+    pub error: String,
+    pub learned_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewModelAlias {
     pub alias: String,

@@ -156,6 +156,8 @@ pub fn parse_grounded_response(
             // Grounding carries no publication date. Recording `None` rather
             // than inventing one keeps recency filtering honest.
             published_date: None,
+            publisher: None,
+            metadata_provenance: None,
         });
     }
 
@@ -288,6 +290,7 @@ impl SearchAdapter for VertexSearchAdapter {
         Ok(SearchResponse {
             results: items,
             engine: "vertex".to_string(),
+            answer: None,
         })
     }
 }

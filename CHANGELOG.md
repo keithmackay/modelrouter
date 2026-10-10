@@ -5,6 +5,17 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-10-05
+
+**Features**
+- Claude on Azure AI Foundry: `[providers.foundry] anthropic_deployments = [...]` sends those deployments to Foundry's Anthropic Messages surface (`{resource}/anthropic/v1/messages`, `anthropic-version: 2023-06-01`) with the provider's credential (Entra bearer token for `https://ai.azure.com/.default` unless `entra_scope` is set, or `x-api-key`). Requests get the direct Anthropic translation: tools, thinking and effort, prompt caching, and streamed events translated to OpenAI chunks. Capability rules and pricing key on the deployment name, so name deployments after their model ids. Other deployments stay on the OpenAI-shaped surface.
+- `[gateway.bootstrap]` (env `MODELROUTER_GATEWAY__BOOTSTRAP__USER` and `..._KEY` or `..._KEY_HASH`) creates a user and an API key at start-up if absent, so a fresh install serves a client whose key was provisioned outside the router with no manual `user create`. Idempotent: a disabled key stays disabled, rotation adds the new key without revoking the old one, and a key already held by another user refuses to start. The raw key is redacted from `Debug` and never serialized or logged.
+- `[logging] format = "json"` (env `MODELROUTER_LOGGING__FORMAT=json`) writes every log line as one JSON object, with the event's fields flattened beside `timestamp`, `level` and `target`, so log collectors can query by field. The default stays `text`. Applies with and without the `otel` feature.
+- `cache.require_opt_in` (default `false`): when `true`, only requests that send `x-modelrouter-cache: use` (or `refresh`) are cached; a request without the header is neither looked up nor stored, whatever its default eligibility. The stats API and `cache stats` report `require_opt_in` and `skipped_without_opt_in`. Combining it with `allow_header_opt_in = false` is refused at start-up.
+
+**Fixes**
+- A non-streamed `/v1/chat/completions` or `/v1/search` response the cache was not involved in no longer carries `x-modelrouter-cache: MISS`; it carries no cache header, as streamed and `/v1/messages` responses already did. `MISS` now always means the cache was consulted and held no entry.
+
 ### Week of 2026-09-28
 
 **Features**
@@ -16,6 +27,9 @@ commit; `git log v0.1.0..` has the detail.
 
 **Fixes**
 - The Anthropic adapter no longer drops an SSE event whose line is split across two network reads; streamed content and usage survive any chunking.
+- `temperature` is no longer forwarded to Claude Opus 5.5, Sonnet 5.5, Opus 4.7 or 4.8, all of which reject it with a 400. The built-in temperature table now matches by model family, so point releases (`claude-opus-5-5`) and `@version` pins inherit their family's entry, and capability lookup strips every provider segment (`vertex/anthropic/claude-opus-5-5` reaches the same entry as `claude-opus-5-5`). Sonnet 5.5 is also listed as thinking by default, accepting effort, and unable to disable thinking.
+- The router learns a model's `temperature` rejection. When a provider answers a request with a 400 that names `temperature`, the router retries it once without the parameter, records the exact model id (version included) in the new `learned_model_capabilities` table, logs one warning, and never sends `temperature` to that model again, across restarts. `GET /admin/api/model-capabilities/learned` lists entries with when they were learned, the error that taught them and how many requests each has changed since start; `DELETE /admin/api/model-capabilities/learned/:model` clears one. A `[[model_capabilities]]` config entry outranks a learned entry, which outranks the built-in table. Other 400s teach nothing.
+- Built-in pricing for Claude Opus 5.5 ($4 / $20 per MTok, cache read $0.20, cache write $5) and Sonnet 5.5 ($2 / $10, cache read $0.20, cache write $2.50); Haiku 4.5 corrected from $0.80 / $4 to its $1 / $5 list price.
 
 ### Week of 2026-09-21
 

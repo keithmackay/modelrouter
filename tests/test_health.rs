@@ -46,6 +46,8 @@ async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
                 snippet: "s".to_string(),
                 score: None,
                 published_date: None,
+                publisher: None,
+                metadata_provenance: None,
             }],
         }))
     } else {
@@ -167,6 +169,8 @@ fn mock_search_registry_health(engines: &[&str]) -> SearchRegistry {
                             snippet: "s".to_string(),
                             score: None,
                             published_date: None,
+                            publisher: None,
+                            metadata_provenance: None,
                         }],
                     });
                 (e, adapter)

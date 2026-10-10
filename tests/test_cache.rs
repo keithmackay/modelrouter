@@ -373,11 +373,48 @@ fn resolved_model_is_part_of_the_completion_key() {
 
 #[test]
 fn search_key_covers_engine_query_and_options() {
-    let base = search_cache_key("tavily", "rust", Some(5));
-    assert_eq!(base, search_cache_key("tavily", "rust", Some(5)));
-    assert_ne!(base, search_cache_key("tavily", "rust", Some(10)));
-    assert_ne!(base, search_cache_key("tavily", "go", Some(5)));
-    assert_ne!(base, search_cache_key("brave", "rust", Some(5)));
+    use modelrouter::router::cache::SearchAnswerKey;
+    let plain = SearchAnswerKey::default();
+    let base = search_cache_key("tavily", "rust", Some(5), &plain);
+    assert_eq!(base, search_cache_key("tavily", "rust", Some(5), &plain));
+    assert_ne!(base, search_cache_key("tavily", "rust", Some(10), &plain));
+    assert_ne!(base, search_cache_key("tavily", "go", Some(5), &plain));
+    assert_ne!(base, search_cache_key("brave", "rust", Some(5), &plain));
+    let answer = SearchAnswerKey { include_answer: true, ..SearchAnswerKey::default() };
+    let with_answer = search_cache_key("tavily", "rust", Some(5), &answer);
+    assert_ne!(
+        base, with_answer,
+        "an answer-bearing payload must never be served to a citations-only request, or back"
+    );
+    for variant in [
+        SearchAnswerKey { instructions: Some("be brief"), ..answer },
+        SearchAnswerKey { context: Some("market: payments"), ..answer },
+        SearchAnswerKey { max_follow_up_queries: 3, ..answer },
+    ] {
+        assert_ne!(with_answer, search_cache_key("tavily", "rust", Some(5), &variant), "{variant:?}");
+    }
+}
+
+#[test]
+fn search_key_covers_freshness_and_result_format_only_when_set() {
+    use modelrouter::router::cache::SearchAnswerKey;
+    let plain = SearchAnswerKey::default();
+    let base = search_cache_key("bing_grounding", "rust", Some(5), &plain);
+    let week = SearchAnswerKey { freshness: Some("week"), ..plain };
+    let month = SearchAnswerKey { freshness: Some("month"), ..plain };
+    assert_ne!(base, search_cache_key("bing_grounding", "rust", Some(5), &week));
+    assert_ne!(
+        search_cache_key("bing_grounding", "rust", Some(5), &week),
+        search_cache_key("bing_grounding", "rust", Some(5), &month),
+        "an age-filtered payload must not answer a request with another filter"
+    );
+    let v1 = SearchAnswerKey { result_format: Some("v1"), ..plain };
+    let v2 = SearchAnswerKey { result_format: Some("v2"), ..plain };
+    assert_ne!(
+        search_cache_key("bing_grounding", "rust", Some(5), &v1),
+        search_cache_key("bing_grounding", "rust", Some(5), &v2),
+        "a result-format change must retire entries cached under the old format"
+    );
 }
 
 // ── Eligibility policy ────────────────────────────────────────────────────────
@@ -656,7 +693,9 @@ async fn high_temperature_requests_never_hit() {
     for _ in 0..2 {
         let resp = post_completion(&server, &body).await;
         assert_eq!(resp.status_code(), 200);
-        assert_eq!(resp.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+        // Never cached, so the cache was not involved: no cache header
+        // (`MISS` means "looked up and not found").
+        assert!(resp.headers().get("x-modelrouter-cache").is_none());
     }
 }
 
@@ -1175,6 +1214,114 @@ async fn operator_can_disable_header_opt_in() {
     deterministic["temperature"] = json!(0.0);
     let bypassed = post_with_mode(&server, &deterministic, "bypass").await;
     assert_eq!(cache_outcome(&bypassed).as_deref(), Some("BYPASS"));
+}
+
+// ── Opt-in only (`cache.require_opt_in`) ────────────────────────────────────
+
+fn opt_in_only_config() -> CacheConfig {
+    CacheConfig {
+        enabled: true,
+        max_entries: 10,
+        ttl_seconds: 60,
+        require_opt_in: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn require_opt_in_caches_only_requests_that_ask() {
+    use modelrouter::router::cache::{CacheMode, CachePlan};
+    let cache = ResponseCache::new(&opt_in_only_config());
+    let deterministic = json!({"temperature": 0.0});
+
+    // Eligible by default, but no header: never looked up or stored.
+    assert_eq!(cache.completion_plan(CacheMode::Default, &deterministic), CachePlan::Skip);
+    assert_eq!(cache.search_plan(CacheMode::Default), CachePlan::Skip);
+    // The caller's explicit choices still apply.
+    assert_eq!(cache.completion_plan(CacheMode::Use, &sampled()), CachePlan::LookupAndStore);
+    assert_eq!(cache.search_plan(CacheMode::Use), CachePlan::LookupAndStore);
+    assert_eq!(cache.completion_plan(CacheMode::Refresh, &deterministic), CachePlan::StoreOnly);
+    assert_eq!(cache.search_plan(CacheMode::Bypass), CachePlan::Bypass);
+
+    let stats = cache.stats().await;
+    assert!(stats.require_opt_in);
+    assert_eq!(stats.skipped_without_opt_in, 2, "only the two header-less requests count");
+}
+
+#[tokio::test]
+async fn without_require_opt_in_default_eligibility_is_unchanged() {
+    use modelrouter::router::cache::{CacheMode, CachePlan};
+    let cache = enabled_cache(10, 60);
+    assert_eq!(
+        cache.completion_plan(CacheMode::Default, &json!({"temperature": 0.0})),
+        CachePlan::LookupAndStore
+    );
+    assert_eq!(cache.completion_plan(CacheMode::Default, &sampled()), CachePlan::Skip);
+    assert_eq!(cache.search_plan(CacheMode::Default), CachePlan::LookupAndStore);
+    let stats = cache.stats().await;
+    assert!(!stats.require_opt_in);
+    assert_eq!(stats.skipped_without_opt_in, 0);
+}
+
+#[test]
+fn require_opt_in_with_opt_in_refused_is_a_config_error() {
+    let contradictory = CacheConfig {
+        require_opt_in: true,
+        allow_header_opt_in: false,
+        ..Default::default()
+    };
+    let err = contradictory.validate().unwrap_err().to_string();
+    assert!(err.contains("require_opt_in"), "{err}");
+    assert!(opt_in_only_config().validate().is_ok());
+    assert!(CacheConfig::default().validate().is_ok());
+
+    // Refused at load time, not only when validate() is called by hand.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[cache]\nenabled = true\nrequire_opt_in = true\nallow_header_opt_in = false\n").unwrap();
+    let loaded = modelrouter::config::load_from_path(path.to_str().unwrap());
+    assert!(loaded.is_err(), "a contradictory cache config must not load");
+}
+
+async fn post_without_mode(server: &TestServer, body: &serde_json::Value) -> axum_test::TestResponse {
+    server
+        .post("/v1/chat/completions")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(body)
+        .await
+}
+
+#[tokio::test]
+async fn require_opt_in_end_to_end_header_less_calls_reach_the_provider() {
+    let adapter = VersionedAdapter::default();
+    let (server, _db, cache) = test_app_with_cache_config(adapter.clone(), opt_in_only_config()).await;
+    let mut deterministic = sampled();
+    deterministic["temperature"] = json!(0.0);
+
+    // Header-less: eligible by default, yet every call goes to the provider.
+    let first = post_without_mode(&server, &deterministic).await;
+    let second = post_without_mode(&server, &deterministic).await;
+    assert_eq!(content_of(&first), "answer 1");
+    assert_eq!(content_of(&second), "answer 2");
+    assert_eq!(cache_outcome(&second), None, "an uncached answer is not a miss");
+    assert_eq!(cache.stats().await.stores, 0);
+    assert_eq!(cache.stats().await.skipped_without_opt_in, 2);
+
+    // `use` opts in: stored, then replayed.
+    let stored = post_with_mode(&server, &deterministic, "use").await;
+    assert_eq!(cache_outcome(&stored).as_deref(), Some("MISS"));
+    let replayed = post_with_mode(&server, &deterministic, "use").await;
+    assert_eq!(cache_outcome(&replayed).as_deref(), Some("HIT"));
+    assert_eq!(content_of(&replayed), content_of(&stored));
+
+    // A header-less call does not read the entry `use` stored.
+    let after = post_without_mode(&server, &deterministic).await;
+    assert_eq!(cache_outcome(&after), None);
+    assert_eq!(content_of(&after), "answer 4");
+    assert_eq!(cache.stats().await.stores, 1, "only the `use` call stored");
 }
 
 // ── Per-request TTL (`x-modelrouter-cache-ttl`) ─────────────────────────────

@@ -47,10 +47,15 @@ async fn responses_inner(
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
 
-    let model = body["model"]
+    let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
+    // A scoped alias override for the request's attribution tags pins the model.
+    let model = state
+        .router
+        .scoped_name(&attribution.tags, &requested_model)
+        .unwrap_or(requested_model);
 
     tracing::Span::current().record("model", model.as_str());
 
@@ -122,9 +127,10 @@ async fn responses_inner(
     // same aliases through the same router, so it reaches the same models that
     // reject `temperature` and would 400 for the same reason.
     let temperature = body["temperature"].as_f64().filter(|_| {
-        crate::router::model_capabilities::supports_temperature(
+        crate::router::model_capabilities::temperature_allowed(
             &canonical_model,
             &state.settings.model_capabilities,
+            state.router.learned_capabilities(),
         )
     });
 
@@ -137,7 +143,11 @@ async fn responses_inner(
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: false,
         temperature,
-        max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        max_tokens: crate::router::model_capabilities::clamp_max_tokens(
+            &canonical_model,
+            body["max_tokens"].as_u64().map(|v| v as u32),
+            &state.settings.model_capabilities,
+        ),
         tools,
         tool_choice,
         // The Responses API nests the level as `reasoning.effort`; accept the
@@ -165,7 +175,24 @@ async fn responses_inner(
         .provider_registry
         .get(&provider_name)
         .map_err(ApiError::ProviderError)?;
-    let result = adapter.complete(&norm_req).await.map_err(|e| {
+    let first_try = adapter.complete(&norm_req).await;
+    let result = match first_try {
+        Err(e) => match crate::router::model_capabilities::temperature_rejection_retry(&norm_req, &e) {
+            Some(retry) => {
+                crate::router::learned_capabilities::record_temperature_rejection(
+                    state.router.learned_capabilities(),
+                    &*state.db,
+                    &norm_req.model,
+                    &e,
+                )
+                .await;
+                adapter.complete(&retry).await
+            }
+            None => Err(e),
+        },
+        ok => ok,
+    };
+    let result = result.map_err(|e| {
         state
             .circuit_breaker
             .record_provider_failure(&provider_name, &e);

@@ -26,6 +26,8 @@ fn mock_results() -> Vec<SearchResultItem> {
         snippet: "Example description".to_string(),
         score: Some(0.9),
         published_date: None,
+        publisher: None,
+        metadata_provenance: None,
     }]
 }
 
@@ -59,93 +61,14 @@ async fn test_app_full(
     search_registry: SearchRegistry,
     default_search_engine: Option<&str>,
 ) -> (TestServer, Arc<dyn DatabaseProvider>) {
-    let db = common::in_memory_db().await;
-    UserRepository::create(
-        &db,
-        NewUser {
-            name: "test-user".to_string(),
-            email: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let user = UserRepository::find_by_name(&db, "test-user")
-        .await
-        .unwrap()
-        .unwrap();
-    ApiKeyRepository::create_api_key(
-        &db,
-        NewApiKey {
-            user_id: user.id,
-            key_hash: hash_token("test-token"),
-            label: Some("test".to_string()),
-            expires_at: None,
-            project: None,
-            session_window_secs: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let mut settings = Settings::default();
-    settings.pricing = pricing;
-    settings.routing.default_search_engine = default_search_engine.map(str::to_string);
-    let settings = Arc::new(settings);
-    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
-    let router = Arc::new(RequestRouter::new(settings.clone()));
-    let cost_calc = Arc::new(CostCalculator::new());
-    let provider_registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
-        response: "hello".to_string(),
-    }));
-    let policy = Arc::new(PolicyEngine::new(db.clone()));
-    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
-    let complexity_router = Arc::new(ComplexityRouter::new(None));
-    let response_cache = Arc::new(ResponseCache::new(&cache));
-    let embedding_registry = Arc::new(EmbeddingRegistry::new_with_mock(
-        common::MockEmbeddingAdapter {
-            embedding: vec![0.1_f32, 0.2, 0.3],
-        },
-    ));
-    let search_registry = Arc::new(search_registry);
-
-    let state = AppState {
-        settings: settings.clone(),
-        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
-        db: db.clone(),
-        pool: None,
-        router,
-        cost_calc,
-        provider_registry,
-        policy,
-        fallback,
-        complexity_router,
-        response_cache,
-        embedding_registry,
+    common::search_app::search_app(
+        pricing,
+        cache,
         search_registry,
-        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
-            std::collections::HashMap::new(),
-        )),
-        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
-        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
-        ip_rate_limiter: Arc::new(
-            modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0),
-        ),
-        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(
-            0, 0,
-        )),
-        session_affinity: Arc::new(
-            modelrouter::router::session_affinity::SessionAffinityMap::new(1800),
-        ),
-        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
-        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
-        prompt_db: db.clone(),
-        app_metrics: None,
-        callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
-        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
-        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
-    };
-    (TestServer::new(build_router(state)).unwrap(), db)
+        default_search_engine,
+        modelrouter::extensions::Extensions::default(),
+    )
+    .await
 }
 
 async fn test_app() -> TestServer {
@@ -186,7 +109,11 @@ async fn search_happy_path_returns_normalized_results_and_usage() {
     assert_eq!(results[0]["score"], 0.9);
     assert!(results[0]["published_date"].is_null());
     assert_eq!(body["usage"]["results"], 1);
-    assert!(body["usage"]["cost_usd"].as_f64().unwrap() > 0.0);
+    // No price is configured for this engine: recorded at $0 and reported
+    // unpriced, never passed off as free (no built-in fallback rate).
+    assert_eq!(body["usage"]["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(body["usage"]["priced"], false);
+    assert_eq!(body["x_router"]["cost"]["priced"], false);
 }
 
 #[tokio::test]
@@ -518,22 +445,12 @@ async fn different_search_options_are_different_cache_entries() {
 async fn search_is_not_cached_when_the_cache_is_disabled() {
     let (server, _db) = test_app_with_pricing(search_pricing()).await;
     let query = serde_json::json!({ "query": "rust" });
-    assert_eq!(
-        post_search(&server, query.clone())
-            .await
-            .headers()
-            .get("x-modelrouter-cache")
-            .unwrap(),
-        "MISS"
-    );
-    assert_eq!(
-        post_search(&server, query)
-            .await
-            .headers()
-            .get("x-modelrouter-cache")
-            .unwrap(),
-        "MISS"
-    );
+    // The cache is off, so it is not involved: no cache header on either call
+    // (`MISS` means "looked up and not found").
+    for _ in 0..2 {
+        let resp = post_search(&server, query.clone()).await;
+        assert!(resp.headers().get("x-modelrouter-cache").is_none());
+    }
 }
 
 async fn post_search_with_mode(
@@ -591,7 +508,7 @@ async fn search_use_mode_cannot_enable_a_disabled_cache() {
     let query = serde_json::json!({ "query": "rust" });
     for _ in 0..2 {
         let resp = post_search_with_mode(&server, query.clone(), "use").await;
-        assert_eq!(resp.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+        assert!(resp.headers().get("x-modelrouter-cache").is_none());
     }
 }
 
@@ -995,6 +912,8 @@ async fn search_fallback_denied_by_model_allow_list_fails_request() {
                     snippet: "snippet".to_string(),
                     score: None,
                     published_date: None,
+                    publisher: None,
+                    metadata_provenance: None,
                 }],
             }),
         ),
@@ -1074,6 +993,8 @@ async fn search_fallback_permitted_by_model_allow_list_serves_request() {
                     snippet: "snippet".to_string(),
                     score: None,
                     published_date: None,
+                    publisher: None,
+                    metadata_provenance: None,
                 }],
             }),
         ),
@@ -1177,4 +1098,225 @@ async fn search_rejects_an_invalid_namespace() {
     let query = serde_json::json!({ "query": "rust" });
     let resp = post_search_in(&server, query, "bad namespace").await;
     assert_eq!(resp.status_code(), 400);
+}
+
+// ── freshness and result metadata ───────────────────────────────────────────
+
+/// Echoes the freshness it was given into the snippet, and reports a
+/// model-extracted date and publisher, so a test sees both directions.
+struct FreshnessEchoAdapter;
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for FreshnessEchoAdapter {
+    async fn search(
+        &self,
+        req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        let mut results = mock_results();
+        results[0].snippet = format!("freshness={}", req.freshness.as_deref().unwrap_or("none"));
+        results.push(SearchResultItem {
+            title: "Dated".into(),
+            url: "https://example.com/dated".into(),
+            snippet: "dated".into(),
+            score: None,
+            published_date: Some("2024-05-01".into()),
+            publisher: Some("Example Wire".into()),
+            metadata_provenance: Some(
+                modelrouter::providers::search::PROVENANCE_MODEL_EXTRACTED.to_string(),
+            ),
+        });
+        Ok(modelrouter::providers::search::SearchResponse {
+            results,
+            engine: "tavily".to_string(),
+            answer: None,
+        })
+    }
+}
+
+async fn search_freshness_body(body: serde_json::Value) -> axum_test::TestResponse {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(FreshnessEchoAdapter),
+        None,
+    )
+    .await;
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn search_freshness_reaches_the_adapter_in_canonical_form() {
+    for (sent, seen) in [
+        (serde_json::json!("Week"), "week"),
+        (serde_json::json!("2024-01-01..2024-06-30"), "2024-01-01..2024-06-30"),
+        (serde_json::json!("2024-02-04"), "2024-02-04"),
+        (serde_json::Value::Null, "none"),
+        (serde_json::json!("  "), "none"),
+    ] {
+        let resp = search_freshness_body(serde_json::json!({"query": "rust", "freshness": sent})).await;
+        assert_eq!(resp.status_code(), 200, "{sent}");
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["results"][0]["snippet"], format!("freshness={seen}"), "{sent}");
+    }
+}
+
+#[tokio::test]
+async fn search_rejects_a_malformed_freshness() {
+    for bad in [
+        serde_json::json!("yesterday"),
+        serde_json::json!("2024-13-01"),
+        serde_json::json!("2024-06-30..2024-01-01"),
+        serde_json::json!("2024-1-1"),
+        serde_json::json!(7),
+    ] {
+        let resp = search_freshness_body(serde_json::json!({"query": "rust", "freshness": bad})).await;
+        assert_eq!(resp.status_code(), 400, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn search_results_carry_publisher_and_provenance_only_when_known() {
+    let resp = search_freshness_body(serde_json::json!({"query": "rust"})).await;
+    let body: serde_json::Value = resp.json();
+    let plain = &body["results"][0];
+    assert!(plain.get("publisher").is_none(), "{plain}");
+    assert!(plain.get("metadata_provenance").is_none(), "{plain}");
+    let dated = &body["results"][1];
+    assert_eq!(dated["published_date"], "2024-05-01");
+    assert_eq!(dated["publisher"], "Example Wire");
+    assert_eq!(dated["metadata_provenance"], "model_extracted");
+}
+
+#[test]
+fn parse_freshness_accepts_the_documented_forms_only() {
+    use modelrouter::providers::search::parse_freshness;
+    assert_eq!(parse_freshness("DAY").as_deref(), Some("day"));
+    assert_eq!(parse_freshness(" month ").as_deref(), Some("month"));
+    assert_eq!(parse_freshness("2024-02-29").as_deref(), Some("2024-02-29"));
+    assert_eq!(parse_freshness("2024-01-01..2024-01-01").as_deref(), Some("2024-01-01..2024-01-01"));
+    for bad in ["", "year", "2023-02-29", "2024-01-01..", "..2024-01-01", "2024-01-01..2023-01-01", "20240101"] {
+        assert_eq!(parse_freshness(bad), None, "{bad}");
+    }
+}
+
+// ── include_answer ──────────────────────────────────────────────────────────
+
+/// Answers only when asked, the way a grounding engine does.
+struct AnsweringSearchAdapter;
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for AnsweringSearchAdapter {
+    async fn search(
+        &self,
+        req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        Ok(modelrouter::providers::search::SearchResponse {
+            results: mock_results(),
+            engine: "tavily".to_string(),
+            answer: req.include_answer.then(|| modelrouter::providers::search::SearchAnswer {
+                text: "Rust is a systems language.".to_string(),
+                query_urls: vec!["https://search.example/?q=rust".to_string()],
+                follow_up_queries: (0..req.max_follow_up_queries).map(|i| format!("rust {i}")).collect(),
+            }),
+        })
+    }
+}
+
+async fn search_with_body(body: serde_json::Value) -> axum_test::TestResponse {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(AnsweringSearchAdapter),
+        None,
+    )
+    .await;
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn search_include_answer_returns_the_answer_beside_the_results() {
+    let resp = search_with_body(serde_json::json!({"query": "rust", "include_answer": true})).await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["answer"]["text"], "Rust is a systems language.");
+    assert_eq!(body["answer"]["query_urls"][0], "https://search.example/?q=rust");
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
+    assert_eq!(body["answer"]["follow_up_queries"].as_array().unwrap().len(), 0);
+}
+
+/// The research options reach the adapter: here the mock proposes as many
+/// follow-ups as it was asked for.
+#[tokio::test]
+async fn search_research_options_reach_the_adapter() {
+    let resp = search_with_body(serde_json::json!({
+        "query": "rust", "include_answer": true, "max_follow_up_queries": 3,
+    }))
+    .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["answer"]["follow_up_queries"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn search_without_include_answer_keeps_the_citations_only_shape() {
+    for body in [
+        serde_json::json!({"query": "rust"}),
+        serde_json::json!({"query": "rust", "include_answer": false}),
+        serde_json::json!({"query": "rust", "include_answer": null}),
+    ] {
+        let resp = search_with_body(body.clone()).await;
+        assert_eq!(resp.status_code(), 200, "{body}");
+        let out: serde_json::Value = resp.json();
+        assert!(out.get("answer").is_none(), "{body} → {out}");
+    }
+}
+
+#[tokio::test]
+async fn search_include_answer_must_be_a_boolean() {
+    let resp = search_with_body(serde_json::json!({"query": "rust", "include_answer": "yes"})).await;
+    assert_eq!(resp.status_code(), 400);
+}
+
+#[tokio::test]
+async fn search_research_options_need_include_answer() {
+    for body in [
+        serde_json::json!({"query": "rust", "instructions": "be brief"}),
+        serde_json::json!({"query": "rust", "context": "market"}),
+        serde_json::json!({"query": "rust", "max_follow_up_queries": 2}),
+    ] {
+        let resp = search_with_body(body.clone()).await;
+        assert_eq!(resp.status_code(), 400, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn search_research_options_are_validated() {
+    for body in [
+        serde_json::json!({"query": "rust", "include_answer": true, "max_follow_up_queries": 11}),
+        serde_json::json!({"query": "rust", "include_answer": true, "max_follow_up_queries": -1}),
+        serde_json::json!({"query": "rust", "include_answer": true, "instructions": 7}),
+    ] {
+        let resp = search_with_body(body.clone()).await;
+        assert_eq!(resp.status_code(), 400, "{body}");
+    }
+    let ok = search_with_body(serde_json::json!({
+        "query": "rust", "include_answer": true, "instructions": "be brief",
+        "context": "market", "max_follow_up_queries": 10,
+    }))
+    .await;
+    assert_eq!(ok.status_code(), 200);
 }

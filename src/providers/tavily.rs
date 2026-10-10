@@ -86,9 +86,12 @@ impl SearchAdapter for TavilyAdapter {
                     snippet: r.content,
                     score: r.score,
                     published_date: r.published_date,
+                    publisher: None,
+                    metadata_provenance: None,
                 })
                 .collect(),
             engine: "tavily".to_string(),
+            answer: None,
         })
     }
 }

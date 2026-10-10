@@ -28,6 +28,7 @@ struct Harness {
     /// `created_at` (the repositories always stamp "now").
     sqlite: modelrouter::db::sqlite::SqliteDb,
     experiments: Arc<ExperimentRegistry>,
+    state: AppState,
 }
 
 /// Build a server with a config alias (`fast -> openai/gpt-4o-mini`), a
@@ -123,11 +124,12 @@ async fn build_server() -> Harness {
         experiments: experiments.clone(),
     };
     Harness {
-        server: TestServer::new(build_router(state)).unwrap(),
+        server: TestServer::new(build_router(state.clone())).unwrap(),
         settings,
         db,
         sqlite,
         experiments,
+        state,
     }
 }
 
@@ -1228,4 +1230,181 @@ async fn results_errors_name_the_offending_field() {
         .get(&format!("/admin/api/experiments/{id}/results"))
         .await
         .assert_status_unauthorized();
+}
+
+// ── Scoped alias overrides ────────────────────────────────────────────────────
+
+async fn put_scope(h: &Harness, role: &str, path: &str, body: &Value) -> axum_test::TestResponse {
+    let (hk, hv) = bearer(&jwt(&h.settings, role));
+    h.server.put(path).add_header(hk, hv).json(body).await
+}
+
+fn tenant_tags(value: &str) -> std::collections::BTreeMap<String, String> {
+    [("tenant".to_string(), value.to_string())].into_iter().collect()
+}
+
+#[tokio::test]
+async fn a_scope_write_pins_its_targets_goes_live_and_is_audited() {
+    let h = build_server().await;
+    let res = put_scope(
+        &h,
+        "superadmin",
+        "/admin/api/scoped-aliases/tenant/t1",
+        &json!({ "aliases": { "fast": "anthropic/claude-haiku-4-5", "deep": "fast" }, "expires_at": 0 }),
+    )
+    .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let scope = &res.json::<Value>()["scope"];
+    assert_eq!(scope["expires_at"], "never");
+    assert_eq!(scope["aliases"]["fast"]["provider"], "anthropic");
+    // An alias target is pinned to what it resolved to when written.
+    assert_eq!(scope["aliases"]["deep"]["target"], "fast");
+    assert_eq!(scope["aliases"]["deep"]["model"], "gpt-4o-mini");
+
+    // The live router now routes the scope's aliases, and only for its tag.
+    let scoped = h.state.router.scoped_aliases();
+    assert_eq!(
+        scoped.target_for(&tenant_tags("t1"), "fast", 1).unwrap().expression(),
+        "anthropic/claude-haiku-4-5"
+    );
+    assert!(scoped.target_for(&tenant_tags("t2"), "fast", 1).is_none());
+
+    // Read back through the API, filtered by scope.
+    let (hk, hv) = bearer(&jwt(&h.settings, "admin"));
+    let list = h
+        .server
+        .get("/admin/api/scoped-aliases")
+        .add_query_param("tag_key", "tenant")
+        .add_query_param("tag_value", "t1")
+        .add_header(hk, hv)
+        .await;
+    list.assert_status_ok();
+    assert_eq!(list.json::<Value>()["scopes"].as_array().unwrap().len(), 1);
+
+    // A second write replaces the whole set.
+    let res = put_scope(
+        &h,
+        "superadmin",
+        "/admin/api/scoped-aliases/tenant/t1",
+        &json!({ "aliases": { "deep": "anthropic/claude-haiku-4-5" }, "expires_at": 0 }),
+    )
+    .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    assert!(h.state.router.scoped_aliases().target_for(&tenant_tags("t1"), "fast", 1).is_none());
+
+    let actions: Vec<String> = {
+        use modelrouter::db::repositories::audit::AuditRepository;
+        AuditRepository::list(&*h.db, 100, 0).await.unwrap().into_iter().map(|e| e.action).collect()
+    };
+    assert!(actions.contains(&"scoped_alias.create".to_string()), "{actions:?}");
+    assert!(actions.contains(&"scoped_alias.update".to_string()), "{actions:?}");
+}
+
+#[tokio::test]
+async fn a_scope_write_refuses_targets_it_cannot_cost_or_pin() {
+    let h = build_server().await;
+    let path = "/admin/api/scoped-aliases/tenant/t1";
+    let cases = [
+        ("mystery", "has no pricing entry"),
+        ("pool", "load balancer pool"),
+        ("no-such-model", "would be substituted"),
+    ];
+    for (target, needle) in cases {
+        let res = put_scope(&h, "superadmin", path, &json!({ "aliases": { "deep": target }, "expires_at": 0 })).await;
+        assert_bad_request(&res, &["aliases: 'deep'", needle]);
+    }
+    assert_bad_request(&put_scope(&h, "superadmin", path, &json!({ "aliases": {}, "expires_at": 0 })).await, &["DELETE"]);
+    assert_eq!(h.state.router.scoped_aliases().scope_count(), 0);
+}
+
+#[tokio::test]
+async fn a_scope_write_carries_parameters_validated_against_the_pinned_model() {
+    let h = build_server().await;
+    let path = "/admin/api/scoped-aliases/tenant/t1";
+    let res = put_scope(
+        &h,
+        "superadmin",
+        path,
+        &json!({ "aliases": {
+            "deep": { "target": "anthropic/claude-haiku-4-5", "params": { "temperature": 0.3, "max_tokens": 2000 } },
+            "fast": "anthropic/claude-haiku-4-5"
+        }, "expires_at": 0 }),
+    )
+    .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let scope = &res.json::<Value>()["scope"];
+    assert_eq!(scope["aliases"]["deep"]["params"], json!({ "temperature": 0.3, "max_tokens": 2000 }));
+    assert_eq!(scope["aliases"]["fast"]["params"], json!({}));
+    let live = h.state.router.scoped_aliases().target_for(&tenant_tags("t1"), "deep", 1).unwrap();
+    assert_eq!(live.params["max_tokens"], 2000);
+
+    // Unsupported or out-of-range values are refused, naming model and parameter.
+    let cases = [
+        (json!({ "reasoning_effort": "high" }), "does not support parameter 'reasoning_effort'"),
+        (json!({ "temperature": 1.5 }), "parameter 'temperature': 1.5 is not a number in 0..=1"),
+    ];
+    for (params, needle) in cases {
+        let body = json!({ "aliases": { "deep": { "target": "anthropic/claude-haiku-4-5", "params": params } }, "expires_at": 0 });
+        let res = put_scope(&h, "superadmin", path, &body).await;
+        assert_bad_request(&res, &["aliases: 'deep'", "model 'anthropic/claude-haiku-4-5'", needle]);
+    }
+    // A refused write leaves the previous scope in force.
+    assert_eq!(h.state.router.scoped_aliases().target_for(&tenant_tags("t1"), "deep", 1).unwrap().params["temperature"], 0.3);
+}
+
+#[tokio::test]
+async fn model_parameters_resolve_a_target_and_list_what_its_model_honours() {
+    let h = build_server().await;
+    let (hk, hv) = bearer(&jwt(&h.settings, "admin"));
+    let res = h.server.get("/admin/api/models/parameters").add_query_param("target", "fast").add_header(hk.clone(), hv.clone()).await;
+    res.assert_status_ok();
+    let doc = res.json::<Value>();
+    assert_eq!((doc["provider"].as_str(), doc["model"].as_str()), (Some("openai"), Some("gpt-4o-mini")));
+    assert!(doc["price"]["output_per_million"].as_f64().unwrap() > 0.0);
+    let names: Vec<&str> = doc["parameters"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["temperature", "max_tokens"]);
+
+    let res = h.server.get("/admin/api/models/parameters").add_query_param("target", "no-such-model").add_header(hk, hv).await;
+    assert_bad_request(&res, &["would be substituted"]);
+    h.server.get("/admin/api/models/parameters").add_query_param("target", "fast").await.assert_status_unauthorized();
+}
+
+#[tokio::test]
+async fn deleting_a_scope_clears_it_and_scope_writes_need_a_superadmin() {
+    let h = build_server().await;
+    let path = "/admin/api/scoped-aliases/tenant/t1";
+    let write = json!({ "aliases": { "fast": "anthropic/claude-haiku-4-5" }, "expires_at": 0 });
+
+    h.server.get("/admin/api/scoped-aliases").await.assert_status_unauthorized();
+    put_scope(&h, "admin", path, &write).await.assert_status_forbidden();
+
+    put_scope(&h, "superadmin", path, &write).await.assert_status_ok();
+    let (hk, hv) = bearer(&jwt(&h.settings, "admin"));
+    h.server.delete(path).add_header(hk, hv).await.assert_status_forbidden();
+    let (sk, sv) = bearer(&jwt(&h.settings, "superadmin"));
+    let res = h.server.delete(path).add_header(sk.clone(), sv.clone()).await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["deleted"], 1);
+    assert_eq!(h.state.router.scoped_aliases().scope_count(), 0);
+    // Clearing an empty scope is not an error.
+    assert_eq!(h.server.delete(path).add_header(sk, sv).await.json::<Value>()["deleted"], 0);
+}
+
+#[tokio::test]
+async fn expired_overrides_are_deleted_audited_and_dropped_from_the_router() {
+    let h = build_server().await;
+    let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    put_scope(
+        &h,
+        "superadmin",
+        "/admin/api/scoped-aliases/tenant/t1",
+        &json!({ "aliases": { "fast": "anthropic/claude-haiku-4-5" }, "expires_at": expires }),
+    )
+    .await
+    .assert_status_ok();
+    assert_eq!(h.state.router.scoped_aliases().scope_count(), 1);
+    modelrouter::api::admin::scoped_aliases::expire_scoped_aliases(&h.state, chrono::Utc::now().timestamp() + 7200).await;
+    assert_eq!(h.state.router.scoped_aliases().scope_count(), 0);
+    use modelrouter::db::repositories::aliases::AliasRepository;
+    assert!(h.db.list_scoped_aliases().await.unwrap().is_empty());
 }
