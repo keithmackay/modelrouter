@@ -1,13 +1,20 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 pub struct CostCalculator {
     pricing: HashMap<String, ModelPricing>,
+    /// Keys priced by the operator's `[[pricing]]` entries. They win over
+    /// `live` prices, which win over the built-in table.
+    configured: HashSet<String>,
+    /// Prices fetched at run time (e.g. Foundry deployments from the Azure
+    /// Retail Prices API), replaced wholesale on each refresh.
+    live: RwLock<HashMap<String, ModelPricing>>,
     /// Pricing keys already reported as unpriced, so the warning fires once
     /// per model per process instead of on every request.
     warned_unpriced: Mutex<HashSet<String>>,
 }
 
+#[derive(Clone, Copy)]
 struct ModelPricing {
     input_per_million: f64,
     output_per_million: f64,
@@ -25,6 +32,15 @@ const CACHE_READ_DISCOUNT: f64 = 0.1;
 const CACHE_WRITE_PREMIUM: f64 = 1.25;
 
 impl ModelPricing {
+    fn from_entry(entry: &crate::config::schema::PricingEntry) -> Self {
+        Self {
+            input_per_million: entry.input_per_million,
+            output_per_million: entry.output_per_million,
+            cache_read_per_million: entry.cache_read_per_million,
+            cache_write_per_million: entry.cache_write_per_million,
+        }
+    }
+
     fn simple(input_per_million: f64, output_per_million: f64) -> Self {
         Self {
             input_per_million,
@@ -72,9 +88,22 @@ impl CostCalculator {
             "claude-sonnet-4-6".to_string(),
             ModelPricing::simple(3.0, 15.0),
         );
+        // Claude Opus 5.5 / Sonnet 5.5 / Haiku 4.5 — first-party list prices,
+        // checked 2026-10-02. Opus 5.5 cache reads are 0.05x input, not the
+        // default 0.1x, so its cache rates are explicit. Vertex AI's global
+        // endpoint lists the same rates; its regional endpoints list ~10% higher.
+        // Reference: https://platform.claude.com/docs/en/about-claude/pricing
+        pricing.insert(
+            "claude-opus-5-5".to_string(),
+            ModelPricing::with_cache(4.0, 20.0, 0.20, 5.0),
+        );
+        pricing.insert(
+            "claude-sonnet-5-5".to_string(),
+            ModelPricing::with_cache(2.0, 10.0, 0.20, 2.50),
+        );
         pricing.insert(
             "claude-haiku-4-5".to_string(),
-            ModelPricing::simple(0.80, 4.0),
+            ModelPricing::simple(1.0, 5.0),
         );
         pricing.insert(
             "claude-3-5-sonnet-20241022".to_string(),
@@ -207,11 +236,13 @@ impl CostCalculator {
         );
         pricing.insert(
             "claude-haiku-4-5@20251001".to_string(),
-            ModelPricing::simple(0.80, 4.0),
+            ModelPricing::simple(1.0, 5.0),
         );
         // Unknown models cost 0 (Ollama etc.) and are reported once as unpriced.
         Self {
             pricing,
+            configured: HashSet::new(),
+            live: RwLock::new(HashMap::new()),
             warned_unpriced: Mutex::new(HashSet::new()),
         }
     }
@@ -219,17 +250,27 @@ impl CostCalculator {
     pub fn new_with_config(config_pricing: &[crate::config::schema::PricingEntry]) -> Self {
         let mut calc = Self::new();
         for entry in config_pricing {
-            calc.pricing.insert(
-                entry.model.to_lowercase(),
-                ModelPricing {
-                    input_per_million: entry.input_per_million,
-                    output_per_million: entry.output_per_million,
-                    cache_read_per_million: entry.cache_read_per_million,
-                    cache_write_per_million: entry.cache_write_per_million,
-                },
-            );
+            let key = entry.model.to_lowercase();
+            calc.configured.insert(key.clone());
+            calc.pricing.insert(key, ModelPricing::from_entry(entry));
         }
         calc
+    }
+
+    /// Replace the run-time prices with `entries` (keyed by model name, as
+    /// `[[pricing]]` is). An operator's `[[pricing]]` entry for the same model
+    /// still wins. Returns how many models now carry a live price.
+    pub fn replace_live_pricing(&self, entries: &[crate::config::schema::PricingEntry]) -> usize {
+        let fresh: HashMap<String, ModelPricing> = entries
+            .iter()
+            .map(|e| (e.model.to_lowercase(), ModelPricing::from_entry(e)))
+            .collect();
+        let count = fresh.len();
+        match self.live.write() {
+            Ok(mut live) => *live = fresh,
+            Err(poisoned) => *poisoned.into_inner() = fresh,
+        }
+        count
     }
 
     /// Normalise a model name to the key the pricing table uses: strip the
@@ -251,22 +292,60 @@ impl CostCalculator {
     /// segment (`claude-x`) — operators usually price models by bare name, and
     /// multi-segment targets (e.g. Claude on Vertex) would otherwise never
     /// match.
-    fn resolve(&self, model: &str) -> Option<&ModelPricing> {
+    ///
+    /// Each layer is searched in that key order: the operator's `[[pricing]]`
+    /// first, then live prices, then the built-in table.
+    fn resolve(&self, model: &str) -> Option<ModelPricing> {
         let key = Self::pricing_key(model);
-        if let Some(p) = self.pricing.get(&key) {
-            return Some(p);
+        let basename = key.rfind('/').map(|pos| key[pos + 1..].to_string());
+        let candidates: Vec<&str> = std::iter::once(key.as_str()).chain(basename.as_deref()).collect();
+        if let Some(c) = candidates.iter().find(|c| self.configured.contains(**c)) {
+            return self.pricing.get(*c).copied();
         }
-        match key.rfind('/') {
-            Some(pos) => self.pricing.get(&key[pos + 1..]),
-            None => None,
+        let live = match self.live.read() {
+            Ok(live) => live,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(p) = candidates.iter().find_map(|c| live.get(*c)) {
+            return Some(*p);
         }
+        candidates.iter().find_map(|c| self.pricing.get(*c)).copied()
     }
 
     /// Whether `model` has a pricing entry. A model without one is recorded in
     /// the ledger at zero cost, so callers presenting cost figures use this to
     /// flag them as incomplete rather than free.
+    /// A flat per-unit rate (dollars per query, image, ...) for a pseudo-model
+    /// such as `search/bing_grounding`, matched on the whole key (no prefix
+    /// stripping): the operator's `[[pricing]]` first, then live prices, then
+    /// the built-in table. The rate is the entry's `input_per_million`.
+    pub fn flat_rate(&self, key: &str) -> Option<f64> {
+        let k = key.to_lowercase();
+        if self.configured.contains(&k) {
+            return self.pricing.get(&k).map(|p| p.input_per_million);
+        }
+        let live = match self.live.read() {
+            Ok(live) => live,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        live.get(&k).or_else(|| self.pricing.get(&k)).map(|p| p.input_per_million)
+    }
+
     pub fn has_price(&self, model: &str) -> bool {
         self.resolve(model).is_some()
+    }
+
+    /// The per-million-token rates `model` is costed at (cache rates with
+    /// their defaults applied), or `None` when it has no pricing entry.
+    pub fn rates(&self, model: &str) -> Option<serde_json::Value> {
+        self.resolve(model).map(|p| {
+            serde_json::json!({
+                "input_per_million": p.input_per_million,
+                "output_per_million": p.output_per_million,
+                "cache_read_per_million": p.cache_read_rate(),
+                "cache_write_per_million": p.cache_write_rate(),
+            })
+        })
     }
 
     /// Cost for a request with no cache activity. Equivalent to
@@ -301,11 +380,28 @@ impl CostCalculator {
         }
     }
 
+    /// Cost of the same request with no prompt cache: the cache-read and
+    /// cache-write tokens priced at the standard input rate. Arguments are as
+    /// for `calculate_with_cache` (`prompt_tokens` is the non-cached share).
+    pub fn calculate_no_cache(
+        &self,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+    ) -> f64 {
+        let whole_prompt = prompt_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens);
+        self.calculate(model, whole_prompt, completion_tokens)
+    }
+
     /// Record that `model` was costed without a pricing entry. Logs a warning
     /// the first time each model is seen, so a missing price shows up in the
     /// logs rather than passing as a silent zero in the cost ledger. Returns
     /// whether this call emitted the warning.
-    fn note_unpriced(&self, model: &str) -> bool {
+    pub fn note_unpriced(&self, model: &str) -> bool {
         let key = Self::pricing_key(model);
         let first = match self.warned_unpriced.lock() {
             Ok(mut seen) => seen.insert(key.clone()),
@@ -364,6 +460,21 @@ mod tests {
     }
 
     #[test]
+    fn no_cache_cost_prices_cached_prompt_tokens_at_the_input_rate() {
+        let calc = CostCalculator::default();
+        // claude-sonnet-5-5: $2/M input, $10/M output, $0.20/M cache read, $2.50/M cache write.
+        let actual = calc.calculate_with_cache("anthropic/claude-sonnet-5-5", 1_000_000, 100_000, 4_000_000, 500_000);
+        let no_cache = calc.calculate_no_cache("anthropic/claude-sonnet-5-5", 1_000_000, 100_000, 4_000_000, 500_000);
+        assert!((actual - (2.0 + 1.0 + 0.8 + 1.25)).abs() < 1e-9, "actual: {actual}");
+        assert!((no_cache - (5.5 * 2.0 + 1.0)).abs() < 1e-9, "no cache: {no_cache}");
+        // No cache activity: the two figures agree.
+        assert_eq!(
+            calc.calculate_with_cache("claude-sonnet-5-5", 1000, 10, 0, 0),
+            calc.calculate_no_cache("claude-sonnet-5-5", 1000, 10, 0, 0)
+        );
+    }
+
+    #[test]
     fn has_price_normalises_prefix_and_case() {
         let calc = CostCalculator::default();
         assert!(calc.has_price("gpt-4o"));
@@ -408,7 +519,32 @@ mod tests {
         // must resolve to it.
         assert!(calc.has_price("vertex/anthropic/claude-haiku-4-5"));
         let cost = calc.calculate("vertex/anthropic/claude-haiku-4-5", 1_000_000, 0);
-        assert!((cost - 0.80).abs() < 0.001, "vertex haiku input: {cost}");
+        assert!((cost - 1.0).abs() < 0.001, "vertex haiku input: {cost}");
+    }
+
+    #[test]
+    fn builtin_opus_and_sonnet_5_5_price_unpinned_vertex_targets() {
+        let calc = CostCalculator::default();
+        // Both are served on Vertex under the bare id, with no `@version` pin.
+        for (model, input, output, cache_read, cache_write) in [
+            ("vertex/anthropic/claude-opus-5-5", 4.0, 20.0, 0.20, 5.0),
+            ("vertex/anthropic/claude-sonnet-5-5", 2.0, 10.0, 0.20, 2.50),
+        ] {
+            assert!(calc.has_price(model), "{model} must be priced");
+            let cost = calc.calculate_with_cache(model, 1_000_000, 1_000_000, 0, 0);
+            assert!((cost - (input + output)).abs() < 0.001, "{model} in+out: {cost}");
+            let cost = calc.calculate_with_cache(model, 0, 0, 1_000_000, 0);
+            assert!((cost - cache_read).abs() < 0.001, "{model} cache read: {cost}");
+            let cost = calc.calculate_with_cache(model, 0, 0, 0, 1_000_000);
+            assert!((cost - cache_write).abs() < 0.001, "{model} cache write: {cost}");
+        }
+    }
+
+    #[test]
+    fn builtin_haiku_4_5_pinned_vertex_target_uses_list_price() {
+        let calc = CostCalculator::default();
+        let cost = calc.calculate("vertex/anthropic/claude-haiku-4-5@20251001", 1_000_000, 1_000_000);
+        assert!((cost - 6.0).abs() < 0.001, "pinned haiku in+out: {cost}");
     }
 
     #[test]
@@ -501,6 +637,62 @@ mod tests {
             // No published cached-input rate: default discount of input.
             assert_cost(&calc, model, (0, 0, M, 0), 0.09 * CACHE_READ_DISCOUNT);
         }
+    }
+
+    #[test]
+    fn live_prices_beat_builtins_and_lose_to_configured_entries() {
+        use crate::config::schema::PricingEntry;
+        let entry = |model: &str, input: f64| PricingEntry {
+            model: model.into(),
+            input_per_million: input,
+            output_per_million: 0.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        };
+        let calc = CostCalculator::new_with_config(&[entry("gpt-4.1", 7.0)]);
+        assert!(!calc.has_price("gpt-5.6-sol"));
+        assert_eq!(calc.replace_live_pricing(&[entry("gpt-5.6-sol", 4.0), entry("GPT-4.1", 2.0)]), 2);
+        assert!((calc.calculate("foundry/gpt-5.6-sol", 1_000_000, 0) - 4.0).abs() < 1e-9);
+        // The operator's [[pricing]] entry outranks the live price.
+        assert!((calc.calculate("foundry/gpt-4.1", 1_000_000, 0) - 7.0).abs() < 1e-9);
+        // A refresh replaces the live set wholesale.
+        calc.replace_live_pricing(&[]);
+        assert!(!calc.has_price("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn live_price_overrides_the_builtin_rate() {
+        use crate::config::schema::PricingEntry;
+        let calc = CostCalculator::new();
+        let builtin = calc.calculate("claude-haiku-4-5", 1_000_000, 0);
+        calc.replace_live_pricing(&[PricingEntry {
+            model: "claude-haiku-4-5".into(),
+            input_per_million: builtin + 1.0,
+            output_per_million: 0.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        }]);
+        assert!((calc.calculate("claude-haiku-4-5", 1_000_000, 0) - (builtin + 1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn search_engines_are_priced_only_by_config_or_live_prices() {
+        use crate::config::schema::PricingEntry;
+        let entry = |model: &str, rate: f64| PricingEntry {
+            model: model.into(),
+            input_per_million: rate,
+            output_per_million: 0.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        };
+        let calc = CostCalculator::new();
+        // No built-in search price: an engine is priced by config or the live feed, or not at all.
+        assert_eq!(calc.flat_rate("search/bing_grounding"), None);
+        calc.replace_live_pricing(&[entry("search/bing_grounding", 0.015)]);
+        assert_eq!(calc.flat_rate("search/bing_grounding"), Some(0.015));
+        let configured = CostCalculator::new_with_config(&[entry("search/bing_grounding", 0.02)]);
+        configured.replace_live_pricing(&[entry("search/bing_grounding", 0.015)]);
+        assert_eq!(configured.flat_rate("search/bing_grounding"), Some(0.02));
     }
 
     #[test]

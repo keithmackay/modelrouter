@@ -572,3 +572,15 @@ async fn models_dashboard_page_and_fragments_render() {
     assert!(providers.text().contains("openai"));
     assert!(providers.text().contains("anthropic"));
 }
+
+#[tokio::test]
+async fn the_providers_api_names_each_endpoint_and_never_the_key() {
+    let (server, settings, _, _) = build_server().await;
+    let (hk, hv) = bearer(&jwt(&settings, "viewer"));
+    let body: serde_json::Value = server.get("/admin/api/providers").add_header(hk, hv).await.json();
+    let providers = body["providers"].as_array().expect("providers");
+    let openai = providers.iter().find(|p| p["provider"] == "openai").expect("openai listed");
+    assert_eq!(openai["api_base"], "http://mock");
+    assert!(openai["region"].is_null() && openai["project"].is_null());
+    assert!(!body.to_string().contains("\"test\""), "the API key must not appear: {body}");
+}

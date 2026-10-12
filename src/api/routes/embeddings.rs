@@ -101,7 +101,11 @@ async fn embeddings_inner(
             .get(&requested_model)
             .cloned()
             .unwrap_or_else(|| requested_model.clone()),
-        None => requested_model.clone(),
+        // A scoped alias override for the request's attribution tags.
+        None => state
+            .router
+            .scoped_name(&attribution.tags, &requested_model)
+            .unwrap_or_else(|| requested_model.clone()),
     };
     if let Some(b) = &binding {
         tracing::info!(
@@ -424,7 +428,7 @@ async fn embeddings_inner(
         }),
         tokens: Some(TokenMeta::new(result.prompt_tokens, 0)),
         results: None,
-        cost: CallCost::spent(cost),
+        cost: CallCost::spent(cost).priced_if(state.cost_calc.has_price(&canonical_model)),
         timing: TimingMeta {
             total_ms: received.elapsed().as_millis() as i64,
             latency_ms,

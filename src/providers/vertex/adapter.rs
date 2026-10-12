@@ -109,6 +109,9 @@ pub struct VertexAdapter {
     /// only way to exercise request translation, error passthrough and SSE
     /// rewriting is a live Google Cloud project.
     api_base: Option<String>,
+    /// Automatic `cache_control` breakpoints on Claude requests (see
+    /// [`crate::providers::anthropic::apply_prompt_caching`]).
+    prompt_caching: bool,
 }
 
 /// Point a Vertex URL at `base` instead of googleapis.com, preserving the path.
@@ -158,6 +161,7 @@ impl VertexAdapter {
             tier_timeouts: TierTimeoutsConfig::default(),
             catalog_base: None,
             api_base: None,
+            prompt_caching: config.prompt_caching,
         })
     }
 
@@ -185,6 +189,7 @@ impl VertexAdapter {
             tier_timeouts: TierTimeoutsConfig::default(),
             catalog_base: None,
             api_base: None,
+            prompt_caching: true,
         })
     }
 
@@ -345,7 +350,11 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req, false)?,
+            Publisher::Anthropic => {
+                let mut body = claude::translate_request(req, false)?;
+                crate::providers::anthropic::apply_prompt_caching(&mut body, req, self.prompt_caching);
+                body
+            }
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let timeout = self.request_timeout(req);
@@ -387,7 +396,11 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req, true)?,
+            Publisher::Anthropic => {
+                let mut body = claude::translate_request(req, true)?;
+                crate::providers::anthropic::apply_prompt_caching(&mut body, req, self.prompt_caching);
+                body
+            }
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
         let timeout = self.request_timeout(req);
@@ -1031,6 +1044,42 @@ mod tests {
         let bodies = seen.lock().unwrap();
         assert_eq!(bodies[0]["stream"], true);
         assert_base64_image_on_the_wire(&bodies[0]);
+    }
+
+    #[tokio::test]
+    async fn claude_calls_mark_the_system_prompt_for_prompt_caching() {
+        let (base, seen, _s) = serve_recording_claude().await;
+        let mut r = req("anthropic/claude-sonnet-4-5");
+        r.messages = vec![
+            serde_json::json!({"role": "system", "content": "Stable instructions."}),
+            serde_json::json!({"role": "user", "content": "Question."}),
+        ];
+        let a = adapter(&base, "global");
+        a.complete(&r).await.unwrap();
+        collect(a.stream(&r).await.unwrap()).await;
+        for body in seen.lock().unwrap().iter() {
+            assert_eq!(body["system"][0]["text"], "Stable instructions.", "{body}");
+            assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_calls_drop_a_blank_system_prompt_instead_of_marking_it() {
+        let (base, seen, _s) = serve_recording_claude().await;
+        let mut r = req("anthropic/claude-sonnet-4-5");
+        r.messages = vec![
+            serde_json::json!({"role": "system", "content": ""}),
+            serde_json::json!({"role": "user", "content": "Question."}),
+        ];
+        let a = adapter(&base, "global");
+        a.complete(&r).await.unwrap();
+        collect(a.stream(&r).await.unwrap()).await;
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            assert!(body.get("system").is_none(), "{body}");
+            assert!(!body.to_string().contains("cache_control"), "{body}");
+        }
     }
 
     #[tokio::test]

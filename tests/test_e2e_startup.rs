@@ -280,3 +280,62 @@ async fn fixture_starts_a_healthy_server() {
     let body: serde_json::Value = resp.json().await.expect("health returns JSON");
     assert_eq!(body["status"], "ok", "unexpected health body: {body}");
 }
+
+/// `[logging] format = "json"`: everything `serve` writes while starting and
+/// serving a request is one JSON object per line.
+#[tokio::test]
+#[ignore = "e2e: spawns the real binary"]
+async fn json_log_format_writes_only_json_lines() {
+    let mock = MockLlm::start().await;
+    let router = RouterProcess::start(
+        RouterOptions::new(mock.base_url()).with_extra_toml("\n[logging]\nformat = \"json\"\n"),
+    )
+    .await;
+    let key = router.create_user_and_key("alice");
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", router.base_url()))
+        .bearer_auth(&key)
+        .json(&serde_json::json!({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("POST completions");
+    assert!(resp.status().is_success(), "completion failed: {}", router.logs());
+
+    let logs = router.logs();
+    let lines: Vec<&str> = logs.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "serve wrote no log lines");
+    for line in lines {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("non-JSON log line ({e}): {line}\n--- log ---\n{logs}"));
+        assert!(v.is_object() && v["level"].is_string(), "not a log object: {line}");
+    }
+}
+
+/// `[gateway.bootstrap]`: a fresh install serves an LLM call with the seeded
+/// key and no `user create` / `key create` step.
+#[tokio::test]
+#[ignore = "e2e: spawns the real binary"]
+async fn gateway_bootstrap_key_serves_a_call_on_a_fresh_install() {
+    let mock = MockLlm::start().await;
+    let key = "mr-seeded-by-the-deployment";
+    let router = RouterProcess::start(RouterOptions::new(mock.base_url()).with_extra_toml(format!(
+        "\n[gateway.bootstrap]\nuser = \"svc\"\nkey = \"{key}\"\n"
+    )))
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", router.base_url()))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("POST completions");
+    assert!(
+        resp.status().is_success(),
+        "seeded key was refused: {}\n--- log ---\n{}",
+        resp.status(),
+        router.logs()
+    );
+    assert_eq!(mock.requests().len(), 1, "the call reached the provider");
+    assert!(!router.logs().contains(key), "the raw key was logged");
+}

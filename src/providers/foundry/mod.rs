@@ -23,8 +23,10 @@
 pub mod adapter;
 pub mod auth;
 pub mod catalog;
+pub mod claude;
 pub mod embed;
 pub mod endpoint;
+pub mod retail_pricing;
 
 pub use adapter::FoundryAdapter;
 pub use embed::FoundryEmbeddingAdapter;

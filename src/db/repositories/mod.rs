@@ -1,5 +1,6 @@
 pub mod app_settings;
 pub mod aliases;
+pub mod learned_capabilities;
 pub mod groups;
 pub mod webhook_callbacks;
 pub mod models;
@@ -19,6 +20,7 @@ pub mod sessions;
 pub mod users;
 
 pub use aliases::AliasRepository;
+pub use learned_capabilities::LearnedCapabilityRepository;
 pub use groups::GroupRepository;
 pub use webhook_callbacks::WebhookCallbackRepository;
 pub use models::ModelRepository;

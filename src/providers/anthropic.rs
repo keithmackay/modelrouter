@@ -20,6 +20,8 @@ pub struct AnthropicAdapter {
     /// uses when a request's `request_model` doesn't name a known tier.
     default_timeout_secs: u64,
     tier_timeouts: TierTimeoutsConfig,
+    /// Automatic `cache_control` breakpoints (see [`apply_prompt_caching`]).
+    prompt_caching: bool,
 }
 
 impl AnthropicAdapter {
@@ -37,6 +39,7 @@ impl AnthropicAdapter {
             client,
             default_timeout_secs: config.timeout_secs,
             tier_timeouts,
+            prompt_caching: config.prompt_caching,
         }
     }
 }
@@ -420,8 +423,28 @@ struct AnthropicUsage {
     output_tokens_details: serde_json::Value,
 }
 
+/// A Messages API response body as a [`CompletionResult`] (no `ttft_ms`; the
+/// caller times the request).
+pub(crate) fn completion_from_response(body: serde_json::Value) -> anyhow::Result<CompletionResult> {
+    let parsed: AnthropicResponse =
+        serde_json::from_value(body).context("Failed to parse Anthropic response")?;
+    Ok(CompletionResult {
+        content: text_from_content(&parsed.content),
+        prompt_tokens: parsed.usage.input_tokens,
+        completion_tokens: parsed.usage.output_tokens,
+        finish_reason: map_stop_reason(parsed.stop_reason.as_deref().unwrap_or("end_turn")),
+        cache_read_tokens: parsed.usage.cache_read_input_tokens,
+        cache_write_tokens: parsed.usage.cache_creation_input_tokens,
+        reasoning_tokens: parsed.usage.output_tokens_details["thinking_tokens"]
+            .as_u64()
+            .map(|n| n as u32),
+        ttft_ms: None,
+        tool_calls: tool_calls_from_content(&parsed.content),
+    })
+}
+
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Fold the request's OpenAI-shaped tools into an Anthropic body (issue #88).
 /// `tool_choice` only rides along with tools — Anthropic rejects it alone.
@@ -451,6 +474,105 @@ pub(crate) fn apply_reasoning(body: &mut serde_json::Value, req: &NormalizedRequ
     }
 }
 
+const CACHE_BREAKPOINT_LIMIT: usize = 4;
+
+/// Content-block types Anthropic accepts a `cache_control` breakpoint on.
+const CACHEABLE_BLOCK_TYPES: [&str; 5] = ["text", "image", "tool_use", "tool_result", "document"];
+
+fn ephemeral() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+/// Breakpoints a body already carries in its message content blocks.
+fn message_breakpoints(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|block| block.get("cache_control").is_some())
+        .count()
+}
+
+/// Did the caller mark any of its system messages (or their blocks) for caching?
+fn system_marked_by_caller(req: &NormalizedRequest) -> bool {
+    req.messages.iter().filter(|m| m["role"] == "system").any(|m| {
+        m.get("cache_control").is_some()
+            || m["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
+    })
+}
+
+/// Mark the last content block of the last message, wrapping string content
+/// in a text block first. Skipped when that block is not a cacheable type.
+fn mark_conversation_tail(messages: &mut [serde_json::Value]) -> bool {
+    let Some(last) = messages.last_mut() else { return false };
+    if let Some(text) = last["content"].as_str() {
+        if text.is_empty() {
+            return false;
+        }
+        last["content"] = serde_json::json!([{"type": "text", "text": text}]);
+    }
+    let Some(block) = last["content"].as_array_mut().and_then(|blocks| blocks.last_mut()) else {
+        return false;
+    };
+    if !block["type"].as_str().is_some_and(|t| CACHEABLE_BLOCK_TYPES.contains(&t)) {
+        return false;
+    }
+    block["cache_control"] = ephemeral();
+    true
+}
+
+/// Anthropic prompt caching. Claude caches only prompt prefixes that carry an
+/// explicit `cache_control` breakpoint, so without one every call bills its
+/// full input. Shared by the direct adapter and Claude-on-Vertex.
+///
+/// - The system prompt (with the tools, which render before it) gets a
+///   breakpoint: it is the prefix most likely to repeat across calls. A
+///   caller's own marker on a system message is honoured the same way, even
+///   when automatic caching is off (system text is flattened, so the marker
+///   moves to the end of the system prompt).
+/// - A multi-turn request (agent and tool loops) also marks the last block of
+///   its last message, so the next turn reads the whole conversation back.
+///   A single-turn request is not marked there: its tail is usually unique,
+///   and marking it would pay the cache-write premium on bytes never read.
+/// - Messages the caller marked itself are left alone, and the total never
+///   exceeds Anthropic's four breakpoints.
+///
+/// A prefix shorter than the model's cacheable minimum is simply not cached;
+/// the API does not reject the marker.
+pub(crate) fn apply_prompt_caching(
+    body: &mut serde_json::Value,
+    req: &NormalizedRequest,
+    automatic: bool,
+) {
+    let caller_marked_system = system_marked_by_caller(req);
+    let mut breakpoints = body["messages"].as_array().map_or(0, |m| message_breakpoints(m));
+    // A blank system prompt is dropped, never marked: the API rejects
+    // `cache_control` on an empty text block.
+    if body["system"].as_str().is_some_and(|s| s.trim().is_empty()) {
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("system");
+        }
+    }
+    if let Some(system) = body["system"].as_str().map(str::to_string) {
+        if (automatic || caller_marked_system) && breakpoints < CACHE_BREAKPOINT_LIMIT {
+            body["system"] = serde_json::json!([
+                {"type": "text", "text": system, "cache_control": ephemeral()}
+            ]);
+            breakpoints += 1;
+        }
+    }
+    if !automatic || breakpoints >= CACHE_BREAKPOINT_LIMIT {
+        return;
+    }
+    let Some(messages) = body["messages"].as_array_mut() else { return };
+    if messages.len() < 2 || message_breakpoints(messages) > 0 {
+        return;
+    }
+    mark_conversation_tail(messages);
+}
+
 /// Thinking tokens from an Anthropic `usage` object
 /// (`output_tokens_details.thinking_tokens`), when reported. They are already
 /// included in `output_tokens`; this is the breakdown.
@@ -463,7 +585,7 @@ pub(crate) fn thinking_tokens_from_usage(usage: &serde_json::Value) -> Option<u3
 /// The Anthropic Messages body for an OpenAI-shaped request — one builder for
 /// the non-streaming and streaming calls, so both carry the same message,
 /// image, tool and reasoning translation.
-fn build_body(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
+pub(crate) fn build_body(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
     let (system_text, messages) = translate_messages(&req.messages);
     let mut body = serde_json::json!({
         "model": req.model,
@@ -485,7 +607,7 @@ fn build_body(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
 
 
 /// Translate an Anthropic event-stream body into OpenAI-compatible chunks.
-fn translate_sse_stream(
+pub(crate) fn translate_sse_stream(
     body: impl futures::Stream<Item = anyhow::Result<Bytes>> + Send + 'static,
 ) -> SseStream {
     // One translator per stream: usage arrives split across events
@@ -508,7 +630,8 @@ fn translate_sse_stream(
 #[async_trait::async_trait]
 impl ProviderAdapter for AnthropicAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
-        let body = build_body(req, false);
+        let mut body = build_body(req, false);
+        apply_prompt_caching(&mut body, req, self.prompt_caching);
 
         let timeout_secs = self
             .tier_timeouts
@@ -534,28 +657,18 @@ impl ProviderAdapter for AnthropicAdapter {
             anyhow::bail!("Anthropic returned {}: {}", status, text);
         }
 
-        let parsed: AnthropicResponse = resp
+        let body: serde_json::Value = resp
             .json()
             .await
             .context("Failed to parse Anthropic response")?;
-
-        Ok(CompletionResult {
-            content: text_from_content(&parsed.content),
-            prompt_tokens: parsed.usage.input_tokens,
-            completion_tokens: parsed.usage.output_tokens,
-            finish_reason: map_stop_reason(parsed.stop_reason.as_deref().unwrap_or("end_turn")),
-            cache_read_tokens: parsed.usage.cache_read_input_tokens,
-            cache_write_tokens: parsed.usage.cache_creation_input_tokens,
-            reasoning_tokens: parsed.usage.output_tokens_details["thinking_tokens"]
-                .as_u64()
-                .map(|n| n as u32),
-            ttft_ms: Some(ttft_ms),
-            tool_calls: tool_calls_from_content(&parsed.content),
-        })
+        let mut result = completion_from_response(body)?;
+        result.ttft_ms = Some(ttft_ms);
+        Ok(result)
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
-        let body = build_body(req, true);
+        let mut body = build_body(req, true);
+        apply_prompt_caching(&mut body, req, self.prompt_caching);
 
         let timeout_secs = self
             .tier_timeouts
@@ -617,6 +730,9 @@ impl ProviderAdapter for AnthropicAdapter {
 pub struct AnthropicSseTranslator {
     input_tokens: u32,
     cache_read_input_tokens: u32,
+    /// Prompt tokens written to the provider's prompt cache. Anthropic bills
+    /// them at the cache-write rate and leaves them out of `input_tokens`.
+    cache_creation_input_tokens: u32,
     output_tokens: u32,
     /// `output_tokens_details.thinking_tokens`, when the provider reported it.
     thinking_tokens: Option<u32>,
@@ -646,6 +762,9 @@ impl AnthropicSseTranslator {
         }
         if let Some(n) = usage["cache_read_input_tokens"].as_u64() {
             self.cache_read_input_tokens = n as u32;
+        }
+        if let Some(n) = usage["cache_creation_input_tokens"].as_u64() {
+            self.cache_creation_input_tokens = n as u32;
         }
         if let Some(n) = usage["output_tokens"].as_u64() {
             self.output_tokens = n as u32;
@@ -736,15 +855,21 @@ impl AnthropicSseTranslator {
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
                 });
                 if self.saw_usage {
-                    // OpenAI's `prompt_tokens` is the whole prompt, cached
-                    // tokens included; `cached_tokens` names the subset.
-                    let prompt_tokens = self.input_tokens + self.cache_read_input_tokens;
+                    // OpenAI's `prompt_tokens` is the whole prompt, cache
+                    // reads and writes included; `cached_tokens` names the
+                    // reads and `cache_creation_tokens` (an extension OpenAI
+                    // clients ignore) the writes, so the ledger can bill each
+                    // at its own rate.
+                    let prompt_tokens = self.input_tokens
+                        + self.cache_read_input_tokens
+                        + self.cache_creation_input_tokens;
                     chunk["usage"] = serde_json::json!({
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": self.output_tokens,
                         "total_tokens": prompt_tokens + self.output_tokens,
                         "prompt_tokens_details": {
-                            "cached_tokens": self.cache_read_input_tokens
+                            "cached_tokens": self.cache_read_input_tokens,
+                            "cache_creation_tokens": self.cache_creation_input_tokens
                         }
                     });
                     if let Some(thinking) = self.thinking_tokens {
@@ -1297,6 +1422,153 @@ mod tool_translation_tests {
 }
 
 #[cfg(test)]
+mod prompt_caching_tests {
+    use super::{apply_prompt_caching, NormalizedRequest};
+    use serde_json::json;
+
+    fn request(messages: Vec<serde_json::Value>) -> NormalizedRequest {
+        NormalizedRequest { messages, ..Default::default() }
+    }
+
+    fn body_for(req: &NormalizedRequest, automatic: bool) -> serde_json::Value {
+        let mut body = super::build_body(req, false);
+        apply_prompt_caching(&mut body, req, automatic);
+        body
+    }
+
+    fn breakpoints(body: &serde_json::Value) -> usize {
+        body.to_string().matches("cache_control").count()
+    }
+
+    #[test]
+    fn single_turn_marks_only_the_system_prompt() {
+        let req = request(vec![
+            json!({"role": "system", "content": "Stable instructions."}),
+            json!({"role": "user", "content": "A unique question."}),
+        ]);
+        let body = body_for(&req, true);
+        assert_eq!(
+            body["system"],
+            json!([{"type": "text", "text": "Stable instructions.", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert_eq!(body["messages"][0]["content"], "A unique question.");
+        assert_eq!(breakpoints(&body), 1);
+    }
+
+    #[test]
+    fn a_blank_system_prompt_is_dropped_not_marked() {
+        for system in ["", "  \n"] {
+            let req = request(vec![
+                json!({"role": "system", "content": system}),
+                json!({"role": "user", "content": "A unique question."}),
+            ]);
+            let body = body_for(&req, true);
+            assert!(body.get("system").is_none(), "{body}");
+            assert_eq!(breakpoints(&body), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn multi_turn_also_marks_the_conversation_tail() {
+        let req = request(vec![
+            json!({"role": "system", "content": "Stable instructions."}),
+            json!({"role": "user", "content": "First."}),
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "result"}),
+        ]);
+        let body = body_for(&req, true);
+        let tail = body["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(tail["content"][0]["type"], "tool_result");
+        assert_eq!(tail["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(breakpoints(&body), 2);
+    }
+
+    #[test]
+    fn a_string_tail_is_wrapped_in_a_text_block_to_carry_the_marker() {
+        let req = request(vec![
+            json!({"role": "user", "content": "First."}),
+            json!({"role": "assistant", "content": "Answer."}),
+            json!({"role": "user", "content": "Follow-up."}),
+        ]);
+        let body = body_for(&req, true);
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([{"type": "text", "text": "Follow-up.", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn switched_off_adds_nothing() {
+        let req = request(vec![
+            json!({"role": "system", "content": "Stable instructions."}),
+            json!({"role": "user", "content": "First."}),
+            json!({"role": "assistant", "content": "Answer."}),
+            json!({"role": "user", "content": "Follow-up."}),
+        ]);
+        let body = body_for(&req, false);
+        assert_eq!(body["system"], "Stable instructions.");
+        assert_eq!(breakpoints(&body), 0);
+    }
+
+    #[test]
+    fn a_caller_marked_system_message_is_honoured_even_when_switched_off() {
+        let req = request(vec![
+            json!({"role": "system", "content": [
+                {"type": "text", "text": "Stable instructions.", "cache_control": {"type": "ephemeral"}}
+            ]}),
+            json!({"role": "user", "content": "Question."}),
+        ]);
+        let body = body_for(&req, false);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(breakpoints(&body), 1);
+    }
+
+    #[test]
+    fn caller_markers_in_messages_suppress_the_automatic_tail() {
+        let req = request(vec![
+            json!({"role": "system", "content": "Stable instructions."}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "Shared page.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Per-call question."}
+            ]}),
+            json!({"role": "assistant", "content": "Answer."}),
+            json!({"role": "user", "content": "Follow-up."}),
+        ]);
+        let body = body_for(&req, true);
+        assert_eq!(body["messages"][2]["content"], "Follow-up.");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(breakpoints(&body), 2);
+    }
+
+    #[test]
+    fn never_exceeds_four_breakpoints() {
+        let marked = |t: &str| json!({"type": "text", "text": t, "cache_control": {"type": "ephemeral"}});
+        let req = request(vec![
+            json!({"role": "system", "content": "Stable instructions."}),
+            json!({"role": "user", "content": [marked("a"), marked("b")]}),
+            json!({"role": "assistant", "content": [marked("c")]}),
+            json!({"role": "user", "content": [marked("d")]}),
+        ]);
+        let body = body_for(&req, true);
+        assert_eq!(body["system"], "Stable instructions.");
+        assert_eq!(breakpoints(&body), 4);
+    }
+
+    #[test]
+    fn a_tail_block_that_cannot_carry_a_marker_is_left_alone() {
+        let req = request(vec![
+            json!({"role": "user", "content": "First."}),
+            json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "s"}]}),
+        ]);
+        let body = body_for(&req, true);
+        assert_eq!(breakpoints(&body), 0);
+    }
+}
+
+#[cfg(test)]
 mod sse_translator_tests {
     use super::AnthropicSseTranslator;
 
@@ -1332,6 +1604,27 @@ mod sse_translator_tests {
         assert_eq!(v["usage"]["total_tokens"], 57);
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 10);
         assert!(out.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn cache_writes_reach_the_final_chunk_and_count_in_prompt_tokens() {
+        let mut t = AnthropicSseTranslator::new();
+        let out = lines(
+            &mut t,
+            &[
+                r#"data: {"type":"message_start","message":{"usage":{"input_tokens":40,"cache_read_input_tokens":10,"cache_creation_input_tokens":300,"output_tokens":1}}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+            ],
+        );
+        let final_chunk = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .rfind(|d| *d != "[DONE]")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(final_chunk).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 350);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 10);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cache_creation_tokens"], 300);
     }
 
     #[test]

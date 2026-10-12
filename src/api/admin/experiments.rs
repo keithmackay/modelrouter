@@ -97,7 +97,7 @@ fn require_bool(body: &Value, field: &str) -> Result<bool, String> {
 
 /// `expires_at`: an RFC3339 timestamp in the future, or the number `0` for
 /// never. Any other number is refused rather than guessed at as an epoch.
-fn parse_expires_at(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
+pub(crate) fn parse_expires_at(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
     match require(body, "expires_at")? {
         Value::Number(n) if n.as_i64() == Some(0) => Ok(0),
         Value::Number(_) => Err("expires_at must be an RFC3339 timestamp or 0 (never)".to_string()),
@@ -272,10 +272,17 @@ impl<'a> GateSources<'a> {
 /// says which check failed.
 fn gate_target(gate: &GateSources<'_>, label: &str, key: &str, expr: &str) -> Result<VariantTarget, String> {
     let at = format!("variants: variant '{label}' key '{key}' target '{expr}'");
+    pin_target(gate, &at, expr)
+}
 
+/// Resolve and pin one target expression, refusing a pool, a substitution,
+/// an unconfigured provider and an unpriced model. `at` names the target in
+/// the refusal. Shared by experiment variants and scoped alias overrides,
+/// which pin targets the same way.
+pub(crate) fn pin_target(gate: &GateSources<'_>, at: &str, expr: &str) -> Result<VariantTarget, String> {
     if gate.load_balancer.is_pool(expr) {
         return Err(format!(
-            "{at} is a load balancer pool; an experiment must pin one provider/model"
+            "{at} is a load balancer pool; a pinned target must be one provider/model"
         ));
     }
 

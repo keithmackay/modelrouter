@@ -888,3 +888,132 @@ async fn the_registry_applies_tier_timeouts_that_outlast_the_flat_timeout() {
         "expected the flat timeout to apply, got: {err:#}"
     );
 }
+
+// ── tools on the OpenAI-shaped surface ──────────────────────────────────────
+
+fn tool_call_payload() -> serde_json::Value {
+    json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "model": DEPLOYMENT,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"revenue\"}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}
+    })
+}
+
+fn tool_req(model: &str) -> NormalizedRequest {
+    NormalizedRequest {
+        tools: Some(vec![json!({
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}
+        })]),
+        tool_choice: Some(json!("auto")),
+        ..req(model)
+    }
+}
+
+/// An OpenAI-shaped deployment (anything not listed in `anthropic_deployments`)
+/// takes tools natively on the OpenAI v1 surface: the gate must not refuse them.
+#[test]
+fn openai_shaped_deployments_support_tools() {
+    let adapter = static_adapter(&config("https://res.services.ai.azure.com"));
+    assert!(adapter.supports_tools(DEPLOYMENT));
+    assert!(adapter.supports_tools("gpt-4.1"));
+}
+
+/// Tools and tool_choice ride on the body verbatim; tool calls come back on
+/// the result with finish_reason `tool_calls`, so an agentic caller sees the
+/// call instead of an empty completion.
+#[tokio::test]
+async fn tools_pass_through_and_tool_calls_parse_back_on_the_openai_surface() {
+    let (base, capture) = spawn_foundry(StatusCode::OK, tool_call_payload(), embeddings_payload(), models_payload(), None).await;
+    let adapter = static_adapter(&config(&base));
+
+    let result = adapter.complete(&tool_req(DEPLOYMENT)).await.unwrap();
+
+    assert_eq!(result.finish_reason, "tool_calls");
+    assert_eq!(result.content, "");
+    let calls = result.tool_calls.expect("tool calls parsed back");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"q\":\"revenue\"}");
+
+    let c = capture.lock().unwrap();
+    assert_eq!(c.bodies[0]["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(c.bodies[0]["tool_choice"], "auto");
+}
+
+/// A request without tools sends neither field (an empty `tools` array is
+/// rejected by some deployments).
+#[tokio::test]
+async fn a_request_without_tools_sends_no_tools_fields() {
+    let (base, capture) = spawn_ok().await;
+    let adapter = static_adapter(&config(&base));
+    let result = adapter.complete(&req(DEPLOYMENT)).await.unwrap();
+    assert!(result.tool_calls.is_none());
+    let c = capture.lock().unwrap();
+    assert!(c.bodies[0].get("tools").is_none());
+    assert!(c.bodies[0].get("tool_choice").is_none());
+}
+
+/// Streaming carries the tools on the request; the SSE (tool-call deltas
+/// included) is passed through untouched, as for any OpenAI-shaped stream.
+#[tokio::test]
+async fn streaming_with_tools_sends_them_on_the_request() {
+    let (base, capture) = spawn_ok().await;
+    let adapter = static_adapter(&config(&base));
+    let mut r = tool_req(DEPLOYMENT);
+    r.stream = true;
+    let _ = adapter.stream(&r).await.unwrap();
+    let c = capture.lock().unwrap();
+    assert_eq!(c.bodies[0]["stream"], true);
+    assert_eq!(c.bodies[0]["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(c.bodies[0]["tool_choice"], "auto");
+}
+
+// ── configured deployments as the catalog ───────────────────────────────────
+
+/// On an AI Services resource the OpenAI v1 `GET /models` lists the BASE-model
+/// catalog (dozens of models nobody deployed), not the resource's deployments.
+/// With `deployments` configured the catalog is exactly those names, plus the
+/// Claude deployments, and the endpoint's listing is not called.
+#[tokio::test]
+async fn configured_deployments_are_the_catalog_and_the_listing_is_not_called() {
+    let (base, capture) = spawn_ok().await;
+    let cfg = ProviderConfig {
+        deployments: vec!["gpt-4.1".into(), "gpt-4.1-mini".into(), "gpt-4.1".into()],
+        anthropic_deployments: vec!["claude-sonnet-x".into()],
+        ..config(&base)
+    };
+    let models = static_adapter(&cfg).list_models().await.unwrap();
+    let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["gpt-4.1", "gpt-4.1-mini", "claude-sonnet-x"]);
+    assert!(models.iter().all(|m| m.provider == "foundry"));
+    assert!(capture.lock().unwrap().paths.is_empty(), "no listing call when deployments are configured");
+}
+
+/// GPT-5-family and o-series deployments reject `max_tokens` on Azure and take
+/// `max_completion_tokens`; everything else keeps `max_tokens`.
+#[tokio::test]
+async fn reasoning_deployments_send_max_completion_tokens_instead_of_max_tokens() {
+    let (base, capture) = spawn_ok().await;
+    let adapter = static_adapter(&config(&base));
+    adapter.complete(&req("gpt-5.5")).await.unwrap();
+    adapter.complete(&req("gpt-4.1")).await.unwrap();
+    let c = capture.lock().unwrap();
+    assert_eq!(c.bodies[0]["max_completion_tokens"], 8);
+    assert!(c.bodies[0].get("max_tokens").is_none());
+    assert_eq!(c.bodies[1]["max_tokens"], 8);
+    assert!(c.bodies[1].get("max_completion_tokens").is_none());
+}

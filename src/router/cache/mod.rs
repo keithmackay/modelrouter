@@ -77,6 +77,9 @@ pub struct CachePolicy {
     pub search: SearchCachePolicy,
     /// See [`CacheConfig::allow_header_opt_in`]. Config-only.
     pub allow_header_opt_in: bool,
+    /// See [`CacheConfig::require_opt_in`]. Config-only.
+    #[serde(default)]
+    pub require_opt_in: bool,
     /// See [`CacheConfig::max_ttl_seconds`]. Config-only.
     pub max_ttl_seconds: u64,
     /// See [`CacheConfig::namespaces`]. Config-only.
@@ -91,6 +94,7 @@ impl CachePolicy {
             completions: config.completions.clone(),
             search: config.search.clone(),
             allow_header_opt_in: config.allow_header_opt_in,
+            require_opt_in: config.require_opt_in,
             max_ttl_seconds: config.max_ttl_seconds,
             namespaces: config.namespaces.clone(),
         }
@@ -160,6 +164,12 @@ pub struct CacheStats {
     pub entries: u64,
     pub hit_rate: f64,
     pub saved_usd: f64,
+    /// `cache.require_opt_in`: only requests carrying `use`/`refresh` are cached.
+    pub require_opt_in: bool,
+    /// Requests skipped under `require_opt_in` because they carried no
+    /// `x-modelrouter-cache` header. A rising count names a caller that is
+    /// not opting in.
+    pub skipped_without_opt_in: u64,
     pub by_model: Vec<ModelCacheStats>,
     /// Traffic that carried `x-modelrouter-cache-namespace`, per namespace.
     /// Requests without one appear only in the totals.
@@ -234,6 +244,7 @@ pub struct ResponseCache {
     misses: AtomicU64,
     stores: AtomicU64,
     saved_micro_usd: AtomicU64,
+    skipped_without_opt_in: AtomicU64,
     by_model: DashMap<String, Counters>,
     by_namespace: DashMap<String, Counters>,
 }
@@ -257,6 +268,7 @@ impl ResponseCache {
             misses: AtomicU64::new(0),
             stores: AtomicU64::new(0),
             saved_micro_usd: AtomicU64::new(0),
+            skipped_without_opt_in: AtomicU64::new(0),
             by_model: DashMap::new(),
             by_namespace: DashMap::new(),
         }
@@ -348,19 +360,26 @@ impl ResponseCache {
     /// `/v1/messages`) under the caller's `mode`.
     pub fn completion_plan(&self, mode: CacheMode, body: &Value) -> CachePlan {
         let policy = self.policy.load();
-        CachePlan::decide(
-            mode,
-            policy.enabled && policy.completions.enabled,
-            self.completion_eligible(body),
-            policy.allow_header_opt_in,
-        )
+        let enabled = policy.enabled && policy.completions.enabled;
+        let eligible = self.completion_eligible(body);
+        self.plan(&policy, mode, enabled, eligible)
     }
 
     /// The plan for a search under the caller's `mode`.
     pub fn search_plan(&self, mode: CacheMode) -> CachePlan {
         let policy = self.policy.load();
         let enabled = policy.enabled && policy.search.enabled;
-        CachePlan::decide(mode, enabled, enabled, policy.allow_header_opt_in)
+        self.plan(&policy, mode, enabled, enabled)
+    }
+
+    /// Under `require_opt_in` nothing is eligible by default: only `use` and
+    /// `refresh` reach the cache.
+    fn plan(&self, policy: &CachePolicy, mode: CacheMode, enabled: bool, eligible: bool) -> CachePlan {
+        if policy.require_opt_in && enabled && mode == CacheMode::Default {
+            self.skipped_without_opt_in.fetch_add(1, Ordering::Relaxed);
+        }
+        let eligible = eligible && !policy.require_opt_in;
+        CachePlan::decide(mode, enabled, eligible, policy.allow_header_opt_in)
     }
 
     // ── Typed access ──────────────────────────────────────────────────────────
@@ -617,6 +636,8 @@ impl ResponseCache {
             entries: self.store.entry_count().await,
             hit_rate: hit_rate(hits, misses),
             saved_usd: self.saved_micro_usd.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            require_opt_in: policy.require_opt_in,
+            skipped_without_opt_in: self.skipped_without_opt_in.load(Ordering::Relaxed),
             by_model,
             by_namespace,
         }
@@ -693,12 +714,46 @@ pub fn messages_cache_key(resolved_model: &str, body: &Value) -> String {
 }
 
 /// Full store key for a search: `search:{engine_fp}:{hash(engine, query, options)}`.
-pub fn search_cache_key(engine: &str, query: &str, max_results: Option<u32>) -> String {
-    let canonical = serde_json::json!({
+/// The parts of a search request, beyond engine, query and count, that change
+/// the payload: what shapes a generated answer, the age filter, and the
+/// engine's result format. Each is part of the key.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SearchAnswerKey<'a> {
+    pub include_answer: bool,
+    pub instructions: Option<&'a str>,
+    pub context: Option<&'a str>,
+    pub max_follow_up_queries: u32,
+    pub freshness: Option<&'a str>,
+    /// `search_registry::result_format` for the engine: a change to how the
+    /// engine builds its results retires what was cached before it.
+    pub result_format: Option<&'a str>,
+}
+
+pub fn search_cache_key(
+    engine: &str,
+    query: &str,
+    max_results: Option<u32>,
+    answer: &SearchAnswerKey<'_>,
+) -> String {
+    let mut canonical = serde_json::json!({
         "engine": engine,
         "query": query,
         "max_results": max_results,
     });
+    // Only keyed when set, so keys for plain requests are unchanged.
+    if answer.include_answer {
+        canonical["answer"] = serde_json::json!({
+            "instructions": answer.instructions,
+            "context": answer.context,
+            "max_follow_up_queries": answer.max_follow_up_queries,
+        });
+    }
+    if let Some(freshness) = answer.freshness {
+        canonical["freshness"] = serde_json::json!(freshness);
+    }
+    if let Some(format) = answer.result_format {
+        canonical["result_format"] = serde_json::json!(format);
+    }
     format!(
         "{}:{}:{}",
         CLASS_SEARCH,

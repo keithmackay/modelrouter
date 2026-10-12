@@ -1,4 +1,7 @@
 pub mod aliases;
+pub mod scoped_aliases;
+pub mod learned_capabilities;
+pub mod pricing;
 pub mod auth;
 pub mod attribution;
 pub mod audit;
