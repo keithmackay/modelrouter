@@ -13,6 +13,7 @@ use crate::providers::adapter::{
 };
 use crate::providers::vertex::auth::{send_with_401_retry, GoogleCloudAuthProvider, TokenProvider};
 use crate::providers::vertex::dispatch::{parse_model_id, Publisher};
+use crate::providers::stream_fallback::{completion_sse, open_within, ByteStream, Opened};
 use crate::providers::vertex::{claude, gemini, maas};
 
 /// Build the full Vertex REST URL for a given (project, region, publisher, model).
@@ -109,6 +110,11 @@ pub struct VertexAdapter {
     /// only way to exercise request translation, error passthrough and SSE
     /// rewriting is a live Google Cloud project.
     api_base: Option<String>,
+    /// Automatic `cache_control` breakpoints on Claude requests (see
+    /// [`crate::providers::anthropic::apply_prompt_caching`]).
+    prompt_caching: bool,
+    /// `stream_first_byte_timeout_secs` (0 = no first-byte fallback).
+    stream_first_byte_timeout_secs: u64,
 }
 
 /// Point a Vertex URL at `base` instead of googleapis.com, preserving the path.
@@ -158,6 +164,8 @@ impl VertexAdapter {
             tier_timeouts: TierTimeoutsConfig::default(),
             catalog_base: None,
             api_base: None,
+            prompt_caching: config.prompt_caching,
+            stream_first_byte_timeout_secs: config.stream_first_byte_timeout_secs,
         })
     }
 
@@ -185,7 +193,15 @@ impl VertexAdapter {
             tier_timeouts: TierTimeoutsConfig::default(),
             catalog_base: None,
             api_base: None,
+            prompt_caching: true,
+            stream_first_byte_timeout_secs: crate::config::schema::DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_SECS,
         })
+    }
+
+    /// Test hook: set the streaming first-byte window (`0` = no fallback).
+    pub fn with_stream_first_byte_timeout(mut self, secs: u64) -> Self {
+        self.stream_first_byte_timeout_secs = secs;
+        self
     }
 
     /// Apply the configured `[tier_timeouts]` table. The serving path
@@ -345,7 +361,11 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req, false)?,
+            Publisher::Anthropic => {
+                let mut body = claude::translate_request(req, false)?;
+                crate::providers::anthropic::apply_prompt_caching(&mut body, req, self.prompt_caching);
+                body
+            }
             Publisher::Maas => maas::translate_request(req, &model, false),
         };
         let timeout = self.request_timeout(req);
@@ -387,21 +407,42 @@ impl ProviderAdapter for VertexAdapter {
         );
         let body = match publisher {
             Publisher::Google => gemini::translate_request(req),
-            Publisher::Anthropic => claude::translate_request(req, true)?,
+            Publisher::Anthropic => {
+                let mut body = claude::translate_request(req, true)?;
+                crate::providers::anthropic::apply_prompt_caching(&mut body, req, self.prompt_caching);
+                body
+            }
             Publisher::Maas => maas::translate_request(req, &model, true),
         };
         let timeout = self.request_timeout(req);
-        let resp = send_with_401_retry(
-            &self.token_provider,
-            "failed to send streaming request to Vertex AI",
-            |token| self.client.post(&url).bearer_auth(token).timeout(timeout).json(&body),
-        )
+        let window = std::time::Duration::from_secs(self.stream_first_byte_timeout_secs);
+        let opened = open_within(window, async {
+            let resp = send_with_401_retry(
+                &self.token_provider,
+                "failed to send streaming request to Vertex AI",
+                |token| self.client.post(&url).bearer_auth(token).timeout(timeout).json(&body),
+            )
+            .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Vertex AI streaming returned {}: {}", status, text);
+            }
+            Ok(Box::pin(resp.bytes_stream().map_err(|e| anyhow::anyhow!("stream error: {}", e))) as ByteStream)
+        })
         .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Vertex AI streaming returned {}: {}", status, text);
-        }
+        let raw = match opened {
+            Opened::Started(raw) => raw,
+            Opened::Silent => {
+                tracing::warn!(
+                    model = %req.model,
+                    window_secs = self.stream_first_byte_timeout_secs,
+                    "vertex: upstream sent no byte within the streaming first-byte window; answering with the non-streamed call"
+                );
+                let result = self.complete(req).await?;
+                return Ok(completion_sse(&result, &req.model));
+            }
+        };
 
         // Body chunks carry no line-boundary guarantee: one SSE event can be
         // split across chunks, and translating per-chunk drops both halves
@@ -418,9 +459,7 @@ impl ProviderAdapter for VertexAdapter {
         let mut claude_tx = crate::providers::anthropic::AnthropicSseTranslator::new();
         let gemini_tx = Arc::new(std::sync::Mutex::new(gemini::GeminiSseTranslator::new()));
         let gemini_tx_lines = gemini_tx.clone();
-        let translated = resp
-            .bytes_stream()
-            .map_err(|e| anyhow::anyhow!("stream error: {}", e))
+        let translated = raw
             .map_ok(move |chunk| {
                 pending.push_str(&String::from_utf8_lossy(&chunk));
                 let mut out = String::new();
@@ -1034,6 +1073,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_calls_mark_the_system_prompt_for_prompt_caching() {
+        let (base, seen, _s) = serve_recording_claude().await;
+        let mut r = req("anthropic/claude-sonnet-4-5");
+        r.messages = vec![
+            serde_json::json!({"role": "system", "content": "Stable instructions."}),
+            serde_json::json!({"role": "user", "content": "Question."}),
+        ];
+        let a = adapter(&base, "global");
+        a.complete(&r).await.unwrap();
+        collect(a.stream(&r).await.unwrap()).await;
+        for body in seen.lock().unwrap().iter() {
+            assert_eq!(body["system"][0]["text"], "Stable instructions.", "{body}");
+            assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_calls_drop_a_blank_system_prompt_instead_of_marking_it() {
+        let (base, seen, _s) = serve_recording_claude().await;
+        let mut r = req("anthropic/claude-sonnet-4-5");
+        r.messages = vec![
+            serde_json::json!({"role": "system", "content": ""}),
+            serde_json::json!({"role": "user", "content": "Question."}),
+        ];
+        let a = adapter(&base, "global");
+        a.complete(&r).await.unwrap();
+        collect(a.stream(&r).await.unwrap()).await;
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            assert!(body.get("system").is_none(), "{body}");
+            assert!(!body.to_string().contains("cache_control"), "{body}");
+        }
+    }
+
+    #[tokio::test]
     async fn claude_image_urls_are_refused_before_any_vertex_call(/* issue #86 */) {
         // Vertex accepts only base64 image sources: a URL is refused locally
         // with a clear message, on both calls, and Vertex is never contacted.
@@ -1285,5 +1360,125 @@ mod tests {
             .to_string();
         assert!(err.contains("429") && err.contains("quota exhausted"), "{err}");
         assert_eq!(provider.rebuild_calls(), 0, "a non-401 failure must not force a credential rebuild");
+    }
+
+    /// A Vertex stand-in for the first-byte fallback: `:streamRawPredict`
+    /// behaves as `stream` says, `:rawPredict` answers at once. Counts calls.
+    #[derive(Clone, Copy)]
+    enum StreamBehaviour {
+        /// Accepts the request and never sends a header.
+        NoHeaders,
+        /// Sends 200 and headers, then no body byte.
+        HeadersThenSilence,
+        /// Streams normally.
+        Streams,
+    }
+
+    async fn serve_stalling_vertex(
+        behaviour: StreamBehaviour,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (streams, completes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (s, c) = (streams.clone(), completes.clone());
+        let router = Router::new().fallback(post(move |uri: axum::http::Uri| {
+            let (s, c) = (s.clone(), c.clone());
+            async move {
+                if uri.path().ends_with(":streamRawPredict") {
+                    s.fetch_add(1, Ordering::SeqCst);
+                    match behaviour {
+                        StreamBehaviour::NoHeaders => futures::future::pending::<axum::response::Response>().await,
+                        StreamBehaviour::HeadersThenSilence => axum::body::Body::from_stream(
+                            futures::stream::pending::<Result<Bytes, std::io::Error>>(),
+                        )
+                        .into_response(),
+                        StreamBehaviour::Streams => "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"streamed\"}}\n\
+                             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n"
+                            .into_response(),
+                    }
+                } else {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "content": [{"type": "text", "text": "answered without streaming"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 4, "output_tokens": 3}
+                    }))
+                    .into_response()
+                }
+            }
+        }));
+        let (base, _handle) = serve(router).await;
+        (base, streams, completes)
+    }
+
+    fn haiku() -> NormalizedRequest {
+        req("anthropic/claude-haiku-4-5")
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_headers_inside_the_first_byte_window_is_answered_non_streamed() {
+        use std::sync::atomic::Ordering;
+        let (base, streams, completes) = serve_stalling_vertex(StreamBehaviour::NoHeaders).await;
+        let a = adapter(&base, "global").with_stream_first_byte_timeout(1);
+
+        let out = collect(a.stream(&haiku()).await.unwrap()).await;
+
+        assert!(out.contains("\"content\":\"answered without streaming\""), "{out}");
+        assert!(out.contains("\"usage\":{\"completion_tokens\":3"), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+        assert_eq!((streams.load(Ordering::SeqCst), completes.load(Ordering::SeqCst)), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_headers_but_no_body_byte_is_answered_non_streamed() {
+        use std::sync::atomic::Ordering;
+        let (base, streams, completes) = serve_stalling_vertex(StreamBehaviour::HeadersThenSilence).await;
+        let a = adapter(&base, "global").with_stream_first_byte_timeout(1);
+
+        let out = collect(a.stream(&haiku()).await.unwrap()).await;
+
+        assert!(out.contains("\"content\":\"answered without streaming\""), "{out}");
+        assert_eq!((streams.load(Ordering::SeqCst), completes.load(Ordering::SeqCst)), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_starts_is_never_answered_twice() {
+        use std::sync::atomic::Ordering;
+        let (base, streams, completes) = serve_stalling_vertex(StreamBehaviour::Streams).await;
+        let a = adapter(&base, "global").with_stream_first_byte_timeout(1);
+
+        let out = collect(a.stream(&haiku()).await.unwrap()).await;
+
+        assert!(out.contains("\"content\":\"streamed\""), "{out}");
+        assert_eq!(out.matches("[DONE]").count(), 1, "{out}");
+        assert_eq!((streams.load(Ordering::SeqCst), completes.load(Ordering::SeqCst)), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_zero_window_turns_the_fallback_off() {
+        use std::sync::atomic::Ordering;
+        let (base, _streams, completes) = serve_stalling_vertex(StreamBehaviour::NoHeaders).await;
+        let a = VertexAdapter::with_token_provider(
+            "proj".into(),
+            "global".into(),
+            Arc::new(StaticTokenProvider::new("tok".into())),
+            2,
+        )
+        .unwrap()
+        .with_api_base(base)
+        .with_stream_first_byte_timeout(0);
+
+        let err = a.stream(&haiku()).await.err().expect("the request ceiling ends a silent stream when the fallback is off");
+        assert!(is_timeout(&err), "{err:#}");
+        assert_eq!(completes.load(Ordering::SeqCst), 0, "no fallback call with the window off");
+    }
+
+    #[test]
+    fn the_first_byte_window_defaults_on_and_far_above_a_real_first_byte() {
+        let config = ProviderConfig::default();
+        assert_eq!(config.stream_first_byte_timeout_secs, 300);
+        let parsed: ProviderConfig = toml::from_str("timeout_secs = 60").unwrap();
+        assert_eq!(parsed.stream_first_byte_timeout_secs, 300);
+        let off: ProviderConfig = toml::from_str("stream_first_byte_timeout_secs = 0").unwrap();
+        assert_eq!(off.stream_first_byte_timeout_secs, 0);
     }
 }

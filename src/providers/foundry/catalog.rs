@@ -48,6 +48,20 @@ pub fn parse_models(v: &serde_json::Value) -> Vec<CatalogModel> {
 #[async_trait]
 impl ProviderCatalog for FoundryAdapter {
     async fn list_models(&self) -> anyhow::Result<Vec<CatalogModel>> {
+        // Configured deployments are the authoritative catalog: the endpoint's
+        // listing on an AI Services resource is the base-model catalog, not
+        // what this resource can actually serve.
+        if !self.configured_catalog().is_empty() {
+            return Ok(self
+                .configured_catalog()
+                .iter()
+                .map(|name| CatalogModel {
+                    provider: "foundry".to_string(),
+                    name: name.clone(),
+                    display_name: None,
+                })
+                .collect());
+        }
         let url = self.endpoint().models_url();
         tracing::debug!(
             url = %url,

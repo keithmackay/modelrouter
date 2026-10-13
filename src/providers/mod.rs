@@ -25,6 +25,7 @@ pub mod registry;
 pub mod search;
 pub mod search_registry;
 pub mod sse_lines;
+pub mod stream_fallback;
 pub mod tavily;
 #[cfg(feature = "vertex")]
 pub mod vertex;
