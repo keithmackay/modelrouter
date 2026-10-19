@@ -888,3 +888,301 @@ async fn the_registry_applies_tier_timeouts_that_outlast_the_flat_timeout() {
         "expected the flat timeout to apply, got: {err:#}"
     );
 }
+
+// ── tools on the OpenAI-shaped surface ──────────────────────────────────────
+
+fn tool_call_payload() -> serde_json::Value {
+    json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "model": DEPLOYMENT,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"revenue\"}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}
+    })
+}
+
+fn tool_req(model: &str) -> NormalizedRequest {
+    NormalizedRequest {
+        tools: Some(vec![json!({
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}
+        })]),
+        tool_choice: Some(json!("auto")),
+        ..req(model)
+    }
+}
+
+/// An OpenAI-shaped deployment (anything not listed in `anthropic_deployments`)
+/// takes tools natively on the OpenAI v1 surface: the gate must not refuse them.
+#[test]
+fn openai_shaped_deployments_support_tools() {
+    let adapter = static_adapter(&config("https://res.services.ai.azure.com"));
+    assert!(adapter.supports_tools(DEPLOYMENT));
+    assert!(adapter.supports_tools("gpt-4.1"));
+}
+
+/// Tools and tool_choice ride on the body verbatim; tool calls come back on
+/// the result with finish_reason `tool_calls`, so an agentic caller sees the
+/// call instead of an empty completion.
+#[tokio::test]
+async fn tools_pass_through_and_tool_calls_parse_back_on_the_openai_surface() {
+    let (base, capture) = spawn_foundry(StatusCode::OK, tool_call_payload(), embeddings_payload(), models_payload(), None).await;
+    let adapter = static_adapter(&config(&base));
+
+    let result = adapter.complete(&tool_req(DEPLOYMENT)).await.unwrap();
+
+    assert_eq!(result.finish_reason, "tool_calls");
+    assert_eq!(result.content, "");
+    let calls = result.tool_calls.expect("tool calls parsed back");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"q\":\"revenue\"}");
+
+    let c = capture.lock().unwrap();
+    assert_eq!(c.bodies[0]["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(c.bodies[0]["tool_choice"], "auto");
+}
+
+/// A request without tools sends neither field (an empty `tools` array is
+/// rejected by some deployments).
+#[tokio::test]
+async fn a_request_without_tools_sends_no_tools_fields() {
+    let (base, capture) = spawn_ok().await;
+    let adapter = static_adapter(&config(&base));
+    let result = adapter.complete(&req(DEPLOYMENT)).await.unwrap();
+    assert!(result.tool_calls.is_none());
+    let c = capture.lock().unwrap();
+    assert!(c.bodies[0].get("tools").is_none());
+    assert!(c.bodies[0].get("tool_choice").is_none());
+}
+
+/// Streaming carries the tools on the request; the SSE (tool-call deltas
+/// included) is passed through untouched, as for any OpenAI-shaped stream.
+#[tokio::test]
+async fn streaming_with_tools_sends_them_on_the_request() {
+    let (base, capture) = spawn_ok().await;
+    let adapter = static_adapter(&config(&base));
+    let mut r = tool_req(DEPLOYMENT);
+    r.stream = true;
+    let _ = adapter.stream(&r).await.unwrap();
+    let c = capture.lock().unwrap();
+    assert_eq!(c.bodies[0]["stream"], true);
+    assert_eq!(c.bodies[0]["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(c.bodies[0]["tool_choice"], "auto");
+}
+
+/// A streamed tool call arrives as `tool_calls` deltas (the id and name first,
+/// then the arguments in pieces) and ends with finish_reason `tool_calls`.
+/// They pass through byte-for-byte, so a streaming agentic caller can
+/// reassemble the call exactly as from any OpenAI-shaped stream.
+const TOOL_CALL_SSE: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]},\"index\":0}]}\n\n",
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\"}}]},\"index\":0}]}\n\n",
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"revenue\\\"}\"}}]},\"index\":0,\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+#[tokio::test]
+async fn streamed_tool_call_deltas_pass_through_untouched() {
+    let (base, capture) = spawn_foundry(
+        StatusCode::OK, chat_payload(), embeddings_payload(), models_payload(), Some(TOOL_CALL_SSE),
+    )
+    .await;
+    let adapter = static_adapter(&config(&base));
+    let mut r = tool_req(DEPLOYMENT);
+    r.stream = true;
+
+    let mut stream = adapter.stream(&r).await.unwrap();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+    let body = String::from_utf8(body).unwrap();
+
+    assert_eq!(body, TOOL_CALL_SSE, "tool-call deltas must not be re-framed or rewritten");
+    // The deltas reassemble into the call the caller asked for.
+    let arguments: String = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|v| v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(arguments, "{\"q\":\"revenue\"}");
+    assert_eq!(capture.lock().unwrap().bodies[0]["tools"][0]["function"]["name"], "lookup");
+}
+
+// ── configured deployments as the catalog ───────────────────────────────────
+
+/// On an AI Services resource the OpenAI v1 `GET /models` lists the BASE-model
+/// catalog (dozens of models nobody deployed), not the resource's deployments.
+/// With `deployments` configured the catalog is exactly those names, plus the
+/// Claude deployments, and the endpoint's listing is not called.
+#[tokio::test]
+async fn configured_deployments_are_the_catalog_and_the_listing_is_not_called() {
+    let (base, capture) = spawn_ok().await;
+    let cfg = ProviderConfig {
+        deployments: vec!["gpt-4.1".into(), "gpt-4.1-mini".into(), "gpt-4.1".into()],
+        anthropic_deployments: vec!["claude-sonnet-x".into()],
+        ..config(&base)
+    };
+    let models = static_adapter(&cfg).list_models().await.unwrap();
+    let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["gpt-4.1", "gpt-4.1-mini", "claude-sonnet-x"]);
+    assert!(models.iter().all(|m| m.provider == "foundry"));
+    assert!(capture.lock().unwrap().paths.is_empty(), "no listing call when deployments are configured");
+}
+
+/// GPT-5-family and o-series deployments reject `max_tokens` on Azure and take
+/// `max_completion_tokens`; everything else keeps `max_tokens`.
+#[tokio::test]
+async fn reasoning_deployments_send_max_completion_tokens_instead_of_max_tokens() {
+    let (base, capture) = spawn_ok().await;
+    let adapter = static_adapter(&config(&base));
+    adapter.complete(&req("gpt-5.5")).await.unwrap();
+    adapter.complete(&req("gpt-4.1")).await.unwrap();
+    let c = capture.lock().unwrap();
+    assert_eq!(c.bodies[0]["max_completion_tokens"], 8);
+    assert!(c.bodies[0].get("max_tokens").is_none());
+    assert_eq!(c.bodies[1]["max_tokens"], 8);
+    assert!(c.bodies[1].get("max_completion_tokens").is_none());
+}
+
+// ── live deployments narrow the catalog (account_resource_id) ───────────────
+
+const ACCOUNT_ID: &str =
+    "/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.CognitiveServices/accounts/res-1";
+
+/// A Resource Manager stand-in serving `accounts/deployments` list pages:
+/// page one links to page two. Records each request's path, query and token.
+async fn spawn_management(status: StatusCode) -> (String, Arc<Mutex<Vec<(String, String, Option<String>)>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let next = format!("{base}{ACCOUNT_ID}/deployments?api-version=2024-10-01&page=2");
+    let handler = {
+        let seen = seen.clone();
+        move |uri: Uri, headers: HeaderMap| {
+            let seen = seen.clone();
+            let next = next.clone();
+            async move {
+                let query = uri.query().unwrap_or("").to_string();
+                seen.lock().unwrap().push((uri.path().to_string(), query.clone(), header(&headers, "authorization")));
+                if status != StatusCode::OK {
+                    return (status, "AuthorizationFailed").into_response();
+                }
+                let body = if query.contains("page=2") {
+                    json!({"value": [
+                        {"name": "gpt-5", "properties": {"provisioningState": "Succeeded"}}
+                    ]})
+                } else {
+                    json!({"value": [
+                        {"name": "gpt-4.1", "properties": {"provisioningState": "Succeeded"}},
+                        {"name": "gpt-4.1-mini", "properties": {"provisioningState": "Failed"}},
+                        {"name": "claude-sonnet-x", "properties": {"provisioningState": "Creating"}}
+                    ], "nextLink": next})
+                };
+                Json(body).into_response()
+            }
+        }
+    };
+    let app = Router::new().route(&format!("{ACCOUNT_ID}/deployments"), get(handler));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, seen)
+}
+
+fn live_config(base: &str, management: &str) -> ProviderConfig {
+    ProviderConfig {
+        deployments: vec!["gpt-4.1".into(), "gpt-4.1-mini".into(), "gpt-oss-120b".into(), "gpt-5".into()],
+        anthropic_deployments: vec!["claude-sonnet-x".into()],
+        account_resource_id: Some(ACCOUNT_ID.into()),
+        management_endpoint: Some(management.into()),
+        ..config(base)
+    }
+}
+
+/// A configured name that was never deployed (gpt-oss-120b), failed
+/// (gpt-4.1-mini) or is still being created (claude-sonnet-x) is left out;
+/// every page of the listing is read.
+#[tokio::test]
+async fn the_account_listing_keeps_only_configured_deployments_that_succeeded() {
+    let (base, capture) = spawn_ok().await;
+    let (mgmt, seen) = spawn_management(StatusCode::OK).await;
+    let models = static_adapter(&live_config(&base, &mgmt)).list_models().await.unwrap();
+    let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["gpt-4.1", "gpt-5"]);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "both pages read");
+    assert_eq!(seen[0].0, format!("{ACCOUNT_ID}/deployments"));
+    assert!(seen[0].1.contains("api-version=2024-10-01"));
+    assert_eq!(seen[0].2.as_deref(), Some("Bearer static-token"));
+    assert!(capture.lock().unwrap().paths.is_empty(), "the data-plane listing is not called");
+}
+
+/// No configured list: the catalog is every Succeeded deployment.
+#[tokio::test]
+async fn with_no_configured_list_the_catalog_is_every_succeeded_deployment() {
+    let (base, _) = spawn_ok().await;
+    let (mgmt, _) = spawn_management(StatusCode::OK).await;
+    let cfg = ProviderConfig { deployments: vec![], anthropic_deployments: vec![], ..live_config(&base, &mgmt) };
+    let models = static_adapter(&cfg).list_models().await.unwrap();
+    let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["gpt-4.1", "gpt-5"]);
+}
+
+/// A refused listing is the catalog's error, never the unfiltered list.
+#[tokio::test]
+async fn a_refused_listing_is_an_error_not_the_configured_list() {
+    let (base, _) = spawn_ok().await;
+    let (mgmt, _) = spawn_management(StatusCode::FORBIDDEN).await;
+    let err = static_adapter(&live_config(&base, &mgmt)).list_models().await.unwrap_err().to_string();
+    assert!(err.contains("403"), "{err}");
+    assert!(err.contains("Cognitive Services User"), "{err}");
+}
+
+/// Key auth cannot read Resource Manager: the catalog says so.
+#[tokio::test]
+#[serial]
+async fn key_auth_with_an_account_resource_id_is_a_catalog_error() {
+    clear_azure_env();
+    let (base, _) = spawn_ok().await;
+    let (mgmt, seen) = spawn_management(StatusCode::OK).await;
+    let cfg = ProviderConfig { api_key: "k".into(), ..live_config(&base, &mgmt) };
+    let err = FoundryAdapter::new(&cfg).unwrap().list_models().await.unwrap_err().to_string();
+    assert!(err.contains("needs an Entra credential"), "{err}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_malformed_account_resource_id_is_refused_at_construction() {
+    let cfg = ProviderConfig { account_resource_id: Some("res-1".into()), ..config("https://res.services.ai.azure.com") };
+    let err = FoundryAdapter::with_token_provider(&cfg, Arc::new(StaticTokenProvider::new("t")))
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(err.contains("account_resource_id"), "{err}");
+}
+
+#[test]
+fn config_toml_parses_the_account_resource_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        format!("[providers.foundry]\nfoundry_endpoint = \"https://res.services.ai.azure.com\"\naccount_resource_id = \"{ACCOUNT_ID}\"\n"),
+    )
+    .unwrap();
+    let settings = modelrouter::config::load(Some(path)).unwrap();
+    assert_eq!(settings.providers["foundry"].account_resource_id.as_deref(), Some(ACCOUNT_ID));
+}

@@ -48,6 +48,10 @@ pub struct ReasoningControl {
 #[serde(default)]
 pub struct CompletionResult {
     pub content: String,
+    /// The whole prompt, cache reads and cache writes included (OpenAI's
+    /// `prompt_tokens`). Adapters for wire formats that report only the
+    /// uncached share (Anthropic's `input_tokens`) add the cache tokens back,
+    /// so every path prices the same response the same way.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub finish_reason: String,
@@ -79,6 +83,14 @@ impl CompletionResult {
     /// A prompt is considered "cached" if any tokens were served from cache.
     pub fn is_cached(&self) -> bool {
         self.cache_read_tokens > 0
+    }
+
+    /// The prompt tokens billed at the standard input rate: the whole prompt
+    /// less cache reads and cache writes.
+    pub fn uncached_prompt_tokens(&self) -> u32 {
+        self.prompt_tokens
+            .saturating_sub(self.cache_read_tokens)
+            .saturating_sub(self.cache_write_tokens)
     }
 }
 

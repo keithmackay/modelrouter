@@ -76,9 +76,15 @@ pub fn context_from_request(
         .flatten();
     // A bound request goes where its variant pins the model, not where the
     // alias would have sent it.
+    // Likewise a scoped alias override for the request's attribution tags.
     let effective_model = binding
         .as_ref()
         .and_then(|b| b.overlay.get(&request_model).cloned())
+        .or_else(|| {
+            attribution
+                .as_ref()
+                .and_then(|a| state.router.scoped_name(&a.tags, &request_model))
+        })
         .unwrap_or_else(|| request_model.clone());
     let (provider, routed_model) = {
         let (p, m) = state.router.resolve(&effective_model);
@@ -120,7 +126,8 @@ fn stage_for(err: &ApiError) -> FailureStage {
         ApiError::PolicyDenied { .. }
         | ApiError::Unauthorized
         | ApiError::Forbidden
-        | ApiError::Disabled(_) => FailureStage::Policy,
+        | ApiError::Disabled(_)
+        | ApiError::Refused { .. } => FailureStage::Policy,
         ApiError::InvalidRequest(_) => FailureStage::Request,
         ApiError::ProviderError(e) => {
             let msg = e.to_string().to_lowercase();
@@ -151,6 +158,7 @@ fn status_for(err: &ApiError) -> i64 {
         ApiError::ProviderError(_) => 502,
         ApiError::InvalidRequest(_) => 400,
         ApiError::PolicyDenied { status, .. } => *status as i64,
+        ApiError::Refused { status, .. } => *status as i64,
         ApiError::Internal => 500,
     }
 }

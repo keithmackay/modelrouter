@@ -150,7 +150,11 @@ async fn anthropic_messages_inner(
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
     let messages_for_complexity = body["messages"].as_array().cloned().unwrap_or_default();
-    let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
+    // A scoped alias override pins the model; otherwise the usual downgrade.
+    let model = state
+        .router
+        .scoped_name(&attribution.tags, &requested_model)
+        .unwrap_or_else(|| state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity));
     let stream = body["stream"].as_bool().unwrap_or(false);
 
     // Policy check
@@ -612,13 +616,7 @@ fn store_streamed_message(
         return;
     };
     let usage = message_as_completion(&message);
-    let cost = state.cost_calc.calculate_with_cache(
-        canonical_model,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.cache_read_tokens,
-        usage.cache_write_tokens,
-    );
+    let cost = state.cost_calc.calculate_result(canonical_model, &usage);
     let state = state.clone();
     let model = canonical_model.to_string();
     tokio::spawn(async move {
@@ -651,13 +649,7 @@ fn serve_cached_message(
         "response cache hit"
     );
     let usage = message_as_completion(&message);
-    let avoided_cost = state.cost_calc.calculate_with_cache(
-        canonical_model,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.cache_read_tokens,
-        usage.cache_write_tokens,
-    );
+    let avoided_cost = state.cost_calc.calculate_result(canonical_model, &usage);
     record_cache_hit(
         state,
         CacheHitCtx {

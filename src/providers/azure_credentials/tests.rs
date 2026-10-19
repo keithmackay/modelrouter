@@ -392,14 +392,14 @@ fn every_documented_reauth_code_is_permanent() {
         .into();
         assert!(is_azure_reauth(&err), "AADSTS{code}");
     }
-    for oauth in ["invalid_grant", "interaction_required"] {
+    for error_code in ["invalid_grant", "interaction_required"] {
         let err: anyhow::Error = AzureTokenError {
             source_kind: "x",
             status: 400,
-            body: format!(r#"{{"error":"{oauth}"}}"#),
+            body: format!(r#"{{"error":"{error_code}"}}"#),
         }
         .into();
-        assert!(is_azure_reauth(&err), "{oauth}");
+        assert!(is_azure_reauth(&err), "{error_code}");
     }
 }
 

@@ -47,6 +47,13 @@ pub struct ModelCapabilityEntry {
     /// off. Omitted leaves the built-in default.
     #[serde(default)]
     pub can_disable_thinking: Option<bool>,
+    /// The most completion tokens the model accepts. A request asking for more
+    /// is clamped to this before dispatch: callers address an alias and size
+    /// `max_tokens` for the largest model it might reach, and a provider
+    /// rejects a value above the resolved model's ceiling with a 400.
+    /// Omitted leaves the built-in default (none for an unknown model).
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
     /// `true` when the model accepts an effort level (`low` … `max`) that
     /// bounds how much it reasons. Omitted leaves the built-in default.
     #[serde(default)]
@@ -86,6 +93,13 @@ pub struct CacheConfig {
     /// `bypass` only narrows caching and is honoured either way.
     #[serde(default = "default_true")]
     pub allow_header_opt_in: bool,
+    /// Cache only requests that ask for it with `x-modelrouter-cache: use`
+    /// (or `refresh`, which stores without a lookup). A request without the
+    /// header is never looked up or stored, whatever its default eligibility,
+    /// so a caller that forgets the header is not cached. Requires
+    /// `allow_header_opt_in`.
+    #[serde(default)]
+    pub require_opt_in: bool,
     /// Upper bound on the TTL a caller may request with
     /// `x-modelrouter-cache-ttl`. `0` lifts the bound, so callers may store
     /// entries that never expire.
@@ -95,6 +109,19 @@ pub struct CacheConfig {
     /// `x-modelrouter-cache-namespace`.
     #[serde(default)]
     pub namespaces: HashMap<String, NamespaceCacheConfig>,
+}
+
+impl CacheConfig {
+    /// Refuse settings that contradict each other.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.require_opt_in && !self.allow_header_opt_in {
+            anyhow::bail!(
+                "cache.require_opt_in = true needs cache.allow_header_opt_in = true: \
+                 with opt-in refused, nothing could ever be cached. Refusing to start."
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for CacheConfig {
@@ -109,6 +136,7 @@ impl Default for CacheConfig {
             completions: CompletionCachePolicy::default(),
             search: SearchCachePolicy::default(),
             allow_header_opt_in: true,
+            require_opt_in: false,
             max_ttl_seconds: default_cache_max_ttl(),
             namespaces: HashMap::new(),
         }
@@ -333,6 +361,174 @@ pub struct Settings {
     pub health: HealthConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub gateway: GatewayConfig,
+}
+
+/// `[gateway]` — API (gateway) key management.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub bootstrap: Option<GatewayBootstrapConfig>,
+}
+
+/// `[gateway.bootstrap]` — idempotent creation of one user and one API key at
+/// startup, so a fresh install can serve a client whose key was provisioned
+/// outside the router (e.g. by a secret store) with no manual CLI step.
+///
+/// Give exactly one of `key` (the raw key the client presents) or `key_hash`
+/// (its SHA-256, lowercase hex). The user is created if absent and the key is
+/// added if no key with that hash exists. Nothing is ever disabled, re-enabled
+/// or overwritten: a key an operator disabled stays disabled, and rotating the
+/// configured key adds the new one while the old one stays valid until
+/// disabled (`modelrouter key disable`). Env: `MODELROUTER_GATEWAY__BOOTSTRAP__USER`,
+/// `..._KEY`, `..._KEY_HASH`, `..._LABEL`.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct GatewayBootstrapConfig {
+    pub user: String,
+    #[serde(default, skip_serializing)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub key_hash: Option<String>,
+    #[serde(default = "default_gateway_bootstrap_label")]
+    pub label: String,
+}
+
+fn default_gateway_bootstrap_label() -> String {
+    "bootstrap".to_string()
+}
+
+impl std::fmt::Debug for GatewayBootstrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayBootstrapConfig")
+            .field("user", &self.user)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .field("key_hash", &self.key_hash)
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl GatewayBootstrapConfig {
+    /// The SHA-256 the key is stored and looked up by. Fails loudly unless
+    /// exactly one well-formed source is given.
+    pub fn resolved_hash(&self) -> anyhow::Result<String> {
+        if self.user.trim().is_empty() {
+            anyhow::bail!("gateway.bootstrap.user is empty. Refusing to start.");
+        }
+        match (self.key.as_deref(), self.key_hash.as_deref()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "gateway.bootstrap sets both key and key_hash; set exactly one. Refusing to start."
+            ),
+            (None, None) => anyhow::bail!(
+                "gateway.bootstrap sets neither key nor key_hash; set exactly one. Refusing to start."
+            ),
+            (Some(key), None) => {
+                if key.trim().is_empty() {
+                    anyhow::bail!("gateway.bootstrap.key is empty. Refusing to start.");
+                }
+                Ok(crate::api::auth::hash_token(key))
+            }
+            (None, Some(hash)) => {
+                if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    anyhow::bail!(
+                        "gateway.bootstrap.key_hash is not a SHA-256 in lowercase hex \
+                         (64 characters, 0-9a-f). Refusing to start."
+                    );
+                }
+                Ok(hash.to_string())
+            }
+        }
+    }
+
+    /// Create the user if absent, then the key if no key has its hash.
+    /// A hash already held by a different user fails loudly.
+    pub async fn apply(
+        &self,
+        db: &dyn crate::api::app::DatabaseProvider,
+    ) -> anyhow::Result<()> {
+        use crate::db::repositories::api_keys::ApiKeyRepository;
+        use crate::db::repositories::users::UserRepository;
+
+        let key_hash = self.resolved_hash()?;
+        let user = match UserRepository::find_by_name(db, &self.user).await? {
+            Some(user) => user,
+            None => {
+                let user = UserRepository::create(
+                    db,
+                    crate::db::models::NewUser { name: self.user.clone(), email: None },
+                )
+                .await?;
+                tracing::info!(user = %user.name, "gateway bootstrap: created user");
+                user
+            }
+        };
+        if !user.enabled {
+            tracing::warn!(
+                user = %user.name,
+                "gateway bootstrap: user is disabled; leaving it disabled, so its keys are refused"
+            );
+        }
+
+        let existing = ApiKeyRepository::list_all_api_keys(db)
+            .await?
+            .into_iter()
+            .find(|k| k.key_hash == key_hash);
+        match existing {
+            Some(k) if k.user_id != user.id => anyhow::bail!(
+                "gateway.bootstrap: the configured key already belongs to another user \
+                 (user id {}), not '{}'. Refusing to start.",
+                k.user_id,
+                user.name
+            ),
+            Some(k) if !k.enabled => tracing::warn!(
+                user = %user.name,
+                key_id = k.id,
+                "gateway bootstrap: configured key exists but is disabled; leaving it disabled"
+            ),
+            Some(k) => tracing::info!(
+                user = %user.name,
+                key_id = k.id,
+                "gateway bootstrap: key already exists, skipping"
+            ),
+            None => {
+                let k = ApiKeyRepository::create_api_key(
+                    db,
+                    crate::db::models::NewApiKey {
+                        user_id: user.id,
+                        key_hash,
+                        label: Some(self.label.clone()),
+                        expires_at: None,
+                        project: None,
+                        session_window_secs: None,
+                    },
+                )
+                .await?;
+                tracing::info!(user = %user.name, key_id = k.id, "gateway bootstrap: created key");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[logging]` — how log lines are written to stdout.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LoggingConfig {
+    /// `text` (default) or `json`. With `json`, every line is one JSON object
+    /// with the event's fields at the top level, for log collectors that
+    /// index by field. Env: `MODELROUTER_LOGGING__FORMAT`.
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -523,6 +719,16 @@ pub struct RoutingConfig {
     /// Caller errors (invalid query → 400) never trigger failover.
     #[serde(default)]
     pub search_fallback_chains: HashMap<String, Vec<String>>,
+    /// At startup, delete runtime-managed aliases (the admin API's
+    /// `model_aliases` table) whose names `model_aliases` above also defines,
+    /// before loading the alias map. A repoint made through the admin API
+    /// then lasts until the next restart, and a deploy (which restarts the
+    /// router with fresh config) makes the config's aliases authoritative
+    /// again. Default `false`: database aliases always win, as before.
+    /// Aliases the config does not name, and aliases derived from registered
+    /// model rows, are never touched.
+    #[serde(default)]
+    pub config_aliases_win_at_start: bool,
 }
 
 impl Default for RoutingConfig {
@@ -538,6 +744,7 @@ impl Default for RoutingConfig {
             strict_model_resolution: false,
             default_search_engine: None,
             search_fallback_chains: HashMap::new(),
+            config_aliases_win_at_start: false,
         }
     }
 }
@@ -732,6 +939,14 @@ pub struct StorageConfig {
     /// Postgres backend.
     #[serde(default)]
     pub prompt_db_path: Option<String>,
+    /// Pin this policy to config.toml. When true, the dashboard cannot change
+    /// `[storage]`, a value it saved earlier is ignored at startup, and an
+    /// experiment cannot force content storage on while
+    /// `store_prompt_content` is false. config.toml only, like
+    /// `prompt_db_path`: a deployment that must never keep conversation bodies
+    /// sets it so no admin session can switch them on.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 impl Default for StorageConfig {
@@ -741,6 +956,27 @@ impl Default for StorageConfig {
             store_prompt_content: false,
             prompt_retention_days: 0,
             prompt_db_path: None,
+            locked: false,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Whether an experiment binding may force content storage on for its requests.
+    pub fn allows_forced_content(&self) -> bool {
+        !self.locked || self.store_prompt_content
+    }
+
+    /// The policy in effect at startup: a policy saved from the dashboard wins
+    /// over the file, unless the file's policy is locked.
+    pub fn effective(file: &StorageConfig, saved: Option<StorageConfig>) -> StorageConfig {
+        match saved {
+            Some(saved) if !file.locked => saved,
+            Some(_) => {
+                tracing::warn!("[storage] is locked in the config file; ignoring the policy saved from the dashboard");
+                file.clone()
+            }
+            None => file.clone(),
         }
     }
 }
@@ -958,6 +1194,20 @@ pub struct ProviderConfig {
     /// preview tool, ignored by the general one.
     #[serde(default)]
     pub custom_search_instance: Option<String>,
+    /// Bing market (`<language>-<country/region>`) sent in the grounding tool's
+    /// search configuration. `bing_grounding` defaults to `en-US`: Bing's docs
+    /// ask callers to always name one, and without it the market is guessed.
+    #[serde(default)]
+    pub search_market: Option<String>,
+    /// Bing `set_lang` (2- or 4-letter language code). `bing_grounding`
+    /// defaults to `en`.
+    #[serde(default)]
+    pub search_set_lang: Option<String>,
+    /// Default Bing `freshness` filter (`day`, `week`, `month`, a date or a
+    /// `YYYY-MM-DD..YYYY-MM-DD` range) for requests that send none. Unset means
+    /// no age filter.
+    #[serde(default)]
+    pub search_freshness: Option<String>,
     /// Whether this provider is reachable via `POST /v1/chat/completions` as
     /// `model = "<provider>/<model>"`. Defaults to true, matching every
     /// existing chat provider (`anthropic`, `azure`, `vertex`, arbitrary
@@ -973,6 +1223,67 @@ pub struct ProviderConfig {
     /// error handling (see #97).
     #[serde(default = "default_true")]
     pub generic_chat: bool,
+    /// Anthropic prompt caching: whether Claude requests (direct Anthropic
+    /// and Claude on Vertex) get automatic `cache_control` breakpoints on the
+    /// system prompt and on a multi-turn conversation's tail. Defaults to
+    /// true. Caller-supplied markers are honoured either way.
+    #[serde(default = "default_true")]
+    pub prompt_caching: bool,
+    /// Streaming first-byte window, in seconds: how long a streamed chat call
+    /// may wait for the upstream to send its first byte (response headers and
+    /// the first body chunk) before the stream is abandoned and the same
+    /// request is answered by the non-streamed call, re-emitted to the caller
+    /// as an ordinary SSE stream. Covers upstreams that accept a streaming
+    /// request and then never send a byte while the connection stays alive.
+    /// Healthy streams send their first event within seconds, so the default
+    /// (300) is far above any real first byte; `0` turns the fallback off.
+    /// Applied by adapters that implement it (Vertex today).
+    #[serde(default = "default_stream_first_byte_timeout_secs")]
+    pub stream_first_byte_timeout_secs: u64,
+    /// `foundry` only: deployments of Anthropic Claude models. Foundry serves
+    /// Claude over the Anthropic Messages API (`{resource}/anthropic/v1/messages`),
+    /// not the OpenAI-shaped surfaces, so requests for these deployments are
+    /// translated like the direct `anthropic` provider's (tools, thinking,
+    /// prompt caching, streaming) and sent there with the same credential.
+    /// Every other deployment stays on the endpoint's OpenAI-shaped surface.
+    #[serde(default)]
+    pub anthropic_deployments: Vec<String>,
+    /// `foundry` only: the resource's OpenAI-shaped deployments, by deployment
+    /// name. When set, the catalog is exactly these (plus
+    /// `anthropic_deployments`) instead of the endpoint's `GET /models`, which
+    /// on an AI Services resource lists the whole base-model catalog — dozens
+    /// of models that were never deployed and would fail at call time.
+    #[serde(default)]
+    pub deployments: Vec<String>,
+    /// `foundry` only: Azure regions whose Retail Prices API list prices price
+    /// `deployments`, in order; a deployment the first region does not list
+    /// takes the next region's rate. Empty (the default) leaves Foundry
+    /// deployments to `[[pricing]]` and the built-in table. Prices are fetched
+    /// at startup and every `retail_pricing_refresh_hours`; an operator's
+    /// `[[pricing]]` entry still wins for any model it names.
+    #[serde(default)]
+    pub retail_pricing_regions: Vec<String>,
+    /// `foundry` only: hours between retail price refreshes (default 24).
+    #[serde(default)]
+    pub retail_pricing_refresh_hours: Option<u64>,
+    /// `foundry` only: Retail Prices API URL override (tests, egress proxies).
+    #[serde(default)]
+    pub retail_pricing_url: Option<String>,
+    /// `foundry` only: the Azure resource id of the Foundry account
+    /// (`/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<name>`).
+    /// When set, the catalog keeps only the deployments the account's
+    /// management-plane listing reports as `provisioningState: Succeeded`, so a
+    /// configured name that was never deployed (or failed to deploy) is not
+    /// offered. A failed listing is reported as the provider's catalog error,
+    /// never as the unfiltered list. Needs an Entra credential with read on
+    /// the account (`Microsoft.CognitiveServices/*/read`).
+    #[serde(default)]
+    pub account_resource_id: Option<String>,
+    /// `foundry` only: Azure Resource Manager base URL override for the
+    /// deployment listing (sovereign clouds, tests). Default
+    /// `https://management.azure.com`.
+    #[serde(default)]
+    pub management_endpoint: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -1005,7 +1316,19 @@ impl Default for ProviderConfig {
             project_connection_id: None,
             custom_search: false,
             custom_search_instance: None,
+            search_market: None,
+            search_set_lang: None,
+            search_freshness: None,
             generic_chat: true,
+            prompt_caching: true,
+            stream_first_byte_timeout_secs: default_stream_first_byte_timeout_secs(),
+            anthropic_deployments: Vec::new(),
+            deployments: Vec::new(),
+            retail_pricing_regions: Vec::new(),
+            retail_pricing_refresh_hours: None,
+            retail_pricing_url: None,
+            account_resource_id: None,
+            management_endpoint: None,
         }
     }
 }
@@ -1293,6 +1616,10 @@ impl Settings {
 // lands." A provider that genuinely needs a *shorter* timeout still sets
 // `timeout_secs` explicitly in `[providers.<name>]`.
 fn default_timeout_secs() -> u64 { TIER_TIMEOUT_DEEP_SECS }
+
+/// See `ProviderConfig::stream_first_byte_timeout_secs`.
+pub const DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_SECS: u64 = 300;
+fn default_stream_first_byte_timeout_secs() -> u64 { DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_SECS }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct HooksConfig {
@@ -1651,5 +1978,43 @@ mod tier_timeouts_tests {
         // the most generous (deep) tier ceiling.
         assert_eq!(default_timeout_secs(), 21600);
         assert_eq!(default_timeout_secs(), TierTimeoutsConfig::default().deep);
+    }
+}
+
+#[cfg(test)]
+mod storage_lock_tests {
+    use super::*;
+
+    fn locked(store_prompt_content: bool) -> StorageConfig {
+        StorageConfig { locked: true, store_prompt_content, ..Default::default() }
+    }
+
+    #[test]
+    fn locked_parses_from_the_config_file_and_defaults_off() {
+        let s: Settings = toml::from_str("[storage]\nlocked = true\nprompt_retention_days = 30\n").unwrap();
+        assert!(s.storage.locked);
+        assert_eq!(s.storage.prompt_retention_days, 30);
+        let s: Settings = toml::from_str("").unwrap();
+        assert!(!s.storage.locked);
+    }
+
+    #[test]
+    fn a_saved_policy_wins_unless_the_file_is_locked() {
+        let saved = StorageConfig { store_prompt_content: true, ..Default::default() };
+        let open = StorageConfig::default();
+        assert!(StorageConfig::effective(&open, Some(saved.clone())).store_prompt_content);
+        assert!(!StorageConfig::effective(&open, None).store_prompt_content);
+        let pinned = StorageConfig { prompt_retention_days: 30, ..locked(false) };
+        let effective = StorageConfig::effective(&pinned, Some(saved));
+        assert!(!effective.store_prompt_content, "a locked file ignores the dashboard's saved policy");
+        assert!(effective.locked);
+        assert_eq!(effective.prompt_retention_days, 30);
+    }
+
+    #[test]
+    fn only_a_locked_policy_without_content_refuses_forced_content() {
+        assert!(StorageConfig::default().allows_forced_content());
+        assert!(locked(true).allows_forced_content());
+        assert!(!locked(false).allows_forced_content());
     }
 }
