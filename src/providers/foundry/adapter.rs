@@ -51,8 +51,9 @@ use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::{
     CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
 };
-use crate::providers::azure_entra::TokenProvider;
+use crate::providers::azure_entra::{TokenProvider, MANAGEMENT_SCOPE};
 use crate::providers::foundry::auth::FoundryAuth;
+use crate::providers::foundry::claude::FoundryClaude;
 use crate::providers::foundry::endpoint::FoundryEndpoint;
 use std::sync::Arc;
 
@@ -66,18 +67,68 @@ pub struct FoundryAdapter {
     /// Per-tier ceilings from `[tier_timeouts]`, applied per request like the
     /// other chat adapters (previously ignored: one flat client timeout).
     tier_timeouts: TierTimeoutsConfig,
+    /// `anthropic_deployments`, served over the Messages surface.
+    claude: Option<FoundryClaude>,
+    /// The configured catalog: `deployments`, then `anthropic_deployments`,
+    /// de-duplicated in order. Empty = list the endpoint's `GET /models`.
+    configured_catalog: Vec<String>,
+    /// `account_resource_id`: the management-plane deployment listing that
+    /// keeps the catalog to what the account actually serves.
+    deployment_listing: Option<DeploymentListing>,
+}
+
+/// Where and how the catalog reads the account's live deployments.
+pub(crate) struct DeploymentListing {
+    /// `{management_endpoint}{account_resource_id}/deployments?api-version=...`.
+    pub(crate) url: String,
+    /// A credential for the management scope (never the `api-key` header,
+    /// which Resource Manager does not accept).
+    pub(crate) auth: FoundryAuth,
+}
+
+/// Resource Manager API version for `accounts/deployments` list.
+pub(crate) const DEPLOYMENTS_API_VERSION: &str = "2024-10-01";
+const DEFAULT_MANAGEMENT_ENDPOINT: &str = "https://management.azure.com";
+
+/// The listing URL for `config.account_resource_id`, or `None` when unset.
+fn deployment_listing_url(config: &ProviderConfig) -> anyhow::Result<Option<String>> {
+    let Some(id) = config.account_resource_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let lower = id.to_ascii_lowercase();
+    if !lower.starts_with("/subscriptions/") || !lower.contains("/providers/microsoft.cognitiveservices/accounts/") {
+        anyhow::bail!(
+            "[providers.foundry] account_resource_id must be an account resource id \
+             (/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<name>), got {id:?}"
+        );
+    }
+    let base = config
+        .management_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_MANAGEMENT_ENDPOINT)
+        .trim_end_matches('/');
+    Ok(Some(format!(
+        "{base}{}/deployments?api-version={DEPLOYMENTS_API_VERSION}",
+        id.trim_end_matches('/')
+    )))
 }
 
 impl FoundryAdapter {
     pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        let auth = FoundryAuth::entra_by_default(
-            "foundry",
-            config,
-            endpoint.scope(),
-            std::time::Duration::from_secs(config.timeout_secs.max(1)),
-        )?;
-        Self::build(endpoint, auth, config)
+        let timeout = std::time::Duration::from_secs(config.timeout_secs.max(1));
+        let auth = FoundryAuth::entra_by_default("foundry", config, endpoint.scope(), timeout)?;
+        let claude = FoundryClaude::from_config(config, &endpoint, timeout)?;
+        let listing = match deployment_listing_url(config)? {
+            None => None,
+            Some(url) => Some(DeploymentListing {
+                url,
+                auth: FoundryAuth::entra_by_default("foundry", config, MANAGEMENT_SCOPE, timeout)?,
+            }),
+        };
+        Self::build(endpoint, auth, claude, listing, config)
     }
 
     /// Test hook: build with a caller-supplied token source, bypassing the
@@ -87,12 +138,21 @@ impl FoundryAdapter {
         token_provider: Arc<dyn TokenProvider>,
     ) -> anyhow::Result<Self> {
         let endpoint = FoundryEndpoint::from_config(config)?;
-        Self::build(endpoint, FoundryAuth::Entra(token_provider), config)
+        let claude = (!config.anthropic_deployments.is_empty()).then(|| {
+            FoundryClaude::with_auth(config, &endpoint, FoundryAuth::Entra(token_provider.clone()))
+        });
+        let listing = deployment_listing_url(config)?.map(|url| DeploymentListing {
+            url,
+            auth: FoundryAuth::Entra(token_provider.clone()),
+        });
+        Self::build(endpoint, FoundryAuth::Entra(token_provider), claude, listing, config)
     }
 
     fn build(
         endpoint: FoundryEndpoint,
         auth: FoundryAuth,
+        claude: Option<FoundryClaude>,
+        deployment_listing: Option<DeploymentListing>,
         config: &ProviderConfig,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -114,6 +174,9 @@ impl FoundryAdapter {
             client,
             default_timeout_secs: config.timeout_secs,
             tier_timeouts: TierTimeoutsConfig::default(),
+            claude,
+            configured_catalog: configured_catalog(config),
+            deployment_listing,
         })
     }
 
@@ -135,6 +198,11 @@ impl FoundryAdapter {
 
     pub fn endpoint(&self) -> &FoundryEndpoint {
         &self.endpoint
+    }
+
+    /// The Messages surface, when `model` is a configured Claude deployment.
+    fn claude_for(&self, model: &str) -> Option<&FoundryClaude> {
+        self.claude.as_ref().filter(|c| c.serves(model))
     }
 
     pub(crate) fn auth(&self) -> &FoundryAuth {
@@ -164,9 +232,37 @@ impl FoundryAdapter {
             body["temperature"] = serde_json::json!(temp);
         }
         if let Some(max) = req.max_tokens {
-            body["max_tokens"] = serde_json::json!(max);
+            // The reasoning generations reject `max_tokens` here and take
+            // `max_completion_tokens`; every other deployment keeps `max_tokens`.
+            let field = if crate::router::model_capabilities::uses_max_completion_tokens(&req.model) {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[field] = serde_json::json!(max);
+        }
+        if let Some(effort) = openai_reasoning_effort(req) {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        // The OpenAI v1 surface takes tools in the same wire shape as the
+        // caller sent them: passed through verbatim, and only when present.
+        if let Some(tools) = req.tools.as_ref().filter(|t| !t.is_empty()) {
+            body["tools"] = serde_json::json!(tools);
+            if let Some(tc) = &req.tool_choice {
+                body["tool_choice"] = tc.clone();
+            }
         }
         body
+    }
+
+    /// The configured catalog (see `configured_catalog`).
+    pub(crate) fn configured_catalog(&self) -> &[String] {
+        &self.configured_catalog
+    }
+
+    /// The live deployment listing, when `account_resource_id` is set.
+    pub(crate) fn deployment_listing(&self) -> Option<&DeploymentListing> {
+        self.deployment_listing.as_ref()
     }
 
     /// Turn a non-2xx into an error that says which endpoint, which
@@ -194,6 +290,27 @@ impl FoundryAdapter {
     }
 }
 
+/// The `reasoning_effort` an OpenAI-dialect reasoning deployment is sent:
+/// the resolved level, only for the families that take the field (see
+/// `model_capabilities::openai_reasoning_levels`).
+fn openai_reasoning_effort(req: &NormalizedRequest) -> Option<&'static str> {
+    crate::router::model_capabilities::openai_reasoning_levels(&req.model)?;
+    req.reasoning?.effort
+}
+
+/// `deployments` then `anthropic_deployments`, trimmed, blanks dropped,
+/// de-duplicated in first-seen order.
+fn configured_catalog(config: &ProviderConfig) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    config
+        .deployments
+        .iter()
+        .chain(config.anthropic_deployments.iter())
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty() && seen.insert(d.clone()))
+        .collect()
+}
+
 #[derive(serde::Deserialize)]
 struct FoundryResponse {
     choices: Vec<FoundryChoice>,
@@ -210,6 +327,8 @@ struct FoundryChoice {
 #[derive(serde::Deserialize)]
 struct FoundryMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
 }
 
 /// `usage` is required by the spec, but a `default` here keeps a model that
@@ -257,7 +376,7 @@ pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> 
         cache_write_tokens: 0,
         reasoning_tokens: parsed.usage.completion_tokens_details.reasoning_tokens,
         ttft_ms: None,
-        tool_calls: None,
+        tool_calls: choice.message.tool_calls.filter(|tc| tc.as_array().is_some_and(|a| !a.is_empty())),
     })
 }
 
@@ -267,10 +386,26 @@ impl ProviderAdapter for FoundryAdapter {
         self.auth.credential_report()
     }
 
+    /// Every deployment takes tools: Claude deployments translated like the
+    /// direct `anthropic` provider, OpenAI-shaped ones passed through verbatim
+    /// on the v1 surface (`build_body`, `parse_response`).
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+
     /// Settings forwarded as normalized; the timeout is the configured ceiling.
+    /// Claude deployments always send `max_tokens` and the reasoning control.
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
+        if self.claude_for(&req.model).is_some() {
+            return EffectiveSettings {
+                reasoning: req.reasoning,
+                temperature: req.temperature,
+                max_tokens: Some(req.max_tokens.unwrap_or(crate::providers::anthropic::DEFAULT_MAX_TOKENS)),
+                timeout_secs: Some(self.request_timeout(req).as_secs()),
+            };
+        }
         EffectiveSettings {
-            reasoning: None,
+            reasoning: openai_reasoning_effort(req).and(req.reasoning),
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: Some(self.request_timeout(req).as_secs()),
@@ -278,6 +413,9 @@ impl ProviderAdapter for FoundryAdapter {
     }
 
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
+        if let Some(claude) = self.claude_for(&req.model) {
+            return claude.complete(&self.client, req, self.request_timeout(req)).await;
+        }
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, false);
         tracing::debug!(
@@ -333,6 +471,9 @@ impl ProviderAdapter for FoundryAdapter {
     }
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
+        if let Some(claude) = self.claude_for(&req.model) {
+            return claude.stream(&self.client, req, self.request_timeout(req)).await;
+        }
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, true);
         tracing::debug!(
@@ -422,6 +563,21 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_reaches_openai_reasoning_deployments_only() {
+        use crate::providers::adapter::ReasoningControl;
+        let effort = Some(ReasoningControl { disable_thinking: false, effort: Some("high") });
+        let mut r = req();
+        r.model = "o3".into();
+        r.reasoning = effort;
+        assert_eq!(FoundryAdapter::build_body(&r, false)["reasoning_effort"], "high");
+        r.model = "Llama-3.3-70B-Instruct".into();
+        assert!(FoundryAdapter::build_body(&r, false).get("reasoning_effort").is_none());
+        r.model = "o3".into();
+        r.reasoning = None;
+        assert!(FoundryAdapter::build_body(&r, false).get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn parses_content_tokens_finish_reason_and_prompt_cache() {
         let result = parse_response(serde_json::json!({
             "choices": [{
@@ -458,6 +614,46 @@ mod tests {
         assert_eq!(result.content, "");
         assert_eq!(result.finish_reason, "stop");
         assert_eq!(result.cache_read_tokens, 0);
+    }
+
+    /// Some deployments answer `"tool_calls": []` on a plain completion. That
+    /// is no call, and must not read as one to an agentic caller.
+    #[test]
+    fn tool_calls_parse_back_and_an_empty_list_is_no_call() {
+        let with_call = parse_response(serde_json::json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        }))
+        .unwrap();
+        assert_eq!(with_call.finish_reason, "tool_calls");
+        assert_eq!(with_call.tool_calls.expect("the call")[0]["function"]["name"], "lookup");
+
+        let empty = parse_response(serde_json::json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "done", "tool_calls": []},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        }))
+        .unwrap();
+        assert!(empty.tool_calls.is_none());
+        assert_eq!(empty.content, "done");
+    }
+
+    /// `tool_choice` means nothing without tools, and an empty `tools` array
+    /// is rejected by some deployments: neither field is sent then.
+    #[test]
+    fn tool_choice_without_tools_is_not_sent() {
+        let mut r = req();
+        r.tool_choice = Some(serde_json::json!("auto"));
+        let body = FoundryAdapter::build_body(&r, false);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+
+        r.tools = Some(vec![]);
+        let body = FoundryAdapter::build_body(&r, false);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]

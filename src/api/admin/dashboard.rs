@@ -1238,6 +1238,7 @@ pub async fn get_prompts(
             store_prompts => storage.store_prompts,
             store_prompt_content => storage.store_prompt_content,
             prompt_retention_days => storage.prompt_retention_days,
+            storage_locked => storage.locked,
         },
     )
 }
@@ -1261,12 +1262,18 @@ pub async fn post_storage_settings(
 ) -> Result<axum::response::Redirect, DashboardError> {
     use crate::db::repositories::app_settings::AppSettingsRepository;
 
+    if state.storage.load().locked {
+        return Err(DashboardError::BadRequest(
+            "The storage policy is locked in the config file and cannot be changed here.".to_string(),
+        ));
+    }
     let cfg = crate::config::schema::StorageConfig {
         store_prompts: form.store_prompts.is_some(),
         store_prompt_content: form.store_prompt_content.is_some(),
         prompt_retention_days: form.prompt_retention_days.unwrap_or(0),
         // Restart-scoped, not in the form — carry the current value through.
         prompt_db_path: state.storage.load().prompt_db_path.clone(),
+        locked: false,
     };
     let json = serde_json::to_string(&cfg).map_err(|_| DashboardError::Internal)?;
     AppSettingsRepository::set_setting(&*state.db, "storage", &json)

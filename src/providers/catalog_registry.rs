@@ -4,7 +4,8 @@
 //! hard-won rule from #24: a feature-gated provider name must NEVER fall
 //! through to the OpenAI-compat arm. Providers without a catalog surface
 //! return `None`, which the aggregate reports as "not supported" rather than
-//! an empty model list.
+//! an empty model list. Search-only providers have no model catalog at all:
+//! the aggregate leaves them out instead of reporting them.
 
 use crate::config::schema::ProviderConfig;
 use crate::providers::catalog::ProviderCatalog;
@@ -15,6 +16,11 @@ use std::sync::Arc;
 /// Catalog capability for one configured provider, or `None` when the
 /// provider has no catalog surface in this binary.
 pub fn catalog_for(provider_name: &str, config: &ProviderConfig) -> Option<Arc<dyn ProviderCatalog>> {
+    if crate::providers::search_registry::is_search_only(provider_name) {
+        // Search-only providers have no model catalog; never let them reach
+        // the compat arm, which would query a default api_base.
+        return None;
+    }
     match provider_name {
         // Azure OpenAI: deployments listing needs the management plane (#33).
         "azure" => None,
@@ -51,9 +57,13 @@ pub fn catalog_for(provider_name: &str, config: &ProviderConfig) -> Option<Arc<d
 
 /// Fan out over every configured provider's catalog concurrently. Each
 /// provider degrades independently: an unreachable catalog yields an `error`
-/// entry for that provider without failing the whole response.
+/// entry for that provider without failing the whole response. Search-only
+/// providers have no model catalog: they contribute no entry and no request.
 pub async fn aggregate_catalogs(providers: &HashMap<String, ProviderConfig>) -> serde_json::Value {
-    let mut names: Vec<&String> = providers.keys().collect();
+    let mut names: Vec<&String> = providers
+        .keys()
+        .filter(|name| !crate::providers::search_registry::is_search_only(name))
+        .collect();
     names.sort();
 
     let fetches = names.iter().map(|name| {
@@ -139,6 +149,54 @@ mod tests {
         assert_eq!(out["groq"]["supported"], true);
         assert!(out["groq"]["error"].as_str().unwrap().contains("500"));
         assert!(out["groq"].get("models").is_none());
+    }
+
+    /// A search-only provider configured beside an OpenAI-compatible one:
+    /// only the latter is aggregated, the search provider's base never sees a
+    /// request, and the result carries no entry (so no error) for it.
+    #[tokio::test]
+    async fn search_only_providers_have_no_catalog_entry_and_no_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let good = serve(Router::new().route(
+            "/models",
+            get(|| async { Json(serde_json::json!({"data": [{"id": "gpt-4o"}]})) }),
+        ))
+        .await;
+        // Every path on the search providers' base counts a hit and answers
+        // 401, so a request reaching it shows up here and as an error entry.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let search_base = serve(Router::new().fallback(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::UNAUTHORIZED, "no key")
+            }
+        }))
+        .await;
+
+        let mut providers = HashMap::new();
+        providers.insert("openai".to_string(), compat_config(&good));
+        for search in ["bing_grounding", "tavily"] {
+            let mut c = ProviderConfig::default();
+            c.api_base = Some(search_base.clone());
+            providers.insert(search.to_string(), c);
+        }
+
+        let out = aggregate_catalogs(&providers).await;
+
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["openai"], "only the model provider is aggregated: {out}");
+        assert_eq!(out["openai"]["models"][0]["name"], "gpt-4o");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a catalog request reached a search-only provider");
+    }
+
+    #[test]
+    fn search_only_names_never_reach_the_compat_arm() {
+        assert!(catalog_for("bing_grounding", &ProviderConfig::default()).is_none());
+        assert!(catalog_for("tavily", &ProviderConfig::default()).is_none());
+        assert!(!crate::providers::search_registry::is_search_only("vertex"));
     }
 
     #[test]

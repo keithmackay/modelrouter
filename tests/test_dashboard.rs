@@ -47,7 +47,7 @@ async fn build_test_server_with_db(
 
     let state = AppState {
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
-        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        storage: Arc::new(arc_swap::ArcSwap::from_pointee(settings.storage.clone())),
         prompt_db: db.clone(),
         settings,
         db: db.clone(),
@@ -1729,6 +1729,36 @@ async fn storage_settings_persist_through_post() {
         .await;
 
     assert_eq!(resp.status_code(), 303, "storage settings should redirect after save");
+}
+
+#[tokio::test]
+async fn a_locked_storage_policy_cannot_be_changed_from_the_dashboard() {
+    use modelrouter::db::repositories::app_settings::AppSettingsRepository;
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let mut settings = Settings::default();
+    settings.storage.locked = true;
+    settings.storage.prompt_retention_days = 30;
+    let settings = Arc::new(settings);
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = server
+        .post("/admin/storage-settings")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .form(&[("store_prompts", "on"), ("store_prompt_content", "on"), ("prompt_retention_days", "0")])
+        .await;
+    assert_eq!(resp.status_code(), 400, "a locked policy refuses the form: {}", resp.text());
+    assert!(
+        AppSettingsRepository::get_setting(&*raw_db, "storage").await.unwrap().is_none(),
+        "nothing is saved to override the file"
+    );
+
+    let page = server
+        .get("/admin/prompts")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(page.status_code(), 200);
+    assert!(page.text().contains("Locked in the config file"), "the page says the policy is locked");
 }
 
 // ── Cost page ─────────────────────────────────────────────────────────────────

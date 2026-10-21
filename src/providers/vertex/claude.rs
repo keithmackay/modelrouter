@@ -88,12 +88,15 @@ pub fn translate_request(
 /// Parse a Vertex Anthropic non-streaming response into the shared `CompletionResult`.
 pub fn parse_response(v: serde_json::Value) -> anyhow::Result<CompletionResult> {
     let usage = &v["usage"];
+    let tokens = |field: &str| usage[field].as_u64().unwrap_or(0) as u32;
+    let (cache_read, cache_write) = (tokens("cache_read_input_tokens"), tokens("cache_creation_input_tokens"));
     Ok(CompletionResult {
         content: text_from_content(&v["content"]),
-        prompt_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
-        completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
-        cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
-        cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
+        // `input_tokens` excludes cache reads and writes; `prompt_tokens` is the whole prompt.
+        prompt_tokens: tokens("input_tokens").saturating_add(cache_read).saturating_add(cache_write),
+        completion_tokens: tokens("output_tokens"),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
         reasoning_tokens: thinking_tokens_from_usage(usage),
         // The adapter, which timed the HTTP send, fills this in.
         ttft_ms: None,
