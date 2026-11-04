@@ -7,6 +7,7 @@ use crate::{
     config::Settings,
     db::repositories::{
         admin_users::AdminUserRepository, aliases::AliasRepository, api_keys::ApiKeyRepository,
+        learned_capabilities::LearnedCapabilityRepository,
         app_settings::AppSettingsRepository,
         audit::AuditRepository,
         budgets::BudgetRepository, costs::CostRepository, experiments::ExperimentRepository,
@@ -26,6 +27,7 @@ pub trait DatabaseProvider:
     UserRepository
     + AppSettingsRepository
     + AliasRepository
+    + LearnedCapabilityRepository
     + AdminUserRepository
     + SessionRepository
     + PromptRepository
@@ -52,6 +54,7 @@ impl<T> DatabaseProvider for T where
     T: UserRepository
         + AppSettingsRepository
         + AliasRepository
+        + LearnedCapabilityRepository
         + AdminUserRepository
         + SessionRepository
         + PromptRepository
@@ -114,10 +117,32 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> axum::Router {
+    build_router_with_extensions(state, crate::extensions::Extensions::default())
+}
+
+/// [`build_router`], with request extensions: their routes are merged in and
+/// the handlers reach their hooks through an `Extension` layer.
+pub fn build_router_with_extensions(state: AppState, extensions: crate::extensions::Extensions) -> axum::Router {
+    // Decision adapters are built lazily from the provider table, like the
+    // embedding registry; they live in a layer rather than AppState so every
+    // AppState literal (tests included) stays unchanged.
+    let decisions = Arc::new(crate::providers::decision_registry::DecisionRegistry::new(
+        state.settings.providers.clone(),
+    ));
+    build_router_with_decision_registry(state, extensions, decisions)
+}
+
+/// [`build_router_with_extensions`] with a caller-supplied decision registry
+/// (tests pin a fake-upstream adapter; production builds it from config).
+pub fn build_router_with_decision_registry(
+    state: AppState,
+    extensions: crate::extensions::Extensions,
+    decision_registry: Arc<crate::providers::decision_registry::DecisionRegistry>,
+) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         audio::{speech, transcriptions},
-        completions::chat_completions, embeddings::embeddings,
+        completions::chat_completions, decisions::decisions as decisions_handler, embeddings::embeddings,
         health::{deep_health, health_check, DeepHealthCache},
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler, search::search, systemone::systemone,
@@ -175,6 +200,15 @@ pub fn build_router(state: AppState) -> axum::Router {
                 include_str!("admin/d3.min.js"),
             )
         }))
+        // The console's own script: every handler the pages bind through
+        // data-* attributes, so no page carries inline script and the console
+        // can run under a strict Content-Security-Policy.
+        .route("/static/admin.js", get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                include_str!("admin/admin.js"),
+            )
+        }))
         // Health + API routes
         .route("/health", get(health_check))
         .route("/health/deep", get(deep_health))
@@ -182,6 +216,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/decisions", post(decisions_handler))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/images/generations", post(image_generations))
@@ -208,6 +243,30 @@ pub fn build_router(state: AppState) -> axum::Router {
             "/admin/api/aliases/:alias",
             axum::routing::put(crate::api::admin::aliases::upsert_alias_api)
                 .delete(crate::api::admin::aliases::delete_alias_api),
+        )
+        // Re-price recorded calls with the router's own prices (#4386)
+        .route(
+            "/admin/api/pricing/quote",
+            axum::routing::post(crate::api::admin::pricing::quote_api),
+        )
+        // Scoped alias overrides: aliases mapped per attribution tag
+        .route(
+            "/admin/api/scoped-aliases",
+            get(crate::api::admin::scoped_aliases::list_scoped_aliases_api),
+        )
+        .route(
+            "/admin/api/scoped-aliases/:tag_key/:tag_value",
+            axum::routing::put(crate::api::admin::scoped_aliases::put_scoped_aliases_api)
+                .delete(crate::api::admin::scoped_aliases::delete_scoped_aliases_api),
+        )
+        // Model capabilities learned from provider rejections
+        .route(
+            "/admin/api/model-capabilities/learned",
+            get(crate::api::admin::learned_capabilities::list_learned_capabilities_api),
+        )
+        .route(
+            "/admin/api/model-capabilities/learned/:model",
+            delete(crate::api::admin::learned_capabilities::delete_learned_capability_api),
         )
         // Controlled experiments (spec §7a)
         .route(
@@ -245,6 +304,7 @@ pub fn build_router(state: AppState) -> axum::Router {
             get(crate::api::admin::compare::get_compare),
         )
         .route("/admin/api/models/available", get(crate::api::admin::models::get_available_models))
+        .route("/admin/api/models/parameters", get(crate::api::admin::models::get_model_parameters))
         .route("/admin/api/cache/stats", get(crate::api::admin::cache::get_cache_stats))
         .route("/admin/api/cache/purge", post(crate::api::admin::cache::post_cache_purge))
         .route(
@@ -349,7 +409,10 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/v1/mcp/servers", get(list_mcp_servers).post(create_mcp_server))
         .route("/v1/mcp/servers/:id", get(get_mcp_server).patch(update_mcp_server).delete(delete_mcp_server))
         .route("/v1/mcp/discover", post(discover_mcp_tools))
+        .merge(extensions.routes())
         .with_state(state.clone())
+        .layer(axum::Extension(extensions))
+        .layer(axum::Extension(decision_registry))
         // Deep-health result cache lives in a layer, not AppState: it is
         // route-local state, and an Extension keeps every AppState literal
         // (tests included) unchanged.

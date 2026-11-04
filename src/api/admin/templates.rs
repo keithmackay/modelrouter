@@ -232,6 +232,72 @@ mod registration_tests {
 
 
 #[cfg(test)]
+mod no_inline_script_tests {
+    /// The console is meant to run under a strict Content-Security-Policy
+    /// (script-src from its own origin only: no inline script, no inline
+    /// event handler, no eval). Every behaviour lives in `admin.js`, bound
+    /// through data-* attributes. This walks the templates and the admin
+    /// handlers' HTML-building sources so a new inline handler or `<script>`
+    /// block fails `cargo test` instead of breaking the console under that
+    /// policy at first visit.
+    fn offending_lines(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // A comment or a test assertion may name the markup it forbids.
+            if trimmed.starts_with("//") || trimmed.contains("assert") {
+                continue;
+            }
+            let l = line.to_ascii_lowercase();
+            let inline_handler = [" onclick=", " onchange=", " oninput=", " onsubmit=", " onload=", " onkeydown=", " onkeyup=", " onmouseover=", "hx-on", "javascript:"]
+                .iter()
+                .any(|needle| l.contains(needle));
+            let executable_script = l.contains("<script") && !l.contains("src=") && !l.contains("application/json");
+            if inline_handler || executable_script {
+                out.push(format!("{}: {}", n + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn admin_templates_and_handler_markup_carry_no_inline_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(root.join("templates/admin")).expect("templates/admin is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("html") {
+                continue;
+            }
+            for line in offending_lines(&std::fs::read_to_string(&path).expect("template is readable")) {
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+        }
+        for entry in std::fs::read_dir(root.join("src/api/admin")).expect("src/api/admin is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            for line in offending_lines(&std::fs::read_to_string(&path).expect("source is readable")) {
+                // The test's own needle list names the attributes; skip this file.
+                if path.ends_with("templates.rs") {
+                    continue;
+                }
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+        }
+        assert!(offenders.is_empty(), "inline script or handlers in the admin console (move them to admin.js and data-* hooks):\n{}", offenders.join("\n"));
+    }
+
+    #[test]
+    fn base_template_loads_the_console_script_and_disables_htmx_eval() {
+        let base = include_str!("../../../templates/admin/base.html");
+        assert!(base.contains("<script src=\"/static/admin.js\"></script>"), "base.html must load /static/admin.js");
+        assert!(base.contains("name=\"htmx-config\"") && base.contains("\"allowEval\":false"), "base.html must switch htmx eval off");
+    }
+}
+
+#[cfg(test)]
 mod money_tests {
     use super::fmt_money;
 

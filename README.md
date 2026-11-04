@@ -666,8 +666,9 @@ config or redeploying. Fallback chains (`[routing.fallback_chains]`) accept any 
 `[providers.foundry]` is to Azure what `[providers.vertex]` is to GCP. A Foundry
 (AI Services) resource fronts every model deployed on it — Llama, Mistral, Phi, DeepSeek,
 Cohere, Grok and the OpenAI models — behind one endpoint, with the deployment named in the
-request body, so `foundry/<deployment>` is all a route needs. Chat, streaming, embeddings
-and `GET /admin/api/models/available` discovery all go through it.
+request body, so `foundry/<deployment>` is all a route needs. Chat, streaming, embeddings,
+decisions (`POST /v1/decisions`) and `GET /admin/api/models/available` discovery all go
+through it.
 
 Distinct from `[providers.azure]`, which speaks the older Azure OpenAI surface
 (`/openai/deployments/<deployment>/…?api-version=`) with an `api-key` header and needs one
@@ -680,6 +681,7 @@ Foundry / AI Services resource.
 | `project` | Foundry project; appends `/api/projects/<project>` | none (resource-level) |
 | `entra_scope` | Override the Entra audience | derived from the endpoint |
 | `api_version` | Override the per-surface api-version | per surface (see below) |
+| `decision_deployments` | Deployments that serve `POST /v1/decisions`. A bare `model` that is no alias and names no provider resolves against this list (a decision is never substituted by `routing.default_model`); a resolved deployment outside the list is refused with a 400 before a call | none (every resolved deployment passed through; a bare name no provider lists is still refused) |
 
 **The surface is the path you configure.** A bare host resolves to the OpenAI-compatible
 data plane (`/openai/v1`), where `api-version` is optional and the service defaults to
@@ -921,6 +923,7 @@ configured.
 store_prompts = true          # false skips prompt-log rows entirely
 store_prompt_content = false  # true stores full request/response bodies
 prompt_retention_days = 0     # purge rows older than N days; 0 = keep forever
+locked = false                # true pins this policy to the file (see below)
 ```
 
 - `store_prompts = false` skips the prompt-log INSERT on every route. Cost
@@ -941,6 +944,15 @@ prompt_retention_days = 0     # purge rows older than N days; 0 = keep forever
 These settings can also be edited in the admin dashboard on the **Prompts**
 page; values saved there persist in the database, override `config.toml`, and
 apply immediately without a restart.
+
+`locked = true` (config file only) pins the policy to `config.toml`, for a
+deployment that must never keep conversation bodies:
+
+- the dashboard shows the settings read-only and refuses a save;
+- a policy saved from the dashboard earlier is ignored at start-up, with a warning;
+- while `store_prompt_content = false`, no request stores content: creating an
+  experiment with `retain_content: true` is refused (API, dashboard and CLI),
+  and an existing retaining experiment's requests are stored as metadata only.
 
 ### Response cache
 
@@ -988,10 +1000,15 @@ creative sampling replayed.
 
 | Value | Effect | Response header |
 |---|---|---|
-| (absent) | The eligibility rules above decide | `HIT` / `MISS` |
+| (absent) | The eligibility rules above decide | `HIT` / `MISS`, or none when not cached |
 | `use` | Look up and store even when the request is not eligible by default, e.g. a sampled `temperature` | `HIT` / `MISS` |
 | `bypass` | Neither look up nor store | `BYPASS` |
 | `refresh` | Skip the lookup, call the provider, store the fresh answer over the old entry | `REFRESH` |
+
+The response header is a status indicator, not an error. `MISS` means the
+cache was consulted and held no entry; a response the cache was not involved
+in (cache off, request ineligible, or not opted in under `require_opt_in`)
+carries no `x-modelrouter-cache` header at all.
 
 Values are case-insensitive; anything else is a 400. The header never switches
 on a cache or class the operator has disabled, and it never overrides a
@@ -1000,6 +1017,17 @@ widen what is cached, so an operator can refuse them with
 `cache.allow_header_opt_in = false`; the router then treats them as absent.
 `bypass` only narrows and is always honoured. `use` suits clients that rerun
 identical workloads with sampling on and want the first answer replayed.
+
+**Opt-in only.** `cache.require_opt_in = true` turns the default around: a
+request is cached only when it carries `x-modelrouter-cache: use` (lookup and
+store) or `refresh` (store only). A request without the header is neither
+looked up nor stored, however eligible it would otherwise be, and it never
+reads an entry a `use` request stored. Use it when the client decides
+call by call what may be cached, and a call that forgets the header must not
+be. `cache stats` and the stats API report `require_opt_in` and
+`skipped_without_opt_in`, the number of header-less requests it skipped. A
+rising count names a client that is not opting in. It requires
+`allow_header_opt_in = true`; the contradictory pair is refused at start-up.
 
 **Per-request TTL.** `x-modelrouter-cache-ttl: <seconds>` sets how long the
 entry this request stores will live, in place of the class TTL; `0` asks for an
@@ -1112,6 +1140,8 @@ written back to the config file — a restart returns to the configured policy.
 
 Models resolve in this order:
 
+0. For a request bound to an experiment, its variant's overlay; then, for a request whose
+   attribution tags carry a scope's tag, that scope's override (see *Scoped alias overrides*)
 1. Runtime aliases (`model_aliases` table — admin API / dashboard / CLI)
 2. Aliases attached to enabled registered models (the `Alias` column on `/admin/models`)
 3. Alias lookup from `routing.model_aliases` in `config.toml`
@@ -1149,6 +1179,56 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_JWT" \
 Reads require any admin role; writes require `superadmin`. The dashboard equivalent is the
 **Model Aliases** section of `/admin/models`. A target may be a concrete `provider/model`
 or another alias; writes that would create a cycle are rejected with a 400.
+
+#### Scoped alias overrides
+
+A scoped override maps aliases to models for requests carrying one attribution tag, so one
+tenant, project or run can be routed to different models while every caller keeps sending the
+same alias names. A scope is a tag `key=value`; writing a scope replaces its whole set of
+aliases. Targets are pinned when written through the same gate as experiment variants (no
+pool, no default-model substitution, a configured provider, a pricing entry), so a later edit of
+a global alias never changes an override. A pinned request skips the complexity downgrade, load
+balancer, session affinity, response cache and fallback, like an experiment-bound one; the
+ledger records the model that answered and the prompt row keeps the alias that was asked for.
+
+```bash
+curl -X PUT http://localhost:8080/admin/api/scoped-aliases/tenant/acme \
+  -H "Authorization: Bearer $ADMIN_JWT" -H 'Content-Type: application/json' \
+  -d '{"aliases":{"deep":"anthropic/claude-opus-4-6","fast":"openai/gpt-5-mini"},"expires_at":"2030-01-01T00:00:00Z"}'
+
+curl -H "Authorization: Bearer $ADMIN_JWT" "http://localhost:8080/admin/api/scoped-aliases?tag_key=tenant"
+curl -X DELETE -H "Authorization: Bearer $ADMIN_JWT" http://localhost:8080/admin/api/scoped-aliases/tenant/acme
+```
+
+`expires_at` is an RFC3339 time in the future or `0` for never. An expired override stops
+applying at once; a minute-by-minute tick then deletes it (audited as `system`) and reloads both
+the overrides and the global runtime aliases, so replicas sharing a database converge. When a
+request's tags name several scopes that map the requested alias, the smallest tag key wins.
+Reads require any admin role; writes require `superadmin` and are audited.
+
+An alias may also set request parameters, by writing `{"target": ..., "params": {...}}` in
+place of the bare target:
+
+```bash
+-d '{"aliases":{"deep":{"target":"foundry/o3","params":{"reasoning_effort":"high","max_tokens":32000}}},"expires_at":0}'
+```
+
+The parameters are checked against the pinned model's parameter schema when written. An
+unsupported parameter, or a value out of range, is refused with a 400 that names the model and
+the parameter. On `/v1/chat/completions` they overwrite the caller's values for every request
+the scope routes. The other surfaces only route the model.
+
+Each model's schema appears as `parameters` in `GET /admin/api/models/available`.
+`GET /admin/api/models/parameters?target=<alias or provider/model>` returns the schema of
+whatever a target resolves to now. The schema lists only what the router actually sends for
+that model:
+
+- `max_tokens`, up to the model's output ceiling where it is known.
+- `temperature`, unless the model rejects it.
+- `reasoning_effort`, only where the provider adapter forwards a reasoning control. It lists
+  only the levels the model accepts as they are. Claude 5 models take `low` to `max`, plus `none`
+  where thinking can be turned off. OpenAI reasoning models (o-series, GPT-5) take their own
+  levels; on Foundry the router forwards `reasoning_effort` to them.
 
 #### Strict model resolution
 
@@ -1506,9 +1586,47 @@ curl http://localhost:8080/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "rust programming language", "max_results": 5}'
 
+# Decisions — typed questions over a document, answered by a decision-capable
+# deployment (today: Azure AI Foundry). The body is passed through with `model`
+# resolved to the deployment; the answer comes back as the provider sent it,
+# plus `usage.cost_usd` and `x_router`. A provider 4xx is returned with its
+# status and body under `error.upstream`, never retried.
+curl http://localhost:8080/v1/decisions \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "foundry/<decision-deployment>",
+       "input": "I was charged twice for my order. Please return the extra charge.",
+       "questions": [{"type": "predicate", "name": "refund_requested",
+                      "instructions": "Does the customer ask for a refund?"}]}'
+
 # Health check
 curl http://localhost:8080/health
 ```
+
+#### Decisions (`POST /v1/decisions`)
+
+JSON passthrough to a provider's Decisions API: a document (`input`) plus typed
+`questions` (a `predicate` answered as a `probability`; `choice` and `score`
+types likewise), answered in question order under `answers[]`. Served today by
+the `foundry` provider (`{endpoint}/openai/v1/decisions`, the same Entra or
+`api-key` credential as chat). `model` resolves as an alias, a scoped alias
+for the request's attribution tags, or `provider/deployment`, as on chat; a
+bare name none of those know resolves against the providers'
+`decision_deployments` (a decision-only deployment is usually absent from the
+chat catalog), and a bare name no provider lists is a 400 naming it, before
+anything is sent. A decision is never substituted: `routing.default_model` and
+`routing.strict_model_resolution` play no part on this route, because the
+caller named the one deployment that is to answer. The resolved deployment
+replaces `model` on the wire; nothing else in the body is read or re-shaped. The call is gated by the policy engine, bounded by the tier
+timeout the request addresses (else the provider's `timeout_secs`), priced from
+the response `usage` at the deployment's chat input/output rates, and written
+to the prompt log (without content) and the cost ledger. A model that resolves
+to a provider with no decisions surface is a 400 naming the provider; a
+deployment outside `[providers.foundry] decision_deployments`, when that list
+is set, is a 400 before anything is sent; a provider 4xx is returned with its
+status, its body under `error.upstream` and code `upstream_rejected`, and is
+never retried; a 5xx is a 502. No fallback chain: a decision names one
+deployment.
 
 #### Typed judgments (`POST /v1/systemone`)
 
@@ -1548,6 +1666,55 @@ to the engine's own default). `engine` is optional; when omitted it falls back
 to `[routing] default_search_engine`, then to the sole configured engine if
 there is exactly one.
 
+A search is priced as the engine's flat per-query rate (`[[pricing]]` or the
+live price feed) plus, for a grounding engine, the tokens of the model call
+that ran the search tool, priced from the model price table under the
+deployment name the provider reports. The platform bills both. `x_router.tokens`
+carries those tokens (`prompt`, `completion`, `cache_read`, `reasoning`) and the
+ledger row records them in place of the result count; a plain search API
+reports no tokens. Tokens of a deployment the price table does not know are
+reported, warned about once, and not priced; the per-query rate still applies.
+
+A grounding engine that ran its search tool and whose model cited nothing is a
+**metered miss**, not an error: the provider served and billed the call. The
+response is `200` with `results: []`, the usual `usage`/`x_router`, and a
+`grounding` object naming it:
+
+```json
+{ "engine": "bing_grounding", "results": [], "grounding": { "status": "no_citations", "detail": "response status: completed; no url_citation annotations in the response" }, "usage": { "...": "" } }
+```
+
+No generated text travels with a miss, so ungrounded prose never reaches a
+caller as a result. A miss on the primary engine still walks the fallback chain
+first, and a miss is never written to the response cache: the next identical
+query reaches the engine again.
+
+`include_answer` is optional (boolean, default `false`). When `true`, a
+grounding engine also returns the text its model wrote around the citations,
+as `answer: {"text": "...", "query_urls": ["..."], "follow_up_queries": ["..."]}`.
+`query_urls` are the search-engine query URLs the provider reported, verbatim
+(Bing's display terms cover them too). The answer is generated, not retrieved:
+use it to decide which cited pages to read or what to search next. It is never
+returned without citations, because a response with no citations is still an
+error. Today only `bing_grounding` produces one; other engines omit `answer`.
+
+Grounded-research mode adds three optional fields, each requiring
+`include_answer: true` (sent without it they are a 400):
+
+- `instructions` (string): replaces the engine's default answer instruction,
+  so a caller can version its research brief alongside its own code. The
+  router always appends its grounding rule (answer only from retrieved pages,
+  cite every claim), so instructions cannot turn the call into an ungrounded
+  answer.
+- `context` (string): appended to the model input after the question.
+- `max_follow_up_queries` (0-10): asks the model for that many follow-up search
+  queries, returned as `answer.follow_up_queries`. The router owns the line
+  format it parses them from and strips that line from `answer.text`. A missing
+  or malformed line yields `[]`, never an error.
+
+`include_answer` and all three fields are part of the response-cache key, so a
+cached answer is never served to a request that asked for something different.
+
 Response:
 
 ```json
@@ -1581,7 +1748,7 @@ re-pricing calls against a private price list that drifts from the router's
 `cost_ledger` (and `prompts`) row for the same request.
 
 Covered endpoints: `/v1/chat/completions` (non-streamed, and the terminal
-chunk of a stream), `/v1/embeddings`, `/v1/search`. Not yet covered:
+chunk of a stream), `/v1/embeddings`, `/v1/search`, `/v1/decisions`. Not yet covered:
 `/v1/messages`, `/v1/responses`, images, audio.
 
 Two additive fields; the OpenAI shape is otherwise unchanged:
@@ -1591,7 +1758,12 @@ Two additive fields; the OpenAI shape is otherwise unchanged:
   `0`, with `usage.cache_hit: true` and `usage.saved_usd` carrying the
   avoided cost. `usage.uncached_cost_usd` is always present: the call's
   cost had it not been served from the cache, equal to `cost_usd` on a live
-  call. `usage.tokens_estimated: true` appears when the provider
+  call. `usage.no_cache_cost_usd` is always present too: the call's cost
+  with no caching at all, neither the response cache nor the provider's
+  prompt cache (every prompt token at the standard input rate). It differs
+  from `uncached_cost_usd` only when the call read from or wrote to the
+  prompt cache; a call that only wrote to it costs more than this figure,
+  since cache writes are priced above the input rate. `usage.tokens_estimated: true` appears when the provider
   reported no usage and the counts (and so the cost) are the router's
   estimate.
 - `x_router` — the full per-call record:
@@ -1624,7 +1796,7 @@ Two additive fields; the OpenAI shape is otherwise unchanged:
 | `settings` | Values actually sent to the provider after router resolution and adapter defaults. `dropped` lists caller parameters the router deliberately did not forward (e.g. `temperature` to a model that rejects it). Search reports `max_results`. |
 | `tokens` | Chat/embeddings only. `prompt` includes provider-cache reads; `reasoning` is `null` when the provider gave no figure; `estimated` mirrors the ledger's `tokens_estimated`. |
 | `results` | Search only: results returned. |
-| `cost` | `cost_usd`, `uncached_cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
+| `cost` | `cost_usd`, `uncached_cost_usd`, `no_cache_cost_usd`, `cache_hit`, and `saved_usd` on a hit. |
 | `timing` | `total_ms` from request receipt; `latency_ms` dispatch to completion including retries and fallback hops (0 on a hit); `provider_ms` for the answering provider call; `ttft_ms` for streams (first byte); `attempts` provider calls made; `fallbacks` hops to another model. |
 
 **Streams.** The router splices one extra `chat.completion.chunk` with

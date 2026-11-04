@@ -49,31 +49,6 @@
 <script id="hitdata" type="application/json">[
 {% for d in daily %}{"day":"{{ d.day }}","hit_rate":{{ d.hit_rate_pct }},"requests":{{ d.requests }}}{% if not loop.last %},{% endif %}
 {% endfor %}]</script>
-<script>
-(function() {
-    var data = JSON.parse(document.getElementById('hitdata').textContent);
-    var svg = d3.select('#hitchart');
-    var box = svg.node().getBoundingClientRect();
-    var w = box.width || 800, h = 220;
-    var m = {top: 10, right: 20, bottom: 30, left: 40};
-    var x = d3.scalePoint().domain(data.map(function(d) { return d.day; })).range([m.left, w - m.right]);
-    var y = d3.scaleLinear().domain([0, 100]).range([h - m.bottom, m.top]);
-    svg.append('g').attr('transform', 'translate(0,' + (h - m.bottom) + ')')
-       .call(d3.axisBottom(x).tickValues(x.domain().filter(function(_, i) {
-           return i % Math.ceil(data.length / 8) === 0;
-       })));
-    svg.append('g').attr('transform', 'translate(' + m.left + ',0)')
-       .call(d3.axisLeft(y).ticks(5).tickFormat(function(v) { return v + '%'; }));
-    var line = d3.line().x(function(d) { return x(d.day); }).y(function(d) { return y(d.hit_rate); });
-    svg.append('path').datum(data).attr('fill', 'none')
-       .attr('stroke', '#27ae60').attr('stroke-width', 2).attr('d', line);
-    svg.selectAll('circle').data(data).enter().append('circle')
-       .attr('cx', function(d) { return x(d.day); })
-       .attr('cy', function(d) { return y(d.hit_rate); })
-       .attr('r', 3).attr('fill', '#27ae60')
-       .append('title').text(function(d) { return d.day + ': ' + d.hit_rate + '% of ' + d.requests + ' requests'; });
-})();
-</script>
 {% else %}
 <p style="color:#777;">No usage recorded in the window yet.</p>
 {% endif %}

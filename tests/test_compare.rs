@@ -112,6 +112,8 @@ async fn build_app() -> (TestServer, Arc<dyn DatabaseProvider>, Arc<Settings>) {
                 snippet: "Example description".to_string(),
                 score: Some(0.9),
                 published_date: None,
+                publisher: None,
+                metadata_provenance: None,
             }],
         })),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(

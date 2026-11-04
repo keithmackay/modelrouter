@@ -188,6 +188,16 @@ fn pct(v: f64) -> String {
     format!("{:.1}%", v * 100.0)
 }
 
+/// The `require_opt_in` line, shown only when the mode is on.
+fn opt_in_line(live: &serde_json::Value) -> Option<String> {
+    live["require_opt_in"].as_bool().filter(|on| *on).map(|_| {
+        format!(
+            "Opt-in only:    yes   ({} header-less requests skipped)",
+            live["skipped_without_opt_in"].as_u64().unwrap_or(0)
+        )
+    })
+}
+
 fn print_stats(stats: &serde_json::Value) {
     let live = &stats["live"];
     let ledger = &stats["ledger"];
@@ -197,6 +207,9 @@ fn print_stats(stats: &serde_json::Value) {
         live["enabled"].as_bool().unwrap_or(false),
         live["healthy"].as_bool().unwrap_or(false)
     );
+    if let Some(line) = opt_in_line(live) {
+        println!("{line}");
+    }
     println!("Entries:        {}", live["entries"].as_u64().unwrap_or(0));
     println!("Evictions:      {}", live["evictions"].as_u64().unwrap_or(0));
     println!(
@@ -288,7 +301,7 @@ fn build_purge_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_policy_update, build_purge_body, namespace_rows};
+    use super::{build_policy_update, build_purge_body, namespace_rows, opt_in_line};
     use serde_json::json;
 
     #[test]
@@ -325,6 +338,15 @@ mod tests {
             build_purge_body(false, None, Some("n".into()), Some("k".into())),
             json!({ "scope": "namespace", "namespace": "n" })
         );
+    }
+
+    #[test]
+    fn opt_in_line_shows_only_when_required() {
+        let on = json!({ "require_opt_in": true, "skipped_without_opt_in": 7 });
+        let line = opt_in_line(&on).expect("shown when on");
+        assert!(line.contains("7 header-less"), "{line}");
+        assert_eq!(opt_in_line(&json!({ "require_opt_in": false })), None);
+        assert_eq!(opt_in_line(&json!({})), None);
     }
 
     #[test]

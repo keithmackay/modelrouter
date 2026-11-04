@@ -21,6 +21,7 @@ fn router_with_aliases() -> RequestRouter {
         strict_model_resolution: false,
         default_search_engine: None,
         search_fallback_chains: HashMap::new(),
+        config_aliases_win_at_start: false,
     };
     RequestRouter::new(Arc::new(settings))
 }

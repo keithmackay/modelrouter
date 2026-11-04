@@ -683,7 +683,7 @@ fn key_group_html(group_id: i64, active: Option<&KeyView>, disabled_keys: &[KeyV
         let arrow = if expanded { "▼" } else { "▶" };
         let label = if sub_count == 1 { "1 old key".to_string() } else { format!("{} old keys", sub_count) };
         format!(
-            " <button id=\"toggle-{gid}\" type=\"button\" onclick=\"toggleGroup('{gid}')\" \
+            " <button id=\"toggle-{gid}\" type=\"button\" data-toggle-group=\"{gid}\" \
             class=\"btn btn-secondary\" data-count=\"{sub_count}\">{arrow} {label}</button>"
         )
     } else {
@@ -760,8 +760,7 @@ fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_h
             <code style=\"color:green;font-family:monospace;font-size:0.85rem;background:#f0fff0;\
             padding:0.2rem 0.4rem;border-radius:3px;border:1px solid #c3e6cb;\">{raw_e}</code>\
             <button type=\"button\" title=\"Copy to clipboard\" \
-            onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{var b=this;\
-            b.textContent='✓';setTimeout(function(){{b.textContent='⧉'}},1500)}}.bind(this))\" \
+            data-copy=\"{raw_e}\" data-copied-label=\"✓\" data-copy-label=\"⧉\" \
             style=\"background:none;border:1px solid #aaa;border-radius:3px;padding:0.1rem 0.35rem;\
             cursor:pointer;font-size:0.85rem;color:#555;\">⧉</button>{mailto_html}</span>"
         )
@@ -974,15 +973,10 @@ pub async fn post_create_key(
               <button class=\"btn btn-secondary\" \
                 hx-post=\"/admin/keys/{gid}/rotate\" \
                 hx-target=\"#key-group-{gid}\" hx-swap=\"outerHTML\" \
-                onclick=\"document.getElementById('key-form-message').innerHTML=''\"\
+                data-clear-html=\"key-form-message\"\
               >Rotate existing key</button>\
             </div>\
-            <script>(function(){{\
-              var el=document.getElementById('key-group-{gid}');\
-              if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});\
-              el.classList.add('row-highlight');\
-              setTimeout(function(){{el.classList.remove('row-highlight');}},2500);}}\
-            }})();</script>",
+            <span hidden data-scroll-highlight=\"key-group-{gid}\"></span>",
             user = he(&user_name),
             proj = he(proj_label),
             status = status_tag,
@@ -1060,21 +1054,11 @@ pub async fn post_create_key(
         <span>✓ Key created for <strong>{user}</strong>{proj_str}. Copy it now — it won't be shown again:</span>\
         <code style=\"font-family:monospace;background:#f0fff0;padding:0.2rem 0.4rem;\
         border-radius:3px;border:1px solid #c3e6cb;\">{raw_e}</code>\
-        <button type=\"button\" onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{\
-        var b=this;b.textContent='✓ Copied';setTimeout(function(){{b.textContent='⧉ Copy'}},1500)\
-        }}.bind(this))\" class=\"btn btn-secondary\">⧉ Copy</button>\
+        <button type=\"button\" data-copy=\"{raw_e}\" data-copied-label=\"✓ Copied\" data-copy-label=\"⧉ Copy\" \
+        class=\"btn btn-secondary\">⧉ Copy</button>\
         {mailto_btn}\
         </div>\
-        <template id=\"__new_group__\">{tbody}</template>\
-        <script>(function(){{\
-        var t=document.getElementById('__new_group__');\
-        var el=t.content.firstElementChild.cloneNode(true);\
-        var table=document.getElementById('keys-table');\
-        var first=table.querySelector('tbody');\
-        table.insertBefore(el,first||null);\
-        htmx.process(el);\
-        t.remove();\
-        }})();</script>",
+        <template data-prepend-into=\"keys-table\">{tbody}</template>",
         user = he(&user.name),
         proj_str = proj_str,
         raw_e = raw_e,
@@ -1238,6 +1222,7 @@ pub async fn get_prompts(
             store_prompts => storage.store_prompts,
             store_prompt_content => storage.store_prompt_content,
             prompt_retention_days => storage.prompt_retention_days,
+            storage_locked => storage.locked,
         },
     )
 }
@@ -1261,12 +1246,18 @@ pub async fn post_storage_settings(
 ) -> Result<axum::response::Redirect, DashboardError> {
     use crate::db::repositories::app_settings::AppSettingsRepository;
 
+    if state.storage.load().locked {
+        return Err(DashboardError::BadRequest(
+            "The storage policy is locked in the config file and cannot be changed here.".to_string(),
+        ));
+    }
     let cfg = crate::config::schema::StorageConfig {
         store_prompts: form.store_prompts.is_some(),
         store_prompt_content: form.store_prompt_content.is_some(),
         prompt_retention_days: form.prompt_retention_days.unwrap_or(0),
         // Restart-scoped, not in the form — carry the current value through.
         prompt_db_path: state.storage.load().prompt_db_path.clone(),
+        locked: false,
     };
     let json = serde_json::to_string(&cfg).map_err(|_| DashboardError::Internal)?;
     AppSettingsRepository::set_setting(&*state.db, "storage", &json)

@@ -282,7 +282,18 @@ timeout_secs             = 300
 # restricted to the domains configured on the Custom Search instance.
 # custom_search          = true
 # custom_search_instance = "<instance-name>"
+
+# Optional search parameters (sent in the tool's search configuration):
+# search_market          = "en-US"   # default en-US
+# search_set_lang        = "en"      # default en
+# search_freshness       = "month"   # default: no age filter
 ```
+
+**Blocking low-quality domains.** Grounding with Bing Custom Search can also be configured to *block* domains and search the rest of the web. The block list lives on the Custom Search instance in the Azure portal, not in modelrouter: create the instance, add the domains to block, connect the Custom Search resource to the project, then set `custom_search = true`, `custom_search_instance` and point `project_connection_id` at that connection. Changing the list needs no router change or restart.
+
+**Freshness per request.** `POST /v1/search` accepts an optional `freshness` (`day`, `week`, `month`, a date `YYYY-MM-DD` or a range `YYYY-MM-DD..YYYY-MM-DD`; anything else is a 400). It overrides `search_freshness` for that call; engines without an age filter ignore it.
+
+**Publication date and publisher.** The adapter asks the model to write one line per source in the form `[PUBLISHED: YYYY-MM-DD or unknown] [PUBLISHER: name] "verbatim quote"`, and parses that prefix into each result's `published_date` and `publisher`, removing it from `snippet`. Those values are read off the page by the model, not reported by Bing, so such results carry `metadata_provenance: "model_extracted"`. Future or malformed dates and `unknown` values are dropped.
 
 `timeout_secs = 300` is not a typo. Unlike Tavily, this call runs a Bing search **and** a model generation before it returns, so it is a completion-length operation; the router logs a warning if you leave it at a search-length value. The endpoint is the version-less `/openai/v1/responses` surface, so no `api-version` is sent — set `api_version` only to reach a preview surface.
 

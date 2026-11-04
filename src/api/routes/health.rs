@@ -25,10 +25,18 @@ use crate::providers::embedding::EmbeddingRequest;
 use crate::providers::search::SearchRequest;
 
 /// GET /health — liveness plus (when caching is enabled) cache-backend state.
-pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
+pub async fn health_check(
+    State(state): State<AppState>,
+    extensions: Option<Extension<crate::extensions::Extensions>>,
+) -> Json<Value> {
     let mut body = json!({"status": "ok"});
     if let Some(cache) = cache_block(&state).await {
         body["cache"] = cache;
+    }
+    // Which request extensions this binary runs with, so a caller that
+    // depends on one can refuse to start without it. Absent when there are none.
+    if let Some(Extension(extensions)) = extensions.filter(|Extension(e)| !e.is_empty()) {
+        body["extensions"] = extensions.health();
     }
     Json(body)
 }
@@ -197,18 +205,7 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
         return CapabilityReport::failed(target, 0, unavailable.message());
     }
 
-    let req = NormalizedRequest {
-        model: model.clone(),
-        request_model: requested.clone(),
-        messages: vec![json!({"role": "user", "content": "health probe"})],
-        stream: false,
-        temperature: None,
-        max_tokens: Some(1),
-        tools: None,
-        tool_choice: None,
-        reasoning: None,
-        extra_params: json!({}),
-    };
+    let req = llm_probe_request(&model, &requested, &state.settings.model_capabilities);
     let started = Instant::now();
     let report = match adapter.complete(&req).await {
         Ok(result) => {
@@ -226,12 +223,60 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
             );
             CapabilityReport::ok(target, latency)
         }
+        // The provider accepted the credential, resolved the deployment and
+        // ran the model; it only ran out of the probe's small output budget.
+        // That proves the capability, so it is not a failure.
+        Err(e) if is_output_limit_error(&e.to_string()) => {
+            CapabilityReport::ok(target, started.elapsed().as_millis() as i64)
+        }
         Err(e) => {
             CapabilityReport::failed(target, started.elapsed().as_millis() as i64, e.to_string())
         }
     };
     // Read after the call: a fallback taken during it changes the answer.
     report.with_credential(adapter.credential_report().map(|r| r.to_json()))
+}
+
+/// Output budget for the LLM probe on a reasoning model. Reasoning tokens
+/// count against `max_completion_tokens`, so a one-token budget is spent
+/// before any visible output and the provider rejects the call.
+const REASONING_PROBE_MAX_TOKENS: u32 = 64;
+
+/// The probe completion for `model`: one token for ordinary models; for the
+/// reasoning families a small budget at the lowest reasoning level the model
+/// accepts, so the probe stays cheap but can actually finish.
+fn llm_probe_request(
+    model: &str,
+    requested: &str,
+    capabilities: &[crate::config::schema::ModelCapabilityEntry],
+) -> NormalizedRequest {
+    use crate::router::model_capabilities::{resolve_reasoning, uses_max_completion_tokens};
+    let reasoning_model = uses_max_completion_tokens(model);
+    NormalizedRequest {
+        model: model.to_string(),
+        request_model: requested.to_string(),
+        messages: vec![json!({"role": "user", "content": "health probe"})],
+        stream: false,
+        temperature: None,
+        max_tokens: Some(if reasoning_model { REASONING_PROBE_MAX_TOKENS } else { 1 }),
+        tools: None,
+        tool_choice: None,
+        reasoning: if reasoning_model {
+            resolve_reasoning(model, Some("minimal"), capabilities)
+        } else {
+            None
+        },
+        extra_params: json!({}),
+    }
+}
+
+/// Whether a provider error only says the output budget ran out (e.g. a
+/// reasoning model that spent the whole budget thinking). Such a call reached
+/// a working model, which is all the probe needs to know.
+fn is_output_limit_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("max_tokens or model output limit was reached")
+        || lower.contains("max_completion_tokens or model output limit was reached")
 }
 
 /// One short embedding through the embedding registry.
@@ -343,6 +388,7 @@ async fn probe_search(state: &AppState) -> CapabilityReport {
     let req = SearchRequest {
         query: "health probe".to_string(),
         max_results: Some(1),
+        ..Default::default()
     };
     let started = Instant::now();
     let report = match adapter.search(&req).await {
@@ -487,4 +533,39 @@ fn record_probe_usage(
             tracing::error!(error = %e, "failed to record health-probe usage");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_gives_reasoning_models_a_budget_they_can_finish_in() {
+        let req = llm_probe_request("gpt-5.4-nano", "fast", &[]);
+        assert_eq!(req.max_tokens, Some(REASONING_PROBE_MAX_TOKENS));
+        assert_eq!(req.reasoning.and_then(|r| r.effort), Some("low"));
+        assert_eq!(req.request_model, "fast");
+
+        let req = llm_probe_request("gpt-5", "gpt-5", &[]);
+        assert_eq!(req.reasoning.and_then(|r| r.effort), Some("minimal"));
+    }
+
+    #[test]
+    fn probe_stays_one_token_for_ordinary_models() {
+        let req = llm_probe_request("gpt-4o-mini", "gpt-4o-mini", &[]);
+        assert_eq!(req.max_tokens, Some(1));
+        assert!(req.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_limit_errors_are_recognised_and_nothing_else_is() {
+        assert!(is_output_limit_error(
+            "Azure AI Foundry returned 400 Bad Request: Could not finish the message because \
+             max_tokens or model output limit was reached. Please try again with higher max_tokens."
+        ));
+        assert!(!is_output_limit_error("Azure AI Foundry returned 401 Unauthorized"));
+        assert!(!is_output_limit_error(
+            "Azure AI Foundry returned 404 Not Found: DeploymentNotFound"
+        ));
+    }
 }

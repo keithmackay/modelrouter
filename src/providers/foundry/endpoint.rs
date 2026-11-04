@@ -209,6 +209,12 @@ impl FoundryEndpoint {
         self.with_api_version(format!("{}/embeddings", self.base))
     }
 
+    /// The Decisions API: `POST {base}/decisions`, on whichever surface the
+    /// endpoint resolved to, with the same api-version rule as chat.
+    pub fn decisions_url(&self) -> String {
+        self.with_api_version(format!("{}/decisions", self.base))
+    }
+
     /// Model listing for catalog discovery.
     ///
     /// The Model Inference surface has no listing operation at all — only
@@ -288,6 +294,20 @@ mod tests {
         assert_eq!(
             e.chat_url(),
             "https://res.services.ai.azure.com/openai/v1/chat/completions?api-version=preview"
+        );
+    }
+
+    #[test]
+    fn decisions_follow_the_surface_and_its_api_version_rule() {
+        let v1 = FoundryEndpoint::from_config(&config("https://res.openai.azure.com")).unwrap();
+        assert_eq!(v1.decisions_url(), "https://res.openai.azure.com/openai/v1/decisions");
+        let mi = FoundryEndpoint::from_config(&config("https://res.services.ai.azure.com/models")).unwrap();
+        assert_eq!(
+            mi.decisions_url(),
+            format!(
+                "https://res.services.ai.azure.com/models/decisions?api-version={}",
+                DEFAULT_MODEL_INFERENCE_API_VERSION
+            )
         );
     }
 

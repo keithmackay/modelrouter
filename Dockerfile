@@ -14,7 +14,7 @@
 #   DOCKER_BUILDKIT=1 docker build ...
 
 # ── Builder stage ────────────────────────────────────────────────────────────
-FROM rust:1.91-slim AS builder
+FROM rust:1.94-slim AS builder
 
 ARG FEATURES=""
 
@@ -45,6 +45,16 @@ COPY --chown=root:root certs/zscaler-root-ca.pem /usr/local/share/ca-certificate
 RUN update-ca-certificates
 
 COPY --from=builder /build/target/release/modelrouter /modelrouter
+
+# Run as an unprivileged user (uid/gid 1001), not root. /data and /config are
+# created owned by that user so a named volume mounted there is writable; a
+# bind-mounted host directory must be writable by uid 1001.
+RUN groupadd --system --gid 1001 modelrouter \
+    && useradd --system --uid 1001 --gid 1001 --home-dir /data --no-create-home \
+       --shell /usr/sbin/nologin modelrouter \
+    && mkdir -p /data /config \
+    && chown 1001:1001 /data /config
+USER 1001:1001
 
 ENTRYPOINT ["/modelrouter"]
 # Default command: start the HTTP server.

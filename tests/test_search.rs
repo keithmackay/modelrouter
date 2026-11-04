@@ -1,5 +1,6 @@
 mod common;
 
+use anyhow::Context as _;
 use axum_test::TestServer;
 use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
 use modelrouter::api::auth::hash_token;
@@ -26,6 +27,8 @@ fn mock_results() -> Vec<SearchResultItem> {
         snippet: "Example description".to_string(),
         score: Some(0.9),
         published_date: None,
+        publisher: None,
+        metadata_provenance: None,
     }]
 }
 
@@ -59,93 +62,14 @@ async fn test_app_full(
     search_registry: SearchRegistry,
     default_search_engine: Option<&str>,
 ) -> (TestServer, Arc<dyn DatabaseProvider>) {
-    let db = common::in_memory_db().await;
-    UserRepository::create(
-        &db,
-        NewUser {
-            name: "test-user".to_string(),
-            email: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let user = UserRepository::find_by_name(&db, "test-user")
-        .await
-        .unwrap()
-        .unwrap();
-    ApiKeyRepository::create_api_key(
-        &db,
-        NewApiKey {
-            user_id: user.id,
-            key_hash: hash_token("test-token"),
-            label: Some("test".to_string()),
-            expires_at: None,
-            project: None,
-            session_window_secs: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let mut settings = Settings::default();
-    settings.pricing = pricing;
-    settings.routing.default_search_engine = default_search_engine.map(str::to_string);
-    let settings = Arc::new(settings);
-    let db: Arc<dyn DatabaseProvider> = Arc::new(db);
-    let router = Arc::new(RequestRouter::new(settings.clone()));
-    let cost_calc = Arc::new(CostCalculator::new());
-    let provider_registry = Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
-        response: "hello".to_string(),
-    }));
-    let policy = Arc::new(PolicyEngine::new(db.clone()));
-    let fallback = Arc::new(FallbackChain::new(HashMap::new()));
-    let complexity_router = Arc::new(ComplexityRouter::new(None));
-    let response_cache = Arc::new(ResponseCache::new(&cache));
-    let embedding_registry = Arc::new(EmbeddingRegistry::new_with_mock(
-        common::MockEmbeddingAdapter {
-            embedding: vec![0.1_f32, 0.2, 0.3],
-        },
-    ));
-    let search_registry = Arc::new(search_registry);
-
-    let state = AppState {
-        settings: settings.clone(),
-        experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
-        db: db.clone(),
-        pool: None,
-        router,
-        cost_calc,
-        provider_registry,
-        policy,
-        fallback,
-        complexity_router,
-        response_cache,
-        embedding_registry,
+    common::search_app::search_app(
+        pricing,
+        cache,
         search_registry,
-        load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
-            std::collections::HashMap::new(),
-        )),
-        concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
-        circuit_breaker: Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
-        ip_rate_limiter: Arc::new(
-            modelrouter::api::middleware::ip_rate_limit::IpRateLimiter::new(0),
-        ),
-        session_limiter: Arc::new(modelrouter::router::session_limits::SessionLimiter::new(
-            0, 0,
-        )),
-        session_affinity: Arc::new(
-            modelrouter::router::session_affinity::SessionAffinityMap::new(1800),
-        ),
-        live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
-        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
-        prompt_db: db.clone(),
-        app_metrics: None,
-        callbacks: std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
-        guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
-        oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
-    };
-    (TestServer::new(build_router(state)).unwrap(), db)
+        default_search_engine,
+        modelrouter::extensions::Extensions::default(),
+    )
+    .await
 }
 
 async fn test_app() -> TestServer {
@@ -186,7 +110,11 @@ async fn search_happy_path_returns_normalized_results_and_usage() {
     assert_eq!(results[0]["score"], 0.9);
     assert!(results[0]["published_date"].is_null());
     assert_eq!(body["usage"]["results"], 1);
-    assert!(body["usage"]["cost_usd"].as_f64().unwrap() > 0.0);
+    // No price is configured for this engine: recorded at $0 and reported
+    // unpriced, never passed off as free (no built-in fallback rate).
+    assert_eq!(body["usage"]["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(body["usage"]["priced"], false);
+    assert_eq!(body["x_router"]["cost"]["priced"], false);
 }
 
 #[tokio::test]
@@ -518,22 +446,12 @@ async fn different_search_options_are_different_cache_entries() {
 async fn search_is_not_cached_when_the_cache_is_disabled() {
     let (server, _db) = test_app_with_pricing(search_pricing()).await;
     let query = serde_json::json!({ "query": "rust" });
-    assert_eq!(
-        post_search(&server, query.clone())
-            .await
-            .headers()
-            .get("x-modelrouter-cache")
-            .unwrap(),
-        "MISS"
-    );
-    assert_eq!(
-        post_search(&server, query)
-            .await
-            .headers()
-            .get("x-modelrouter-cache")
-            .unwrap(),
-        "MISS"
-    );
+    // The cache is off, so it is not involved: no cache header on either call
+    // (`MISS` means "looked up and not found").
+    for _ in 0..2 {
+        let resp = post_search(&server, query.clone()).await;
+        assert!(resp.headers().get("x-modelrouter-cache").is_none());
+    }
 }
 
 async fn post_search_with_mode(
@@ -591,14 +509,47 @@ async fn search_use_mode_cannot_enable_a_disabled_cache() {
     let query = serde_json::json!({ "query": "rust" });
     for _ in 0..2 {
         let resp = post_search_with_mode(&server, query.clone(), "use").await;
-        assert_eq!(resp.headers().get("x-modelrouter-cache").unwrap(), "MISS");
+        assert!(resp.headers().get("x-modelrouter-cache").is_none());
     }
+}
+
+/// A cached search app whose memory store reads the returned clock (seconds
+/// since the epoch) instead of the system time, so an entry's lifetime is the
+/// test's decision, not the host's speed between two requests.
+async fn test_app_with_clock_cache(
+    pricing: Vec<PricingEntry>,
+) -> (TestServer, Arc<dyn DatabaseProvider>, Arc<std::sync::atomic::AtomicI64>) {
+    use modelrouter::router::cache::store::MemoryStore;
+    use modelrouter::router::cache::{CachePolicy, ResponseCache};
+    let config = enabled_cache_config();
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_700_000_000));
+    let reads = clock.clone();
+    let store = MemoryStore::with_clock(
+        &config,
+        Arc::new(move || reads.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+    let cache = Arc::new(ResponseCache::with_store(
+        Arc::new(store),
+        CachePolicy::from_config(&config),
+    ));
+    let (server, db) = common::search_app::search_app_with_cache(
+        pricing,
+        cache,
+        SearchRegistry::new_with_mock(common::MockSearchAdapter {
+            results: mock_results(),
+        }),
+        None,
+        modelrouter::extensions::Extensions::default(),
+    )
+    .await;
+    (server, db, clock)
 }
 
 #[tokio::test]
 async fn search_ttl_header_sets_the_entry_lifetime() {
-    let (server, _db) =
-        test_app_with_pricing_and_cache(search_pricing(), enabled_cache_config()).await;
+    // Whole-second stamps made a 1-second entry stored late in a wall second
+    // expire at the next tick; the test's clock decides the lifetime instead.
+    let (server, _db, clock) = test_app_with_clock_cache(search_pricing()).await;
     let query = serde_json::json!({ "query": "short lived" });
     let first = server
         .post("/v1/search")
@@ -616,7 +567,7 @@ async fn search_ttl_header_sets_the_entry_lifetime() {
     let hit = post_search(&server, query.clone()).await;
     assert_eq!(hit.headers().get("x-modelrouter-cache").unwrap(), "HIT");
 
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let expired = post_search(&server, query).await;
     assert_eq!(
         expired.headers().get("x-modelrouter-cache").unwrap(),
@@ -995,6 +946,8 @@ async fn search_fallback_denied_by_model_allow_list_fails_request() {
                     snippet: "snippet".to_string(),
                     score: None,
                     published_date: None,
+                    publisher: None,
+                    metadata_provenance: None,
                 }],
             }),
         ),
@@ -1074,6 +1027,8 @@ async fn search_fallback_permitted_by_model_allow_list_serves_request() {
                     snippet: "snippet".to_string(),
                     score: None,
                     published_date: None,
+                    publisher: None,
+                    metadata_provenance: None,
                 }],
             }),
         ),
@@ -1177,4 +1132,450 @@ async fn search_rejects_an_invalid_namespace() {
     let query = serde_json::json!({ "query": "rust" });
     let resp = post_search_in(&server, query, "bad namespace").await;
     assert_eq!(resp.status_code(), 400);
+}
+
+// ── freshness and result metadata ───────────────────────────────────────────
+
+/// Echoes the freshness it was given into the snippet, and reports a
+/// model-extracted date and publisher, so a test sees both directions.
+struct FreshnessEchoAdapter;
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for FreshnessEchoAdapter {
+    async fn search(
+        &self,
+        req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        let mut results = mock_results();
+        results[0].snippet = format!("freshness={}", req.freshness.as_deref().unwrap_or("none"));
+        results.push(SearchResultItem {
+            title: "Dated".into(),
+            url: "https://example.com/dated".into(),
+            snippet: "dated".into(),
+            score: None,
+            published_date: Some("2024-05-01".into()),
+            publisher: Some("Example Wire".into()),
+            metadata_provenance: Some(
+                modelrouter::providers::search::PROVENANCE_MODEL_EXTRACTED.to_string(),
+            ),
+        });
+        Ok(modelrouter::providers::search::SearchResponse {
+            results,
+            engine: "tavily".to_string(),
+            answer: None,
+            usage: None,
+            grounding_miss: None,
+        })
+    }
+}
+
+async fn search_freshness_body(body: serde_json::Value) -> axum_test::TestResponse {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(FreshnessEchoAdapter),
+        None,
+    )
+    .await;
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn search_freshness_reaches_the_adapter_in_canonical_form() {
+    for (sent, seen) in [
+        (serde_json::json!("Week"), "week"),
+        (serde_json::json!("2024-01-01..2024-06-30"), "2024-01-01..2024-06-30"),
+        (serde_json::json!("2024-02-04"), "2024-02-04"),
+        (serde_json::Value::Null, "none"),
+        (serde_json::json!("  "), "none"),
+    ] {
+        let resp = search_freshness_body(serde_json::json!({"query": "rust", "freshness": sent})).await;
+        assert_eq!(resp.status_code(), 200, "{sent}");
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["results"][0]["snippet"], format!("freshness={seen}"), "{sent}");
+    }
+}
+
+#[tokio::test]
+async fn search_rejects_a_malformed_freshness() {
+    for bad in [
+        serde_json::json!("yesterday"),
+        serde_json::json!("2024-13-01"),
+        serde_json::json!("2024-06-30..2024-01-01"),
+        serde_json::json!("2024-1-1"),
+        serde_json::json!(7),
+    ] {
+        let resp = search_freshness_body(serde_json::json!({"query": "rust", "freshness": bad})).await;
+        assert_eq!(resp.status_code(), 400, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn search_results_carry_publisher_and_provenance_only_when_known() {
+    let resp = search_freshness_body(serde_json::json!({"query": "rust"})).await;
+    let body: serde_json::Value = resp.json();
+    let plain = &body["results"][0];
+    assert!(plain.get("publisher").is_none(), "{plain}");
+    assert!(plain.get("metadata_provenance").is_none(), "{plain}");
+    let dated = &body["results"][1];
+    assert_eq!(dated["published_date"], "2024-05-01");
+    assert_eq!(dated["publisher"], "Example Wire");
+    assert_eq!(dated["metadata_provenance"], "model_extracted");
+}
+
+#[test]
+fn parse_freshness_accepts_the_documented_forms_only() {
+    use modelrouter::providers::search::parse_freshness;
+    assert_eq!(parse_freshness("DAY").as_deref(), Some("day"));
+    assert_eq!(parse_freshness(" month ").as_deref(), Some("month"));
+    assert_eq!(parse_freshness("2024-02-29").as_deref(), Some("2024-02-29"));
+    assert_eq!(parse_freshness("2024-01-01..2024-01-01").as_deref(), Some("2024-01-01..2024-01-01"));
+    for bad in ["", "year", "2023-02-29", "2024-01-01..", "..2024-01-01", "2024-01-01..2023-01-01", "20240101"] {
+        assert_eq!(parse_freshness(bad), None, "{bad}");
+    }
+}
+
+// ── include_answer ──────────────────────────────────────────────────────────
+
+/// Answers only when asked, the way a grounding engine does.
+struct AnsweringSearchAdapter;
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for AnsweringSearchAdapter {
+    async fn search(
+        &self,
+        req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        Ok(modelrouter::providers::search::SearchResponse {
+            results: mock_results(),
+            engine: "tavily".to_string(),
+            answer: req.include_answer.then(|| modelrouter::providers::search::SearchAnswer {
+                text: "Rust is a systems language.".to_string(),
+                query_urls: vec!["https://search.example/?q=rust".to_string()],
+                follow_up_queries: (0..req.max_follow_up_queries).map(|i| format!("rust {i}")).collect(),
+            }),
+            usage: None,
+            grounding_miss: None,
+        })
+    }
+}
+
+async fn search_with_body(body: serde_json::Value) -> axum_test::TestResponse {
+    let (server, _db) = test_app_full(
+        vec![],
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(AnsweringSearchAdapter),
+        None,
+    )
+    .await;
+    server
+        .post("/v1/search")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn search_include_answer_returns_the_answer_beside_the_results() {
+    let resp = search_with_body(serde_json::json!({"query": "rust", "include_answer": true})).await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["answer"]["text"], "Rust is a systems language.");
+    assert_eq!(body["answer"]["query_urls"][0], "https://search.example/?q=rust");
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
+    assert_eq!(body["answer"]["follow_up_queries"].as_array().unwrap().len(), 0);
+}
+
+/// The research options reach the adapter: here the mock proposes as many
+/// follow-ups as it was asked for.
+#[tokio::test]
+async fn search_research_options_reach_the_adapter() {
+    let resp = search_with_body(serde_json::json!({
+        "query": "rust", "include_answer": true, "max_follow_up_queries": 3,
+    }))
+    .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["answer"]["follow_up_queries"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn search_without_include_answer_keeps_the_citations_only_shape() {
+    for body in [
+        serde_json::json!({"query": "rust"}),
+        serde_json::json!({"query": "rust", "include_answer": false}),
+        serde_json::json!({"query": "rust", "include_answer": null}),
+    ] {
+        let resp = search_with_body(body.clone()).await;
+        assert_eq!(resp.status_code(), 200, "{body}");
+        let out: serde_json::Value = resp.json();
+        assert!(out.get("answer").is_none(), "{body} → {out}");
+    }
+}
+
+#[tokio::test]
+async fn search_include_answer_must_be_a_boolean() {
+    let resp = search_with_body(serde_json::json!({"query": "rust", "include_answer": "yes"})).await;
+    assert_eq!(resp.status_code(), 400);
+}
+
+#[tokio::test]
+async fn search_research_options_need_include_answer() {
+    for body in [
+        serde_json::json!({"query": "rust", "instructions": "be brief"}),
+        serde_json::json!({"query": "rust", "context": "market"}),
+        serde_json::json!({"query": "rust", "max_follow_up_queries": 2}),
+    ] {
+        let resp = search_with_body(body.clone()).await;
+        assert_eq!(resp.status_code(), 400, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn search_research_options_are_validated() {
+    for body in [
+        serde_json::json!({"query": "rust", "include_answer": true, "max_follow_up_queries": 11}),
+        serde_json::json!({"query": "rust", "include_answer": true, "max_follow_up_queries": -1}),
+        serde_json::json!({"query": "rust", "include_answer": true, "instructions": 7}),
+    ] {
+        let resp = search_with_body(body.clone()).await;
+        assert_eq!(resp.status_code(), 400, "{body}");
+    }
+    let ok = search_with_body(serde_json::json!({
+        "query": "rust", "include_answer": true, "instructions": "be brief",
+        "context": "market", "max_follow_up_queries": 10,
+    }))
+    .await;
+    assert_eq!(ok.status_code(), 200);
+}
+
+// ── grounding engines: the model call behind a search is billed too ─────────
+
+fn grounding_usage(model: &str) -> modelrouter::providers::search::SearchUsage {
+    modelrouter::providers::search::SearchUsage {
+        model: model.to_string(),
+        input_tokens: 1000,
+        output_tokens: 500,
+        cached_input_tokens: 200,
+        reasoning_tokens: Some(20),
+    }
+}
+
+/// A search engine that answers with results and the grounding model's usage.
+struct UsageSearchAdapter {
+    usage: modelrouter::providers::search::SearchUsage,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for UsageSearchAdapter {
+    async fn search(
+        &self,
+        _req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        Ok(modelrouter::providers::search::SearchResponse {
+            results: mock_results(),
+            engine: "tavily".to_string(),
+            answer: None,
+            usage: Some(self.usage.clone()),
+            grounding_miss: None,
+        })
+    }
+}
+
+/// A grounding engine whose model ran and cited nothing, every time.
+struct MissSearchAdapter {
+    usage: Option<modelrouter::providers::search::SearchUsage>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::search::SearchAdapter for MissSearchAdapter {
+    async fn search(
+        &self,
+        _req: &modelrouter::providers::search::SearchRequest,
+    ) -> anyhow::Result<modelrouter::providers::search::SearchResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(anyhow::Error::new(modelrouter::providers::search::GroundingMiss {
+            engine: "tavily".to_string(),
+            detail: "response status: completed; no url_citation annotations in the response".to_string(),
+            usage: self.usage.clone(),
+        })
+        .context("adapter wrapped the miss"))
+    }
+}
+
+fn grounded_pricing() -> Vec<PricingEntry> {
+    vec![
+        PricingEntry {
+            model: "search/tavily".to_string(),
+            input_per_million: 0.25,
+            output_per_million: 0.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        },
+        PricingEntry {
+            model: "ground-model".to_string(),
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_read_per_million: Some(0.1),
+            cache_write_per_million: None,
+        },
+    ]
+}
+
+/// 800 uncached input at $1/M + 200 cached at $0.1/M + 500 output at $2/M.
+const GROUND_MODEL_TOKEN_COST: f64 = 0.0008 + 0.00002 + 0.001;
+/// The same call with no prompt cache: 1000 input at $1/M + 500 output at $2/M.
+const GROUND_MODEL_NO_CACHE_COST: f64 = 0.001 + 0.001;
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+#[tokio::test]
+async fn grounding_model_tokens_are_priced_beside_the_per_query_rate() {
+    let (server, db) = test_app_full(
+        grounded_pricing(),
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(UsageSearchAdapter { usage: grounding_usage("ground-model") }),
+        None,
+    )
+    .await;
+
+    let body: serde_json::Value = post_search(&server, serde_json::json!({ "query": "rust" })).await.json();
+    let cost = body["usage"]["cost_usd"].as_f64().unwrap();
+    assert!(close(cost, 0.25 + GROUND_MODEL_TOKEN_COST), "cost {cost}");
+    assert!(close(body["usage"]["no_cache_cost_usd"].as_f64().unwrap(), 0.25 + GROUND_MODEL_NO_CACHE_COST));
+    assert!(body["usage"].get("priced").is_none(), "a priced call carries no priced:false: {}", body["usage"]);
+    assert_eq!(body["x_router"]["cost"]["priced"], true);
+    assert_eq!(body["usage"]["results"], 1);
+    let tokens = &body["x_router"]["tokens"];
+    assert_eq!(tokens["prompt"], 1000);
+    assert_eq!(tokens["completion"], 500);
+    assert_eq!(tokens["cache_read"], 200);
+    assert_eq!(tokens["reasoning"], 20);
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert!(close(ledger[0].cost_usd, cost), "ledger {} vs usage {cost}", ledger[0].cost_usd);
+    assert_eq!((ledger[0].tokens_in, ledger[0].tokens_out), (1000, 500));
+}
+
+#[tokio::test]
+async fn tokens_of_an_unpriced_grounding_model_are_reported_and_the_query_rate_still_charged() {
+    let (server, _db) = test_app_full(
+        grounded_pricing(),
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(UsageSearchAdapter { usage: grounding_usage("mystery-deployment") }),
+        None,
+    )
+    .await;
+
+    let body: serde_json::Value = post_search(&server, serde_json::json!({ "query": "rust" })).await.json();
+    assert_eq!(body["usage"]["cost_usd"], 0.25);
+    assert!(body["usage"].get("priced").is_none(), "a priced call carries no priced:false: {}", body["usage"]);
+    assert_eq!(body["x_router"]["cost"]["priced"], true);
+    assert_eq!(body["x_router"]["tokens"]["prompt"], 1000);
+}
+
+#[tokio::test]
+async fn a_grounding_miss_is_metered_and_answered_as_empty_results() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (server, db) = test_app_full(
+        grounded_pricing(),
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(MissSearchAdapter { usage: Some(grounding_usage("ground-model")), calls }),
+        None,
+    )
+    .await;
+
+    let resp = post_search(&server, serde_json::json!({ "query": "rust" })).await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["results"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["grounding"]["status"], "no_citations");
+    assert!(body["grounding"]["detail"].as_str().unwrap().contains("no url_citation"));
+    let cost = body["usage"]["cost_usd"].as_f64().unwrap();
+    assert!(close(cost, 0.25 + GROUND_MODEL_TOKEN_COST), "a miss is billed like any call: {cost}");
+    assert_eq!(body["usage"]["results"], 0);
+    assert_eq!(body["x_router"]["results"], 0);
+    assert_eq!(body["x_router"]["tokens"]["prompt"], 1000);
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert!(close(ledger[0].cost_usd, cost));
+    assert_eq!(ledger[0].model, "search/tavily");
+}
+
+#[tokio::test]
+async fn a_grounding_miss_without_usage_is_metered_at_the_query_rate() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (server, db) = test_app_full(
+        grounded_pricing(),
+        CacheConfig::default(),
+        SearchRegistry::new_with_mock(MissSearchAdapter { usage: None, calls }),
+        None,
+    )
+    .await;
+
+    let body: serde_json::Value = post_search(&server, serde_json::json!({ "query": "rust" })).await.json();
+    assert_eq!(body["usage"]["cost_usd"], 0.25);
+    assert!(body["x_router"].get("tokens").is_none());
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger[0].cost_usd, 0.25);
+    assert_eq!((ledger[0].tokens_in, ledger[0].tokens_out), (0, 0));
+}
+
+#[tokio::test]
+async fn a_grounding_miss_is_never_served_from_the_cache() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (server, db) = test_app_full(
+        grounded_pricing(),
+        enabled_cache_config(),
+        SearchRegistry::new_with_mock(MissSearchAdapter { usage: None, calls: calls.clone() }),
+        None,
+    )
+    .await;
+
+    let first: serde_json::Value = post_search(&server, serde_json::json!({ "query": "rust" })).await.json();
+    let second: serde_json::Value = post_search(&server, serde_json::json!({ "query": "rust" })).await.json();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "the second identical query reached the engine again");
+    assert_eq!(first["grounding"]["status"], "no_citations");
+    assert_eq!(second["grounding"]["status"], "no_citations");
+    assert!(second["usage"].get("cache_hit").is_none(), "{second}");
+    assert_eq!(second["usage"]["cost_usd"], 0.25);
+    let ledger = common::wait_for_ledger_rows(&*db, 2).await;
+    assert!(ledger.iter().all(|row| row.cost_usd == 0.25));
+}
+
+#[tokio::test]
+async fn a_grounding_miss_on_the_primary_still_walks_the_fallback_chain() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = SearchRegistry::new_with_mock_engines(vec![
+        ("tavily", Arc::new(MissSearchAdapter { usage: None, calls: calls.clone() })),
+        (
+            "vertex",
+            Arc::new(common::NamedMockSearchAdapter {
+                results: mock_results(),
+                engine_name: "vertex".to_string(),
+            }),
+        ),
+    ]);
+    let mut chains = HashMap::new();
+    chains.insert("tavily".to_string(), vec!["vertex".to_string()]);
+    let (server, _db) = test_app_with_chain(registry, chains).await;
+
+    let body: serde_json::Value = post_search(&server, serde_json::json!({ "query": "rust", "engine": "tavily" })).await.json();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(body["engine"], "vertex");
+    assert_eq!(body["results"][0]["url"], "https://example.com");
+    assert!(body.get("grounding").is_none(), "the engine that answered did not miss: {body}");
 }

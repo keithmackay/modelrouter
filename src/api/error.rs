@@ -21,6 +21,10 @@ pub enum ApiError {
     /// Deliberately *not* a `ProviderError`: nothing was called upstream.
     #[error("{0}")]
     Disabled(String),
+    /// A request extension refused the request. The body is what the caller
+    /// receives; the reason is the router's own record of why.
+    #[error("{reason}")]
+    Refused { status: u16, body: serde_json::Value, reason: String },
     #[error("internal error")]
     Internal,
 }
@@ -48,6 +52,10 @@ impl IntoResponse for ApiError {
                 });
                 return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
             }
+        }
+        if let ApiError::Refused { status, body, .. } = self {
+            let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            return (sc, Json(body)).into_response();
         }
         let (status, message, code) = match &self {
             ApiError::Unauthorized => (
@@ -81,6 +89,7 @@ impl IntoResponse for ApiError {
                 "internal error".to_string(),
                 "internal_error",
             ),
+            ApiError::Refused { .. } => unreachable!("answered above with the extension's own body"),
         };
         let body = json!({
             "error": {
