@@ -904,6 +904,8 @@ Suggested timings, as the Helm chart ships them:
 
 `/health/deep` (below) makes real provider calls and is for operators, not probes.
 
+**Graceful drain.** On SIGTERM or SIGINT the router flips `/health/ready` to 503 with `{"part":"draining"}`, keeps the listener open, answers every new non-probe request with 503 and `Connection: close` so the client retries on another replica, and lets requests already in flight finish, streams included, until the last byte is written. It exits as soon as nothing is in flight, or when `[server] shutdown_grace_secs` elapses, whichever comes first. The grace defaults to the longest configured tier timeout so the router never cuts short a request it would otherwise still serve; an idle replica exits in milliseconds. The shutdown log reports how many requests it waited for and how many it refused. Set the pod's `terminationGracePeriodSeconds` at least as high as the grace, otherwise the kubelet kills the process first; the Helm chart sets both from the same value.
+
 ### Credential health and `credential_expired`
 
 Every provider with a managed credential (`vertex`, `azure`, `foundry`, `bing_grounding`)

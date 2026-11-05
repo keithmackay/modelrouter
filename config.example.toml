@@ -10,6 +10,11 @@ host = "127.0.0.1"
 port = 8080
 # Maximum request body size in megabytes.
 request_body_limit_mb = 10
+# After SIGTERM, how long to let in-flight requests finish before exiting.
+# Unset: the longest configured tier timeout. The process exits as soon as
+# nothing is in flight, so an idle replica never waits this long. Set the
+# pod's terminationGracePeriodSeconds at least this high.
+# shutdown_grace_secs = 21600
 
 # ---------------------------------------------------------------------------
 # Database

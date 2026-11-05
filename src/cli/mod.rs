@@ -11,7 +11,9 @@ use crate::report::formatter::{print_rows, OutputFormat};
 
 /// Graceful shutdown deadline in seconds. The server drains in-flight requests
 /// until this deadline, then forces exit.
-const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+/// After the drain grace has elapsed (or in-flight work reached zero), how
+/// long to give hyper to close connections before exiting regardless.
+const FORCE_EXIT_AFTER_DRAIN_SECS: u64 = 5;
 
 // ── Service install/uninstall ─────────────────────────────────────────────────
 
@@ -740,7 +742,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
                 tracing::info!(extensions = ?names, "request extensions loaded");
             }
-            let app = crate::api::app::build_router_with_extensions_and_readiness(state, extensions, readiness);
+            let app = crate::api::app::build_router_with_extensions_and_readiness(state, extensions, readiness.clone());
 
             // Flag > config > built-in default. The config defaults already
             // supply 127.0.0.1:8080 when the section is absent.
@@ -751,38 +753,58 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             use std::net::SocketAddr;
 
-            // Serve with graceful shutdown. Axum drains in-flight connections
-            // when the shutdown signal arrives. The drain deadline must start
-            // at the SIGNAL, not at startup — wrapping the whole serve future
-            // in a timeout would kill a healthy server after 30s of uptime.
-            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+            // Drain on signal. The listener stays open while draining so the
+            // platform keeps reading /health/ready (503) and late arrivals
+            // get a 503 with Connection: close instead of a refused socket.
+            // Axum's own shutdown runs once in-flight work reaches zero or
+            // the grace elapses; every clock here starts at the SIGNAL, never
+            // at startup.
+            let grace_secs = settings.shutdown_grace_secs();
+            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<usize>();
+            let drain = readiness.clone();
             let serve_future = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
-                let _ = signal_tx.send(());
+                drain.begin_drain();
+                let waiting_for = drain.in_flight();
+                tracing::info!(in_flight = waiting_for, grace_secs, "draining");
+                tokio::select! {
+                    _ = drain.wait_idle() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(grace_secs)) => {
+                        tracing::warn!(
+                            still_in_flight = drain.in_flight(),
+                            grace_secs,
+                            "drain grace elapsed; closing remaining connections"
+                        );
+                    }
+                }
+                let _ = signal_tx.send(waiting_for);
             });
 
-            let drain_deadline = async move {
-                // Pending until the signal fires; only then does the clock start.
-                let _ = signal_rx.await;
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
-                ))
-                .await;
+            let force_exit = async move {
+                // Pending until the drain finished; only then does this clock start.
+                let waited_for = signal_rx.await.unwrap_or(0);
+                tokio::time::sleep(tokio::time::Duration::from_secs(FORCE_EXIT_AFTER_DRAIN_SECS)).await;
+                waited_for
             };
 
             tokio::select! {
                 result = serve_future => {
                     result?;
-                    tracing::info!("graceful shutdown complete");
+                    tracing::info!(
+                        refused = readiness.refused(),
+                        "graceful shutdown complete"
+                    );
                 }
-                _ = drain_deadline => {
+                waited_for = force_exit => {
                     tracing::warn!(
-                        "graceful shutdown exceeded {}s deadline, forcing exit",
-                        GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                        waited_for,
+                        refused = readiness.refused(),
+                        "connections still open {}s after drain; forcing exit",
+                        FORCE_EXIT_AFTER_DRAIN_SECS
                     );
                 }
             }

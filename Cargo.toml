@@ -42,6 +42,9 @@ otel = [
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
+# Named directly so the drain gate can wrap response bodies; already in the
+# tree through axum.
+http-body = "1"
 tokio = { version = "1", features = ["full"] }
 # sqlx 0.9: the runtime and TLS features are separate (the 0.8 combination
 # feature `runtime-tokio-native-tls` no longer exists), and the SQLite surface

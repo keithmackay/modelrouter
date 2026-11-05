@@ -466,7 +466,7 @@ pub fn build_router_with_registries(
         // route-local state, and an Extension keeps every AppState literal
         // (tests included) unchanged.
         .layer(axum::Extension(DeepHealthCache::default()))
-        .layer(axum::Extension(readiness))
+        .layer(axum::Extension(readiness.clone()))
         // axum's built-in limit is 2 MB; `[server] request_body_limit_mb`
         // documents 10 and was never applied (#55).
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -476,5 +476,11 @@ pub fn build_router_with_registries(
         .layer(axum::middleware::from_fn_with_state(
             state.ip_rate_limiter.clone(),
             crate::api::middleware::ip_rate_limit::ip_rate_limit_middleware,
+        ))
+        // Outermost: a draining replica answers probes and refuses the rest
+        // before any other layer spends work on them.
+        .layer(axum::middleware::from_fn_with_state(
+            readiness,
+            crate::api::middleware::drain::drain_gate,
         ))
 }
