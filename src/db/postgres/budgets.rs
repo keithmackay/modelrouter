@@ -10,7 +10,7 @@ use super::{PostgresDb, now_utc};
 impl BudgetRepository for PostgresDb {
     async fn list_for_user(&self, user_id: i64) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
                       project, window_start, window_end
                FROM budget_rules WHERE user_id = $1 ORDER BY id"#,
@@ -23,7 +23,7 @@ impl BudgetRepository for PostgresDb {
 
     async fn list_for_group(&self, group_name: &str) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
                       project, window_start, window_end
                FROM budget_rules WHERE group_name = $1 ORDER BY id"#,
@@ -36,7 +36,7 @@ impl BudgetRepository for PostgresDb {
 
     async fn list_for_key(&self, api_key_id: i64) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
                       project, window_start, window_end
                FROM budget_rules WHERE api_key_id = $1 ORDER BY id"#,
@@ -49,7 +49,7 @@ impl BudgetRepository for PostgresDb {
 
     async fn list_all(&self) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+            r#"SELECT id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                       model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
                       project, window_start, window_end
                FROM budget_rules ORDER BY id"#,
@@ -64,11 +64,11 @@ impl BudgetRepository for PostgresDb {
         let model_allow_json = serde_json::to_string(&rule.model_allow).unwrap_or_else(|_| "[]".to_string());
         let model_deny_json = serde_json::to_string(&rule.model_deny).unwrap_or_else(|_| "[]".to_string());
         let row = sqlx::query_as::<_, BudgetRule>(
-            r#"INSERT INTO budget_rules (user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+            r#"INSERT INTO budget_rules (user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                                          model_allow, model_deny, rate_rpm, max_concurrent, project, window_start, window_end,
                                          created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-               RETURNING id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+               RETURNING id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                          model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
                          project, window_start, window_end"#,
         )
@@ -95,7 +95,7 @@ impl BudgetRepository for PostgresDb {
 
     async fn list_for_tag(&self, tag: &str) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = sqlx::query_as::<_, BudgetRule>(
-            "SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens, \
+            "SELECT id, user_id, group_name, api_key_id, tag, \"window\", limit_usd, limit_tokens, \
              model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at, \
              project, window_start, window_end \
              FROM budget_rules WHERE tag = $1"
@@ -115,7 +115,7 @@ impl BudgetRepository for PostgresDb {
     }
 
     async fn list_for_scope(&self, scope: &BudgetScope) -> anyhow::Result<Vec<BudgetRule>> {
-        let cols = "id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens, \
+        let cols = "id, user_id, group_name, api_key_id, tag, \"window\", limit_usd, limit_tokens, \
                     model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at, \
                     project, window_start, window_end";
         let rows = match scope {
@@ -177,7 +177,7 @@ impl BudgetRepository for PostgresDb {
                 window_end = COALESCE($8, window_end),
                 updated_at = $9
                WHERE id = $10
-               RETURNING id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+               RETURNING id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                          model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
                          project, window_start, window_end"#,
         )

@@ -287,11 +287,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
 
             // Init DB
-            let sqlite_db =
-                crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&sqlite_db.pool).await?;
-            let pool = sqlite_db.pool.clone();
-            let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(sqlite_db);
+            let store = crate::db::open(&settings.database).await?;
+            tracing::info!(backend = store.backend, "database opened and migrated");
+            let pool = store.sqlite_pool.clone();
+            let db: Arc<dyn crate::api::app::DatabaseProvider> = store.db.clone();
 
             // Sync hook permissions from config into DB
             crate::hooks::permissions::sync_hook_permissions(&db, &settings.hooks).await?;
@@ -436,7 +435,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 storage: storage_live.clone(),
                 prompt_db: prompt_db.clone(),
                 db,
-                pool: Some(pool),
+                pool,
                 router,
                 cost_calc,
                 provider_registry,
@@ -667,23 +666,21 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Commands::Migrate => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
-            println!("Migrations complete.");
+            let store = crate::db::open(&settings.database).await?;
+            println!("Migrations complete ({}).", store.backend);
         }
         Commands::User(user_args) => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match user_args.command {
                 UserCommands::Create { name } => {
                     use crate::db::repositories::users::UserRepository;
-                    use crate::db::repositories::api_keys::ApiKeyRepository;
                     use crate::db::models::NewUser;
                     use crate::api::auth::hash_token;
 
-                    let user = UserRepository::create(&db, NewUser {
+                    let user = UserRepository::create(db, NewUser {
                         name: name.clone(),
                         email: None,
                     }).await?;
@@ -705,7 +702,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 UserCommands::List => {
                     use crate::db::repositories::users::UserRepository;
-                    let users = UserRepository::list(&db).await?;
+                    let users = UserRepository::list(db).await?;
                     for u in users {
                         println!(
                             "{:>4}  {:20}  {}",
@@ -717,23 +714,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 UserCommands::Enable { name } => {
                     use crate::db::repositories::users::UserRepository;
-                    let user = UserRepository::find_by_name(&db, &name).await?
+                    let user = UserRepository::find_by_name(db, &name).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", name))?;
-                    UserRepository::set_enabled(&db, user.id, true).await?;
+                    UserRepository::set_enabled(db, user.id, true).await?;
                     println!("Enabled user '{}'", name);
                 }
                 UserCommands::Disable { name } => {
                     use crate::db::repositories::users::UserRepository;
-                    let user = UserRepository::find_by_name(&db, &name).await?
+                    let user = UserRepository::find_by_name(db, &name).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", name))?;
-                    UserRepository::set_enabled(&db, user.id, false).await?;
+                    UserRepository::set_enabled(db, user.id, false).await?;
                     println!("Disabled user '{}'", name);
                 }
                 UserCommands::RotateKey { name } => {
                     use crate::db::repositories::users::UserRepository;
-                    use crate::db::repositories::api_keys::ApiKeyRepository;
                     use crate::api::auth::hash_token;
-                    let user = UserRepository::find_by_name(&db, &name).await?
+                    let user = UserRepository::find_by_name(db, &name).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", name))?;
                     // Generate new key
                     let new_key = format!("mr-{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
@@ -755,8 +751,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Budget(budget_args) => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match budget_args.command {
                 BudgetCommands::Set {
@@ -799,7 +795,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         } else if let Some(ref proj) = project {
                             (BudgetScope::Project(proj.clone()), window.clone(), None, None, Some(proj.clone()))
                         } else if let Some(ref uname) = user {
-                            let found = UserRepository::find_by_name(&db, uname).await?
+                            let found = UserRepository::find_by_name(db, uname).await?
                                 .ok_or_else(|| anyhow::anyhow!("User not found: {}", uname))?;
                             (BudgetScope::User(found.id), window.clone(), Some(found.id), None, None)
                         } else {
@@ -826,7 +822,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     };
 
                     // Duplicate check
-                    let existing = BudgetRepository::list_for_scope(&db, &scope).await?;
+                    let existing = BudgetRepository::list_for_scope(db, &scope).await?;
                     for r in &existing {
                         if r.window == effective_window {
                             anyhow::bail!(
@@ -844,7 +840,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         .map(|s| s.split(',').map(|m| m.trim().to_string()).collect::<Vec<_>>())
                         .unwrap_or_default();
 
-                    let rule = BudgetRepository::create(&db, NewBudgetRule {
+                    let rule = BudgetRepository::create(db, NewBudgetRule {
                         user_id,
                         group_name: group_name_val,
                         api_key_id: None,
@@ -894,26 +890,26 @@ pub async fn run(cli: Cli) -> Result<()> {
                         window_end: window_end.as_deref().map(date_suffix),
                     };
 
-                    let rule = BudgetRepository::update(&db, id, &changes).await?;
+                    let rule = BudgetRepository::update(db, id, &changes).await?;
                     println!("Updated budget rule id={}: window={} limit_usd={:?} limit_tokens={:?} rate_rpm={:?} max_concurrent={:?}",
                         rule.id, rule.window, rule.limit_usd, rule.limit_tokens, rule.rate_rpm, rule.max_concurrent);
                 }
                 BudgetCommands::Delete { id } => {
                     use crate::db::repositories::budgets::BudgetRepository;
-                    BudgetRepository::delete(&db, id).await?;
+                    BudgetRepository::delete(db, id).await?;
                     println!("Deleted budget rule {}", id);
                 }
                 BudgetCommands::List { user } => {
                     use crate::db::repositories::{users::UserRepository, budgets::BudgetRepository};
 
-                    let all_rules = BudgetRepository::list_all(&db).await?;
-                    let all_users = UserRepository::list(&db).await?;
+                    let all_rules = BudgetRepository::list_all(db).await?;
+                    let all_users = UserRepository::list(db).await?;
                     let user_map: std::collections::HashMap<i64, String> =
                         all_users.iter().map(|u| (u.id, u.name.clone())).collect();
 
                     // If --user filter, get that user's id
                     let filter_user_id: Option<i64> = if let Some(ref name) = user {
-                        let found = UserRepository::find_by_name(&db, name).await?
+                        let found = UserRepository::find_by_name(db, name).await?
                             .ok_or_else(|| anyhow::anyhow!("User not found: {}", name))?;
                         Some(found.id)
                     } else {
@@ -979,21 +975,21 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Group(group_args) => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match group_args.command {
                 GroupCommands::Create { name, priority } => {
                     use crate::db::repositories::groups::GroupRepository;
-                    if GroupRepository::find_group_by_name(&db, &name).await?.is_some() {
+                    if GroupRepository::find_group_by_name(db, &name).await?.is_some() {
                         anyhow::bail!("Group '{}' already exists", name);
                     }
-                    let g = GroupRepository::create_group(&db, &name, priority).await?;
+                    let g = GroupRepository::create_group(db, &name, priority).await?;
                     println!("Created group '{}' (id={}, priority={})", g.name, g.id, g.priority);
                 }
                 GroupCommands::List => {
                     use crate::db::repositories::groups::GroupRepository;
-                    let groups = GroupRepository::list_groups(&db).await?;
+                    let groups = GroupRepository::list_groups(db).await?;
                     for g in groups {
                         println!("{:>4}  {:20}  priority={:<4}  {}",
                             g.id, g.name, g.priority,
@@ -1002,23 +998,23 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 GroupCommands::Enable { name } => {
                     use crate::db::repositories::groups::GroupRepository;
-                    let g = GroupRepository::find_group_by_name(&db, &name).await?
+                    let g = GroupRepository::find_group_by_name(db, &name).await?
                         .ok_or_else(|| anyhow::anyhow!("Group not found: {}", name))?;
-                    GroupRepository::set_group_enabled(&db, g.id, true).await?;
+                    GroupRepository::set_group_enabled(db, g.id, true).await?;
                     println!("Enabled group '{}'", name);
                 }
                 GroupCommands::Disable { name } => {
                     use crate::db::repositories::groups::GroupRepository;
-                    let g = GroupRepository::find_group_by_name(&db, &name).await?
+                    let g = GroupRepository::find_group_by_name(db, &name).await?
                         .ok_or_else(|| anyhow::anyhow!("Group not found: {}", name))?;
-                    GroupRepository::set_group_enabled(&db, g.id, false).await?;
+                    GroupRepository::set_group_enabled(db, g.id, false).await?;
                     println!("Disabled group '{}'", name);
                 }
                 GroupCommands::Members { group } => {
                     use crate::db::repositories::groups::GroupRepository;
-                    let g = GroupRepository::find_group_by_name(&db, &group).await?
+                    let g = GroupRepository::find_group_by_name(db, &group).await?
                         .ok_or_else(|| anyhow::anyhow!("Group not found: {}", group))?;
-                    let members = GroupRepository::list_memberships(&db, g.id).await?;
+                    let members = GroupRepository::list_memberships(db, g.id).await?;
                     for m in members {
                         let status = if let Some(ref da) = m.disabled_at {
                             format!("Disabled {}", &da[..10.min(da.len())])
@@ -1031,33 +1027,33 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 GroupCommands::AddMember { group, user } => {
                     use crate::db::repositories::{groups::GroupRepository, users::UserRepository};
-                    let g = GroupRepository::find_group_by_name(&db, &group).await?
+                    let g = GroupRepository::find_group_by_name(db, &group).await?
                         .ok_or_else(|| anyhow::anyhow!("Group not found: {}", group))?;
-                    let u = UserRepository::find_by_name(&db, &user).await?
+                    let u = UserRepository::find_by_name(db, &user).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
-                    if GroupRepository::find_active_membership(&db, g.id, u.id).await?.is_some() {
+                    if GroupRepository::find_active_membership(db, g.id, u.id).await?.is_some() {
                         anyhow::bail!("User '{}' is already an active member of group '{}'", user, group);
                     }
-                    GroupRepository::add_member(&db, g.id, u.id).await?;
+                    GroupRepository::add_member(db, g.id, u.id).await?;
                     println!("Added '{}' to group '{}'", user, group);
                 }
                 GroupCommands::RemoveMember { group, user } => {
                     use crate::db::repositories::{groups::GroupRepository, users::UserRepository};
-                    let g = GroupRepository::find_group_by_name(&db, &group).await?
+                    let g = GroupRepository::find_group_by_name(db, &group).await?
                         .ok_or_else(|| anyhow::anyhow!("Group not found: {}", group))?;
-                    let u = UserRepository::find_by_name(&db, &user).await?
+                    let u = UserRepository::find_by_name(db, &user).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
-                    let membership = GroupRepository::find_active_membership(&db, g.id, u.id).await?
+                    let membership = GroupRepository::find_active_membership(db, g.id, u.id).await?
                         .ok_or_else(|| anyhow::anyhow!("No active membership for '{}' in group '{}'", user, group))?;
-                    GroupRepository::disable_membership(&db, membership.id).await?;
+                    GroupRepository::disable_membership(db, membership.id).await?;
                     println!("Removed '{}' from group '{}'", user, group);
                 }
             }
         }
         Commands::Report(report_args) => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             use crate::cli::commands::ReportCommands;
 
@@ -1070,11 +1066,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                     // and the other filters do not compose with it.
                     if tag.is_some() || correlation_id.is_some() {
                         let filter = parse_attribution_filter(tag.as_deref(), correlation_id)?;
-                        report_attribution(&db, &filter, by, &window, format).await?;
+                        report_attribution(db, &filter, by, &window, format).await?;
                         return Ok(());
                     }
                     let rows = crate::report::cost_by_user_window(
-                        &db.pool, &window,
+                        store.sqlite_pool("this report")?, &window,
                         user.as_deref(),
                         project.as_deref(),
                         group.as_deref(),
@@ -1114,7 +1110,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         // `alltime` is the CLI's spelling of the API's `all`.
                         window: if window == "alltime" { "all".to_string() } else { window },
                     };
-                    report_compare(db, &settings, &query, format).await?;
+                    report_compare(store.db.clone(), &settings, &query, format).await?;
                 }
                 ReportCommands::Usage {
                     total, subtotal, detail,
@@ -1167,7 +1163,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         _ => UsageScope::Global,
                     };
 
-                    let rows = fetch_usage_rows(&db.pool, &scope, &window, &granularity).await?;
+                    let rows = fetch_usage_rows(store.sqlite_pool("this report")?, &scope, &window, &granularity).await?;
 
                     match format {
                         OutputFormat::Json => {
@@ -1344,7 +1340,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 ReportCommands::Prompts { user, limit, since, format } => {
                     let rows = crate::report::recent_prompts(
-                        &db.pool,
+                        store.sqlite_pool("this report")?,
                         user.as_deref(),
                         limit,
                         since.as_deref(),
@@ -1369,11 +1365,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 ReportCommands::Audit { actor, tail, format } => {
                     let rows =
-                        crate::report::recent_audit(&db.pool, actor.as_deref(), tail).await?;
+                        crate::report::recent_audit(store.sqlite_pool("this report")?, actor.as_deref(), tail).await?;
                     print_audit_rows(rows, format);
                 }
                 ReportCommands::Hooks { format } => {
-                    let rows = crate::report::hook_latency_stats(&db.pool).await?;
+                    let rows = crate::report::hook_latency_stats(store.sqlite_pool("this report")?).await?;
                     print_rows(
                         &rows,
                         &["Hook", "Invocations", "Success %", "Avg ms", "p50 ms", "p95 ms", "p99 ms"],
@@ -1395,9 +1391,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Audit { tail, format } => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
-            let rows = crate::report::recent_audit(&db.pool, None, tail).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let rows = crate::report::recent_audit(store.sqlite_pool("this report")?, None, tail).await?;
             print_audit_rows(rows, format);
         }
         Commands::InstallService => {
@@ -1410,21 +1405,21 @@ pub async fn run(cli: Cli) -> Result<()> {
             admin::run(cli.config, admin_args.command).await?;
         }
         Commands::Key(key_args) => {
-            use crate::db::repositories::{api_keys::ApiKeyRepository, users::UserRepository};
+            use crate::db::repositories::users::UserRepository;
             use crate::db::models::NewUser;
 
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match key_args.command {
                 KeyCommands::Create { user, project, label, email: _, session_window } => {
                     use crate::api::auth::hash_token;
 
                     // Find or create user
-                    let u = match UserRepository::find_by_name(&db, &user).await? {
+                    let u = match UserRepository::find_by_name(db, &user).await? {
                         Some(u) => u,
-                        None => UserRepository::create(&db, NewUser {
+                        None => UserRepository::create(db, NewUser {
                             name: user.clone(),
                             email: None,
                         }).await?,
@@ -1451,7 +1446,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 KeyCommands::List { user, project } => {
                     let keys = db.list_all_api_keys().await?;
-                    let users = UserRepository::list(&db).await?;
+                    let users = UserRepository::list(db).await?;
                     let user_map: std::collections::HashMap<i64, String> =
                         users.iter().map(|u| (u.id, u.name.clone())).collect();
 
@@ -1482,7 +1477,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 KeyCommands::Rotate { user, project } => {
                     use crate::api::auth::hash_token;
 
-                    let u = UserRepository::find_by_name(&db, &user).await?
+                    let u = UserRepository::find_by_name(db, &user).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
 
                     let group_keys = db.list_keys_for_group(u.id, Some(&project)).await?;
@@ -1512,7 +1507,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     println!("Store this securely — it cannot be retrieved later.");
                 }
                 KeyCommands::Disable { user, project } => {
-                    let u = UserRepository::find_by_name(&db, &user).await?
+                    let u = UserRepository::find_by_name(db, &user).await?
                         .ok_or_else(|| anyhow::anyhow!("User not found: {}", user))?;
 
                     let group_keys = db.list_keys_for_group(u.id, Some(&project)).await?;
@@ -1528,11 +1523,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Provider(provider_args) => {
-            use crate::db::repositories::models::ModelRepository;
 
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match provider_args.command {
                 ProviderCommands::List => {
@@ -1583,12 +1577,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Alias(alias_args) => {
             use crate::db::models::NewModelAlias;
-            use crate::db::repositories::aliases::AliasRepository;
-            use crate::db::repositories::models::ModelRepository;
 
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match alias_args.command {
                 AliasCommands::List { format } => {
@@ -1670,12 +1662,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Model(model_args) => {
-            use crate::db::repositories::models::ModelRepository;
             use crate::db::models::NewModel;
 
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match model_args.command {
                 ModelCommands::Add { provider, name, alias } => {
@@ -1843,12 +1834,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Webhook(webhook_args) => {
-            use crate::db::repositories::webhook_callbacks::{NewWebhookCallback, WebhookCallbackRepository};
+            use crate::db::repositories::webhook_callbacks::NewWebhookCallback;
             use commands::WebhookCommands;
 
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
+            let store = crate::db::open(&settings.database).await?;
+            let db = &*store.db;
 
             match webhook_args.command {
                 WebhookCommands::List => {
@@ -1903,10 +1894,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Experiment(experiment_args) => {
             let settings = crate::config::load(cli.config)?;
-            let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-            crate::db::migrations::run_migrations(&db.pool).await?;
-            let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
-            run_experiment_command(&db, &settings, experiment_args.command).await?;
+            let store = crate::db::open(&settings.database).await?;
+            run_experiment_command(&store.db, &settings, experiment_args.command).await?;
         }
     }
     Ok(())
@@ -1986,7 +1975,7 @@ async fn open_prompt_db(
 /// main database, the dedicated prompt database when one is configured, and
 /// the configured pricing — and print it. Never constructs an `AppState`.
 async fn report_compare(
-    db: crate::db::sqlite::SqliteDb,
+    db: Arc<dyn crate::api::app::DatabaseProvider>,
     settings: &crate::config::schema::Settings,
     query: &crate::api::admin::compare::CompareQuery,
     format: OutputFormat,
@@ -1996,7 +1985,6 @@ async fn report_compare(
     // Validate before opening anything else, so a typo fails fast.
     query.validate()?;
 
-    let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(db);
     let prompt_db = open_prompt_db(settings, &db).await?;
     let sources = CompareSources {
         db,
@@ -2146,7 +2134,7 @@ fn write_comparison(
 }
 
 async fn report_attribution(
-    db: &crate::db::sqlite::SqliteDb,
+    db: &dyn crate::api::app::DatabaseProvider,
     filter: &crate::db::repositories::costs::AttributionFilter,
     by: crate::cli::commands::AttributionBreakdown,
     window: &str,
@@ -2620,7 +2608,7 @@ mod tests {
         let settings = crate::config::schema::Settings::default();
         let mut q = variant_query(1);
         q.key = "one".into();
-        let err = report_compare(db, &settings, &q, OutputFormat::Table).await.unwrap_err();
+        let err = report_compare(Arc::new(db), &settings, &q, OutputFormat::Table).await.unwrap_err();
         assert!(err.to_string().starts_with("key must be an experiment id"), "{}", err);
     }
 
@@ -2631,7 +2619,7 @@ mod tests {
         let settings = crate::config::schema::Settings::default();
         let mut q = query();
         q.dimension = "pair".into();
-        let err = report_compare(db, &settings, &q, OutputFormat::Table).await.unwrap_err();
+        let err = report_compare(Arc::new(db), &settings, &q, OutputFormat::Table).await.unwrap_err();
         assert!(err.to_string().starts_with("dimension must be one of"), "{}", err);
     }
 

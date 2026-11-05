@@ -11,7 +11,7 @@ use crate::db::repositories::costs::{
 use super::{PostgresDb, now_utc};
 
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
-const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)";
+const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)::BIGINT";
 
 #[async_trait]
 impl CostRepository for PostgresDb {
@@ -228,7 +228,7 @@ impl CostRepository for PostgresDb {
 
     async fn sum_tokens_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM cost_ledger
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0)::BIGINT FROM cost_ledger
              WHERE user_id = $1 AND created_at >= $2",
         )
         .bind(user_id)
@@ -251,7 +251,7 @@ impl CostRepository for PostgresDb {
 
     async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM cost_ledger WHERE api_key_id = $1 AND created_at >= $2"
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0)::BIGINT FROM cost_ledger WHERE api_key_id = $1 AND created_at >= $2"
         )
         .bind(api_key_id)
         .bind(since)
@@ -334,8 +334,8 @@ impl CostRepository for PostgresDb {
         let mut sql = format!(
             "SELECT user_id, \
                     COALESCE(SUM(cost_usd), 0.0), \
-                    COALESCE(SUM(tokens_in), 0), \
-                    COALESCE(SUM(tokens_out), 0), \
+                    COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                    COALESCE(SUM(tokens_out), 0)::BIGINT, \
                     COUNT(*), \
                     COALESCE(SUM(cost_usd), 0.0) + COALESCE(SUM(saved_usd), 0.0) \
              FROM cost_ledger \
@@ -418,8 +418,8 @@ impl CostRepository for PostgresDb {
         let mut sql = format!(
             "SELECT user_id, model, project, api_key_id, \
                     COALESCE(SUM(cost_usd), 0.0), \
-                    COALESCE(SUM(tokens_in), 0), \
-                    COALESCE(SUM(tokens_out), 0), \
+                    COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                    COALESCE(SUM(tokens_out), 0)::BIGINT, \
                     COUNT(*) \
              FROM cost_ledger \
              WHERE created_at >= ${}", param
@@ -474,8 +474,8 @@ impl CostRepository for PostgresDb {
     async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)> {
         let row: (f64, i64, i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(cost_usd), 0.0),
-                    COALESCE(SUM(tokens_in), 0),
-                    COALESCE(SUM(tokens_out), 0),
+                    COALESCE(SUM(tokens_in), 0)::BIGINT,
+                    COALESCE(SUM(tokens_out), 0)::BIGINT,
                     COUNT(*)
              FROM cost_ledger
              WHERE user_id = $1 AND created_at >= $2",
@@ -559,8 +559,8 @@ impl CostRepository for PostgresDb {
         let mut param = 2usize;
         let mut sql = "SELECT model, \
                               COALESCE(SUM(cost_usd), 0.0), \
-                              COALESCE(SUM(tokens_in), 0), \
-                              COALESCE(SUM(tokens_out), 0), \
+                              COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                              COALESCE(SUM(tokens_out), 0)::BIGINT, \
                               COUNT(*), \
                               COALESCE(SUM(saved_usd), 0.0) \
                        FROM cost_ledger \
@@ -932,7 +932,7 @@ type BreakdownRow = (String, f64, f64, i64, i64, i64, i64);
 fn totals_select() -> String {
     format!(
         "COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(saved_usd), 0.0), \
-         COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0), COUNT(*), {}",
+         COALESCE(SUM(tokens_in), 0)::BIGINT, COALESCE(SUM(tokens_out), 0)::BIGINT, COUNT(*), {}",
         CACHE_HIT_SUM
     )
 }

@@ -5,6 +5,14 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-02
+
+**Features**
+- `database.postgres_url` now selects the PostgreSQL backend for `serve` and every CLI command, and runs the PostgreSQL migration set on start. The setting existed but nothing read it: the server and CLI always opened SQLite. A binary built without the `postgres` feature refuses a config that sets it. The CLI `report` and `audit` subcommands and the dashboard's hook statistics still query SQLite directly and say so on PostgreSQL. (#138)
+
+**Fixes**
+- The PostgreSQL migration set never applied on a real server: the first migration declares a `budget_rules` column named `window`, a reserved word, so `CREATE TABLE` failed before any later file ran. The column is now quoted in that file and in every query that names it. Editing a shipped migration is normally forbidden because sqlx checksums the file, but no database can have recorded this one. Six columns the PostgreSQL repositories read and write but the schema never gained (`users.spend_reset_at`, `api_keys.expires_at`, `api_keys.tag`, `api_keys.project`, `budget_rules.max_concurrent`, `budget_rules.tag`) arrive in a new expand-only migration. Integer sums in the PostgreSQL cost queries are cast to `BIGINT`; PostgreSQL returns `NUMERIC` for `SUM(BIGINT)`, which the row types could not decode. A live end-to-end test behind `MODELROUTER_TEST_POSTGRES_URL` now runs the binary, the CLI and a priced request against PostgreSQL. (#138)
+
 ### Week of 2026-09-28
 
 **Features**

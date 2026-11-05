@@ -92,6 +92,14 @@ async fn heal_inert_checksum_edits(pool: &sqlx::SqlitePool) -> anyhow::Result<()
     Ok(())
 }
 
+/// Bring a PostgreSQL store to head. sqlx takes an advisory lock for the
+/// run, so replicas starting together apply each step once.
+#[cfg(feature = "postgres")]
+pub async fn run_postgres_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::migrate!("./migrations/postgres").run(pool).await?;
+    Ok(())
+}
+
 pub async fn run_dev_seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     if std::env::var("MODELROUTER_DEV_SEED").as_deref() == Ok("true") {
         sqlx::query(include_str!("dev_seed.sql"))

@@ -310,6 +310,22 @@ default_model = "claude-opus-4-6"
 
 See [`config.example.toml`](config.example.toml) for all provider options, guardrail definitions, policy rules, OIDC, and telemetry settings.
 
+### Choosing the store: SQLite or PostgreSQL
+
+SQLite is the default and right for one replica. Set `database.postgres_url` to run on PostgreSQL instead; `serve` and every CLI command then open that database and bring its schema to head on start (sqlx takes an advisory lock, so replicas starting together migrate once). The binary must be built with `--features postgres`; one built without it refuses a config that sets the URL rather than silently opening SQLite beside it.
+
+```toml
+[database]
+postgres_url = "postgres://modelrouter:secret@db.internal:5432/modelrouter"
+```
+
+Still SQLite-only in this release: the `report` and `audit` CLI subcommands and the dashboard's hook statistics. On PostgreSQL they print `not available on the postgres backend yet` instead of a database error. To prove the backend against a real server locally:
+
+```bash
+MODELROUTER_TEST_POSTGRES_URL=postgres://user:pass@localhost/modelrouter_test \
+  cargo test --features postgres --test test_postgres_live -- --ignored
+```
+
 ### 2. Run migrations and start the server
 
 ```bash
