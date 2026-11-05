@@ -5,6 +5,11 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-02
+
+**Features**
+- `docs/deploying-replicated.md`: how to run several replicas on PostgreSQL with Redis for the cache and the cross-replica limits, the three probes and their timings, the drain grace, expand-only migrations, `serve --check-config`, and the rollout settings that keep one proven pod serving before an old one stops. The Helm chart gains `rollout` (maxSurge 1, maxUnavailable 0), an optional PodDisruptionBudget and optional topology spread across zones and nodes. (#136)
+
 ### Week of 2026-09-28
 
 **Features**

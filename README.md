@@ -1888,6 +1888,10 @@ The binary entry point at `src/main.rs` delegates entirely to the library crate,
 
 ---
 
+## Running several replicas
+
+See [docs/deploying-replicated.md](docs/deploying-replicated.md): PostgreSQL store, Redis for cache and limits, probes, drain, expand-only migrations, pre-start check, and the Helm rollout settings.
+
 ## Development
 
 ```bash
