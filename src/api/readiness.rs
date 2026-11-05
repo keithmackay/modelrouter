@@ -7,7 +7,7 @@
 //! /health/ready` reads the handle on every poll. Liveness stays separate and
 //! never consults this.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,9 @@ pub struct Readiness(Arc<Inner>);
 struct Inner {
     migrated: AtomicBool,
     draining: AtomicBool,
+    in_flight: AtomicUsize,
+    refused: AtomicUsize,
+    idle: tokio::sync::Notify,
     provider_failures: RwLock<Vec<ProviderFailure>>,
     db_probe: tokio::sync::Mutex<Option<(Instant, Option<String>)>>,
 }
@@ -55,6 +58,9 @@ impl Readiness {
         Self(Arc::new(Inner {
             migrated: AtomicBool::new(false),
             draining: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            refused: AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
             provider_failures: RwLock::new(Vec::new()),
             db_probe: tokio::sync::Mutex::new(None),
         }))
@@ -78,6 +84,37 @@ impl Readiness {
 
     pub fn is_draining(&self) -> bool {
         self.0.draining.load(Ordering::Acquire)
+    }
+
+    /// Admit one request. `None` while draining, in which case the refusal
+    /// is counted. The guard holds the in-flight count until dropped.
+    pub fn track(&self) -> Option<InFlightGuard> {
+        if self.is_draining() {
+            self.0.refused.fetch_add(1, Ordering::AcqRel);
+            return None;
+        }
+        self.0.in_flight.fetch_add(1, Ordering::AcqRel);
+        Some(InFlightGuard(self.0.clone()))
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.0.in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn refused(&self) -> usize {
+        self.0.refused.load(Ordering::Acquire)
+    }
+
+    /// Resolves once no request is in flight. The notify permit set by the
+    /// last guard to drop survives a check-then-wait race, so no wakeup is
+    /// lost.
+    pub async fn wait_idle(&self) {
+        loop {
+            if self.in_flight() == 0 {
+                return;
+            }
+            self.0.idle.notified().await;
+        }
     }
 
     /// Record the outcome of building each provider adapter. Replaces any
@@ -138,6 +175,17 @@ impl Readiness {
         let result = db.ping().await.err().map(|e| e.to_string());
         *cached = Some((Instant::now(), result.clone()));
         result
+    }
+}
+
+/// Held for the life of one admitted request, body included.
+pub struct InFlightGuard(Arc<Inner>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_one();
+        }
     }
 }
 
@@ -235,6 +283,50 @@ mod tests {
             r.failing(&db(false)).await,
             vec![NotReady::Draining, NotReady::Migrations]
         );
+    }
+
+    #[tokio::test]
+    async fn guards_count_in_flight_and_wait_idle_resolves_when_the_last_drops() {
+        let r = Readiness::started();
+        let a = r.track().expect("admitted");
+        let b = r.track().expect("admitted");
+        assert_eq!(r.in_flight(), 2);
+        drop(a);
+        assert_eq!(r.in_flight(), 1);
+
+        let waiter = {
+            let r = r.clone();
+            tokio::spawn(async move { r.wait_idle().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "one request still in flight");
+        drop(b);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_idle resolved")
+            .unwrap();
+        assert_eq!(r.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_idle_returns_at_once_when_nothing_is_in_flight() {
+        let r = Readiness::started();
+        tokio::time::timeout(Duration::from_millis(100), r.wait_idle())
+            .await
+            .expect("idle already");
+    }
+
+    #[test]
+    fn draining_refuses_new_requests_and_counts_them() {
+        let r = Readiness::started();
+        let held = r.track().expect("admitted before drain");
+        r.begin_drain();
+        assert!(r.track().is_none());
+        assert!(r.track().is_none());
+        assert_eq!(r.refused(), 2);
+        assert_eq!(r.in_flight(), 1, "the earlier request is still counted");
+        drop(held);
+        assert_eq!(r.in_flight(), 0);
     }
 
     #[test]
