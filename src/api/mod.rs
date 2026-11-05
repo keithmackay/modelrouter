@@ -5,4 +5,5 @@ pub mod auth;
 pub mod error;
 pub mod failure_log;
 pub mod middleware;
+pub mod readiness;
 pub mod routes;

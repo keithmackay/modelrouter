@@ -14,6 +14,7 @@ use crate::{
         failures::FailureRepository, outcomes::OutcomeRepository,
         hooks::HookRepository,
         groups::GroupRepository,
+        health::HealthRepository,
         webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
         users::UserRepository,
@@ -43,6 +44,7 @@ pub trait DatabaseProvider:
     + McpServerRepository
     + ModelRepository
     + GroupRepository
+    + HealthRepository
     + WebhookCallbackRepository
     + Send
     + Sync
@@ -70,6 +72,7 @@ impl<T> DatabaseProvider for T where
         + McpServerRepository
         + ModelRepository
         + GroupRepository
+        + HealthRepository
         + WebhookCallbackRepository
         + Send
         + Sync
@@ -116,12 +119,22 @@ pub struct AppState {
     pub experiments: Arc<crate::router::experiments::ExperimentRegistry>,
 }
 
+/// Build the router for a process whose startup steps already ran, so
+/// `/health/ready` depends only on the store. `serve` uses
+/// [`build_router_with_readiness`] to report its own startup.
 pub fn build_router(state: AppState) -> axum::Router {
+    build_router_with_readiness(state, crate::api::readiness::Readiness::started())
+}
+
+pub fn build_router_with_readiness(
+    state: AppState,
+    readiness: crate::api::readiness::Readiness,
+) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         audio::{speech, transcriptions},
         completions::chat_completions, embeddings::embeddings,
-        health::{deep_health, health_check, DeepHealthCache},
+        health::{deep_health, health_check, health_live, health_ready, DeepHealthCache},
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler, search::search, systemone::systemone,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
@@ -181,6 +194,8 @@ pub fn build_router(state: AppState) -> axum::Router {
         // Health + API routes
         .route("/health", get(health_check))
         .route("/health/deep", get(deep_health))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -366,6 +381,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         // route-local state, and an Extension keeps every AppState literal
         // (tests included) unchanged.
         .layer(axum::Extension(DeepHealthCache::default()))
+        .layer(axum::Extension(readiness))
         // axum's built-in limit is 2 MB; `[server] request_body_limit_mb`
         // documents 10 and was never applied (#55).
         .layer(axum::extract::DefaultBodyLimit::max(

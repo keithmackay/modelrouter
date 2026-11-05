@@ -286,10 +286,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             };
 
+            let readiness = crate::api::readiness::Readiness::new();
+
             // Init DB
             let sqlite_db =
                 crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
             crate::db::migrations::run_migrations(&sqlite_db.pool).await?;
+            readiness.mark_migrated();
             let pool = sqlite_db.pool.clone();
             let db: Arc<dyn crate::api::app::DatabaseProvider> = Arc::new(sqlite_db);
 
@@ -382,6 +385,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                     settings.tier_timeouts.clone(),
                 ),
             );
+            // Build every chat adapter now so a bad provider section keeps
+            // this replica out of the Service instead of failing its first
+            // request. The process still starts: an operator can read the
+            // reason from /health/ready, and older replicas keep serving.
+            let warm = provider_registry.warm_all();
+            for (provider, result) in &warm {
+                if let Err(error) = result {
+                    tracing::warn!(provider, %error, "provider adapter failed to build; /health/ready reports it");
+                }
+            }
+            readiness.record_provider_results(warm);
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
                 settings.routing.fallback_chains.clone(),
             ));
@@ -614,7 +628,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 });
             }
 
-            let app = crate::api::app::build_router(state);
+            let app = crate::api::app::build_router_with_readiness(state, readiness);
 
             // Flag > config > built-in default. The config defaults already
             // supply 127.0.0.1:8080 when the section is absent.

@@ -5,6 +5,11 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-02
+
+**Features**
+- Readiness that means "can serve". `GET /health/ready` answers 200 only when the store answers a trivial query, the schema is at the version the binary expects, every chat provider adapter was built, and the process is not draining; otherwise 503 with a `failing` list that names each part (`database`, `migrations`, `provider`, `draining`). `GET /health/live` is a cheap process check with no I/O. `GET /health` is unchanged. `serve` now builds every chat provider adapter at start and reports a provider that fails to build through readiness instead of on its first request; the Azure adapter returns an error instead of panicking when `api_base` is missing. The Helm chart points the startup and readiness probes at `/health/ready` and liveness at `/health/live`, with timings under `probes`. (#130)
+
 ### Week of 2026-09-28
 
 **Features**
