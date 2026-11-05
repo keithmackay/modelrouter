@@ -8,7 +8,8 @@ commit; `git log v0.1.0..` has the detail.
 ### Week of 2026-11-02
 
 **Features**
-- `[cluster] replicas` divides the in-memory limits across replicas. Per-user concurrency (from budget rules), per-session `tpm`/`rpm` buckets and `[server] ip_rate_limit_rpm` are counted in process memory, so N replicas behind one address enforced N times the configured value. Each replica now enforces `ceil(limit / replicas)`, never below 1 for a set limit, and 0 keeps meaning disabled. Default 1, so single-node deployments are unchanged. The Helm chart passes `replicaCount` through `MODELROUTER_CLUSTER__REPLICAS`. Shared counters in Redis are the next step for the same issue. (#133)
+- `[cluster] replicas` divides the in-memory limits across replicas. Per-user concurrency (from budget rules), per-session `tpm`/`rpm` buckets and `[server] ip_rate_limit_rpm` are counted in process memory, so N replicas behind one address enforced N times the configured value. Each replica now enforces `ceil(limit / replicas)`, never below 1 for a set limit, and 0 keeps meaning disabled. Default 1, so single-node deployments are unchanged. The Helm chart passes `replicaCount` through `MODELROUTER_CLUSTER__REPLICAS`. (#133)
+- `[cluster] backend = "redis"` moves the cross-replica state into one Redis so every replica enforces the full configured limit and sees every pin: per-user concurrency as a sorted set of leased permits (refreshed while held, expiring on their own if the holder dies), per-session buckets and per-IP counters as atomically checked keys, session affinity pins with a sliding TTL, and pending OIDC logins so an admin login started on one replica can finish on another. `cluster.redis_url` and `cluster.namespace` default to the cache's. When Redis is unreachable the limiters fall back to this replica's share and pins to the local map; a login that cannot be recorded fails with a clear message rather than silently binding to one replica. (#133)
 
 ### Week of 2026-09-28
 

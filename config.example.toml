@@ -16,6 +16,15 @@ request_body_limit_mb = 10
 # # buckets and per-IP rate limits are counted in process memory, so each
 # # replica enforces ceil(limit / replicas), never below 1. Default 1.
 # replicas = 1
+# # "memory" (default) or "redis". With "redis" the limits above, session
+# # affinity pins and pending OIDC logins are shared by every replica.
+# backend = "memory"
+# # Both default to the [cache] values when unset.
+# redis_url = "redis://127.0.0.1:6379"
+# namespace = "modelrouter:cluster"
+# # A concurrency permit expires this long after its holder stops refreshing
+# # it, so a crashed replica's permits free themselves.
+# lease_secs = 60
 
 # ---------------------------------------------------------------------------
 # Database

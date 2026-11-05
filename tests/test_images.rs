@@ -448,7 +448,7 @@ async fn image_generation_policy_concurrency_limit_exceeded() {
     }));
     let policy = Arc::new(PolicyEngine::new(db.clone()));
     let concurrency = Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new());
-    let _permit = concurrency.try_acquire(user_id, 1).unwrap();
+    let _permit = concurrency.try_acquire(user_id, 1).await.unwrap();
 
     let state = AppState {
         settings: settings.clone(),

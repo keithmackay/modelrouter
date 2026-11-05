@@ -61,7 +61,7 @@ async fn image_generations_inner(
     {
         PolicyDecision::Allow { max_concurrent } => {
             if let Some(max) = max_concurrent {
-                match state.concurrency.try_acquire(user.id, max) {
+                match state.concurrency.try_acquire(user.id, max).await {
                     Some(permit) => Some(permit),
                     None => return Err(ApiError::PolicyDenied {
                         reason: "concurrent request limit exceeded".to_string(),
