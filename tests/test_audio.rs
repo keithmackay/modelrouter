@@ -319,7 +319,7 @@ async fn speech_policy_concurrency_limit_exceeded() {
 
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
     let concurrency = Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new());
-    let _permit = concurrency.try_acquire(user_id, 1).unwrap();
+    let _permit = concurrency.try_acquire(user_id, 1).await.unwrap();
 
     let state = AppState {
         settings: settings.clone(),

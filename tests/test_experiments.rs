@@ -738,26 +738,26 @@ async fn bound_request_neither_reads_nor_writes_an_affinity_pin() {
     let id = h.seed_experiment(vec![], false).await;
 
     // A pin left by an earlier unbound request must not steer the bound one.
-    h.session_affinity.set("session-7", "mock", "model-a");
+    h.session_affinity.set("session-7", "mock", "model-a").await;
     let mut body = chat_body("planner", "run-1");
     body["session_id"] = json!("session-7");
     let resp = complete(&h, TOKEN_A, Some(&format!("{id}:candidate")), &body).await;
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
     assert_eq!(resp.json::<Value>()["model"], "model-b");
-    let pin = h.session_affinity.get("session-7").expect("pin untouched");
+    let pin = h.session_affinity.get("session-7").await.expect("pin untouched");
     assert_eq!(pin.model, "model-a");
 
     // And a fresh session under a binding creates no pin at all.
     body["session_id"] = json!("session-8");
     let resp = complete(&h, TOKEN_A, Some(&format!("{id}:candidate")), &body).await;
     assert_eq!(resp.status_code(), 200);
-    assert!(h.session_affinity.get("session-8").is_none());
+    assert!(h.session_affinity.get("session-8").await.is_none());
     assert_eq!(h.session_affinity.len(), 1);
 
     // Whereas the same request unbound pins the session.
     let resp = complete(&h, TOKEN_A, None, &body).await;
     assert_eq!(resp.status_code(), 200);
-    assert_eq!(h.session_affinity.get("session-8").unwrap().model, "model-a");
+    assert_eq!(h.session_affinity.get("session-8").await.unwrap().model, "model-a");
 }
 
 #[tokio::test]

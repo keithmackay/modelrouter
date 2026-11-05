@@ -380,7 +380,7 @@ async fn policy_concurrency_limit_is_enforced() {
     // Hold the user's one permit on the exact ConcurrencyLimiter instance the
     // route itself uses (same pattern as tests/test_images.rs), so the route
     // must see it as exhausted without any real concurrent HTTP traffic.
-    let _held_permit = concurrency.try_acquire(user_id, 1).expect("first acquire should succeed");
+    let _held_permit = concurrency.try_acquire(user_id, 1).await.expect("first acquire should succeed");
 
     let resp = call(&server, &request_body()).await;
     assert_eq!(resp.status_code().as_u16(), 429);
