@@ -41,6 +41,9 @@ otel = [
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
+# Named directly so the drain gate can wrap response bodies; already in the
+# tree through axum.
+http-body = "1"
 tokio = { version = "1", features = ["full"] }
 # Advisory note: rsa 0.9.x (RUSTSEC-2023-0071, Marvin-class timing, no fixed
 # release) appears in Cargo.lock via sqlx-mysql, but no feature of this crate

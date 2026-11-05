@@ -48,6 +48,9 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      # At least [server] shutdown_grace_secs: the router exits as soon as
+      # nothing is in flight, so this is a ceiling, not a wait.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: modelrouter
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

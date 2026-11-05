@@ -8,7 +8,7 @@
 mod common;
 
 use common::e2e::{RouterOptions, RouterProcess};
-use common::mock_llm::MockLlm;
+use common::mock_llm::{MockLlm, ModelProfile};
 
 use std::process::Command;
 use std::time::Duration;
@@ -266,4 +266,167 @@ async fn server_survives_past_drain_deadline_uptime() {
             Err(e) => panic!("try_wait failed: {e}"),
         }
     }
+}
+
+/// Send SIGTERM to a fixture-managed process.
+fn sigterm(pid: u32) {
+    let term = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(term.success(), "kill -TERM failed");
+}
+
+/// Poll until the process exits, failing after `within`.
+fn wait_for_exit(router: &mut RouterProcess, within: Duration) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(status) = router.try_wait() {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process did not exit within {within:?}\n--- log ---\n{}",
+            router.logs()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The tracing subscriber colours its output; match on the words.
+fn without_ansi(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn slow_profile(ms: u64) -> ModelProfile {
+    ModelProfile {
+        latency_ms: (ms, 0),
+        ..ModelProfile::default()
+    }
+}
+
+/// The drain contract end to end: a slow request admitted before SIGTERM
+/// finishes with 2xx, a request arriving after it is refused with 503 and
+/// `Connection: close`, readiness reports draining while liveness stays up,
+/// and the process exits as soon as the slow request is done rather than
+/// waiting out the grace (which defaults to hours).
+#[tokio::test]
+async fn drain_finishes_in_flight_refuses_late_arrivals_and_exits_when_idle() {
+    let mock = MockLlm::start().await;
+    mock.set_profile("slow", slow_profile(1500));
+    let mut router = RouterProcess::start(RouterOptions::new(mock.base_url())).await;
+    let api_key = router.create_user_and_key("drainuser");
+    let base_url = router.base_url();
+
+    let in_flight = {
+        let base_url = base_url.clone();
+        let api_key = api_key.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&serde_json::json!({
+                    "model": "mock/slow",
+                    "messages": [{"role": "user", "content": "take your time"}],
+                }))
+                .send()
+                .await
+        })
+    };
+    // The mock records a request only after its think-time, so poll nothing:
+    // a short wait is enough for the request to be in flight, and the
+    // think-time dwarfs it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    sigterm(router.pid());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let late = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "mock/test",
+            "messages": [{"role": "user", "content": "too late"}],
+        }))
+        .send()
+        .await
+        .expect("late request answered, not refused at the socket");
+    assert_eq!(late.status(), 503, "{}", router.logs());
+    assert_eq!(late.headers()["connection"], "close");
+
+    let ready = reqwest::get(format!("{base_url}/health/ready")).await.expect("ready");
+    assert_eq!(ready.status(), 503);
+    let ready_body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["failing"][0]["part"], "draining");
+    assert_eq!(reqwest::get(format!("{base_url}/health/live")).await.unwrap().status(), 200);
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), in_flight)
+        .await
+        .expect("in-flight request finished")
+        .expect("task")
+        .expect("request ok");
+    assert!(resp.status().is_success(), "in-flight returned {}", resp.status());
+
+    let status = wait_for_exit(&mut router, Duration::from_secs(10));
+    assert!(status.success(), "exit status {status}");
+    let logs = without_ansi(&router.logs());
+    assert!(logs.contains("draining"), "{logs}");
+    assert!(logs.contains("in_flight=1"), "{logs}");
+    assert!(logs.contains("graceful shutdown complete"), "{logs}");
+    assert!(logs.contains("refused=1"), "{logs}");
+}
+
+/// `[server] shutdown_grace_secs` bounds the wait: a request slower than the
+/// grace is cut off and the process still exits soon after the grace.
+#[tokio::test]
+async fn shutdown_grace_secs_bounds_the_drain() {
+    let mock = MockLlm::start().await;
+    mock.set_profile("slow", slow_profile(6000));
+    let mut router = RouterProcess::start(
+        RouterOptions::new(mock.base_url()).with_shutdown_grace_secs(1),
+    )
+    .await;
+    let api_key = router.create_user_and_key("graceuser");
+    let base_url = router.base_url();
+
+    let in_flight = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{base_url}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&serde_json::json!({
+                "model": "mock/slow",
+                "messages": [{"role": "user", "content": "too slow"}],
+            }))
+            .send()
+            .await
+    });
+    // The mock records a request only after its think-time, so poll nothing:
+    // a short wait is enough for the request to be in flight, and the
+    // think-time dwarfs it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let signalled = std::time::Instant::now();
+    sigterm(router.pid());
+    let status = wait_for_exit(&mut router, Duration::from_secs(8));
+    let took = signalled.elapsed();
+    assert!(status.success(), "exit status {status}");
+    assert!(took >= Duration::from_secs(1), "exited before the grace: {took:?}");
+    assert!(took < Duration::from_secs(7), "did not exit soon after the grace: {took:?}");
+    assert!(router.logs().contains("drain grace elapsed"), "{}", router.logs());
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), in_flight).await.expect("task returned").unwrap();
+    assert!(outcome.is_err(), "a request slower than the grace must not succeed: {outcome:?}");
 }

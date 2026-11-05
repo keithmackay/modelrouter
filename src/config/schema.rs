@@ -443,6 +443,13 @@ pub struct ServerConfig {
     /// Max requests per minute per IP address. 0 = disabled (default).
     #[serde(default)]
     pub ip_rate_limit_rpm: u32,
+    /// How long, after SIGTERM, to wait for in-flight requests before
+    /// exiting. Unset: the longest configured tier timeout, so no request
+    /// the router would still serve is cut short by its own shutdown. The
+    /// process exits as soon as in-flight work reaches zero, so an idle
+    /// replica never waits this long.
+    #[serde(default)]
+    pub shutdown_grace_secs: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -452,7 +459,21 @@ impl Default for ServerConfig {
             port: default_port(),
             request_body_limit_mb: default_request_body_limit_mb(),
             ip_rate_limit_rpm: 0,
+            shutdown_grace_secs: None,
         }
+    }
+}
+
+impl Settings {
+    /// Seconds to wait for in-flight requests after a shutdown signal:
+    /// `[server] shutdown_grace_secs`, else the longest tier timeout.
+    pub fn shutdown_grace_secs(&self) -> u64 {
+        self.server.shutdown_grace_secs.unwrap_or_else(|| {
+            self.tier_timeouts
+                .fast
+                .max(self.tier_timeouts.balanced)
+                .max(self.tier_timeouts.deep)
+        })
     }
 }
 
@@ -1651,5 +1672,35 @@ mod tier_timeouts_tests {
         // the most generous (deep) tier ceiling.
         assert_eq!(default_timeout_secs(), 21600);
         assert_eq!(default_timeout_secs(), TierTimeoutsConfig::default().deep);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_grace_tests {
+    use super::*;
+
+    #[test]
+    fn grace_defaults_to_the_longest_tier_timeout() {
+        let s = Settings {
+            tier_timeouts: TierTimeoutsConfig { fast: 10, balanced: 300, deep: 120 },
+            ..Settings::default()
+        };
+        assert_eq!(s.shutdown_grace_secs(), 300);
+    }
+
+    #[test]
+    fn explicit_grace_wins_over_tier_timeouts() {
+        let s = Settings {
+            server: ServerConfig { shutdown_grace_secs: Some(45), ..ServerConfig::default() },
+            ..Settings::default()
+        };
+        assert_eq!(s.shutdown_grace_secs(), 45);
+    }
+
+    #[test]
+    fn grace_parses_from_the_server_section() {
+        let s: Settings = toml::from_str("[server]\nshutdown_grace_secs = 7\n").unwrap();
+        assert_eq!(s.server.shutdown_grace_secs, Some(7));
+        assert_eq!(s.shutdown_grace_secs(), 7);
     }
 }

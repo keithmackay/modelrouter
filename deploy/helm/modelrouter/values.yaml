@@ -79,6 +79,12 @@ probes:
     periodSeconds: 10
     failureThreshold: 3
 
+# Ceiling on the drain after SIGTERM. The router exits as soon as no request
+# is in flight; this only matters while a long stream is still running. Keep
+# it at or above [server] shutdown_grace_secs in `config` (default: the
+# longest tier timeout, 6 hours).
+terminationGracePeriodSeconds: 21630
+
 # Node selector, tolerations, affinity
 nodeSelector: {}
 tolerations: []
