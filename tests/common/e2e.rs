@@ -60,6 +60,8 @@ pub struct RouterOptions {
     pub request_body_limit_mb: Option<usize>,
     /// TOML appended verbatim after the generated sections.
     pub extra_toml: String,
+    /// `[database] postgres_url`. `None` leaves the line out so SQLite applies.
+    pub postgres_url: Option<String>,
 }
 
 impl RouterOptions {
@@ -70,11 +72,17 @@ impl RouterOptions {
             jwt_secret: None,
             request_body_limit_mb: None,
             extra_toml: String::new(),
+            postgres_url: None,
         }
     }
 
     pub fn with_extra_toml(mut self, toml: impl Into<String>) -> Self {
         self.extra_toml.push_str(&toml.into());
+        self
+    }
+
+    pub fn with_postgres_url(mut self, url: impl Into<String>) -> Self {
+        self.postgres_url = Some(url.into());
         self
     }
 
@@ -105,6 +113,11 @@ pub fn render_config(dir: &Path, port: u16, opts: &RouterOptions) -> String {
         .request_body_limit_mb
         .map(|mb| format!("request_body_limit_mb = {mb}\n"))
         .unwrap_or_default();
+    let postgres_url = opts
+        .postgres_url
+        .as_deref()
+        .map(|u| format!("postgres_url = \"{u}\"\n"))
+        .unwrap_or_default();
     format!(
         r#"
 [server]
@@ -113,7 +126,7 @@ port = {port}
 {body_limit}
 [database]
 path = "{db}"
-
+{postgres_url}
 [routing]
 default_provider = "mock"
 default_model = "mock-model"
@@ -139,6 +152,7 @@ store_prompts = true
         cache = opts.cache_enabled,
         body_limit = body_limit,
         extra = opts.extra_toml,
+        postgres_url = postgres_url,
     )
 }
 
@@ -385,4 +399,23 @@ pub fn try_serve_expecting_exit(config: &Path) -> (bool, String) {
         String::from_utf8_lossy(&out.stderr)
     );
     (out.status.success(), combined)
+}
+
+/// The tracing subscriber colours its output; strip the escapes so tests can
+/// match on words.
+pub fn without_ansi(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
