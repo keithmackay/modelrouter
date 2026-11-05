@@ -66,6 +66,8 @@ pub enum Commands {
     Webhook(WebhookArgs),
     /// Inspect and control the response cache on a running router
     Cache(CacheArgs),
+    /// Move a whole store between backends as JSON
+    Db(DbArgs),
     /// Manage controlled experiments (spec §7a)
     Experiment(ExperimentArgs),
 }
@@ -809,4 +811,30 @@ mod tests {
         let err = AdminRole::from_str("god").unwrap_err();
         assert!(err.contains("superadmin") && err.contains("viewer"));
     }
+}
+
+#[derive(Args)]
+pub struct DbArgs {
+    #[command(subcommand)]
+    pub command: DbCommands,
+}
+
+#[derive(Subcommand)]
+pub enum DbCommands {
+    /// Write every table of the configured store to a JSON file
+    Export {
+        /// Output file. Overwritten if it exists.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Load a JSON export into the configured store inside one transaction
+    Import {
+        /// File written by `db export`.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Import into a store that already holds rows. Without it a
+        /// non-empty target is refused.
+        #[arg(long)]
+        merge: bool,
+    },
 }

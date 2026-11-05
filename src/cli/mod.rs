@@ -289,7 +289,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Init DB
             let store = crate::db::open(&settings.database).await?;
             tracing::info!(backend = store.backend, "database opened and migrated");
-            let pool = store.sqlite_pool.clone();
+            let pool = store.sqlite_pool_opt().cloned();
             let db: Arc<dyn crate::api::app::DatabaseProvider> = store.db.clone();
 
             // Sync hook permissions from config into DB
@@ -657,6 +657,41 @@ pub async fn run(cli: Cli) -> Result<()> {
                         "graceful shutdown exceeded {}s deadline, forcing exit",
                         GRACEFUL_SHUTDOWN_TIMEOUT_SECS
                     );
+                }
+            }
+        }
+        Commands::Db(db_args) => {
+            let settings = crate::config::load(cli.config)?;
+            let store = crate::db::open(&settings.database).await?;
+            if settings.storage.prompt_db_path.is_some() {
+                eprintln!(
+                    "note: [storage] prompt_db_path is set; the prompt log is a separate SQLite file \
+                     and is not part of this export. Copy that file alongside."
+                );
+            }
+            match db_args.command {
+                commands::DbCommands::Export { out } => {
+                    let dump = crate::db::transfer::export(&store).await?;
+                    let json = serde_json::to_vec_pretty(&dump)?;
+                    tokio::fs::write(&out, json).await?;
+                    println!("exported {} backend to {}", store.backend, out.display());
+                    for (table, t) in &dump.tables {
+                        println!("  {table}: {} rows", t.rows.len());
+                    }
+                }
+                commands::DbCommands::Import { input, merge } => {
+                    let bytes = tokio::fs::read(&input).await?;
+                    let dump: crate::db::transfer::Dump = serde_json::from_slice(&bytes)?;
+                    let reports = crate::db::transfer::import(&store, &dump, merge).await?;
+                    println!(
+                        "imported {} ({} export) into the {} backend",
+                        input.display(),
+                        dump.source_backend,
+                        store.backend
+                    );
+                    for r in &reports {
+                        println!("  {}: {} inserted, {} total (verified)", r.table, r.inserted, r.total_after);
+                    }
                 }
             }
         }
