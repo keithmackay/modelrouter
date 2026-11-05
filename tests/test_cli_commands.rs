@@ -2405,3 +2405,89 @@ fn db_export_then_import_moves_users_and_keys_to_a_fresh_store() {
     assert!(!ok);
     assert!(err.contains("already holds rows") && err.contains("--merge"), "{err}");
 }
+
+// ── serve --check-config and --version ───────────────────────────────────────
+
+/// Rewrite one `key = ...` line in a generated config so a check can be made
+/// to fail on exactly that setting.
+fn config_with_line(config: &std::path::Path, key: &str, replacement: &str) -> PathBuf {
+    let original = std::fs::read_to_string(config).expect("read config");
+    let rewritten: Vec<String> = original
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with(key) && t[key.len()..].trim_start().starts_with('=') {
+                replacement.to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    assert_ne!(original, rewritten.join("\n"), "{key} not found in config");
+    let path = config.with_file_name(format!("{key}.toml"));
+    std::fs::write(&path, rewritten.join("\n") + "\n").expect("write config");
+    path
+}
+
+#[test]
+fn check_config_passes_on_a_working_config_without_serving() {
+    let (_dir, config) = setup_db();
+    let (ok, out, err) = run_cli(&config, &["serve", "--check-config"]);
+    assert!(ok, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("result: ok"), "{out}");
+    assert!(out.contains("migrations applied, 0 pending"), "{out}");
+    assert!(out.contains("auth.jwt_secret: ok"), "{out}");
+}
+
+#[test]
+fn check_config_reports_pending_migrations_on_a_fresh_store_and_still_passes() {
+    let (dir, config) = setup_db();
+    let fresh = dir.path().join("fresh.db");
+    let path = config_with_line(&config, "path", &format!("path = \"{}\"", fresh.display()));
+    let (ok, out, _err) = run_cli(&path, &["serve", "--check-config"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("0 migrations applied"), "{out}");
+    assert!(!out.contains(" 0 pending"), "a fresh store must have pending migrations: {out}");
+    // Nothing was applied: a later migrate still has work to do.
+    let (ok, mout, _) = run_cli(&path, &["migrate"]);
+    assert!(ok, "{mout}");
+}
+
+#[test]
+fn check_config_fails_on_the_placeholder_signing_secret() {
+    let (_dir, config) = setup_db();
+    let path = config_with_line(&config, "jwt_secret", "jwt_secret = \"change-me-jwt-secret\"");
+    let (ok, out, err) = run_cli(&path, &["serve", "--check-config"]);
+    assert!(!ok, "a placeholder secret must fail the check: {out}");
+    assert!(out.contains("auth.jwt_secret: FAIL"), "{out}");
+    assert!(out.contains("result: FAIL"), "{out}");
+    assert!(err.contains("check-config found 1 problem"), "{err}");
+}
+
+#[test]
+fn check_config_names_a_provider_whose_adapter_cannot_be_built() {
+    let (_dir, config) = setup_db();
+    let mut content = std::fs::read_to_string(&config).expect("read config");
+    content.push_str("\n[providers.azure]\napi_key = \"k\"\n");
+    let path = config.with_file_name("azure.toml");
+    std::fs::write(&path, content).expect("write config");
+
+    let (ok, out, _err) = run_cli(&path, &["serve", "--check-config"]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("provider azure: FAIL"), "{out}");
+    assert!(out.contains("api_base"), "the cause must be printed: {out}");
+}
+
+#[test]
+fn version_works_with_no_config_at_all() {
+    let home = tempfile::tempdir().expect("temp home");
+    let out = std::process::Command::new(BIN)
+        .arg("--version")
+        .env("HOME", home.path())
+        .env_remove("MODELROUTER_CONFIG")
+        .output()
+        .expect("run --version");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
+}
