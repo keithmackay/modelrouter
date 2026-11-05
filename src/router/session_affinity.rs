@@ -1,6 +1,15 @@
+//! Session affinity pins: which provider and model a session last used.
+//!
+//! In memory the pin is known only to the replica that set it. With a
+//! cluster Redis link, pins live in Redis with a sliding TTL and every
+//! replica sees them; Redis unreachable falls back to the local map.
+
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::cluster::RedisLink;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -20,6 +29,7 @@ pub struct SessionAffinityMap {
     ttl_secs: u64,
     map: DashMap<String, SessionPin>,
     count: AtomicU64,
+    redis: Option<Arc<RedisLink>>,
 }
 
 impl SessionAffinityMap {
@@ -28,11 +38,45 @@ impl SessionAffinityMap {
             ttl_secs,
             map: DashMap::new(),
             count: AtomicU64::new(0),
+            redis: None,
         }
     }
 
+    /// Keep pins in Redis so every replica honours them.
+    pub fn with_redis(mut self, link: Option<Arc<RedisLink>>) -> Self {
+        self.redis = link;
+        self
+    }
+
     /// Look up a non-expired pin. Refreshes TTL on hit.
-    pub fn get(&self, session_id: &str) -> Option<SessionPin> {
+    pub async fn get(&self, session_id: &str) -> Option<SessionPin> {
+        if let Some(link) = &self.redis {
+            // GETEX reads and slides the TTL in one round trip; a missing key
+            // decodes as None, an unreachable Redis as a local lookup.
+            let found: Option<Option<String>> = link
+                .run(
+                    "pin get",
+                    redis::cmd("GETEX")
+                        .arg(link.key(&format!("pin:{session_id}")))
+                        .arg("EX")
+                        .arg(self.ttl_secs.max(1)),
+                )
+                .await;
+            if let Some(found) = found {
+                return found.and_then(|raw| {
+                    let (provider, model) = raw.split_once('\n')?;
+                    Some(SessionPin {
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                        last_seen: now_secs(),
+                    })
+                });
+            }
+        }
+        self.get_local(session_id)
+    }
+
+    fn get_local(&self, session_id: &str) -> Option<SessionPin> {
         let mut entry = self.map.get_mut(session_id)?;
         let now = now_secs();
         if now.saturating_sub(entry.last_seen) > self.ttl_secs {
@@ -46,7 +90,26 @@ impl SessionAffinityMap {
     }
 
     /// Store or overwrite a pin.
-    pub fn set(&self, session_id: &str, provider: &str, model: &str) {
+    pub async fn set(&self, session_id: &str, provider: &str, model: &str) {
+        if let Some(link) = &self.redis {
+            let stored: Option<()> = link
+                .run(
+                    "pin set",
+                    redis::cmd("SET")
+                        .arg(link.key(&format!("pin:{session_id}")))
+                        .arg(format!("{provider}\n{model}"))
+                        .arg("EX")
+                        .arg(self.ttl_secs.max(1)),
+                )
+                .await;
+            if stored.is_some() {
+                return;
+            }
+        }
+        self.set_local(session_id, provider, model);
+    }
+
+    fn set_local(&self, session_id: &str, provider: &str, model: &str) {
         let is_new = !self.map.contains_key(session_id);
         self.map.insert(session_id.to_string(), SessionPin {
             provider: provider.to_string(),
@@ -128,16 +191,16 @@ pub fn resolve_with_pin(
 mod tests {
     use super::*;
 
-    #[test]
-    fn no_pin_returns_resolved_and_requests_update() {
+    #[tokio::test]
+    async fn no_pin_returns_resolved_and_requests_update() {
         let (p, m, update) = resolve_with_pin(None, "anthropic", "claude-opus-4-5");
         assert_eq!(p, "anthropic");
         assert_eq!(m, "claude-opus-4-5");
         assert!(update);
     }
 
-    #[test]
-    fn exact_match_uses_pin() {
+    #[tokio::test]
+    async fn exact_match_uses_pin() {
         let pin = SessionPin { provider: "anthropic".into(), model: "claude-opus-4-5".into(), last_seen: 0 };
         let (p, m, update) = resolve_with_pin(Some(&pin), "anthropic", "claude-opus-4-5");
         assert_eq!(p, "anthropic");
@@ -145,8 +208,8 @@ mod tests {
         assert!(update);
     }
 
-    #[test]
-    fn same_provider_different_model_keeps_provider() {
+    #[tokio::test]
+    async fn same_provider_different_model_keeps_provider() {
         let pin = SessionPin { provider: "anthropic".into(), model: "claude-haiku-4-5".into(), last_seen: 0 };
         let (p, m, update) = resolve_with_pin(Some(&pin), "anthropic", "claude-opus-4-5");
         assert_eq!(p, "anthropic");
@@ -154,8 +217,8 @@ mod tests {
         assert!(update);
     }
 
-    #[test]
-    fn different_provider_clears_pin() {
+    #[tokio::test]
+    async fn different_provider_clears_pin() {
         let pin = SessionPin { provider: "anthropic".into(), model: "claude-opus-4-5".into(), last_seen: 0 };
         let (p, m, update) = resolve_with_pin(Some(&pin), "openai", "gpt-4o");
         assert_eq!(p, "openai");
@@ -163,43 +226,43 @@ mod tests {
         assert!(update);
     }
 
-    #[test]
-    fn map_set_and_get() {
+    #[tokio::test]
+    async fn map_set_and_get() {
         let map = SessionAffinityMap::new(1800);
-        map.set("sess1", "anthropic", "claude-opus-4-5");
-        let pin = map.get("sess1").unwrap();
+        map.set("sess1", "anthropic", "claude-opus-4-5").await;
+        let pin = map.get("sess1").await.unwrap();
         assert_eq!(pin.provider, "anthropic");
         assert_eq!(pin.model, "claude-opus-4-5");
     }
 
-    #[test]
-    fn map_expired_entry_returns_none() {
+    #[tokio::test]
+    async fn map_expired_entry_returns_none() {
         let map = SessionAffinityMap::new(1800);
-        map.set("sess1", "anthropic", "claude-opus-4-5");
+        map.set("sess1", "anthropic", "claude-opus-4-5").await;
         if let Some(mut e) = map.map.get_mut("sess1") {
             e.last_seen = 0; // force expiry
         }
-        assert!(map.get("sess1").is_none());
+        assert!(map.get("sess1").await.is_none());
     }
 
-    #[test]
-    fn evict_expired_removes_old_entries() {
+    #[tokio::test]
+    async fn evict_expired_removes_old_entries() {
         let map = SessionAffinityMap::new(1800);
-        map.set("old", "openai", "gpt-4o");
-        map.set("new", "anthropic", "claude-haiku-4-5");
+        map.set("old", "openai", "gpt-4o").await;
+        map.set("new", "anthropic", "claude-haiku-4-5").await;
         if let Some(mut e) = map.map.get_mut("old") {
             e.last_seen = 0; // force expiry
         }
         map.evict_expired();
-        assert!(map.get("old").is_none());
-        assert!(map.get("new").is_some());
+        assert!(map.get("old").await.is_none());
+        assert!(map.get("new").await.is_some());
     }
 
-    #[test]
-    fn is_empty_tracks_len() {
+    #[tokio::test]
+    async fn is_empty_tracks_len() {
         let map = SessionAffinityMap::new(1800);
         assert!(map.is_empty());
-        map.set("sess1", "anthropic", "claude-haiku-4-5");
+        map.set("sess1", "anthropic", "claude-haiku-4-5").await;
         assert!(!map.is_empty());
         assert_eq!(map.len(), 1);
     }

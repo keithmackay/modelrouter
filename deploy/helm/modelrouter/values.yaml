@@ -62,6 +62,14 @@ secrets:
   #   openai: "sk-..."
   #   anthropic: "sk-ant-..."
 
+# Cross-replica state. "memory" divides the in-memory limits by replicaCount;
+# "redis" shares them (and session pins and pending admin logins) through
+# one Redis. redisUrl may be left empty when the response cache already
+# names one under [cache] in `config`.
+cluster:
+  backend: memory
+  redisUrl: ""
+
 # Node selector, tolerations, affinity
 nodeSelector: {}
 tolerations: []

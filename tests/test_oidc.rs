@@ -59,15 +59,15 @@ auto_provision_role = "superadmin"
 }
 
 mod oidc_core_tests {
-    #[test]
-    fn test_oidc_state_store_insert_and_take() {
+    #[tokio::test]
+    async fn test_oidc_state_store_insert_and_take() {
         use modelrouter::api::admin::oidc::OidcStateStore;
         let store = OidcStateStore::new();
-        store.insert("state1".to_string(), "verifier1".to_string());
-        let v = store.take("state1");
+        store.insert("state1".to_string(), "verifier1".to_string()).await.unwrap();
+        let v = store.take("state1").await;
         assert_eq!(v, Some("verifier1".to_string()));
         // Second take returns None (consumed)
-        assert!(store.take("state1").is_none());
+        assert!(store.take("state1").await.is_none());
     }
 
     #[test]
@@ -353,11 +353,11 @@ mod oidc_integration_tests {
     }
 
     /// Test state store expiry logic
-    #[test]
-    fn test_state_store_take_unknown_returns_none() {
+    #[tokio::test]
+    async fn test_state_store_take_unknown_returns_none() {
         use modelrouter::api::admin::oidc::OidcStateStore;
         let store = OidcStateStore::new();
-        assert!(store.take("unknown").is_none());
+        assert!(store.take("unknown").await.is_none());
     }
 
     /// Test PKCE challenge with wrong verifier fails

@@ -65,6 +65,12 @@ spec:
             # Each replica enforces its share of the in-memory limits.
             - name: MODELROUTER_CLUSTER__REPLICAS
               value: {{ .Values.replicaCount | quote }}
+            - name: MODELROUTER_CLUSTER__BACKEND
+              value: {{ .Values.cluster.backend | quote }}
+            {{- if .Values.cluster.redisUrl }}
+            - name: MODELROUTER_CLUSTER__REDIS_URL
+              value: {{ .Values.cluster.redisUrl | quote }}
+            {{- end }}
             - name: MODELROUTER_DATABASE__PATH
               value: /data/router.db
             - name: MODELROUTER_AUTH__JWT_SECRET

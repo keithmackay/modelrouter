@@ -349,21 +349,76 @@ pub struct ClusterConfig {
     /// limit as configured.
     #[serde(default = "default_replicas")]
     pub replicas: u32,
+    /// Where cross-replica state lives: "memory" (each replica enforces its
+    /// share, pins and pending logins stay local) or "redis" (one shared
+    /// counter per limit, pins and pending logins visible to every replica).
+    #[serde(default = "default_cluster_backend")]
+    pub backend: String,
+    /// Redis URL for `backend = "redis"`. Empty: `cache.redis_url`.
+    #[serde(default)]
+    pub redis_url: String,
+    /// Key prefix. Empty: `cache.namespace` followed by `:cluster`.
+    #[serde(default)]
+    pub namespace: String,
+    /// How long a concurrency permit survives without its holder refreshing
+    /// it, so permits of a replica that died disappear on their own.
+    #[serde(default = "default_lease_secs")]
+    pub lease_secs: u64,
 }
 
 fn default_replicas() -> u32 {
     1
 }
 
+fn default_cluster_backend() -> String {
+    "memory".to_string()
+}
+
+fn default_lease_secs() -> u64 {
+    60
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             replicas: default_replicas(),
+            backend: default_cluster_backend(),
+            redis_url: String::new(),
+            namespace: String::new(),
+            lease_secs: default_lease_secs(),
         }
     }
 }
 
 impl ClusterConfig {
+    pub fn uses_redis(&self) -> bool {
+        self.backend.eq_ignore_ascii_case("redis")
+    }
+
+    /// `(url, namespace)` for the shared store when `backend = "redis"`,
+    /// falling back to the cache's settings for whichever is unset.
+    pub fn redis_target(&self, cache: &CacheConfig) -> anyhow::Result<Option<(String, String)>> {
+        if !self.uses_redis() {
+            return Ok(None);
+        }
+        let url = if self.redis_url.trim().is_empty() {
+            cache.redis_url.trim()
+        } else {
+            self.redis_url.trim()
+        };
+        if url.is_empty() {
+            anyhow::bail!(
+                "[cluster] backend = \"redis\" needs cluster.redis_url or cache.redis_url"
+            );
+        }
+        let namespace = if self.namespace.trim().is_empty() {
+            format!("{}:cluster", cache.namespace)
+        } else {
+            self.namespace.trim().to_string()
+        };
+        Ok(Some((url.to_string(), namespace)))
+    }
+
     /// One replica's share of a limit: `ceil(limit / replicas)`, never below
     /// 1 for a non-zero limit so a small limit across many replicas cannot
     /// become 0, which the limiters read as "disabled" or "deny all".
@@ -1709,7 +1764,10 @@ mod cluster_tests {
 
     #[test]
     fn share_rounds_up_and_never_reaches_zero_for_a_set_limit() {
-        let c = ClusterConfig { replicas: 3 };
+        let c = ClusterConfig {
+            replicas: 3,
+            ..ClusterConfig::default()
+        };
         assert_eq!(c.share(9), 3);
         assert_eq!(c.share(10), 4);
         assert_eq!(c.share(1), 1);
@@ -1718,7 +1776,14 @@ mod cluster_tests {
 
     #[test]
     fn zero_replicas_is_treated_as_one() {
-        assert_eq!(ClusterConfig { replicas: 0 }.share(5), 5);
+        assert_eq!(
+            ClusterConfig {
+                replicas: 0,
+                ..ClusterConfig::default()
+            }
+            .share(5),
+            5
+        );
     }
 
     #[test]
@@ -1727,5 +1792,68 @@ mod cluster_tests {
         assert_eq!(s.cluster.replicas, 4);
         let s: Settings = toml::from_str("").unwrap();
         assert_eq!(s.cluster.replicas, 1);
+    }
+}
+
+#[cfg(test)]
+mod cluster_redis_target_tests {
+    use super::*;
+
+    #[test]
+    fn memory_backend_has_no_redis_target() {
+        let c = ClusterConfig::default();
+        assert!(c.redis_target(&CacheConfig::default()).unwrap().is_none());
+    }
+
+    #[test]
+    fn redis_backend_borrows_the_cache_url_and_namespace_when_unset() {
+        let c = ClusterConfig {
+            backend: "redis".into(),
+            ..ClusterConfig::default()
+        };
+        let cache = CacheConfig {
+            redis_url: "redis://cache:6379".into(),
+            namespace: "mr".into(),
+            ..CacheConfig::default()
+        };
+        assert_eq!(
+            c.redis_target(&cache).unwrap(),
+            Some(("redis://cache:6379".to_string(), "mr:cluster".to_string()))
+        );
+    }
+
+    #[test]
+    fn redis_backend_prefers_its_own_url_and_namespace() {
+        let c = ClusterConfig {
+            backend: "redis".into(),
+            redis_url: "redis://own:6379".into(),
+            namespace: "own".into(),
+            ..ClusterConfig::default()
+        };
+        assert_eq!(
+            c.redis_target(&CacheConfig::default()).unwrap(),
+            Some(("redis://own:6379".to_string(), "own".to_string()))
+        );
+    }
+
+    #[test]
+    fn redis_backend_without_any_url_is_a_config_error() {
+        let c = ClusterConfig {
+            backend: "redis".into(),
+            ..ClusterConfig::default()
+        };
+        let err = c.redis_target(&CacheConfig::default()).unwrap_err().to_string();
+        assert!(err.contains("cluster.redis_url") && err.contains("cache.redis_url"), "{err}");
+    }
+
+    #[test]
+    fn cluster_redis_settings_parse() {
+        let s: Settings = toml::from_str(
+            "[cluster]\nreplicas = 2\nbackend = \"redis\"\nredis_url = \"redis://r:6379\"\nlease_secs = 30\n",
+        )
+        .unwrap();
+        assert!(s.cluster.uses_redis());
+        assert_eq!(s.cluster.lease_secs, 30);
+        assert_eq!(s.cluster.redis_url, "redis://r:6379");
     }
 }

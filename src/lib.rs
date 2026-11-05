@@ -3,6 +3,7 @@ pub mod archival;
 pub mod callbacks;
 pub mod guardrails;
 pub mod cli;
+pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod hooks;

@@ -513,7 +513,7 @@ async fn responses_over_the_concurrency_cap_returns_429() {
     // real requests through the test transport is not.
     let _in_flight = h
         .concurrency
-        .try_acquire(h.user_id, 1)
+        .try_acquire(h.user_id, 1).await
         .expect("the first slot is free");
 
     let (hk, hv) = auth();

@@ -171,7 +171,7 @@ async fn chat_completions_inner(
     // after resolution (issue #88).
     validate_tool_choice_requires_tools(&body)?;
 
-    check_session_rate_limit(&state, &body)?;
+    check_session_rate_limit(&state, &body).await?;
 
     // Pre-request guardrail check
     let guardrail_ctx = crate::guardrails::GuardrailContext {
@@ -218,7 +218,7 @@ async fn chat_completions_inner(
         session_for_affinity,
         provider_name,
         canonical_model,
-    );
+    ).await;
 
     // Operator disable gate (issue #5). Checked before the cache, the circuit
     // breaker and any provider dispatch, so a disabled model or provider is
@@ -510,7 +510,7 @@ async fn enforce_policy(
     state: &AppState,
     user: &crate::db::models::User,
     model: &str,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ApiError> {
+) -> Result<Option<crate::router::concurrency::ConcurrencyPermit>, ApiError> {
     let policy_result = state
         .policy
         .check(user, model)
@@ -519,7 +519,7 @@ async fn enforce_policy(
         .map_err(|_| ApiError::Internal)?;
     match policy_result {
         PolicyDecision::Allow { max_concurrent } => match max_concurrent {
-            Some(max) => match state.concurrency.try_acquire(user.id, max) {
+            Some(max) => match state.concurrency.try_acquire(user.id, max).await {
                 Some(permit) => Ok(Some(permit)),
                 None => Err(ApiError::PolicyDenied {
                     reason: "concurrent request limit exceeded".to_string(),
@@ -569,7 +569,7 @@ async fn enforce_policy(
 }
 
 /// Session rate limit: estimated from message content length when present.
-fn check_session_rate_limit(state: &AppState, body: &Value) -> Result<(), ApiError> {
+async fn check_session_rate_limit(state: &AppState, body: &Value) -> Result<(), ApiError> {
     if let Some(session_id) = body["session_id"].as_str() {
         let estimated_tokens = body["messages"]
             .as_array()
@@ -581,7 +581,7 @@ fn check_session_rate_limit(state: &AppState, body: &Value) -> Result<(), ApiErr
                     .sum::<u32>()
             })
             .unwrap_or(100);
-        if !state.session_limiter.check_and_record(session_id, estimated_tokens) {
+        if !state.session_limiter.check_and_record(session_id, estimated_tokens).await {
             return Err(ApiError::PolicyDenied {
                 reason: "session rate limit exceeded".to_string(),
                 status: 429,
@@ -635,7 +635,7 @@ fn resolve_provider_and_model(
 /// pass `session_id = None` for a bound request: the variant already fixed
 /// the model, and a pin left behind would steer the session's unbound
 /// requests to it.
-fn apply_session_affinity(
+async fn apply_session_affinity(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     session_id: Option<&str>,
@@ -649,14 +649,15 @@ fn apply_session_affinity(
     let pin = if should_skip_affinity(headers) {
         None
     } else {
-        state.session_affinity.get(session_id)
+        state.session_affinity.get(session_id).await
     };
     let (pinned_provider, pinned_model, should_update) =
         resolve_with_pin(pin.as_ref(), &provider_name, &canonical_model);
     if should_update {
         state
             .session_affinity
-            .set(session_id, &pinned_provider, &pinned_model);
+            .set(session_id, &pinned_provider, &pinned_model)
+            .await;
     }
     (pinned_provider, pinned_model)
 }
