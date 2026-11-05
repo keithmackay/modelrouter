@@ -326,6 +326,21 @@ MODELROUTER_TEST_POSTGRES_URL=postgres://user:pass@localhost/modelrouter_test \
   cargo test --features postgres --test test_postgres_live -- --ignored
 ```
 
+### Moving a SQLite store to PostgreSQL: `db export` and `db import`
+
+```bash
+# 1. Stop writes: scale the router to zero, or stop the process.
+# 2. Export from the SQLite config.
+modelrouter --config sqlite.toml db export --out store.json
+# 3. Import into the PostgreSQL config (the target is migrated to head first).
+modelrouter --config postgres.toml db import --in store.json
+# 4. Repoint the deployment at postgres.toml and start it.
+# 5. Verify: a key issued before the move still works.
+curl -H "Authorization: Bearer $OLD_KEY" http://localhost:8080/v1/models
+```
+
+Export writes every table and column the live schema has, so it needs no update when the schema grows. Import runs in one transaction in parent-first order, converts each value to the target column's type, moves PostgreSQL sequences past the imported ids, verifies per-table row counts, and only then commits; any failure leaves the target untouched. A target that already holds rows is refused unless you pass `--merge`, and ids that collide under `--merge` roll the whole import back. Both commands print per-table counts. A dedicated prompt-log database (`[storage] prompt_db_path`) is a separate SQLite file and is not part of the export; copy it alongside.
+
 ### 2. Run migrations and start the server
 
 ```bash

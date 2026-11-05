@@ -8,6 +8,7 @@ commit; `git log v0.1.0..` has the detail.
 ### Week of 2026-11-02
 
 **Features**
+- `modelrouter db export --out store.json` writes every table of the configured store as JSON, from SQLite or PostgreSQL, and `db import --in store.json` loads it into the configured store inside one transaction: parent-first order, values converted to the target column types (SQLite's 0/1 booleans become `BOOLEAN`, text timestamps become `TIMESTAMPTZ`), PostgreSQL sequences moved past the imported ids, per-table counts verified before commit. A non-empty target is refused unless `--merge`. Key hashes move as stored, so keys issued on the old store keep working on the new one. This is the supported way to move a SQLite store to PostgreSQL; the README has the cut-over steps. (#132)
 - `database.postgres_url` now selects the PostgreSQL backend for `serve` and every CLI command, and runs the PostgreSQL migration set on start. The setting existed but nothing read it: the server and CLI always opened SQLite. A binary built without the `postgres` feature refuses a config that sets it. The CLI `report` and `audit` subcommands and the dashboard's hook statistics still query SQLite directly and say so on PostgreSQL. (#138)
 
 **Fixes**

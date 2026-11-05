@@ -34,6 +34,8 @@ modelrouter experiment add --name <n> --variant <label>=<key>:<target>[,...] ...
 modelrouter experiment list [--status active|closed|all] [--format table|csv|json]
 modelrouter experiment close --id <id>
 modelrouter experiment results --id <id> [--limit <1-1000>] [--offset <n>] [--format table|csv|json]
+modelrouter db export --out <file.json>
+modelrouter db import --in <file.json> [--merge]
 modelrouter webhook list
 modelrouter webhook add --name <name> --url <url> [--events completion] [--secret-header-name <h>] [--secret-header-value <v>]
 modelrouter webhook delete --id <id>
