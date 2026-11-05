@@ -18,6 +18,8 @@ request_body_limit_mb = 10
 # Path to the SQLite database file. ~ is expanded automatically.
 path = "~/.modelrouter/router.db"
 # Uncomment to use PostgreSQL instead of SQLite (requires --features postgres).
+# When set, serve and every CLI command open this database and migrate it on
+# start; `path` above is then unused.
 # postgres_url = "postgres://user:pass@localhost:5432/modelrouter"
 
 # ---------------------------------------------------------------------------

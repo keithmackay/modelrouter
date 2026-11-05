@@ -7,19 +7,16 @@ use crate::db::repositories::{
 };
 use crate::report::formatter::print_rows;
 
-/// DB bootstrap shared by all admin commands.
-/// NOTE: Always uses SQLite. The `--features postgres` build still uses SQLite
-/// for CLI commands — Postgres is only wired at serve time via AppState.
-async fn connect(config: Option<std::path::PathBuf>) -> Result<crate::db::sqlite::SqliteDb> {
+/// DB bootstrap shared by all admin commands: whichever backend `[database]`
+/// names, migrated.
+async fn connect(config: Option<std::path::PathBuf>) -> Result<crate::db::Store> {
     let settings = crate::config::load(config)?;
-    let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
-    crate::db::migrations::run_migrations(&db.pool).await?;
-    Ok(db)
+    crate::db::open(&settings.database).await
 }
 
 /// Write an audit row with actor = "cli". Logs a warning on failure but does not abort.
 async fn audit(
-    db: &impl AuditRepository,
+    db: &(impl AuditRepository + ?Sized),
     action: &str,
     target: &str,
     after_json: serde_json::Value,
@@ -57,10 +54,11 @@ pub(crate) async fn audit_change(
 pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Result<()> {
     match cmd {
         AdminCommands::Create { name, role } => {
-            let db = connect(config).await?;
+            let store = connect(config).await?;
+            let db = &*store.db;
 
             // Check uniqueness before prompting for password
-            if AdminUserRepository::find_by_name(&db, &name).await?.is_some() {
+            if AdminUserRepository::find_by_name(db, &name).await?.is_some() {
                 anyhow::bail!("admin user '{}' already exists", name);
             }
 
@@ -74,7 +72,7 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
                 .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
 
             let admin = AdminUserRepository::create(
-                &db,
+                db,
                 crate::db::models::NewAdminUser {
                     name: name.clone(),
                     password_hash,
@@ -84,7 +82,7 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
             .await?;
 
             audit(
-                &db,
+                db,
                 "admin.create",
                 &format!("admin:{}", admin.id),
                 serde_json::json!({ "name": admin.name, "role": admin.role }),
@@ -96,8 +94,9 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
         }
 
         AdminCommands::List { format } => {
-            let db = connect(config).await?;
-            let admins = AdminUserRepository::list(&db).await?;
+            let store = connect(config).await?;
+            let db = &*store.db;
+            let admins = AdminUserRepository::list(db).await?;
 
             // Project to a safe DTO — AdminUser derives Serialize which includes
             // password_hash. Using explicit row closure ensures the hash never
@@ -135,9 +134,10 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
         }
 
         AdminCommands::ResetPassword { name } => {
-            let db = connect(config).await?;
+            let store = connect(config).await?;
+            let db = &*store.db;
 
-            let admin = AdminUserRepository::find_by_name(&db, &name)
+            let admin = AdminUserRepository::find_by_name(db, &name)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("admin user '{}' not found", name))?;
 
@@ -145,10 +145,10 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
             let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
                 .map_err(|e| anyhow::anyhow!("bcrypt error: {e}"))?;
 
-            AdminUserRepository::update_password_hash(&db, admin.id, &password_hash).await?;
+            AdminUserRepository::update_password_hash(db, admin.id, &password_hash).await?;
 
             audit(
-                &db,
+                db,
                 "admin.reset_password",
                 &format!("admin:{}", admin.id),
                 serde_json::json!({ "name": admin.name }),
@@ -159,16 +159,17 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
         }
 
         AdminCommands::Enable { name } => {
-            let db = connect(config).await?;
+            let store = connect(config).await?;
+            let db = &*store.db;
 
-            let admin = AdminUserRepository::find_by_name(&db, &name)
+            let admin = AdminUserRepository::find_by_name(db, &name)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("admin user '{}' not found", name))?;
 
-            AdminUserRepository::set_enabled(&db, admin.id, true).await?;
+            AdminUserRepository::set_enabled(db, admin.id, true).await?;
 
             audit(
-                &db,
+                db,
                 "admin.enable",
                 &format!("admin:{}", admin.id),
                 serde_json::json!({ "name": admin.name, "enabled": true }),
@@ -179,16 +180,17 @@ pub async fn run(config: Option<std::path::PathBuf>, cmd: AdminCommands) -> Resu
         }
 
         AdminCommands::Disable { name } => {
-            let db = connect(config).await?;
+            let store = connect(config).await?;
+            let db = &*store.db;
 
-            let admin = AdminUserRepository::find_by_name(&db, &name)
+            let admin = AdminUserRepository::find_by_name(db, &name)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("admin user '{}' not found", name))?;
 
-            AdminUserRepository::set_enabled(&db, admin.id, false).await?;
+            AdminUserRepository::set_enabled(db, admin.id, false).await?;
 
             audit(
-                &db,
+                db,
                 "admin.disable",
                 &format!("admin:{}", admin.id),
                 serde_json::json!({ "name": admin.name, "enabled": false }),
