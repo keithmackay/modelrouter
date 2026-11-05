@@ -882,6 +882,28 @@ curl -s localhost:8090/health/deep | jq '.credentials'
    with a search: `curl -s localhost:8090/v1/search -H "Authorization: Bearer $ROUTER_KEY"
    -H 'Content-Type: application/json' -d '{"engine":"bing_grounding","query":"ping"}'`.
 
+### Health endpoints and Kubernetes probes
+
+Three endpoints, one per probe. None requires authentication.
+
+| Endpoint | Answers | Use it for |
+|---|---|---|
+| `GET /health/live` | 200 `{"status":"ok"}` whenever the process runs. No I/O. | Liveness probe. A slow store or provider must not restart a replica that is merely not ready. |
+| `GET /health/ready` | 200 `{"status":"ready"}` when this replica can serve a request. 503 `{"status":"not_ready","failing":[...]}` otherwise. | Readiness and startup probes. A 503 removes the replica from the Service without restarting it. |
+| `GET /health` | 200 with the cache block, as before. | Existing dashboards and scripts. |
+
+`/health/ready` checks, in order: the process is not draining; migrations ran; every provider section reachable through `/v1/chat/completions` built its adapter at start (building an adapter never calls the provider); the configured store answers `SELECT 1`. The store check is cached for one second so several controllers polling at once cost one query. Each entry in `failing` carries a `part` (`draining`, `migrations`, `provider`, `database`) and, where there is one, a `detail` or `name`.
+
+Suggested timings, as the Helm chart ships them:
+
+| Probe | Path | Period | Failure threshold | Why |
+|---|---|---|---|---|
+| startup | `/health/ready` | 5 s | 60 | Migrations run before the listener binds, so a first start answers nothing until they finish. 60 x 5 s gives them five minutes. |
+| readiness | `/health/ready` | 5 s | 3 | Fifteen seconds from a lost store connection to leaving the Service. |
+| liveness | `/health/live` | 10 s | 3 | Only a hung process fails this. |
+
+`/health/deep` (below) makes real provider calls and is for operators, not probes.
+
 ### Credential health and `credential_expired`
 
 Every provider with a managed credential (`vertex`, `azure`, `foundry`, `bing_grounding`)

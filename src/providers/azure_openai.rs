@@ -38,6 +38,13 @@ impl AzureOpenAIAdapter {
         config: &ProviderConfig,
         tier_timeouts: TierTimeoutsConfig,
     ) -> anyhow::Result<Self> {
+        if config.api_base.is_none() {
+            anyhow::bail!(
+                "Azure OpenAI adapter requires `api_base` to be set. \
+                 Configure it as the full deployment endpoint, e.g.: \
+                 https://{{resource}}.openai.azure.com/openai/deployments/{{deployment-name}}"
+            );
+        }
         let scope = config
             .entra_scope
             .as_deref()

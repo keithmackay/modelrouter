@@ -62,6 +62,23 @@ secrets:
   #   openai: "sk-..."
   #   anthropic: "sk-ant-..."
 
+# Probe timings. The startup probe absorbs first-start migrations: the
+# listener binds only after they finish, so the pod answers nothing for that
+# long and the kubelet must wait periodSeconds * failureThreshold before it
+# restarts the container. Readiness polls /health/ready (store reachable,
+# schema at head, provider adapters built, not draining); liveness polls
+# /health/live, which does no I/O.
+probes:
+  startup:
+    periodSeconds: 5
+    failureThreshold: 60
+  readiness:
+    periodSeconds: 5
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 10
+    failureThreshold: 3
+
 # Node selector, tolerations, affinity
 nodeSelector: {}
 tolerations: []
