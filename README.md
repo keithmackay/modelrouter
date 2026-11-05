@@ -310,6 +310,10 @@ default_model = "claude-opus-4-6"
 
 See [`config.example.toml`](config.example.toml) for all provider options, guardrail definitions, policy rules, OIDC, and telemetry settings.
 
+### Running more than one replica: `[cluster] replicas`
+
+Per-user concurrency, per-session rate buckets and per-IP rate limits are counted in each process. With several replicas behind one address, set `[cluster] replicas` to the replica count and each process enforces `ceil(limit / replicas)` of every such limit, never below 1 for a limit that is set; 0 still means disabled. Per-budget-rule `rate_rpm` is counted in the database and needs no division. The Helm chart sets this from `replicaCount`. If the replica count varies under autoscaling, set it to the usual count; the shared-counter backend for the same limits is tracked separately.
+
 ### 2. Run migrations and start the server
 
 ```bash

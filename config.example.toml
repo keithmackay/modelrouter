@@ -11,6 +11,12 @@ port = 8080
 # Maximum request body size in megabytes.
 request_body_limit_mb = 10
 
+# [cluster]
+# # Replicas serving behind one address. Per-user concurrency, per-session
+# # buckets and per-IP rate limits are counted in process memory, so each
+# # replica enforces ceil(limit / replicas), never below 1. Default 1.
+# replicas = 1
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------

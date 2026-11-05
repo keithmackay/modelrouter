@@ -38,6 +38,9 @@ spec:
           env:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
+            # Each replica enforces its share of the in-memory limits.
+            - name: MODELROUTER_CLUSTER__REPLICAS
+              value: {{ .Values.replicaCount | quote }}
             - name: MODELROUTER_DATABASE__PATH
               value: /data/router.db
           volumeMounts:
@@ -59,6 +62,9 @@ spec:
           env:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
+            # Each replica enforces its share of the in-memory limits.
+            - name: MODELROUTER_CLUSTER__REPLICAS
+              value: {{ .Values.replicaCount | quote }}
             - name: MODELROUTER_DATABASE__PATH
               value: /data/router.db
             - name: MODELROUTER_AUTH__JWT_SECRET
