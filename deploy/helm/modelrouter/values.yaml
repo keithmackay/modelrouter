@@ -66,3 +66,27 @@ secrets:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Rolling update: bring one new pod up and Ready before any old pod stops.
+# With replicaCount 1 this is still what makes an upgrade zero-downtime.
+rollout:
+  maxSurge: 1
+  maxUnavailable: 0
+
+# Keep at least this many pods serving through voluntary disruptions (node
+# drains, cluster upgrades). Set minAvailable to "" to use maxUnavailable.
+# Enable only with replicaCount >= 2, otherwise a drain can never proceed.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: ""
+
+# Spread replicas across zones and nodes so losing one costs at most the
+# requests in flight on it. Enable with replicaCount >= 2.
+topologySpread:
+  enabled: false
+  maxSkew: 1
+  whenUnsatisfiable: ScheduleAnyway
+  topologyKeys:
+    - topology.kubernetes.io/zone
+    - kubernetes.io/hostname
