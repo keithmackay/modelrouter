@@ -1,7 +1,8 @@
 mod common;
 
 use axum_test::TestServer;
-use modelrouter::api::app::{build_router, AppState, DatabaseProvider};
+use modelrouter::api::app::{build_router, build_router_with_readiness, AppState, DatabaseProvider};
+use modelrouter::api::readiness::Readiness;
 use modelrouter::config::schema::{CacheConfig, ProviderConfig, Settings};
 use modelrouter::providers::{
     embed_registry::EmbeddingRegistry, registry::ProviderRegistry, search::SearchResultItem,
@@ -17,11 +18,12 @@ use std::sync::Arc;
 /// Build a full app. `with_mocks` controls whether the provider registries
 /// carry a working adapter (deep-health capabilities probe "ok") or are empty
 /// (nothing configured — capabilities must read "skipped").
-async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
+async fn test_state(cache: CacheConfig, with_mocks: bool) -> (AppState, sqlx::SqlitePool) {
     let db = common::in_memory_db().await;
     let mut settings = Settings::default();
     settings.health.embedding_probe_model = "openai/text-embedding-3-small".to_string();
     let settings = Arc::new(settings);
+    let pool = db.pool.clone();
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
 
     let provider_registry = if with_mocks {
@@ -86,6 +88,11 @@ async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: Arc::new(modelrouter::router::experiments::ExperimentRegistry::default()),
     };
+    (state, pool)
+}
+
+async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
+    let (state, _pool) = test_state(cache, with_mocks).await;
     TestServer::new(build_router(state)).unwrap()
 }
 
@@ -494,4 +501,86 @@ async fn unresolved_embedding_probe_without_a_provider_remains_skipped() {
     let server = test_app_with(Settings::default(), SearchRegistry::new(HashMap::new())).await;
     let body: serde_json::Value = server.get("/health/deep").await.json();
     assert_eq!(body["capabilities"]["embedding"]["status"], "skipped");
+}
+
+// ── GET /health/live and /health/ready ───────────────────────────────────────
+
+#[tokio::test]
+async fn live_is_ok_without_touching_anything() {
+    let server = test_app(CacheConfig::default(), false).await;
+    let resp = server.get("/health/live").await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(resp.json::<serde_json::Value>()["status"], "ok");
+}
+
+#[tokio::test]
+async fn ready_is_200_when_the_store_answers_and_startup_already_ran() {
+    let server = test_app(CacheConfig::default(), false).await;
+    let resp = server.get("/health/ready").await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(resp.json::<serde_json::Value>()["status"], "ready");
+}
+
+#[tokio::test]
+async fn ready_is_503_naming_the_database_when_the_pool_is_closed() {
+    let (state, pool) = test_state(CacheConfig::default(), false).await;
+    let server = TestServer::new(build_router(state)).unwrap();
+    pool.close().await;
+
+    let resp = server.get("/health/ready").await;
+    assert_eq!(resp.status_code(), 503);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["failing"][0]["part"], "database");
+    assert!(
+        !body["failing"][0]["detail"].as_str().unwrap_or("").is_empty(),
+        "database failure must carry the error: {body}"
+    );
+    // Liveness must not follow the store down.
+    assert_eq!(server.get("/health/live").await.status_code(), 200);
+    assert_eq!(server.get("/health").await.status_code(), 200);
+}
+
+#[tokio::test]
+async fn ready_is_503_until_serve_reports_migrations() {
+    let (state, _pool) = test_state(CacheConfig::default(), false).await;
+    let readiness = Readiness::new();
+    let server = TestServer::new(build_router_with_readiness(state, readiness.clone())).unwrap();
+
+    let body: serde_json::Value = server.get("/health/ready").expect_failure().await.json();
+    assert_eq!(body["failing"], serde_json::json!([{"part": "migrations"}]));
+
+    readiness.mark_migrated();
+    assert_eq!(server.get("/health/ready").await.status_code(), 200);
+}
+
+#[tokio::test]
+async fn ready_names_a_provider_whose_adapter_failed_to_build() {
+    let (state, _pool) = test_state(CacheConfig::default(), false).await;
+    let readiness = Readiness::started();
+    readiness.record_provider_results(vec![
+        ("openai".to_string(), Ok(())),
+        ("azure".to_string(), Err("requires `api_base`".to_string())),
+    ]);
+    let server = TestServer::new(build_router_with_readiness(state, readiness)).unwrap();
+
+    let resp = server.get("/health/ready").await;
+    assert_eq!(resp.status_code(), 503);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["failing"][0]["part"], "provider");
+    assert_eq!(body["failing"][0]["name"], "azure");
+    assert_eq!(body["failing"][0]["detail"], "requires `api_base`");
+}
+
+#[tokio::test]
+async fn ready_is_503_while_draining_and_live_stays_200() {
+    let (state, _pool) = test_state(CacheConfig::default(), false).await;
+    let readiness = Readiness::started();
+    let server = TestServer::new(build_router_with_readiness(state, readiness.clone())).unwrap();
+    assert_eq!(server.get("/health/ready").await.status_code(), 200);
+
+    readiness.begin_drain();
+    let body: serde_json::Value = server.get("/health/ready").expect_failure().await.json();
+    assert_eq!(body["failing"], serde_json::json!([{"part": "draining"}]));
+    assert_eq!(server.get("/health/live").await.status_code(), 200);
 }

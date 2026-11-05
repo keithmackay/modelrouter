@@ -143,6 +143,28 @@ impl ProviderRegistry {
         Ok(entry.clone())
     }
 
+    /// Build the adapter for every provider reachable through chat routing,
+    /// so a misconfigured one surfaces at start instead of on its first
+    /// request. Construction never calls the provider. Sections with
+    /// `generic_chat = false` are skipped: their routes read config directly
+    /// and `get` refuses them by design.
+    pub fn warm_all(&self) -> Vec<(String, Result<(), String>)> {
+        let mut names: Vec<&String> = self
+            .configs
+            .iter()
+            .filter(|(_, c)| c.generic_chat)
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let result = self.get(name).map(|_| ()).map_err(|e| e.to_string());
+                (name.clone(), result)
+            })
+            .collect()
+    }
+
     /// Test helper: create registry with a single mock adapter for any provider.
     /// When `get` is called and configs are empty, falls back to the first available adapter.
     pub fn new_with_mock<A: ProviderAdapter + 'static>(mock: A) -> Self {
@@ -191,6 +213,30 @@ mod tests {
         let registry = ProviderRegistry::new(configs);
 
         assert!(registry.get("custom").is_ok());
+    }
+
+    #[test]
+    fn warm_all_builds_chat_providers_and_skips_dedicated_route_sections() {
+        let mut configs = HashMap::new();
+        configs.insert("custom".to_string(), config_with(true));
+        configs.insert("typesafe".to_string(), config_with(false));
+        let registry = ProviderRegistry::new(configs);
+
+        let results = registry.warm_all();
+        assert_eq!(results, vec![("custom".to_string(), Ok(()))]);
+        assert!(registry.adapters.contains_key("custom"));
+    }
+
+    #[test]
+    fn warm_all_reports_a_provider_whose_adapter_cannot_be_built() {
+        let mut configs = HashMap::new();
+        configs.insert("azure".to_string(), config_with(true));
+        let registry = ProviderRegistry::new(configs);
+
+        let results = registry.warm_all();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "azure");
+        assert!(results[0].1.is_err(), "azure without an endpoint must fail to build");
     }
 
     #[test]

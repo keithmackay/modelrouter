@@ -63,6 +63,29 @@ async fn init_then_serve_starts() {
     );
 }
 
+/// The probes a platform wires up: liveness answers with no I/O, readiness
+/// answers 200 only once `serve` has migrated, built every chat adapter and
+/// reached the store. Through the real binary, because only `serve` reports
+/// those steps; in-process tests start from a router that assumes them.
+#[tokio::test]
+#[ignore = "e2e: spawns the real binary"]
+async fn serve_answers_live_and_ready_probes() {
+    let mock = MockLlm::start().await;
+    let router = RouterProcess::start(RouterOptions::new(mock.base_url())).await;
+
+    let live = reqwest::get(format!("{}/health/live", router.base_url()))
+        .await
+        .expect("GET /health/live");
+    assert_eq!(live.status(), 200);
+
+    let ready = reqwest::get(format!("{}/health/ready", router.base_url()))
+        .await
+        .expect("GET /health/ready");
+    assert_eq!(ready.status(), 200, "logs:\n{}", router.logs());
+    let body: serde_json::Value = ready.json().await.expect("ready body");
+    assert_eq!(body["status"], "ready");
+}
+
 /// The guard itself: a config carrying the shipped placeholder must refuse,
 /// and must name the field so the operator knows what to fix.
 #[tokio::test]
