@@ -28,6 +28,11 @@ pub enum Commands {
         /// Port to bind. Overrides `[server] port` in config.toml.
         #[arg(long)]
         port: Option<u16>,
+        /// Load the config, open the database and build every provider
+        /// adapter, then exit 0 without serving. Any failure is reported and
+        /// the exit code is 1. For a pre-start check of a new build.
+        #[arg(long)]
+        check_config: bool,
     },
     /// Run database migrations
     Migrate,

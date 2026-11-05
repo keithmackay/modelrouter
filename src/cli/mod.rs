@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod admin;
 pub mod cache;
+pub mod check_config;
 
 use std::sync::Arc;
 
@@ -251,7 +252,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             println!("  3. Run: modelrouter serve");
             println!("  4. Test: curl http://localhost:8080/health");
         }
-        Commands::Serve { host, port } => {
+        Commands::Serve { host, port, check_config } => {
             let config_path: Option<String> = cli.config.as_ref()
                 .and_then(|p| p.to_str().map(|s| s.to_string()))
                 .or_else(|| std::env::var("MODELROUTER_CONFIG").ok());
@@ -285,6 +286,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     None
                 }
             };
+
+            if check_config {
+                return check_config::run(settings, config_path.as_deref()).await;
+            }
 
             // Init DB
             let sqlite_db =

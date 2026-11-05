@@ -92,6 +92,41 @@ async fn heal_inert_checksum_edits(pool: &sqlx::SqlitePool) -> anyhow::Result<()
     Ok(())
 }
 
+/// Where a database stands against this binary's embedded migrations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationStatus {
+    /// Versions recorded as applied.
+    pub applied: usize,
+    /// Embedded versions not yet applied, ascending.
+    pub pending: Vec<i64>,
+}
+
+/// Compare the database with the embedded migration set without applying
+/// anything. A database with no migration table at all is reported as having
+/// every migration pending.
+pub async fn migration_status(pool: &sqlx::SqlitePool) -> anyhow::Result<MigrationStatus> {
+    let table: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'")
+            .fetch_optional(pool)
+            .await?;
+    let applied: Vec<i64> = if table.is_some() {
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1 ORDER BY version")
+            .fetch_all(pool)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let pending = sqlx::migrate!("./migrations")
+        .iter()
+        .filter(|m| !applied.contains(&m.version))
+        .map(|m| m.version)
+        .collect();
+    Ok(MigrationStatus {
+        applied: applied.len(),
+        pending,
+    })
+}
+
 pub async fn run_dev_seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     if std::env::var("MODELROUTER_DEV_SEED").as_deref() == Ok("true") {
         sqlx::query(include_str!("dev_seed.sql"))
@@ -232,5 +267,20 @@ mod tests {
                 "migration {version} matches its listed previous checksum; the entry is stale"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn migration_status_counts_pending_then_applied() {
+        let db = SqliteDb::connect(":memory:").await.unwrap();
+        let embedded = sqlx::migrate!("./migrations").iter().count();
+
+        let before = migration_status(&db.pool).await.unwrap();
+        assert_eq!(before.applied, 0);
+        assert_eq!(before.pending.len(), embedded);
+
+        run_migrations(&db.pool).await.unwrap();
+        let after = migration_status(&db.pool).await.unwrap();
+        assert_eq!(after.applied, embedded);
+        assert!(after.pending.is_empty(), "{:?}", after.pending);
     }
 }
