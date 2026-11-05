@@ -16,6 +16,11 @@ use crate::router::cache::store::{LinkTransition, ReconnectGate};
 
 const RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// Longest a request waits on Redis for one command or one dial. A Redis
+/// that answers slowly must degrade to the local fallback like one that is
+/// down, never stall every request behind it.
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub struct RedisLink {
     client: redis::Client,
     namespace: String,
@@ -62,7 +67,13 @@ impl RedisLink {
         {
             return None;
         }
-        match self.client.get_multiplexed_async_connection().await {
+        let dialed = tokio::time::timeout(
+            COMMAND_TIMEOUT,
+            self.client.get_multiplexed_async_connection(),
+        )
+        .await
+        .unwrap_or_else(|_| Err(timed_out("connect")));
+        match dialed {
             Ok(c) => {
                 let transition = self
                     .gate
@@ -93,7 +104,10 @@ impl RedisLink {
         cmd: &redis::Cmd,
     ) -> Option<T> {
         let mut conn = self.conn().await?;
-        match cmd.query_async::<T>(&mut conn).await {
+        let outcome = tokio::time::timeout(COMMAND_TIMEOUT, cmd.query_async::<T>(&mut conn))
+            .await
+            .unwrap_or_else(|_| Err(timed_out(op)));
+        match outcome {
             Ok(v) => Some(v),
             Err(e) => {
                 *self.conn.write().await = None;
@@ -120,5 +134,64 @@ impl RedisLink {
         } else {
             tracing::debug!(error = %err, op, "cluster redis still unreachable");
         }
+    }
+}
+
+fn timed_out(op: &str) -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::Io,
+        "cluster redis timed out",
+        format!("{op} took longer than {COMMAND_TIMEOUT:?}"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A server that accepts and never answers: the slow-Redis case.
+    async fn black_hole() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    held.push(sock);
+                }
+            }
+        });
+        format!("redis://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_costs_one_timeout_then_cheap_misses() {
+        let link = RedisLink::open(&black_hole().await, "t").unwrap();
+        let started = Instant::now();
+        let first: Option<String> = link.run("ping", &redis::cmd("PING")).await;
+        assert!(first.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded by the timeout: {:?}",
+            started.elapsed()
+        );
+
+        let again = Instant::now();
+        let second: Option<String> = link.run("ping", &redis::cmd("PING")).await;
+        assert!(second.is_none());
+        assert!(
+            again.elapsed() < Duration::from_millis(50),
+            "inside the backoff window nothing is dialled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_port_is_a_fast_none() {
+        let link = RedisLink::open("redis://127.0.0.1:1", "t").unwrap();
+        let started = Instant::now();
+        let r: Option<String> = link.run("ping", &redis::cmd("PING")).await;
+        assert!(r.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
