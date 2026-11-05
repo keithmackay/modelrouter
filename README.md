@@ -357,6 +357,10 @@ curl -H "Authorization: Bearer $OLD_KEY" http://localhost:8080/v1/models
 
 Export writes every table and column the live schema has, so it needs no update when the schema grows. Import runs in one transaction in parent-first order, converts each value to the target column's type, moves PostgreSQL sequences past the imported ids, verifies per-table row counts, and only then commits; any failure leaves the target untouched. A target that already holds rows is refused unless you pass `--merge`, and ids that collide under `--merge` roll the whole import back. Both commands print per-table counts. A dedicated prompt-log database (`[storage] prompt_db_path`) is a separate SQLite file and is not part of the export; copy it alongside.
 
+### Running more than one replica: `[cluster] replicas`
+
+Per-user concurrency, per-session rate buckets and per-IP rate limits are counted in each process. With several replicas behind one address, set `[cluster] replicas` to the replica count and each process enforces `ceil(limit / replicas)` of every such limit, never below 1 for a limit that is set; 0 still means disabled. Per-budget-rule `rate_rpm` is counted in the database and needs no division. The Helm chart sets this from `replicaCount`. If the replica count varies under autoscaling, set it to the usual count; the shared-counter backend for the same limits is tracked separately.
+
 ### 2. Run migrations and start the server
 
 ```bash

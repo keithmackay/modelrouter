@@ -16,6 +16,12 @@ request_body_limit_mb = 10
 # pod's terminationGracePeriodSeconds at least this high.
 # shutdown_grace_secs = 21600
 
+# [cluster]
+# # Replicas serving behind one address. Per-user concurrency, per-session
+# # buckets and per-IP rate limits are counted in process memory, so each
+# # replica enforces ceil(limit / replicas), never below 1. Default 1.
+# replicas = 1
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------

@@ -447,6 +447,15 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             }
 
             // Build app components
+            if settings.cluster.replicas > 1 {
+                tracing::info!(
+                    replicas = settings.cluster.replicas,
+                    ip_rpm_per_replica = settings.cluster.share(settings.server.ip_rate_limit_rpm),
+                    session_tpm_per_replica = settings.cluster.share(settings.session_limits.tpm),
+                    session_rpm_per_replica = settings.cluster.share(settings.session_limits.rpm),
+                    "in-memory limits divided across replicas"
+                );
+            }
             let router =
                 Arc::new(crate::router::engine::RequestRouter::new(settings.clone()));
             let cost_calc = Arc::new(crate::router::cost::CostCalculator::new_with_config(&settings.pricing));
@@ -550,14 +559,16 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 embedding_registry,
                 search_registry,
                 load_balancer,
-                concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::new()),
+                concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::for_cluster(
+                    settings.cluster.clone(),
+                )),
                 circuit_breaker: Arc::new(crate::router::circuit_breaker::CircuitBreaker::default()),
                 ip_rate_limiter: Arc::new(crate::api::middleware::ip_rate_limit::IpRateLimiter::new(
-                    settings.server.ip_rate_limit_rpm,
+                    settings.cluster.share(settings.server.ip_rate_limit_rpm),
                 )),
                 session_limiter: Arc::new(crate::router::session_limits::SessionLimiter::new(
-                    settings.session_limits.tpm,
-                    settings.session_limits.rpm,
+                    settings.cluster.share(settings.session_limits.tpm),
+                    settings.cluster.share(settings.session_limits.rpm),
                 )),
                 session_affinity: Arc::new(crate::router::session_affinity::SessionAffinityMap::new(30 * 60)),
                 callbacks: {
