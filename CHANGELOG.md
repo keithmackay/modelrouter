@@ -5,6 +5,11 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-02
+
+**Features**
+- `[cluster] replicas` divides the in-memory limits across replicas. Per-user concurrency (from budget rules), per-session `tpm`/`rpm` buckets and `[server] ip_rate_limit_rpm` are counted in process memory, so N replicas behind one address enforced N times the configured value. Each replica now enforces `ceil(limit / replicas)`, never below 1 for a set limit, and 0 keeps meaning disabled. Default 1, so single-node deployments are unchanged. The Helm chart passes `replicaCount` through `MODELROUTER_CLUSTER__REPLICAS`. Shared counters in Redis are the next step for the same issue. (#133)
+
 ### Week of 2026-09-28
 
 **Features**
