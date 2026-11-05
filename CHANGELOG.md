@@ -5,6 +5,11 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-02
+
+**Features**
+- Expand-only migration policy. `migrations/README.md` states the rule: a migration adds tables, nullable or defaulted columns and indexes, and never drops, renames, retypes or tightens in the release that stops using the old shape; a later release ships the removal as a contract step marked `-- contract-step: <release> <reason>`. A test reads every migration in both backend directories and fails on an unmarked contracting statement, with the five pre-policy files grandfathered. A new CI workflow runs `cargo test --locked` and the `postgres` build on every pull request, the first PR-triggered CI in the repository. (#134)
+
 ### Week of 2026-09-28
 
 **Features**
