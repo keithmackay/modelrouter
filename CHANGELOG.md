@@ -5,6 +5,11 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-02
+
+**Features**
+- `modelrouter serve --check-config` proves a build and its config can start without serving: it loads the config, checks compiled-in provider features, the signing secret and the OIDC role, opens the database and reports applied and pending migrations without applying any, opens the prompt-log database when one is configured, and builds every chat provider adapter without calling a provider. Every check runs even after one fails and each prints `ok` or `FAIL` with its cause; the exit code is 0 only when all pass. `--version` needs no config. (#135)
+
 ### Week of 2026-09-28
 
 **Features**
