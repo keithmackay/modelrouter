@@ -1903,6 +1903,37 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
         Commands::Db(db_args) => {
             let settings = crate::config::load(cli.config)?;
             match db_args.command {
+                commands::DbCommands::Export { out } => {
+                    if settings.storage.prompt_db_path.is_some() {
+                        eprintln!(
+                        "note: [storage] prompt_db_path is set; the prompt log is a separate SQLite file \
+                         and is not part of this export. Copy that file alongside."
+                        );
+                    }
+                    let main_db = crate::db::open(&settings.database).await?;
+                    let dump = crate::db::transfer::export(&main_db.reports).await?;
+                    let json = serde_json::to_vec_pretty(&dump)?;
+                    tokio::fs::write(&out, json).await?;
+                    println!("exported {} backend to {}", main_db.reports.backend(), out.display());
+                    for (table, t) in &dump.tables {
+                        println!("  {table}: {} rows", t.rows.len());
+                    }
+                }
+                commands::DbCommands::Import { input, merge } => {
+                    let main_db = crate::db::open(&settings.database).await?;
+                    let bytes = tokio::fs::read(&input).await?;
+                    let dump: crate::db::transfer::Dump = serde_json::from_slice(&bytes)?;
+                    let reports = crate::db::transfer::import(&main_db.reports, &dump, merge).await?;
+                    println!(
+                        "imported {} ({} export) into the {} backend",
+                        input.display(),
+                        dump.source_backend,
+                        main_db.reports.backend()
+                    );
+                    for r in &reports {
+                        println!("  {}: {} inserted, {} total (verified)", r.table, r.inserted, r.total_after);
+                    }
+                }
                 DbCommands::Vacuum => {
                     let db = crate::db::sqlite::SqliteDb::connect(&settings.database.path).await?;
                     let (pages, page_size) = db.page_count_and_size().await?;
