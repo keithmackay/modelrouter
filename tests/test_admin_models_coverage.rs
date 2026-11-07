@@ -15,6 +15,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 async fn build_server() -> (TestServer, Arc<Settings>, Arc<dyn DatabaseProvider>) {
+    build_server_with_cost_calc(modelrouter::router::cost::CostCalculator::new()).await
+}
+
+async fn build_server_with_cost_calc(
+    cost_calc: modelrouter::router::cost::CostCalculator,
+) -> (TestServer, Arc<Settings>, Arc<dyn DatabaseProvider>) {
     let db = common::in_memory_db().await;
 
     AdminUserRepository::create(
@@ -47,7 +53,7 @@ async fn build_server() -> (TestServer, Arc<Settings>, Arc<dyn DatabaseProvider>
         db: db_arc.clone(),
         pool: None,
         router: Arc::new(modelrouter::router::engine::RequestRouter::new(settings.clone())),
-        cost_calc: Arc::new(modelrouter::router::cost::CostCalculator::new()),
+        cost_calc: Arc::new(cost_calc),
         provider_registry: Arc::new(modelrouter::providers::registry::ProviderRegistry::new_with_mock(
             common::MockAdapter { response: "ok".to_string() },
         )),
@@ -431,4 +437,104 @@ async fn get_models_page() {
     assert!(html.contains("openai"));
     assert!(html.contains("gpt-5"));
     assert!(html.contains("latest"));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Effective pricing table
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn pricing_row<'a>(body: &'a serde_json::Value, model: &str) -> &'a serde_json::Value {
+    body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == model)
+        .unwrap_or_else(|| panic!("{model} missing from pricing table"))
+}
+
+#[tokio::test]
+async fn pricing_requires_admin_auth() {
+    let (server, _settings, _db) = build_server().await;
+
+    let resp = server.get("/admin/api/pricing").await;
+
+    assert_eq!(resp.status_code(), 401);
+}
+
+#[tokio::test]
+async fn pricing_lists_builtins_with_default_and_explicit_cache_rates() {
+    let (server, settings, _db) = build_server().await;
+    let (hk, hv) = bearer(&jwt(&settings, "viewer"));
+
+    let resp = server.get("/admin/api/pricing").add_header(hk, hv).await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        body["defaults"],
+        json!({ "cache_read_multiplier": 0.1, "cache_write_multiplier": 1.25 })
+    );
+    assert_eq!(
+        *pricing_row(&body, "claude-opus-5-5"),
+        json!({
+            "model": "claude-opus-5-5",
+            "input_per_million": 4.0,
+            "output_per_million": 20.0,
+            "cache_read_per_million": 0.2,
+            "cache_write_per_million": 5.0,
+            "cache_read_defaulted": false,
+            "cache_write_defaulted": false,
+        })
+    );
+    let gpt4o = pricing_row(&body, "gpt-4o");
+    assert_eq!(gpt4o["input_per_million"], json!(2.5));
+    assert_eq!(gpt4o["cache_read_per_million"], json!(0.25));
+    assert_eq!(gpt4o["cache_write_per_million"], json!(3.125));
+    assert_eq!(gpt4o["cache_read_defaulted"], json!(true));
+    assert_eq!(gpt4o["cache_write_defaulted"], json!(true));
+}
+
+#[tokio::test]
+async fn pricing_reflects_config_overrides() {
+    use modelrouter::config::schema::PricingEntry;
+    let cost_calc = modelrouter::router::cost::CostCalculator::new_with_config(&[
+        PricingEntry {
+            model: "gpt-4o".to_string(),
+            input_per_million: 8.0,
+            output_per_million: 16.0,
+            cache_read_per_million: None,
+            cache_write_per_million: Some(9.0),
+        },
+        PricingEntry {
+            model: "Local-Model".to_string(),
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        },
+    ]);
+    let (server, settings, _db) = build_server_with_cost_calc(cost_calc).await;
+    let (hk, hv) = bearer(&jwt(&settings, "viewer"));
+
+    let resp = server.get("/admin/api/pricing").add_header(hk, hv).await;
+
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        *pricing_row(&body, "gpt-4o"),
+        json!({
+            "model": "gpt-4o",
+            "input_per_million": 8.0,
+            "output_per_million": 16.0,
+            "cache_read_per_million": 0.8,
+            "cache_write_per_million": 9.0,
+            "cache_read_defaulted": true,
+            "cache_write_defaulted": false,
+        })
+    );
+    // Config keys are stored lowercased, as the calculator matches them.
+    assert_eq!(
+        pricing_row(&body, "local-model")["input_per_million"],
+        json!(1.0)
+    );
 }

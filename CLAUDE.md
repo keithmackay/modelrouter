@@ -73,6 +73,7 @@ modelrouter install-service  (macOS/Linux)
 | `GET /admin/experiments` | Experiments page (admin dashboard); `POST` creates from the form (superadmin session) |
 | `POST /admin/experiments/:id/close` | Close from the dashboard (superadmin session) |
 | `GET /admin/experiments/:id/panels` | Results panels for one experiment (admin dashboard) |
+| `GET /admin/api/pricing` | Effective pricing table (built-ins plus `[[pricing]]` overrides), per-million rates with defaulted cache rates flagged (admin JWT required; name matching in README) |
 | `GET /admin/api/model-capabilities/learned` | Model capabilities learned from provider rejections, with when and why (admin JWT required) |
 | `DELETE /admin/api/model-capabilities/learned/:model` | Clear one learned capability (superadmin JWT required) |
 | `GET /admin/webhooks` | Webhook management page (admin dashboard) |
