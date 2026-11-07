@@ -20,9 +20,27 @@ struct ModelPricing {
 }
 
 /// Anthropic-style cache read tokens cost ~10% of a standard input token.
-const CACHE_READ_DISCOUNT: f64 = 0.1;
+pub const CACHE_READ_DISCOUNT: f64 = 0.1;
 /// Anthropic-style cache write (5-minute TTL) tokens cost ~125% of a standard input token.
-const CACHE_WRITE_PREMIUM: f64 = 1.25;
+pub const CACHE_WRITE_PREMIUM: f64 = 1.25;
+
+/// One model's effective rates, in USD per million tokens, as the calculator
+/// applies them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PriceEntry {
+    /// The pricing key: lowercased, as stored in the table.
+    pub model: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_read_per_million: f64,
+    pub cache_write_per_million: f64,
+    /// `true` when no cache read rate is set and `CACHE_READ_DISCOUNT` of
+    /// the input rate applies.
+    pub cache_read_defaulted: bool,
+    /// `true` when no cache write rate is set and `CACHE_WRITE_PREMIUM` of
+    /// the input rate applies.
+    pub cache_write_defaulted: bool,
+}
 
 impl ModelPricing {
     fn simple(input_per_million: f64, output_per_million: f64) -> Self {
@@ -63,18 +81,51 @@ impl ModelPricing {
 impl CostCalculator {
     pub fn new() -> Self {
         let mut pricing = HashMap::new();
-        // Anthropic models (as of early 2025)
+        // Anthropic Claude 5.x, Claude API list prices. Cache write is the
+        // 5-minute write rate; cache read is the published cache-hit rate
+        // (0.05x input on Opus/Sonnet 5.5, 0.025x on Fable/Mythos 5.1).
+        // Reference: https://platform.claude.com/docs/en/about-claude/pricing
+        pricing.insert(
+            "claude-opus-5-5".to_string(),
+            ModelPricing::with_cache(4.0, 20.0, 0.20, 5.0),
+        );
+        pricing.insert(
+            "claude-opus-5".to_string(),
+            ModelPricing::with_cache(5.0, 25.0, 0.50, 6.25),
+        );
+        pricing.insert(
+            "claude-sonnet-5-5".to_string(),
+            ModelPricing::with_cache(2.0, 10.0, 0.10, 2.50),
+        );
+        pricing.insert(
+            "claude-sonnet-5".to_string(),
+            ModelPricing::with_cache(2.0, 10.0, 0.20, 2.50),
+        );
+        for name in ["claude-fable-5-1", "claude-mythos-5-1"] {
+            pricing.insert(
+                name.to_string(),
+                ModelPricing::with_cache(10.0, 50.0, 0.25, 12.50),
+            );
+        }
+        for name in ["claude-fable-5", "claude-mythos-5"] {
+            pricing.insert(
+                name.to_string(),
+                ModelPricing::with_cache(10.0, 50.0, 1.0, 12.50),
+            );
+        }
+        // Anthropic Claude 4.x, Claude API list prices (5-minute cache write).
+        // Reference: https://platform.claude.com/docs/en/about-claude/pricing
         pricing.insert(
             "claude-opus-4-6".to_string(),
-            ModelPricing::simple(15.0, 75.0),
+            ModelPricing::with_cache(5.0, 25.0, 0.50, 6.25),
         );
         pricing.insert(
             "claude-sonnet-4-6".to_string(),
-            ModelPricing::simple(3.0, 15.0),
+            ModelPricing::with_cache(3.0, 15.0, 0.30, 3.75),
         );
         pricing.insert(
             "claude-haiku-4-5".to_string(),
-            ModelPricing::simple(0.80, 4.0),
+            ModelPricing::with_cache(1.0, 5.0, 0.10, 1.25),
         );
         pricing.insert(
             "claude-3-5-sonnet-20241022".to_string(),
@@ -96,6 +147,26 @@ impl CostCalculator {
         pricing.insert(
             "gpt-3.5-turbo".to_string(),
             ModelPricing::simple(0.50, 1.50),
+        );
+        // OpenAI GPT-5.x, Standard tier. Cache read is the cached-input rate;
+        // cache write is the published 30-minute write rate, or the input rate
+        // where none is published. gpt-5.5 is its <272K-context tier.
+        // Reference: https://developers.openai.com/api/docs/pricing
+        pricing.insert(
+            "gpt-5.6-luna".to_string(),
+            ModelPricing::with_cache(0.20, 1.20, 0.02, 0.25),
+        );
+        pricing.insert(
+            "gpt-5.5".to_string(),
+            ModelPricing::with_cache(5.0, 30.0, 0.50, 5.0),
+        );
+        pricing.insert(
+            "gpt-5".to_string(),
+            ModelPricing::with_cache(1.25, 10.0, 0.125, 1.25),
+        );
+        pricing.insert(
+            "gpt-5-mini".to_string(),
+            ModelPricing::with_cache(0.25, 2.0, 0.025, 0.25),
         );
         // Gemini
         pricing.insert(
@@ -192,22 +263,26 @@ impl CostCalculator {
             "doubao-pro-32k".to_string(),
             ModelPricing::simple(0.80, 0.80),
         );
-        // Claude on Vertex — versioned IDs (@YYYYMMDD). Same rates as Anthropic direct.
+        // Claude on Vertex — versioned IDs (@YYYYMMDD), matched literally.
+        // Global-endpoint list prices, the same as the Claude API; regional
+        // and multi-region endpoints list 10% higher. claude-sonnet-4-5 lists
+        // higher for prompts over 200K tokens.
+        // Reference: https://cloud.google.com/model-garden/partner-models/pricing
         pricing.insert(
             "claude-opus-4-5@20250101".to_string(),
-            ModelPricing::simple(15.0, 75.0),
+            ModelPricing::with_cache(5.0, 25.0, 0.50, 6.25),
         );
         pricing.insert(
             "claude-sonnet-4-6@20250514".to_string(),
-            ModelPricing::simple(3.0, 15.0),
+            ModelPricing::with_cache(3.0, 15.0, 0.30, 3.75),
         );
         pricing.insert(
             "claude-sonnet-4-5@20250929".to_string(),
-            ModelPricing::simple(3.0, 15.0),
+            ModelPricing::with_cache(3.0, 15.0, 0.30, 3.75),
         );
         pricing.insert(
             "claude-haiku-4-5@20251001".to_string(),
-            ModelPricing::simple(0.80, 4.0),
+            ModelPricing::with_cache(1.0, 5.0, 0.10, 1.25),
         );
         // Unknown models cost 0 (Ollama etc.) and are reported once as unpriced.
         Self {
@@ -260,6 +335,26 @@ impl CostCalculator {
             Some(pos) => self.pricing.get(&key[pos + 1..]),
             None => None,
         }
+    }
+
+    /// Every pricing entry (built-ins with config overrides applied), sorted
+    /// by model key.
+    pub fn price_table(&self) -> Vec<PriceEntry> {
+        let mut table: Vec<PriceEntry> = self
+            .pricing
+            .iter()
+            .map(|(model, p)| PriceEntry {
+                model: model.clone(),
+                input_per_million: p.input_per_million,
+                output_per_million: p.output_per_million,
+                cache_read_per_million: p.cache_read_rate(),
+                cache_write_per_million: p.cache_write_rate(),
+                cache_read_defaulted: p.cache_read_per_million.is_none(),
+                cache_write_defaulted: p.cache_write_per_million.is_none(),
+            })
+            .collect();
+        table.sort_by(|a, b| a.model.cmp(&b.model));
+        table
     }
 
     /// Whether `model` has a pricing entry. A model without one is recorded in
@@ -408,7 +503,7 @@ mod tests {
         // must resolve to it.
         assert!(calc.has_price("vertex/anthropic/claude-haiku-4-5"));
         let cost = calc.calculate("vertex/anthropic/claude-haiku-4-5", 1_000_000, 0);
-        assert!((cost - 0.80).abs() < 0.001, "vertex haiku input: {cost}");
+        assert!((cost - 1.0).abs() < 0.001, "vertex haiku input: {cost}");
     }
 
     #[test]
@@ -501,6 +596,141 @@ mod tests {
             // No published cached-input rate: default discount of input.
             assert_cost(&calc, model, (0, 0, M, 0), 0.09 * CACHE_READ_DISCOUNT);
         }
+    }
+
+    /// Asserts `model` costs `(input, output, cache read, cache write)` per 1M
+    /// tokens, bare and behind a provider prefix.
+    fn assert_list_prices(calc: &CostCalculator, model: &str, rates: (f64, f64, f64, f64)) {
+        const M: u32 = 1_000_000;
+        let (input, output, read, write) = rates;
+        for name in [model.to_string(), format!("anthropic/{model}")] {
+            assert!(calc.has_price(&name), "{name} should be priced");
+            assert_cost(calc, &name, (M, 0, 0, 0), input);
+            assert_cost(calc, &name, (0, M, 0, 0), output);
+            assert_cost(calc, &name, (0, 0, M, 0), read);
+            assert_cost(calc, &name, (0, 0, 0, M), write);
+        }
+    }
+
+    #[test]
+    fn claude_5_list_prices() {
+        let calc = CostCalculator::default();
+        // (model, input, output, cache hit, 5m cache write) per 1M tokens.
+        let table = [
+            ("claude-opus-5-5", 4.0, 20.0, 0.20, 5.0),
+            ("claude-opus-5", 5.0, 25.0, 0.50, 6.25),
+            ("claude-sonnet-5-5", 2.0, 10.0, 0.10, 2.50),
+            ("claude-sonnet-5", 2.0, 10.0, 0.20, 2.50),
+            ("claude-fable-5-1", 10.0, 50.0, 0.25, 12.50),
+            ("claude-fable-5", 10.0, 50.0, 1.0, 12.50),
+            ("claude-mythos-5-1", 10.0, 50.0, 0.25, 12.50),
+            ("claude-mythos-5", 10.0, 50.0, 1.0, 12.50),
+        ];
+        for (model, input, output, read, write) in table {
+            assert_list_prices(&calc, model, (input, output, read, write));
+        }
+    }
+
+    #[test]
+    fn claude_4_list_prices() {
+        let calc = CostCalculator::default();
+        let table = [
+            ("claude-opus-4-6", 5.0, 25.0, 0.50, 6.25),
+            ("claude-sonnet-4-6", 3.0, 15.0, 0.30, 3.75),
+            ("claude-haiku-4-5", 1.0, 5.0, 0.10, 1.25),
+            // Vertex versioned IDs, global endpoint.
+            ("claude-opus-4-5@20250101", 5.0, 25.0, 0.50, 6.25),
+            ("claude-sonnet-4-6@20250514", 3.0, 15.0, 0.30, 3.75),
+            ("claude-sonnet-4-5@20250929", 3.0, 15.0, 0.30, 3.75),
+            ("claude-haiku-4-5@20251001", 1.0, 5.0, 0.10, 1.25),
+        ];
+        for (model, input, output, read, write) in table {
+            assert_list_prices(&calc, model, (input, output, read, write));
+        }
+    }
+
+    #[test]
+    fn gpt_5_list_prices() {
+        let calc = CostCalculator::default();
+        const M: u32 = 1_000_000;
+        // (model, input, output, cached input, cache write) per 1M tokens.
+        let table = [
+            ("gpt-5.6-luna", 0.20, 1.20, 0.02, 0.25),
+            // No published cache-write price: writes bill at the input rate.
+            ("gpt-5.5", 5.0, 30.0, 0.50, 5.0),
+            ("gpt-5", 1.25, 10.0, 0.125, 1.25),
+            ("gpt-5-mini", 0.25, 2.0, 0.025, 0.25),
+        ];
+        for (model, input, output, read, write) in table {
+            for name in [model.to_string(), format!("openai/{model}")] {
+                assert!(calc.has_price(&name), "{name} should be priced");
+                assert_cost(&calc, &name, (M, 0, 0, 0), input);
+                assert_cost(&calc, &name, (0, M, 0, 0), output);
+                assert_cost(&calc, &name, (0, 0, M, 0), read);
+                assert_cost(&calc, &name, (0, 0, 0, M), write);
+            }
+        }
+    }
+
+    #[test]
+    fn price_table_lists_builtins_sorted_with_default_flags() {
+        let calc = CostCalculator::default();
+        let table = calc.price_table();
+        let names: Vec<&str> = table.iter().map(|e| e.model.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "rows are sorted by model key");
+
+        let gpt4o = table.iter().find(|e| e.model == "gpt-4o").unwrap();
+        assert_eq!(
+            *gpt4o,
+            PriceEntry {
+                model: "gpt-4o".into(),
+                input_per_million: 2.50,
+                output_per_million: 10.0,
+                cache_read_per_million: 2.50 * CACHE_READ_DISCOUNT,
+                cache_write_per_million: 2.50 * CACHE_WRITE_PREMIUM,
+                cache_read_defaulted: true,
+                cache_write_defaulted: true,
+            }
+        );
+
+        let opus = table.iter().find(|e| e.model == "claude-opus-5-5").unwrap();
+        assert_eq!(opus.cache_read_per_million, 0.20);
+        assert_eq!(opus.cache_write_per_million, 5.0);
+        assert!(!opus.cache_read_defaulted);
+        assert!(!opus.cache_write_defaulted);
+    }
+
+    #[test]
+    fn price_table_reflects_config_overrides() {
+        use crate::config::schema::PricingEntry;
+        let calc = CostCalculator::new_with_config(&[
+            PricingEntry {
+                model: "GPT-4o".into(),
+                input_per_million: 99.0,
+                output_per_million: 199.0,
+                cache_read_per_million: Some(1.5),
+                cache_write_per_million: None,
+            },
+            PricingEntry {
+                model: "custom-model".into(),
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+            },
+        ]);
+        let table = calc.price_table();
+        assert_eq!(table.iter().filter(|e| e.model == "gpt-4o").count(), 1);
+        let gpt4o = table.iter().find(|e| e.model == "gpt-4o").unwrap();
+        assert_eq!(gpt4o.input_per_million, 99.0);
+        assert_eq!(gpt4o.output_per_million, 199.0);
+        assert_eq!(gpt4o.cache_read_per_million, 1.5);
+        assert!(!gpt4o.cache_read_defaulted);
+        assert_eq!(gpt4o.cache_write_per_million, 99.0 * CACHE_WRITE_PREMIUM);
+        assert!(gpt4o.cache_write_defaulted);
+        assert!(table.iter().any(|e| e.model == "custom-model"));
     }
 
     #[test]

@@ -1349,6 +1349,55 @@ input_per_million = 0.14
 output_per_million = 0.28
 ```
 
+**Reading the effective pricing table.** `GET /admin/api/pricing` returns every
+rate the router costs requests with: the built-in table with `[[pricing]]`
+entries applied, in USD per million tokens, sorted by model key. It needs an
+admin JWT (any role), the same as the other `/admin/api/*` reads.
+
+```json
+{
+  "defaults": { "cache_read_multiplier": 0.1, "cache_write_multiplier": 1.25 },
+  "models": [
+    {
+      "model": "claude-opus-5-5",
+      "input_per_million": 4.0,
+      "output_per_million": 20.0,
+      "cache_read_per_million": 0.2,
+      "cache_write_per_million": 5.0,
+      "cache_read_defaulted": false,
+      "cache_write_defaulted": false
+    },
+    {
+      "model": "gpt-4o",
+      "input_per_million": 2.5,
+      "output_per_million": 10.0,
+      "cache_read_per_million": 0.25,
+      "cache_write_per_million": 3.125,
+      "cache_read_defaulted": true,
+      "cache_write_defaulted": true
+    }
+  ]
+}
+```
+
+The cache rates are always the rates charged. `cache_read_defaulted` /
+`cache_write_defaulted` are `true` when the entry sets no such rate and the
+matching `defaults` multiplier of the input rate applies instead.
+
+**How a model name is matched to a pricing row.** A client pricing tokens
+itself should match names the same way:
+
+1. Lowercase the name. Config `[[pricing]]` keys are lowercased too.
+2. Drop everything up to and including the first `/` (the provider prefix):
+   `anthropic/claude-haiku-4-5` looks up `claude-haiku-4-5`, and
+   `vertex/anthropic/claude-x` looks up `anthropic/claude-x`.
+3. If that key has no row and still contains a `/`, look up the part after the
+   last `/` (`claude-x`). A vendor-qualified row therefore wins over a bare one.
+4. A `@version` suffix is not stripped. `claude-haiku-4-5@20251001` matches only
+   a row with that exact key; with no such row it is unpriced, and does not fall
+   back to `claude-haiku-4-5`.
+5. A name with no row costs $0, and the router logs a warning once per model.
+
 ---
 
 ## Usage
