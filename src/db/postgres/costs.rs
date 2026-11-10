@@ -10,6 +10,15 @@ use crate::db::repositories::costs::{
 };
 use super::{PostgresDb, now_utc};
 
+/// Columns selected when reading a ledger row back. `prompt_id` is nullable
+/// (skip-log and cache-hit rows) but the model field is not: SQLite decodes
+/// NULL as 0, so Postgres coalesces to match.
+const LEDGER_COLUMNS: &str = "id, user_id, COALESCE(prompt_id, 0) AS prompt_id, model, provider, \
+                              project, tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
+                              cache_hit, saved_usd, attribution_correlation_id, \
+                              attribution_tags, experiment_id, experiment_variant, \
+                              tokens_estimated";
+
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
 const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)";
 
@@ -17,18 +26,15 @@ const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END)
 impl CostRepository for PostgresDb {
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
         let now = now_utc();
-        let row = sqlx::query_as::<_, CostLedgerEntry>(
+        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-               RETURNING id, user_id, prompt_id, model, provider, project,
-                         tokens_in, tokens_out, cost_usd, created_at, api_key_id,
-                         cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags,
-                         experiment_id, experiment_variant, tokens_estimated"#,
-        )
+               RETURNING {}"#,
+            LEDGER_COLUMNS
+        ))
         .bind(entry.user_id)
         .bind(entry.prompt_id)
         .bind(&entry.model)
@@ -52,19 +58,16 @@ impl CostRepository for PostgresDb {
     async fn create_cache_hit(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
         let now = now_utc();
         // cost_usd is hard-coded to 0: a cache hit is usage, never spend.
-        let row = sqlx::query_as::<_, CostLedgerEntry>(
+        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated)
                VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15)
-               RETURNING id, user_id, prompt_id, model, provider, project,
-                         tokens_in, tokens_out, cost_usd, created_at, api_key_id,
-                         cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags,
-                         experiment_id, experiment_variant, tokens_estimated"#,
-        )
+               RETURNING {}"#,
+            LEDGER_COLUMNS
+        ))
         .bind(entry.user_id)
         .bind(entry.prompt_id)
         .bind(&entry.model)
@@ -228,7 +231,7 @@ impl CostRepository for PostgresDb {
 
     async fn sum_tokens_for_user_since(&self, user_id: i64, since: &str) -> anyhow::Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM cost_ledger
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0)::BIGINT FROM cost_ledger
              WHERE user_id = $1 AND created_at >= $2",
         )
         .bind(user_id)
@@ -251,7 +254,7 @@ impl CostRepository for PostgresDb {
 
     async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM cost_ledger WHERE api_key_id = $1 AND created_at >= $2"
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0)::BIGINT FROM cost_ledger WHERE api_key_id = $1 AND created_at >= $2"
         )
         .bind(api_key_id)
         .bind(since)
@@ -260,11 +263,25 @@ impl CostRepository for PostgresDb {
         Ok(row.0)
     }
 
-    async fn list_cost_entries_before(&self, _cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
-        Ok(vec![])
+    async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
+        let rows = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+            "SELECT {} FROM cost_ledger WHERE created_at < $1 ORDER BY created_at ASC LIMIT 10000",
+            LEDGER_COLUMNS
+        ))
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
-    async fn delete_cost_entries_by_ids(&self, _ids: &[i64]) -> anyhow::Result<()> {
+    async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM cost_ledger WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -334,8 +351,8 @@ impl CostRepository for PostgresDb {
         let mut sql = format!(
             "SELECT user_id, \
                     COALESCE(SUM(cost_usd), 0.0), \
-                    COALESCE(SUM(tokens_in), 0), \
-                    COALESCE(SUM(tokens_out), 0), \
+                    COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                    COALESCE(SUM(tokens_out), 0)::BIGINT, \
                     COUNT(*), \
                     COALESCE(SUM(cost_usd), 0.0) + COALESCE(SUM(saved_usd), 0.0) \
              FROM cost_ledger \
@@ -418,8 +435,8 @@ impl CostRepository for PostgresDb {
         let mut sql = format!(
             "SELECT user_id, model, project, api_key_id, \
                     COALESCE(SUM(cost_usd), 0.0), \
-                    COALESCE(SUM(tokens_in), 0), \
-                    COALESCE(SUM(tokens_out), 0), \
+                    COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                    COALESCE(SUM(tokens_out), 0)::BIGINT, \
                     COUNT(*) \
              FROM cost_ledger \
              WHERE created_at >= ${}", param
@@ -474,8 +491,8 @@ impl CostRepository for PostgresDb {
     async fn user_cost_stats_since(&self, user_id: i64, since: &str) -> anyhow::Result<(f64, i64, i64, i64)> {
         let row: (f64, i64, i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(cost_usd), 0.0),
-                    COALESCE(SUM(tokens_in), 0),
-                    COALESCE(SUM(tokens_out), 0),
+                    COALESCE(SUM(tokens_in), 0)::BIGINT,
+                    COALESCE(SUM(tokens_out), 0)::BIGINT,
                     COUNT(*)
              FROM cost_ledger
              WHERE user_id = $1 AND created_at >= $2",
@@ -516,7 +533,7 @@ impl CostRepository for PostgresDb {
             }
         }
         let mut param = 3usize;
-        let mut sql = "SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, \
+        let mut sql = "SELECT SUBSTRING(created_at FROM 1 FOR 10) AS day, \
                               COALESCE(SUM(cost_usd), 0.0) \
                        FROM cost_ledger \
                        WHERE created_at >= $1 AND created_at < $2"
@@ -559,8 +576,8 @@ impl CostRepository for PostgresDb {
         let mut param = 2usize;
         let mut sql = "SELECT model, \
                               COALESCE(SUM(cost_usd), 0.0), \
-                              COALESCE(SUM(tokens_in), 0), \
-                              COALESCE(SUM(tokens_out), 0), \
+                              COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                              COALESCE(SUM(tokens_out), 0)::BIGINT, \
                               COUNT(*), \
                               COALESCE(SUM(saved_usd), 0.0) \
                        FROM cost_ledger \
@@ -932,7 +949,7 @@ type BreakdownRow = (String, f64, f64, i64, i64, i64, i64);
 fn totals_select() -> String {
     format!(
         "COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(saved_usd), 0.0), \
-         COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0), COUNT(*), {}",
+         COALESCE(SUM(tokens_in), 0)::BIGINT, COALESCE(SUM(tokens_out), 0)::BIGINT, COUNT(*), {}",
         CACHE_HIT_SUM
     )
 }

@@ -5,6 +5,17 @@
 Everything since 0.1.0, by week. Entries are the merged result, not every
 commit; `git log v0.1.0..` has the detail.
 
+### Week of 2026-11-09
+
+**Features**
+- PostgreSQL backend. With `--features postgres` and `database.postgres_url` set (or `MODELROUTER_DATABASE__POSTGRES_URL`), `serve`, `migrate` and the `user`, `admin`, `key`, `budget`, `group`, `model`, `alias`, `provider`, `webhook` and `experiment` commands run on Postgres and apply `migrations/postgres/` first. Previously the setting was ignored and everything used SQLite. A binary built without the feature refuses to start with `postgres_url` set. The CLI reports that query SQLite directly (`report cost` without `--tag`/`--correlation-id`, `report usage`, `report prompts`, `report audit`, `report hooks`, `audit`) exit with an error on Postgres, and the dashboard's hook latency panel is empty.
+- `docker-compose.postgres.yml` overlays a Postgres 17 service on a base stack and builds modelrouter with `otel,postgres`. Every service in `docker-compose.otel.yml` now restarts with Docker, and Phoenix keeps its traces in a volume.
+
+**Fixes**
+- The Postgres implementation had never run against a database. Fixed: the migration chain (a reserved-word column, six missing columns, 32-bit integer columns read as 64-bit, a `TIMESTAMPTZ` column written as text), unquoted `window` in every budget query, `NUMERIC` token sums, a `NULL` `prompt_id` failing every cost insert, two cost-archival methods that were stubs, NULL and collation ordering differences, and errors reported as "not found". `tests/test_db_conformance.rs` now runs every repository method against both backends, plus a table-and-column parity check.
+- The README's `docker run` example was unreachable (the server bound `127.0.0.1` inside the container) and kept the database outside the `/data` volume.
+- The Docker build image moves to Rust 1.94 (`rust-version` 1.94.1), the minimum the locked AWS SDK crates accept.
+
 ### Week of 2026-09-28
 
 **Features**

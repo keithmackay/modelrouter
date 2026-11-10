@@ -6,15 +6,18 @@ use crate::db::models::{BudgetRule, BudgetScope, NewBudgetRule, UpdateBudgetRule
 use crate::db::repositories::budgets::BudgetRepository;
 use super::{PostgresDb, now_utc};
 
+// `window` is a reserved word in Postgres, so it is quoted wherever it is named.
+const BUDGET_COLS: &str =
+    r#"id, user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
+       model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
+       project, window_start, window_end"#;
+
 #[async_trait]
 impl BudgetRepository for PostgresDb {
     async fn list_for_user(&self, user_id: i64) -> anyhow::Result<Vec<BudgetRule>> {
-        let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
-                      model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
-                      project, window_start, window_end
-               FROM budget_rules WHERE user_id = $1 ORDER BY id"#,
-        )
+        let rows = sqlx::query_as::<_, BudgetRule>(&format!(
+            "SELECT {BUDGET_COLS} FROM budget_rules WHERE user_id = $1 ORDER BY id"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -22,12 +25,9 @@ impl BudgetRepository for PostgresDb {
     }
 
     async fn list_for_group(&self, group_name: &str) -> anyhow::Result<Vec<BudgetRule>> {
-        let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
-                      model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
-                      project, window_start, window_end
-               FROM budget_rules WHERE group_name = $1 ORDER BY id"#,
-        )
+        let rows = sqlx::query_as::<_, BudgetRule>(&format!(
+            "SELECT {BUDGET_COLS} FROM budget_rules WHERE group_name = $1 ORDER BY id"
+        ))
         .bind(group_name)
         .fetch_all(&self.pool)
         .await?;
@@ -35,12 +35,9 @@ impl BudgetRepository for PostgresDb {
     }
 
     async fn list_for_key(&self, api_key_id: i64) -> anyhow::Result<Vec<BudgetRule>> {
-        let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
-                      model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
-                      project, window_start, window_end
-               FROM budget_rules WHERE api_key_id = $1 ORDER BY id"#,
-        )
+        let rows = sqlx::query_as::<_, BudgetRule>(&format!(
+            "SELECT {BUDGET_COLS} FROM budget_rules WHERE api_key_id = $1 ORDER BY id"
+        ))
         .bind(api_key_id)
         .fetch_all(&self.pool)
         .await?;
@@ -48,12 +45,9 @@ impl BudgetRepository for PostgresDb {
     }
 
     async fn list_all(&self) -> anyhow::Result<Vec<BudgetRule>> {
-        let rows = sqlx::query_as::<_, BudgetRule>(
-            r#"SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
-                      model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
-                      project, window_start, window_end
-               FROM budget_rules ORDER BY id"#,
-        )
+        let rows = sqlx::query_as::<_, BudgetRule>(&format!(
+            "SELECT {BUDGET_COLS} FROM budget_rules ORDER BY id"
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -61,17 +55,15 @@ impl BudgetRepository for PostgresDb {
 
     async fn create(&self, rule: NewBudgetRule) -> anyhow::Result<BudgetRule> {
         let now = now_utc();
-        let model_allow_json = serde_json::to_string(&rule.model_allow).unwrap_or_else(|_| "[]".to_string());
-        let model_deny_json = serde_json::to_string(&rule.model_deny).unwrap_or_else(|_| "[]".to_string());
-        let row = sqlx::query_as::<_, BudgetRule>(
-            r#"INSERT INTO budget_rules (user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
+        let model_allow_json = serde_json::to_string(&rule.model_allow)?;
+        let model_deny_json = serde_json::to_string(&rule.model_deny)?;
+        let row = sqlx::query_as::<_, BudgetRule>(&format!(
+            r#"INSERT INTO budget_rules (user_id, group_name, api_key_id, tag, "window", limit_usd, limit_tokens,
                                          model_allow, model_deny, rate_rpm, max_concurrent, project, window_start, window_end,
                                          created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-               RETURNING id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
-                         model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
-                         project, window_start, window_end"#,
-        )
+               RETURNING {BUDGET_COLS}"#
+        ))
         .bind(rule.user_id)
         .bind(&rule.group_name)
         .bind(rule.api_key_id)
@@ -94,12 +86,9 @@ impl BudgetRepository for PostgresDb {
     }
 
     async fn list_for_tag(&self, tag: &str) -> anyhow::Result<Vec<BudgetRule>> {
-        let rows = sqlx::query_as::<_, BudgetRule>(
-            "SELECT id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens, \
-             model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at, \
-             project, window_start, window_end \
-             FROM budget_rules WHERE tag = $1"
-        )
+        let rows = sqlx::query_as::<_, BudgetRule>(&format!(
+            "SELECT {BUDGET_COLS} FROM budget_rules WHERE tag = $1"
+        ))
         .bind(tag)
         .fetch_all(&self.pool)
         .await?;
@@ -115,22 +104,19 @@ impl BudgetRepository for PostgresDb {
     }
 
     async fn list_for_scope(&self, scope: &BudgetScope) -> anyhow::Result<Vec<BudgetRule>> {
-        let cols = "id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens, \
-                    model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at, \
-                    project, window_start, window_end";
         let rows = match scope {
             BudgetScope::Global => {
                 sqlx::query_as::<_, BudgetRule>(&format!(
-                    "SELECT {} FROM budget_rules \
+                    "SELECT {BUDGET_COLS} FROM budget_rules \
                      WHERE user_id IS NULL AND group_name IS NULL AND project IS NULL AND api_key_id IS NULL \
-                     ORDER BY id", cols
+                     ORDER BY id"
                 ))
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::Project(name) => {
                 sqlx::query_as::<_, BudgetRule>(&format!(
-                    "SELECT {} FROM budget_rules WHERE project = $1 ORDER BY id", cols
+                    "SELECT {BUDGET_COLS} FROM budget_rules WHERE project = $1 ORDER BY id"
                 ))
                 .bind(name)
                 .fetch_all(&self.pool)
@@ -138,7 +124,7 @@ impl BudgetRepository for PostgresDb {
             }
             BudgetScope::User(user_id) => {
                 sqlx::query_as::<_, BudgetRule>(&format!(
-                    "SELECT {} FROM budget_rules WHERE user_id = $1 ORDER BY id", cols
+                    "SELECT {BUDGET_COLS} FROM budget_rules WHERE user_id = $1 ORDER BY id"
                 ))
                 .bind(user_id)
                 .fetch_all(&self.pool)
@@ -146,7 +132,7 @@ impl BudgetRepository for PostgresDb {
             }
             BudgetScope::Group(group_name) => {
                 sqlx::query_as::<_, BudgetRule>(&format!(
-                    "SELECT {} FROM budget_rules WHERE group_name = $1 ORDER BY id", cols
+                    "SELECT {BUDGET_COLS} FROM budget_rules WHERE group_name = $1 ORDER BY id"
                 ))
                 .bind(group_name)
                 .fetch_all(&self.pool)
@@ -165,7 +151,7 @@ impl BudgetRepository for PostgresDb {
             .map(serde_json::to_string)
             .transpose()?;
 
-        let row = sqlx::query_as::<_, BudgetRule>(
+        let row = sqlx::query_as::<_, BudgetRule>(&format!(
             r#"UPDATE budget_rules SET
                 limit_usd = COALESCE($1, limit_usd),
                 limit_tokens = COALESCE($2, limit_tokens),
@@ -177,10 +163,8 @@ impl BudgetRepository for PostgresDb {
                 window_end = COALESCE($8, window_end),
                 updated_at = $9
                WHERE id = $10
-               RETURNING id, user_id, group_name, api_key_id, tag, window, limit_usd, limit_tokens,
-                         model_allow, model_deny, rate_rpm, max_concurrent, created_at, updated_at,
-                         project, window_start, window_end"#,
-        )
+               RETURNING {BUDGET_COLS}"#
+        ))
         .bind(changes.limit_usd)
         .bind(changes.limit_tokens)
         .bind(&model_allow)
@@ -191,9 +175,8 @@ impl BudgetRepository for PostgresDb {
         .bind(&changes.window_end)
         .bind(&now)
         .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|_| anyhow::anyhow!("budget rule {id} not found"))?;
-        Ok(row)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.ok_or_else(|| anyhow::anyhow!("budget rule {id} not found"))
     }
 }

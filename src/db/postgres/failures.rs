@@ -36,9 +36,9 @@ impl FailureRepository for PostgresDb {
         .bind(&failure.routed_model)
         .bind(&failure.provider)
         .bind(failure.stage.as_str())
-        .bind(failure.status_code.map(|c| c as i32))
+        .bind(failure.status_code)
         .bind(&failure.error_message)
-        .bind(failure.attempts as i32)
+        .bind(failure.attempts)
         .bind(failure.latency_ms)
         .bind(&failure.project)
         .bind(&failure.attribution_correlation_id)
@@ -137,6 +137,8 @@ impl FailureRepository for PostgresDb {
         &self,
         experiment_id: i64,
     ) -> anyhow::Result<Vec<ExperimentRunFailures>> {
+        // Byte order with a missing variant first, as SQLite sorts: Postgres
+        // otherwise puts NULLs last and orders text by the database locale.
         let rows = sqlx::query_as::<_, (i64, String, Option<String>, i64, String, String)>(
             "SELECT user_id, attribution_correlation_id, experiment_variant, COUNT(*), \
                     MIN(created_at), MAX(created_at) \
@@ -144,7 +146,8 @@ impl FailureRepository for PostgresDb {
              WHERE experiment_id = $1 AND user_id IS NOT NULL \
                AND attribution_correlation_id IS NOT NULL \
              GROUP BY user_id, attribution_correlation_id, experiment_variant \
-             ORDER BY user_id ASC, attribution_correlation_id ASC, experiment_variant ASC",
+             ORDER BY user_id ASC, attribution_correlation_id COLLATE \"C\" ASC, \
+                      experiment_variant COLLATE \"C\" ASC NULLS FIRST",
         )
         .bind(experiment_id)
         .fetch_all(&self.pool)

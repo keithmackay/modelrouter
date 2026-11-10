@@ -34,6 +34,7 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.102.0
+    restart: unless-stopped
     volumes:
       - ./otel-collector/config.yml:/etc/otelcol-contrib/config.yaml:ro
     ports:
@@ -46,6 +47,9 @@ services:
 
   phoenix:
     image: arizephoenix/phoenix:latest
+    restart: unless-stopped
+    volumes:
+      - phoenix-data:/phoenix   # traces survive a container restart
     ports:
       - "6006:6006"   # Phoenix UI + OTLP HTTP
     environment:
@@ -53,7 +57,11 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.52.0
+    restart: unless-stopped
     volumes:
       - ./otel-collector/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+
+volumes:
+  phoenix-data:
