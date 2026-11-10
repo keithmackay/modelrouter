@@ -297,33 +297,35 @@ rotation_overlap_mins = 15
 
 # ---------------------------------------------------------------------------
 # Hooks — lifecycle
-# Lifecycle hooks run at server startup/shutdown.
+# Lifecycle hooks run at server startup/shutdown. Examples only: each `exec`
+# must be a script that exists, and a pipeline hook with fail_open = false
+# rejects every request when its script fails.
 # ---------------------------------------------------------------------------
-[[hooks.lifecycle]]
-name        = "notify-start"
-event       = "server.start"
-exec        = "/usr/local/bin/my-notify.sh"
-timeout_secs = 5
+# [[hooks.lifecycle]]
+# name        = "notify-start"
+# event       = "server.start"
+# exec        = "/usr/local/bin/my-notify.sh"
+# timeout_secs = 5
 
 # ---------------------------------------------------------------------------
 # Hooks — pipeline
 # Pipeline hooks intercept every request/response.
 # ---------------------------------------------------------------------------
-[[hooks.pipeline]]
-name         = "pii-scrubber"
-event        = "request.pre"
-exec         = "/usr/local/bin/pii-scrub"
-capabilities = ["mutate_request"]
-timeout_secs = 3
-fail_open    = false   # If true, proxy continues even if the hook fails.
+# [[hooks.pipeline]]
+# name         = "pii-scrubber"
+# event        = "request.pre"
+# exec         = "/usr/local/bin/pii-scrub"
+# capabilities = ["mutate_request"]
+# timeout_secs = 3
+# fail_open    = false   # If true, proxy continues even if the hook fails.
 
-[[hooks.pipeline]]
-name         = "usage-logger"
-event        = "response.post"
-exec         = "/usr/local/bin/log-usage"
-capabilities = []
-timeout_secs = 2
-fail_open    = true
+# [[hooks.pipeline]]
+# name         = "usage-logger"
+# event        = "response.post"
+# exec         = "/usr/local/bin/log-usage"
+# capabilities = []
+# timeout_secs = 2
+# fail_open    = true
 
 # ── Telemetry (requires --features otel) ──────────────────────────────
 # [telemetry]

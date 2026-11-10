@@ -88,7 +88,7 @@ pub struct AppState {
     /// prompt-log reads/writes and the retention purge stays on `db`.
     pub prompt_db: Arc<dyn DatabaseProvider>,
     pub db: Arc<dyn DatabaseProvider>,
-    pub pool: Option<sqlx::SqlitePool>,
+    pub pool: Option<crate::report::ReportPool>,
     pub router: Arc<RequestRouter>,
     pub cost_calc: Arc<CostCalculator>,
     pub provider_registry: Arc<ProviderRegistry>,

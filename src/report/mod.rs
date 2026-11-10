@@ -4,6 +4,132 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// The database a report reads. The report SQL is written once, in the
+/// subset both backends accept (`?` placeholders are renumbered for
+/// Postgres, sums are cast to `BIGINT`, day buckets use `substr`).
+#[derive(Clone)]
+pub enum ReportPool {
+    Sqlite(sqlx::SqlitePool),
+    #[cfg(feature = "postgres")]
+    Postgres(sqlx::PgPool),
+}
+
+impl From<sqlx::SqlitePool> for ReportPool {
+    fn from(pool: sqlx::SqlitePool) -> Self {
+        ReportPool::Sqlite(pool)
+    }
+}
+
+impl From<&sqlx::SqlitePool> for ReportPool {
+    fn from(pool: &sqlx::SqlitePool) -> Self {
+        ReportPool::Sqlite(pool.clone())
+    }
+}
+
+impl From<&ReportPool> for ReportPool {
+    fn from(pool: &ReportPool) -> Self {
+        pool.clone()
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl From<sqlx::PgPool> for ReportPool {
+    fn from(pool: sqlx::PgPool) -> Self {
+        ReportPool::Postgres(pool)
+    }
+}
+
+/// A bound report parameter.
+enum Arg {
+    Text(String),
+    Int(i64),
+}
+
+/// A row type every enabled backend can decode.
+#[cfg(not(feature = "postgres"))]
+trait ReportRow: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin {}
+#[cfg(not(feature = "postgres"))]
+impl<T> ReportRow for T where T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin {}
+
+#[cfg(feature = "postgres")]
+trait ReportRow:
+    for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow>
+    + for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>
+    + Send
+    + Unpin
+{
+}
+#[cfg(feature = "postgres")]
+impl<T> ReportRow for T where
+    T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow>
+        + for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>
+        + Send
+        + Unpin
+{
+}
+
+impl ReportPool {
+    /// `"sqlite"` or `"postgres"`.
+    pub fn backend(&self) -> &'static str {
+        match self {
+            ReportPool::Sqlite(_) => "sqlite",
+            #[cfg(feature = "postgres")]
+            ReportPool::Postgres(_) => "postgres",
+        }
+    }
+
+    async fn fetch_all<R: ReportRow>(&self, sql: &str, args: &[Arg]) -> Result<Vec<R>> {
+        match self {
+            ReportPool::Sqlite(pool) => {
+                let mut q = sqlx::query_as::<_, R>(sql);
+                for arg in args {
+                    q = match arg {
+                        Arg::Text(v) => q.bind(v.clone()),
+                        Arg::Int(v) => q.bind(*v),
+                    };
+                }
+                Ok(q.fetch_all(pool).await?)
+            }
+            #[cfg(feature = "postgres")]
+            ReportPool::Postgres(pool) => {
+                let sql = numbered_placeholders(sql);
+                let mut q = sqlx::query_as::<_, R>(&sql);
+                for arg in args {
+                    q = match arg {
+                        Arg::Text(v) => q.bind(v.clone()),
+                        Arg::Int(v) => q.bind(*v),
+                    };
+                }
+                Ok(q.fetch_all(pool).await?)
+            }
+        }
+    }
+}
+
+/// Rewrite `?` placeholders as `$1`, `$2`, … for Postgres, leaving any `?`
+/// inside a single-quoted literal alone.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+fn numbered_placeholders(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0;
+    let mut in_quote = false;
+    for c in sql.chars() {
+        match c {
+            '\'' => {
+                in_quote = !in_quote;
+                out.push(c);
+            }
+            '?' if !in_quote => {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CostRow {
     pub user_name: String,
@@ -69,7 +195,7 @@ pub struct HookStats {
 }
 
 pub async fn cost_by_user_window(
-    pool: &sqlx::SqlitePool,
+    pool: impl Into<ReportPool>,
     window: &str,
     user_name: Option<&str>,
     project: Option<&str>,
@@ -77,18 +203,19 @@ pub async fn cost_by_user_window(
     model: Option<&str>,
     key_id: Option<i64>,
 ) -> Result<Vec<CostRow>> {
+    let pool: ReportPool = pool.into();
     let window_start = window_start_str(window)?;
 
     // ── Resolve group → active member user_ids ────────────────────────────
     let group_user_ids: Option<Vec<i64>> = if let Some(gname) = group {
-        let ids: Vec<(i64,)> = sqlx::query_as(
-            "SELECT gm.user_id FROM group_memberships gm
-             JOIN groups g ON gm.group_id = g.id
-             WHERE g.name = ? AND gm.disabled_at IS NULL",
-        )
-        .bind(gname)
-        .fetch_all(pool)
-        .await?;
+        let ids: Vec<(i64,)> = pool
+            .fetch_all(
+                "SELECT gm.user_id FROM group_memberships gm
+                 JOIN groups g ON gm.group_id = g.id
+                 WHERE g.name = ? AND gm.disabled_at IS NULL",
+                &[Arg::Text(gname.to_string())],
+            )
+            .await?;
         Some(ids.into_iter().map(|(id,)| id).collect())
     } else {
         None
@@ -102,15 +229,16 @@ pub async fn cost_by_user_window(
     }
 
     // ── Pre-load user_id → groups map (active memberships) ────────────────
-    let membership_rows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT gm.user_id, g.name
-         FROM group_memberships gm
-         JOIN groups g ON gm.group_id = g.id
-         WHERE gm.disabled_at IS NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let membership_rows: Vec<(i64, String)> = pool
+        .fetch_all(
+            "SELECT gm.user_id, g.name
+             FROM group_memberships gm
+             JOIN groups g ON gm.group_id = g.id
+             WHERE gm.disabled_at IS NULL",
+            &[],
+        )
+        .await
+        .unwrap_or_default();
     let mut user_group_map: std::collections::HashMap<i64, Vec<String>> =
         std::collections::HashMap::new();
     for (uid, gname) in membership_rows {
@@ -125,8 +253,8 @@ pub async fn cost_by_user_window(
                           COALESCE(ak.label, '') as key_label, \
                           COALESCE(SUM(cl.cost_usd), 0.0), \
                           COALESCE(SUM(cl.saved_usd), 0.0), \
-                          COALESCE(SUM(cl.tokens_in), 0), \
-                          COALESCE(SUM(cl.tokens_out), 0), \
+                          CAST(COALESCE(SUM(cl.tokens_in), 0) AS BIGINT), \
+                          CAST(COALESCE(SUM(cl.tokens_out), 0) AS BIGINT), \
                           COUNT(*) \
                    FROM cost_ledger cl \
                    JOIN users u ON cl.user_id = u.id \
@@ -143,18 +271,19 @@ pub async fn cost_by_user_window(
     }
     if model.is_some() { sql.push_str(" AND cl.model = ?"); }
 
-    sql.push_str(" GROUP BY u.id, u.name, cl.model, cl.project, cl.api_key_id \
+    // The key's project and label are functionally dependent on api_key_id,
+    // but Postgres still requires every selected column to be grouped.
+    sql.push_str(" GROUP BY u.id, u.name, cl.model, cl.project, cl.api_key_id, ak.project, ak.label \
                    ORDER BY SUM(cl.cost_usd) DESC");
 
     type Row = (i64, String, String, String, Option<i64>, String, String, f64, f64, i64, i64, i64);
-    let mut q = sqlx::query_as::<_, Row>(&sql);
-    q = q.bind(&window_start);
-    if let Some(v) = user_name { q = q.bind(v); }
-    if let Some(v) = project   { q = q.bind(v); }
-    if let Some(v) = key_id    { q = q.bind(v); }
-    if let Some(v) = model     { q = q.bind(v); }
+    let mut args = vec![Arg::Text(window_start)];
+    if let Some(v) = user_name { args.push(Arg::Text(v.to_string())); }
+    if let Some(v) = project   { args.push(Arg::Text(v.to_string())); }
+    if let Some(v) = key_id    { args.push(Arg::Int(v)); }
+    if let Some(v) = model     { args.push(Arg::Text(v.to_string())); }
 
-    let rows = q.fetch_all(pool).await?;
+    let rows: Vec<Row> = pool.fetch_all(&sql, &args).await?;
     Ok(rows
         .into_iter()
         .map(|(uid, uname, mdl, proj, _api_key_id, key_proj, key_lbl, cost, saved, tin, tout, cnt)| {
@@ -187,7 +316,7 @@ pub async fn cost_by_user_window(
 }
 
 pub async fn usage_by_model(
-    pool: &sqlx::SqlitePool,
+    pool: impl Into<ReportPool>,
     since: Option<&str>,
     model: Option<&str>,
     project: Option<&str>,
@@ -208,8 +337,8 @@ pub async fn usage_by_model(
     let base_query = format!(
         r#"SELECT model, provider,
                   COUNT(*) as request_count,
-                  COALESCE(SUM(tokens_in), 0) as tokens_in,
-                  COALESCE(SUM(tokens_out), 0) as tokens_out,
+                  CAST(COALESCE(SUM(tokens_in), 0) AS BIGINT) as tokens_in,
+                  CAST(COALESCE(SUM(tokens_out), 0) AS BIGINT) as tokens_out,
                   COALESCE(SUM(cost_usd), 0.0) as total_cost
            FROM cost_ledger
            WHERE {}
@@ -218,16 +347,16 @@ pub async fn usage_by_model(
         where_clause
     );
 
-    let mut q = sqlx::query_as::<_, (String, String, i64, i64, i64, f64)>(&base_query);
-    q = q.bind(since);
+    let mut args = vec![Arg::Text(since.to_string())];
     if let Some(m) = model {
-        q = q.bind(m);
+        args.push(Arg::Text(m.to_string()));
     }
     if let Some(p) = project {
-        q = q.bind(p);
+        args.push(Arg::Text(p.to_string()));
     }
 
-    let rows = q.fetch_all(pool).await?;
+    let rows: Vec<(String, String, i64, i64, i64, f64)> =
+        pool.into().fetch_all(&base_query, &args).await?;
     Ok(rows
         .into_iter()
         .map(
@@ -246,45 +375,30 @@ pub async fn usage_by_model(
 }
 
 pub async fn recent_prompts(
-    pool: &sqlx::SqlitePool,
+    pool: impl Into<ReportPool>,
     user_name: Option<&str>,
     limit: u32,
     since: Option<&str>,
 ) -> Result<Vec<PromptRow>> {
     let since = since.unwrap_or("1970-01-01T00:00:00Z");
+    let mut sql = String::from(
+        "SELECT p.id, u.name, p.request_model, p.routed_model, \
+                p.cost_usd, p.prompt_tokens, p.completion_tokens, \
+                p.cache_read_tokens, p.cache_write_tokens, p.created_at \
+         FROM prompts p \
+         JOIN users u ON p.user_id = u.id \
+         WHERE p.created_at >= ?",
+    );
+    let mut args = vec![Arg::Text(since.to_string())];
+    if let Some(name) = user_name {
+        sql.push_str(" AND u.name = ?");
+        args.push(Arg::Text(name.to_string()));
+    }
+    sql.push_str(" ORDER BY p.created_at DESC LIMIT ?");
+    args.push(Arg::Int(limit as i64));
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, String, f64, i64, i64, i64, i64, String)> = if let Some(name) = user_name {
-        sqlx::query_as(
-            r#"SELECT p.id, u.name, p.request_model, p.routed_model,
-                      p.cost_usd, p.prompt_tokens, p.completion_tokens,
-                      p.cache_read_tokens, p.cache_write_tokens, p.created_at
-               FROM prompts p
-               JOIN users u ON p.user_id = u.id
-               WHERE u.name = ? AND p.created_at >= ?
-               ORDER BY p.created_at DESC
-               LIMIT ?"#,
-        )
-        .bind(name)
-        .bind(since)
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            r#"SELECT p.id, u.name, p.request_model, p.routed_model,
-                      p.cost_usd, p.prompt_tokens, p.completion_tokens,
-                      p.cache_read_tokens, p.cache_write_tokens, p.created_at
-               FROM prompts p
-               JOIN users u ON p.user_id = u.id
-               WHERE p.created_at >= ?
-               ORDER BY p.created_at DESC
-               LIMIT ?"#,
-        )
-        .bind(since)
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?
-    };
+    let rows: Vec<(i64, String, String, String, f64, i64, i64, i64, i64, String)> =
+        pool.into().fetch_all(&sql, &args).await?;
     Ok(rows
         .into_iter()
         .map(
@@ -308,58 +422,46 @@ pub async fn recent_prompts(
 }
 
 pub async fn recent_audit(
-    pool: &sqlx::SqlitePool,
+    pool: impl Into<ReportPool>,
     actor_name: Option<&str>,
     limit: u32,
 ) -> Result<Vec<AuditRow>> {
+    let mut sql = String::from("SELECT id, actor_name, action, target, created_at FROM audit_log");
+    let mut args = Vec::new();
     if let Some(actor) = actor_name {
-        let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, String)>(
-            "SELECT id, actor_name, action, target, created_at FROM audit_log WHERE actor_name = ? ORDER BY created_at DESC LIMIT ?"
-        )
-        .bind(actor)
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, actor_name, action, target, created_at)| AuditRow {
-                id,
-                actor_name,
-                action,
-                target,
-                created_at,
-            })
-            .collect())
-    } else {
-        let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, String)>(
-            "SELECT id, actor_name, action, target, created_at FROM audit_log ORDER BY created_at DESC LIMIT ?"
-        )
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, actor_name, action, target, created_at)| AuditRow {
-                id,
-                actor_name,
-                action,
-                target,
-                created_at,
-            })
-            .collect())
+        sql.push_str(" WHERE actor_name = ?");
+        args.push(Arg::Text(actor.to_string()));
     }
+    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+    args.push(Arg::Int(limit as i64));
+    let rows: Vec<(i64, String, String, Option<String>, String)> =
+        pool.into().fetch_all(&sql, &args).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, actor_name, action, target, created_at)| AuditRow {
+            id,
+            actor_name,
+            action,
+            target,
+            created_at,
+        })
+        .collect())
 }
 
-pub async fn hook_latency_stats(pool: &sqlx::SqlitePool) -> Result<Vec<HookStats>> {
+pub async fn hook_latency_stats(pool: impl Into<ReportPool>) -> Result<Vec<HookStats>> {
     // Single query: fetch all rows sorted by hook_name, duration_ms
-    // This avoids N+1 queries and lets us group in Rust.
-    let raw: Vec<(String, i64, i64)> = sqlx::query_as(
-        r#"SELECT hook_name, duration_ms, success
-           FROM hook_metrics
-           ORDER BY hook_name, duration_ms"#,
-    )
-    .fetch_all(pool)
-    .await?;
+    // This avoids N+1 queries and lets us group in Rust. `success` is an
+    // integer in SQLite and a BOOLEAN in Postgres; the CASE reads both.
+    let raw: Vec<(String, i64, i64)> = pool
+        .into()
+        .fetch_all(
+            "SELECT hook_name, duration_ms, \
+                    CAST(CASE WHEN success THEN 1 ELSE 0 END AS BIGINT) \
+             FROM hook_metrics \
+             ORDER BY hook_name, duration_ms",
+            &[],
+        )
+        .await?;
 
     // Group durations and aggregate per hook name
     let mut durations_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
@@ -455,7 +557,7 @@ impl UsageReportRow {
 }
 
 pub async fn fetch_usage_rows(
-    pool: &sqlx::SqlitePool,
+    pool: impl Into<ReportPool>,
     scope: &UsageScope,
     window: &UsageWindow,
     granularity: &UsageGranularity,
@@ -463,24 +565,25 @@ pub async fn fetch_usage_rows(
     // Build bucket expression
     let bucket_expr = match window {
         UsageWindow::AllTime => "NULL".to_string(),
-        UsageWindow::Annual => "strftime('%Y', cl.created_at)".to_string(),
-        UsageWindow::Monthly => "strftime('%Y-%m', cl.created_at)".to_string(),
+        // created_at is RFC 3339 text, so the year and month are prefixes.
+        UsageWindow::Annual => "substr(cl.created_at, 1, 4)".to_string(),
+        UsageWindow::Monthly => "substr(cl.created_at, 1, 7)".to_string(),
     };
 
     // Build SELECT fields based on granularity
     let select_fields = match granularity {
         UsageGranularity::Total => format!(
             "{} as bucket, NULL as user_name, NULL as project_col, NULL as model_col, \
-             COALESCE(SUM(cl.tokens_in), 0) as tokens_in, \
-             COALESCE(SUM(cl.tokens_out), 0) as tokens_out, \
+             CAST(COALESCE(SUM(cl.tokens_in), 0) AS BIGINT) as tokens_in, \
+             CAST(COALESCE(SUM(cl.tokens_out), 0) AS BIGINT) as tokens_out, \
              COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd, \
              COALESCE(SUM(cl.saved_usd), 0.0) as saved_usd",
             bucket_expr
         ),
         UsageGranularity::Subtotal => format!(
             "{} as bucket, u.name as user_name, cl.project as project_col, NULL as model_col, \
-             COALESCE(SUM(cl.tokens_in), 0) as tokens_in, \
-             COALESCE(SUM(cl.tokens_out), 0) as tokens_out, \
+             CAST(COALESCE(SUM(cl.tokens_in), 0) AS BIGINT) as tokens_in, \
+             CAST(COALESCE(SUM(cl.tokens_out), 0) AS BIGINT) as tokens_out, \
              COALESCE(SUM(cl.cost_usd), 0.0) as cost_usd, \
              COALESCE(SUM(cl.saved_usd), 0.0) as saved_usd",
             bucket_expr
@@ -571,24 +674,10 @@ pub async fn fetch_usage_rows(
         "SELECT {select_fields} FROM cost_ledger cl {joins} {where_clause} {group_by} {order_by}"
     );
 
-    let mut q = sqlx::query_as::<
-        _,
-        (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-            f64,
-            f64,
-        ),
-    >(&sql);
-    for val in &bind_values {
-        q = q.bind(val);
-    }
-
-    let rows = q.fetch_all(pool).await?;
+    let args: Vec<Arg> = bind_values.into_iter().map(Arg::Text).collect();
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, f64, f64)> =
+        pool.into().fetch_all(&sql, &args).await?;
     Ok(rows
         .into_iter()
         .map(

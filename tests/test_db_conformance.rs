@@ -34,3 +34,5 @@ mod catalog;
 #[path = "db_conformance/integrations.rs"]
 mod integrations;
 
+#[path = "db_conformance/reports.rs"]
+mod reports;

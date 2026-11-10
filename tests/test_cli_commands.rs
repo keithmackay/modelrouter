@@ -29,6 +29,7 @@ fn setup_db() -> (TempDir, PathBuf) {
     let out = std::process::Command::new(BIN)
         .arg("init")
         .env("HOME", init_home.path())
+        .env_remove("MODELROUTER_CONFIG")
         .output()
         .expect("run init");
     assert!(out.status.success(), "init failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -2261,4 +2262,43 @@ fn init_overwrite_prompt_accepts_and_declines() {
     assert!(!rewritten.contains(marker), "accepted init must rewrite the config");
     // Each init mints a fresh signing secret rather than shipping a placeholder.
     assert!(!rewritten.contains("change-me"), "generated secret: {rewritten}");
+}
+
+#[test]
+fn init_writes_to_the_config_flag_path() {
+    let home = tempfile::tempdir().expect("temp home");
+    let target = home.path().join("elsewhere/config.toml");
+    let out = std::process::Command::new(BIN)
+        .arg("--config")
+        .arg(&target)
+        .arg("init")
+        .env("HOME", home.path())
+        .env_remove("MODELROUTER_CONFIG")
+        .output()
+        .expect("run init");
+    assert!(out.status.success(), "init failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(target.exists(), "init did not write {target:?}");
+    assert!(
+        !home.path().join(".modelrouter/config.toml").exists(),
+        "init also wrote the default path"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("modelrouter --config {} migrate", target.display())),
+        "next steps should name the config: {stdout}"
+    );
+}
+
+#[test]
+fn init_honours_modelrouter_config() {
+    let home = tempfile::tempdir().expect("temp home");
+    let target = home.path().join("from-env.toml");
+    let out = std::process::Command::new(BIN)
+        .arg("init")
+        .env("HOME", home.path())
+        .env("MODELROUTER_CONFIG", &target)
+        .output()
+        .expect("run init");
+    assert!(out.status.success(), "init failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(target.exists());
 }

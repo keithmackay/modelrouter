@@ -210,8 +210,8 @@ docker run -d --name modelrouter --restart unless-stopped \
   container is unreachable through the published port.
 - `MODELROUTER_DATABASE__PATH` puts the SQLite file on the `/data` volume; the default
   (`~/.modelrouter/router.db`) lives in the container's filesystem and is lost with it.
-- `/host/config/config.toml` must exist first — generate one with `modelrouter init` on the
-  host (it writes `~/.modelrouter/config.toml`) and copy it over.
+- `/host/config/config.toml` must exist first — generate it with
+  `modelrouter --config /host/config/config.toml init`.
 - `-p 127.0.0.1:8080:8080` keeps the proxy and admin dashboard off the network; drop the
   `127.0.0.1:` to expose them.
 - The release images are distroless (no shell), so run other commands as arguments:
@@ -937,14 +937,11 @@ postgres_url = "postgres://modelrouter:secret@db-host:5432/modelrouter"
 
 or `MODELROUTER_DATABASE__POSTGRES_URL=postgres://…` (an empty value switches it back
 off). `serve`, `migrate`, and the `user`, `admin`, `key`, `budget`, `group`, `model`,
-`alias`, `provider`, `webhook` and `experiment` commands all use it, and each one applies
+`alias`, `provider`, `webhook`, `experiment`, `report` and `audit` commands all use it, and each one applies
 the Postgres migrations (`migrations/postgres/`) before running. A binary built without
 the feature refuses to start when `postgres_url` is set, rather than quietly using SQLite.
 
-Not on Postgres yet: the CLI reports that query SQLite directly (`report cost` without
-`--tag`/`--correlation-id`, `report usage`, `report prompts`, `report audit`,
-`report hooks`, `audit`) exit with an error naming the command, and the dashboard's hook
-latency panel is empty. The dashboard's own cost, usage and audit pages work. A dedicated
+Every CLI command, report and dashboard page works on either backend. A dedicated
 prompt-log file (`storage.prompt_db_path`) is always SQLite.
 
 **Docker Compose.** `docker-compose.postgres.yml` is an overlay that adds a `postgres:17`
@@ -1527,7 +1524,7 @@ modelrouter report cost --group team-alpha --project myapp --window alltime --fo
 
 ### API
 
-All `/v1/*` endpoints accept `Authorization: Bearer <api-key>`.
+All `/v1/*` endpoints except `GET /v1/models` require `Authorization: Bearer <api-key>`.
 
 ```bash
 # List available models
