@@ -41,6 +41,14 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Apply the Postgres schema (`migrations/postgres`). The Postgres history has
+/// no inert-checksum edits to heal.
+#[cfg(feature = "postgres")]
+pub async fn run_postgres_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::migrate!("./migrations/postgres").run(pool).await?;
+    Ok(())
+}
+
 /// Re-stamp migrations whose file was edited without changing its SQL, so a
 /// database migrated before such an edit still starts.
 ///

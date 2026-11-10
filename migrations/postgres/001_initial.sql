@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS budget_rules (
     id           BIGSERIAL PRIMARY KEY,
     user_id      BIGINT REFERENCES users(id) ON DELETE CASCADE,
     group_name   TEXT,
-    window       TEXT NOT NULL,
+    "window"     TEXT NOT NULL,
     limit_usd    DOUBLE PRECISION,
     limit_tokens BIGINT,
     model_allow  TEXT NOT NULL DEFAULT '[]',

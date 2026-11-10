@@ -24,3 +24,6 @@ coverage/
 *.bak
 # Locally built binaries (Dockerfile.local copies bin/modelrouter after a local build)
 /bin/
+
+# docker compose secrets (Postgres password, etc.)
+/.env
