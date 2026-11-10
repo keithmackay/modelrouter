@@ -50,9 +50,10 @@ impl OutcomeRepository for PostgresDb {
     }
 
     async fn for_experiment(&self, experiment_id: i64) -> anyhow::Result<Vec<RunOutcome>> {
+        // Byte order, as SQLite sorts, not the database locale's.
         let rows = sqlx::query_as::<_, RunOutcome>(&format!(
             "SELECT {SELECT_COLS} FROM run_outcomes WHERE experiment_id = $1 \
-             ORDER BY user_id, attribution_correlation_id"
+             ORDER BY user_id, attribution_correlation_id COLLATE \"C\""
         ))
         .bind(experiment_id)
         .fetch_all(&self.pool)

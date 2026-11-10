@@ -173,7 +173,7 @@ Or in the admin dashboard under **Keys → Session Window (secs)**. The value is
 ### Prerequisites
 
 - At least one upstream provider API key (OpenAI, Anthropic, Gemini, or a local Ollama instance)
-- Rust 1.75+ if building from source
+- Rust 1.94.1+ if building from source (the AWS SDK crates set that floor)
 - Optional: PostgreSQL 14+ if using `--features postgres`
 
 ### Installation
@@ -197,13 +197,28 @@ Pick the image that matches the features you need:
 
 ```bash
 docker pull ghcr.io/keithmackay/modelrouter:latest
-docker run \
-  -v /host/config:/config \
+docker run -d --name modelrouter --restart unless-stopped \
+  -v /host/config:/config:ro \
   -v /host/data:/data \
   -e MODELROUTER_CONFIG=/config/config.toml \
-  -p 8080:8080 \
-  ghcr.io/keithmackay/modelrouter:latest serve
+  -e MODELROUTER_DATABASE__PATH=/data/router.db \
+  -p 127.0.0.1:8080:8080 \
+  ghcr.io/keithmackay/modelrouter:latest serve --host 0.0.0.0
 ```
+
+- `--host 0.0.0.0` is required: `[server] host` defaults to `127.0.0.1`, which inside a
+  container is unreachable through the published port.
+- `MODELROUTER_DATABASE__PATH` puts the SQLite file on the `/data` volume; the default
+  (`~/.modelrouter/router.db`) lives in the container's filesystem and is lost with it.
+- `/host/config/config.toml` must exist first — generate one with `modelrouter init` on the
+  host (it writes `~/.modelrouter/config.toml`) and copy it over.
+- `-p 127.0.0.1:8080:8080` keeps the proxy and admin dashboard off the network; drop the
+  `127.0.0.1:` to expose them.
+- The release images are distroless (no shell), so run other commands as arguments:
+  `docker exec -it modelrouter /modelrouter admin create --name ops --role superadmin`.
+
+For Postgres and the OpenTelemetry stack under Docker Compose, see
+[Running on PostgreSQL](#running-on-postgresql).
 
 **Build from source:**
 
@@ -576,6 +591,7 @@ Configuration lives at `~/.modelrouter/config.toml` by default, or at the path i
 | `server.port` | Listen port (`--port` overrides for one run) | `8080` |
 | `server.request_body_limit_mb` | Largest request body accepted; larger returns 413 | `10` |
 | `database.path` | SQLite file path | `~/.modelrouter/router.db` |
+| `database.postgres_url` | Use PostgreSQL instead of SQLite (requires `--features postgres`; see [Running on PostgreSQL](#running-on-postgresql)) | unset |
 | `routing.default_provider` | Fallback provider when model prefix is absent | `openai` |
 | `routing.model_aliases` | Map short names to canonical model IDs | — |
 | `providers.<name>.api_key` | Upstream provider API key | required |
@@ -908,6 +924,52 @@ Capture wraps each handler as a whole rather than sitting at individual error
 returns, so an error path added later cannot silently escape being recorded. No
 prompt or response bodies are stored — a failure record must never become a
 second, unlogged copy of content that `X-No-Log: true` was used to suppress.
+
+### Running on PostgreSQL
+
+SQLite is the default. To use PostgreSQL 14+, build with `--features postgres` and set
+the connection URL:
+
+```toml
+[database]
+postgres_url = "postgres://modelrouter:secret@db-host:5432/modelrouter"
+```
+
+or `MODELROUTER_DATABASE__POSTGRES_URL=postgres://…` (an empty value switches it back
+off). `serve`, `migrate`, and the `user`, `admin`, `key`, `budget`, `group`, `model`,
+`alias`, `provider`, `webhook` and `experiment` commands all use it, and each one applies
+the Postgres migrations (`migrations/postgres/`) before running. A binary built without
+the feature refuses to start when `postgres_url` is set, rather than quietly using SQLite.
+
+Not on Postgres yet: the CLI reports that query SQLite directly (`report cost` without
+`--tag`/`--correlation-id`, `report usage`, `report prompts`, `report audit`,
+`report hooks`, `audit`) exit with an error naming the command, and the dashboard's hook
+latency panel is empty. The dashboard's own cost, usage and audit pages work. A dedicated
+prompt-log file (`storage.prompt_db_path`) is always SQLite.
+
+**Docker Compose.** `docker-compose.postgres.yml` is an overlay that adds a `postgres:17`
+service (data in the `pgdata` volume, published on `127.0.0.1:5438`) and builds
+modelrouter with `FEATURES="otel,postgres"`. With the OTel stack:
+
+```bash
+echo "MODELROUTER_PG_PASSWORD=$(openssl rand -hex 24)" > .env    # gitignored
+docker compose -p modelrouter -f docker-compose.otel.yml -f docker-compose.postgres.yml up -d --build
+docker compose -p modelrouter -f docker-compose.otel.yml -f docker-compose.postgres.yml \
+  exec -it modelrouter /modelrouter admin create --name ops --role superadmin
+```
+
+Every service has `restart: unless-stopped`, so the stack comes back after a reboot as
+long as Docker itself starts at login (Docker Desktop: *Settings → General → Start Docker
+Desktop when you sign in*).
+
+**Testing against Postgres.** `tests/test_db_conformance.rs` runs every repository
+scenario against SQLite and, when `MODELROUTER_TEST_POSTGRES_URL` is set, against a fresh
+Postgres schema per test:
+
+```bash
+MODELROUTER_TEST_POSTGRES_URL=postgres://modelrouter:$MODELROUTER_PG_PASSWORD@127.0.0.1:5438/modelrouter_test \
+  cargo test --features postgres --test test_db_conformance
+```
 
 ### Prompt-log storage
 

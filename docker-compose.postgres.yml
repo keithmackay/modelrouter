@@ -1,0 +1,48 @@
+# docker-compose.postgres.yml — run modelrouter on PostgreSQL instead of SQLite
+#
+# An overlay: combine it with a base compose file, e.g. the OTel stack:
+#
+#   echo "MODELROUTER_PG_PASSWORD=$(openssl rand -hex 24)" > .env
+#   docker compose -f docker-compose.otel.yml -f docker-compose.postgres.yml up -d --build
+#
+# The modelrouter image must be built with the `postgres` feature; this overlay
+# rebuilds it from the full Dockerfile with FEATURES="otel,postgres".
+# Postgres data lives in the named volume `pgdata`, so it survives
+# `docker compose down` (but not `down -v`).
+#
+# Postgres is published on 127.0.0.1:5438 for psql and the live-Postgres tests:
+#   psql postgres://modelrouter:$MODELROUTER_PG_PASSWORD@127.0.0.1:5438/modelrouter
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: modelrouter
+      POSTGRES_PASSWORD: ${MODELROUTER_PG_PASSWORD:?set MODELROUTER_PG_PASSWORD in .env}
+      POSTGRES_DB: modelrouter
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5438:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modelrouter -d modelrouter"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  modelrouter:
+    image: modelrouter:otel-postgres
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FEATURES: "otel,postgres"
+    environment:
+      MODELROUTER_DATABASE__POSTGRES_URL: postgres://modelrouter:${MODELROUTER_PG_PASSWORD}@postgres:5432/modelrouter
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

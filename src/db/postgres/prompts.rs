@@ -250,12 +250,13 @@ impl PromptRepository for PostgresDb {
         &self,
         experiment_id: i64,
     ) -> anyhow::Result<Vec<ExperimentRunLatency>> {
+        // Byte order, as SQLite sorts, not the database locale's.
         let sql = format!(
             "SELECT user_id, attribution_correlation_id, COUNT(*), AVG(latency_ms)::float8 \
              FROM prompts \
              WHERE experiment_id = $1 AND attribution_correlation_id IS NOT NULL AND {} \
              GROUP BY user_id, attribution_correlation_id \
-             ORDER BY user_id ASC, attribution_correlation_id ASC",
+             ORDER BY user_id ASC, attribution_correlation_id COLLATE \"C\" ASC",
             LATENCY_SAMPLE
         );
         let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(&sql)
