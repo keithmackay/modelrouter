@@ -21,7 +21,7 @@ async fn postgres_migrations_are_idempotent() {
 
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.unwrap();
 
     let opts = PgConnectOptions::from_str(&url)
         .unwrap()
@@ -31,7 +31,7 @@ async fn postgres_migrations_are_idempotent() {
     modelrouter::db::migrations::run_postgres_migrations(&pool).await.unwrap();
     pool.close().await;
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
 }
 
 /// Every SQLite table and column exists in the Postgres schema too, and vice
@@ -59,7 +59,7 @@ async fn postgres_schema_matches_sqlite() {
     let mut sqlite_cols = BTreeSet::new();
     for (table,) in tables {
         let cols: Vec<(String,)> =
-            sqlx::query_as(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT name FROM pragma_table_info('{table}')")))
                 .fetch_all(&lite.pool)
                 .await
                 .unwrap();
@@ -70,7 +70,7 @@ async fn postgres_schema_matches_sqlite() {
 
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&admin).await.unwrap();
     let opts = PgConnectOptions::from_str(&url)
         .unwrap()
         .options([("search_path", schema.as_str())]);
@@ -85,7 +85,7 @@ async fn postgres_schema_matches_sqlite() {
     .await
     .unwrap();
     pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
     // hook_metrics has no declared key in SQLite (it uses the implicit rowid);
     // Postgres needs an explicit one.
     let pg_cols: BTreeSet<String> = rows

@@ -139,7 +139,7 @@ async fn sqlite_store_moves_to_postgres_and_keys_keep_working() {
     // A database of our own, so the non-empty check is meaningful.
     let admin = sqlx::PgPool::connect(&pg_url()).await.expect("admin connect");
     let db_name = unique("mr_import").replace('-', "_");
-    sqlx::query(&format!("CREATE DATABASE {db_name}")).execute(&admin).await.expect("create database");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&admin).await.expect("create database");
     let target_url = {
         let url = pg_url();
         let cut = url.rfind('/').expect("database in url");
@@ -192,6 +192,6 @@ async fn sqlite_store_moves_to_postgres_and_keys_keep_working() {
 
     drop(pg);
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {db_name} WITH (FORCE)")).execute(&admin).await.expect("drop database");
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {db_name} WITH (FORCE)"))).execute(&admin).await.expect("drop database");
     let _ = std::fs::remove_file(&dump);
 }

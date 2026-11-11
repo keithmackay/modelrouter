@@ -87,7 +87,7 @@ impl Drop for PgSchema {
                 .unwrap();
             rt.block_on(async {
                 if let Ok(pool) = sqlx::PgPool::connect(&url).await {
-                    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {name} CASCADE"))
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA IF EXISTS {name} CASCADE")))
                         .execute(&pool)
                         .await;
                 }
@@ -106,7 +106,7 @@ async fn postgres() -> Option<Backend> {
     let name = format!("t_{}", uuid::Uuid::new_v4().simple());
 
     let admin = sqlx::PgPool::connect(&url).await.expect("connect to test postgres");
-    sqlx::query(&format!("CREATE SCHEMA {name}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
         .execute(&admin)
         .await
         .expect("create test schema");
