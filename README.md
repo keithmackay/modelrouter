@@ -1027,6 +1027,27 @@ modelrouter runs as. That makes it a host deployment (`modelrouter serve` or
 `install-service`): the Docker images contain no CLIs or logins, and Claude
 Code's macOS login lives in the keychain.
 
+A host deployment can still keep Postgres and the OpenTelemetry stack in Docker:
+
+```bash
+# Supporting services only — leave the modelrouter container out.
+docker compose -p modelrouter -f docker-compose.otel.yml -f docker-compose.postgres.yml \
+  up -d postgres otel-collector phoenix prometheus
+
+cargo install --path . --features otel,postgres --locked   # → ~/.cargo/bin/modelrouter
+modelrouter init        # then set in ~/.modelrouter/config.toml:
+#   [database]  postgres_url = "postgres://modelrouter:<password>@127.0.0.1:5438/modelrouter"
+#   [telemetry] enabled = true, endpoint = "http://localhost:4317"
+#   [subscription] enabled = true
+modelrouter install-service   # launchd agent: starts at login, restarts on exit
+```
+
+`install-service` writes `~/Library/LaunchAgents/dev.modelrouter.plist` with this
+binary's path, the config `--config`/`MODELROUTER_CONFIG` selects, and the
+installing shell's `PATH` (so the agent finds the CLIs); it logs to
+`modelrouter.log` beside the config. Until Docker has Postgres up after a reboot,
+the agent exits and launchd retries it every ten seconds.
+
 ### Prompt-log storage
 
 The `[storage]` section controls what the prompt log records. Defaults are

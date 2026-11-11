@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for `modelrouter install-service`, which fills in the placeholders:
+  launchd expands no variables, so every path must be absolute.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -8,26 +12,36 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/modelrouter</string>
+        <string>{{BINARY}}</string>
         <string>serve</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>MODELROUTER_CONFIG</key>
-        <string>${HOME}/.modelrouter/config.toml</string>
+        <string>{{CONFIG}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <!-- launchd's default PATH has no Homebrew or user bin directories;
+             subscription mode needs to find the vendor CLIs. -->
+        <key>PATH</key>
+        <string>{{PATH}}</string>
     </dict>
 
     <key>RunAtLoad</key>
     <true/>
 
     <key>StandardOutPath</key>
-    <string>${HOME}/.modelrouter/modelrouter.log</string>
+    <string>{{LOG}}</string>
 
     <key>StandardErrorPath</key>
-    <string>${HOME}/.modelrouter/modelrouter.log</string>
+    <string>{{LOG}}</string>
 
     <key>KeepAlive</key>
     <true/>
+
+    <!-- A start before its database is reachable exits; retry every 10s. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
 </dict>
 </plist>
