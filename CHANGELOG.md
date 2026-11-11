@@ -21,6 +21,33 @@ commit; `git log v0.1.0..` has the detail.
 - The Postgres implementation had never run against a database. Fixed: the migration chain (a reserved-word column, six missing columns, 32-bit integer columns read as 64-bit, a `TIMESTAMPTZ` column written as text), unquoted `window` in every budget query, `NUMERIC` token sums, a `NULL` `prompt_id` failing every cost insert, two cost-archival methods that were stubs, NULL and collation ordering differences, and errors reported as "not found". `tests/test_db_conformance.rs` now runs every repository method against both backends, plus a table-and-column parity check.
 - The README's `docker run` example was unreachable (the server bound `127.0.0.1` inside the container) and kept the database outside the `/data` volume.
 - The Docker build image moves to Rust 1.94 (`rust-version` 1.94.1), the minimum the locked AWS SDK crates accept.
+### Week of 2026-11-02
+
+**Features**
+- `[providers.foundry] discover_deployments = true` (with `account_resource_id`): the configured `deployments` are a seed, and every other deployment the account's management-plane listing reports as `Succeeded` joins the catalog, classified from its capability map or name (`chat`, `embedding`, `rerank`, `image`, `audio`, `other`). Catalog entries now carry `source` (`configured` or `discovered`) where the provider can tell, and `kind` gains those values beside `chat` and `decision`. Default `false`: the catalog is exactly the configured list, as before.
+- `[retention]` bounds the per-request tables the prompt log does not cover: `cost_ledger_days`, `request_failures_days`, `hook_metrics_days` and `audit_log_days`, each `0` (the default) keeping that table forever, purged on the hourly retention tick. The usage-row cutoff never enters the current calendar month and never passes a `total` budget rule's `window_start`; a `total` rule with no start holds the whole ledger and is named in the log, so a retention cannot make a budget under-count. After each tick the free pages are returned to the file system where the SQLite file is in incremental auto-vacuum mode; new files are created in that mode, and `modelrouter db vacuum` converts and compacts an existing one (a full `VACUUM`, for a quiet window). Postgres runs the same purges and leaves space to autovacuum.
+
+**Fixes**
+- The prompt-log purge (`prompt_retention_days`) failed on the first prompt that had a usage row: `cost_ledger.prompt_id` references `prompts(id)` with no `ON DELETE` and foreign keys are enforced, so the DELETE hit a constraint and the log was never pruned. The purge now detaches the usage rows (their `prompt_id` becomes `NULL`, the row stays) and deletes the prompts in one transaction; the exception list for retaining experiments is unchanged.
+
+### Week of 2026-10-12
+
+**Features**
+- `[storage] locked = true` (config file only) pins the prompt-log policy to `config.toml`: the dashboard's storage form is read-only and refuses a save, a policy saved there earlier is ignored at start-up (with a warning), and while `store_prompt_content = false` no request stores content, so creating an experiment with `retain_content: true` is refused and an existing retaining experiment's requests are stored as metadata only. Default `false`, so nothing changes unless it is set.
+
+**Fixes**
+- Vertex streaming no longer waits out the request timeout when the upstream accepts a streamed request and sends no byte. If neither the response headers nor a first body chunk arrive within `stream_first_byte_timeout_secs` (per provider, default 300, `0` = off), the stream is abandoned and the same request is answered by the non-streamed call, sent to the caller as an ordinary SSE stream with its usage and `[DONE]`. Only the opening is bounded: a stream that has started runs under the request timeout as before, and nothing reaches the caller before the decision, so an answer is never duplicated.
+
+### Week of 2026-10-05
+
+**Features**
+- Claude on Azure AI Foundry: `[providers.foundry] anthropic_deployments = [...]` sends those deployments to Foundry's Anthropic Messages surface (`{resource}/anthropic/v1/messages`, `anthropic-version: 2023-06-01`) with the provider's credential (Entra bearer token for `https://ai.azure.com/.default` unless `entra_scope` is set, or `x-api-key`). Requests get the direct Anthropic translation: tools, thinking and effort, prompt caching, and streamed events translated to OpenAI chunks. Capability rules and pricing key on the deployment name, so name deployments after their model ids. Other deployments stay on the OpenAI-shaped surface.
+- `[gateway.bootstrap]` (env `MODELROUTER_GATEWAY__BOOTSTRAP__USER` and `..._KEY` or `..._KEY_HASH`) creates a user and an API key at start-up if absent, so a fresh install serves a client whose key was provisioned outside the router with no manual `user create`. Idempotent: a disabled key stays disabled, rotation adds the new key without revoking the old one, and a key already held by another user refuses to start. The raw key is redacted from `Debug` and never serialized or logged.
+- `[logging] format = "json"` (env `MODELROUTER_LOGGING__FORMAT=json`) writes every log line as one JSON object, with the event's fields flattened beside `timestamp`, `level` and `target`, so log collectors can query by field. The default stays `text`. Applies with and without the `otel` feature.
+- `cache.require_opt_in` (default `false`): when `true`, only requests that send `x-modelrouter-cache: use` (or `refresh`) are cached; a request without the header is neither looked up nor stored, whatever its default eligibility. The stats API and `cache stats` report `require_opt_in` and `skipped_without_opt_in`. Combining it with `allow_header_opt_in = false` is refused at start-up.
+
+**Fixes**
+- A non-streamed `/v1/chat/completions` or `/v1/search` response the cache was not involved in no longer carries `x-modelrouter-cache: MISS`; it carries no cache header, as streamed and `/v1/messages` responses already did. `MISS` now always means the cache was consulted and held no entry.
 
 ### Week of 2026-09-28
 

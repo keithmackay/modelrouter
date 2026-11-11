@@ -62,6 +62,50 @@ pub(crate) fn ensure_tools_supported(
     }
 }
 
+/// The `response_format` to put on the provider request: the caller's object
+/// when it names a mode the OpenAI wire shape defines (`json_object`, or
+/// `json_schema` with a `json_schema.schema` object), `None` when absent or
+/// null. Anything else was rejected at the door by
+/// [`ensure_response_format_valid`].
+pub(crate) fn forwarded_response_format(body: &Value) -> Option<Value> {
+    body.get("response_format")
+        .filter(|rf| !rf.is_null())
+        .filter(|rf| response_format_problem(rf).is_none())
+        .cloned()
+}
+
+/// Why a `response_format` is not one the router forwards, or `None` when it is.
+fn response_format_problem(rf: &Value) -> Option<String> {
+    let Some(kind) = rf.get("type").and_then(Value::as_str) else {
+        return Some("`response_format.type` must be \"json_object\" or \"json_schema\"".to_string());
+    };
+    match kind {
+        "json_object" => None,
+        "json_schema" => {
+            if rf["json_schema"]["schema"].is_object() {
+                None
+            } else {
+                Some("`response_format.json_schema.schema` must be a JSON Schema object".to_string())
+            }
+        }
+        other => Some(format!("`response_format.type` '{other}' is not supported; use \"json_object\" or \"json_schema\"")),
+    }
+}
+
+/// A malformed `response_format` is a 400 at the door, like a `tool_choice`
+/// without tools: forwarding it would fail at the provider with a less clear
+/// message, and dropping it silently would hand back prose where the caller
+/// asked for JSON.
+pub(crate) fn ensure_response_format_valid(body: &Value) -> Result<(), ApiError> {
+    match body.get("response_format").filter(|rf| !rf.is_null()) {
+        None => Ok(()),
+        Some(rf) => match response_format_problem(rf) {
+            None => Ok(()),
+            Some(problem) => Err(ApiError::InvalidRequest(problem)),
+        },
+    }
+}
+
 /// The `tools`/`tool_choice` pair to put on the provider request. Tools ride
 /// along only as a pair: a `tool_choice` without tools was rejected at the
 /// door, and forwarding one alone would be invalid at the provider.
@@ -162,5 +206,46 @@ mod tests {
         let m = assistant_message(&plain);
         assert_eq!(m["content"], "hi");
         assert!(m.get("tool_calls").is_none());
+    }
+}
+
+#[cfg(test)]
+mod response_format_tests {
+    use super::{ensure_response_format_valid, forwarded_response_format};
+    use serde_json::json;
+
+    #[test]
+    fn json_object_and_a_schema_pass_through_as_sent() {
+        let body = json!({"response_format": {"type": "json_object"}});
+        assert_eq!(forwarded_response_format(&body), Some(json!({"type": "json_object"})));
+        assert!(ensure_response_format_valid(&body).is_ok());
+
+        let schema = json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}, "strict": false}});
+        let body = json!({"response_format": schema});
+        assert_eq!(forwarded_response_format(&body), Some(schema));
+        assert!(ensure_response_format_valid(&body).is_ok());
+    }
+
+    #[test]
+    fn absent_or_null_is_none_and_valid() {
+        for body in [json!({"messages": []}), json!({"response_format": null})] {
+            assert_eq!(forwarded_response_format(&body), None);
+            assert!(ensure_response_format_valid(&body).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_is_refused_at_the_door_with_the_reason() {
+        let cases = [
+            (json!({"response_format": "json"}), "`response_format.type` must be"),
+            (json!({"response_format": {"type": "text"}}), "'text' is not supported"),
+            (json!({"response_format": {"type": "json_schema"}}), "json_schema.schema` must be a JSON Schema object"),
+            (json!({"response_format": {"type": "json_schema", "json_schema": {"schema": "not an object"}}}), "must be a JSON Schema object"),
+        ];
+        for (body, expected) in cases {
+            let err = ensure_response_format_valid(&body).expect_err("refused");
+            assert!(format!("{err:?}").contains(expected), "{body}: {err:?}");
+            assert_eq!(forwarded_response_format(&body), None);
+        }
     }
 }

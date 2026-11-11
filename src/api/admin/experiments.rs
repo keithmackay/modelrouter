@@ -97,7 +97,7 @@ fn require_bool(body: &Value, field: &str) -> Result<bool, String> {
 
 /// `expires_at`: an RFC3339 timestamp in the future, or the number `0` for
 /// never. Any other number is refused rather than guessed at as an epoch.
-fn parse_expires_at(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
+pub(crate) fn parse_expires_at(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
     match require(body, "expires_at")? {
         Value::Number(n) if n.as_i64() == Some(0) => Ok(0),
         Value::Number(_) => Err("expires_at must be an RFC3339 timestamp or 0 (never)".to_string()),
@@ -254,6 +254,28 @@ pub struct GateSources<'a> {
     /// Whether a provider name is configured.
     pub has_provider: Box<dyn Fn(&str) -> bool + 'a>,
     pub cost_calc: &'a CostCalculator,
+    /// A provider's `decision_deployments` (trimmed, empties dropped), empty
+    /// for a provider that serves no decisions. Lets the gate resolve a bare
+    /// decision deployment the way `POST /v1/decisions` does and refuse a
+    /// decision variant pinned to a deployment that cannot answer one.
+    pub decision_deployments: Box<dyn Fn(&str) -> Vec<String> + 'a>,
+}
+
+/// The trimmed `decision_deployments` of `provider`, from the provider table.
+pub fn decision_deployments_of(
+    providers: &std::collections::HashMap<String, crate::config::schema::ProviderConfig>,
+    provider: &str,
+) -> Vec<String> {
+    providers
+        .get(provider)
+        .map(|c| {
+            c.decision_deployments
+                .iter()
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl<'a> GateSources<'a> {
@@ -263,27 +285,90 @@ impl<'a> GateSources<'a> {
             load_balancer: &state.load_balancer,
             has_provider: Box::new(move |name| state.provider_registry.get(name).is_ok()),
             cost_calc: &state.cost_calc,
+            decision_deployments: Box::new(move |p| decision_deployments_of(&state.settings.providers, p)),
         }
     }
 }
 
 /// Resolve and pin one overlay target, refusing anything whose cost could
 /// not be accounted for. The error names the variant, key and target and
-/// says which check failed.
+/// says which check failed. A key that is a decision model (it resolves to,
+/// or is, one of a provider's `decision_deployments`) may only be pinned to
+/// a decision-capable deployment: a decision sent to a chat deployment is
+/// refused by the provider at call time, so it is refused here instead.
 fn gate_target(gate: &GateSources<'_>, label: &str, key: &str, expr: &str) -> Result<VariantTarget, String> {
     let at = format!("variants: variant '{label}' key '{key}' target '{expr}'");
+    let target = pin_target(gate, &at, expr)?;
+    if is_decision_model(gate, key) {
+        let allowed = (gate.decision_deployments)(&target.provider);
+        if !allowed.iter().any(|d| d == &target.model) {
+            return Err(format!(
+                "{at}: '{key}' is a decision model, and the target resolves to '{}/{}', which is not one of \
+                 {}'s decision_deployments ({}); a decision variant must pin a decision-capable deployment",
+                target.provider,
+                target.model,
+                target.provider,
+                if allowed.is_empty() { "none configured".to_string() } else { allowed.join(", ") }
+            ));
+        }
+    }
+    Ok(target)
+}
 
+/// Whether `name` is a decision model: a bare `decision_deployments` entry, or
+/// an alias / `provider/deployment` that resolves to one.
+fn is_decision_model(gate: &GateSources<'_>, name: &str) -> bool {
+    let res = gate.router.resolve_detailed(name);
+    if res.substituted {
+        return bare_decision_provider(gate, name).is_some();
+    }
+    (gate.decision_deployments)(&res.provider).iter().any(|d| d == &res.model)
+}
+
+/// The provider whose `decision_deployments` lists the bare `name`, tried in
+/// [`DECISION_PROVIDERS`] order: the decisions route's own resolution of a
+/// bare name, through the gate's lookup so the CLI and the API agree.
+fn bare_decision_provider(gate: &GateSources<'_>, name: &str) -> Option<String> {
+    let wanted = name.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    DECISION_PROVIDERS
+        .iter()
+        .find(|p| (gate.has_provider)(p) && (gate.decision_deployments)(p).iter().any(|d| d == wanted))
+        .map(|p| p.to_string())
+}
+
+/// Providers with a decisions surface, in the order a bare name is tried.
+const DECISION_PROVIDERS: &[&str] = &["foundry"];
+
+/// Resolve and pin one target expression, refusing a pool, a substitution,
+/// an unconfigured provider and an unpriced model. `at` names the target in
+/// the refusal. Shared by experiment variants and scoped alias overrides,
+/// which pin targets the same way.
+pub(crate) fn pin_target(gate: &GateSources<'_>, at: &str, expr: &str) -> Result<VariantTarget, String> {
     if gate.load_balancer.is_pool(expr) {
         return Err(format!(
-            "{at} is a load balancer pool; an experiment must pin one provider/model"
+            "{at} is a load balancer pool; a pinned target must be one provider/model"
         ));
     }
 
-    let res = gate.router.resolve_detailed(expr);
+    let mut res = gate.router.resolve_detailed(expr);
     if res.substituted {
-        return Err(format!(
-            "{at} is not an alias or provider/model and would be substituted with the default model"
-        ));
+        // A bare decision deployment resolves the way POST /v1/decisions
+        // resolves it: through the provider that lists it, never substituted.
+        match bare_decision_provider(gate, expr) {
+            Some(provider) => {
+                res.provider = provider;
+                res.model = expr.trim().to_string();
+                res.substituted = false;
+            }
+            None => {
+                return Err(format!(
+                    "{at} is not an alias or provider/model and would be substituted with the default model"
+                ));
+            }
+        }
     }
     if !(gate.has_provider)(&res.provider) {
         return Err(format!("{at} resolves to unconfigured provider '{}'", res.provider));
@@ -387,6 +472,22 @@ impl From<WriteError> for DashboardError {
 /// Validate, gate, store, refresh and audit one experiment. Shared by the
 /// JSON endpoint and the dashboard form so both apply exactly the same rules;
 /// `actor` is whichever session performed the write.
+/// A locked storage policy that keeps no content refuses an experiment that
+/// would retain content: the experiment would switch content storage on.
+pub fn refuse_content_retention_when_locked(
+    storage: &crate::config::schema::StorageConfig,
+    retain_content: bool,
+) -> Result<(), String> {
+    if retain_content && !storage.allows_forced_content() {
+        return Err(
+            "retain_content: true is refused: [storage] is locked with store_prompt_content = false, \
+             so no request may store content"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub async fn create_experiment(
     state: &AppState,
     actor: &AdminClaims,
@@ -394,6 +495,7 @@ pub async fn create_experiment(
 ) -> Result<Experiment, WriteError> {
     let now = chrono::Utc::now();
     let parsed = parse_create(body, now).map_err(WriteError::Invalid)?;
+    refuse_content_retention_when_locked(&state.storage.load(), parsed.retain_content).map_err(WriteError::Invalid)?;
 
     for id in &parsed.allowed_user_ids {
         let known = UserRepository::find_by_id(&*state.db, *id)
@@ -2031,6 +2133,68 @@ mod tests {
             let err = parse_create(&b, now()).unwrap_err();
             assert!(err.starts_with(field), "{field}: {err}");
         }
+    }
+
+    fn decision_gate_fixture() -> (
+        RequestRouter,
+        LoadBalancer,
+        CostCalculator,
+        std::collections::HashMap<String, crate::config::schema::ProviderConfig>,
+    ) {
+        use crate::config::schema::{PricingEntry, ProviderConfig, Settings};
+        let mut settings = Settings::default();
+        settings.routing.default_model = "openai/gpt-4o-mini".to_string();
+        settings.routing.model_aliases.insert("decide".to_string(), "foundry/decision-a".to_string());
+        settings.routing.model_aliases.insert("fast".to_string(), "openai/gpt-4o-mini".to_string());
+        let router = RequestRouter::new(Arc::new(settings));
+        let load_balancer = LoadBalancer::new(std::collections::HashMap::new());
+        let price = |model: &str| PricingEntry {
+            model: model.to_string(),
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            ..Default::default()
+        };
+        let cost_calc = CostCalculator::new_with_config(&[
+            price("decision-a"),
+            price("decision-b"),
+            price("chat-x"),
+            price("gpt-4o-mini"),
+        ]);
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "foundry".to_string(),
+            ProviderConfig { decision_deployments: vec!["decision-a".into(), "decision-b".into()], ..Default::default() },
+        );
+        providers.insert("openai".to_string(), ProviderConfig::default());
+        (router, load_balancer, cost_calc, providers)
+    }
+
+    #[test]
+    fn a_decision_key_pins_only_a_decision_capable_deployment_and_a_bare_one_resolves() {
+        let (router, lb, cost_calc, providers) = decision_gate_fixture();
+        let gate = GateSources {
+            router: &router,
+            load_balancer: &lb,
+            has_provider: Box::new(|p| providers.contains_key(p)),
+            cost_calc: &cost_calc,
+            decision_deployments: Box::new(|p| decision_deployments_of(&providers, p)),
+        };
+        // Prefixed and bare decision targets both pin to the deployment named.
+        let t = gate_target(&gate, "candidate", "decide", "foundry/decision-b").unwrap();
+        assert_eq!((t.provider.as_str(), t.model.as_str()), ("foundry", "decision-b"));
+        let t = gate_target(&gate, "candidate", "decide", "decision-b").unwrap();
+        assert_eq!((t.provider.as_str(), t.model.as_str()), ("foundry", "decision-b"));
+        // A bare decision deployment as the KEY is a decision model too.
+        assert!(is_decision_model(&gate, "decision-a"));
+        // A chat deployment cannot answer a decision variant.
+        let err = gate_target(&gate, "candidate", "decide", "foundry/chat-x").unwrap_err();
+        assert!(err.contains("'decide' is a decision model"), "{err}");
+        assert!(err.contains("decision-a, decision-b"), "{err}");
+        // Chat keys are untouched by the rule, and an unresolvable target is still refused.
+        let t = gate_target(&gate, "candidate", "fast", "openai/gpt-4o-mini").unwrap();
+        assert_eq!(t.model, "gpt-4o-mini");
+        let err = gate_target(&gate, "candidate", "fast", "nope").unwrap_err();
+        assert!(err.contains("substituted"), "{err}");
     }
 
     #[test]

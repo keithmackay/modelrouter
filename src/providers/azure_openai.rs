@@ -112,6 +112,10 @@ impl AzureOpenAIAdapter {
         if let Some(tc) = &req.tool_choice {
             body["tool_choice"] = tc.clone();
         }
+        // Same wire shape: a structured-output request passes through verbatim.
+        if let Some(rf) = &req.response_format {
+            body["response_format"] = rf.clone();
+        }
 
         body
     }
@@ -253,8 +257,13 @@ impl ProviderAdapter for AzureOpenAIAdapter {
 
     /// Temperature and `max_tokens` are forwarded as normalized; the timeout
     /// is the tier-resolved ceiling this adapter applies to the call.
+    fn supports_response_format(&self, _model: &str) -> bool {
+        true
+    }
+
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            response_format_forwarded: req.response_format.is_some(),
             reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,

@@ -47,10 +47,15 @@ async fn responses_inner(
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
 
-    let model = body["model"]
+    let requested_model = body["model"]
         .as_str()
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
+    // A scoped alias override for the request's attribution tags pins the model.
+    let model = state
+        .router
+        .scoped_name(&attribution.tags, &requested_model)
+        .unwrap_or(requested_model);
 
     tracing::Span::current().record("model", model.as_str());
 
@@ -97,6 +102,7 @@ async fn responses_inner(
     reject_non_function_tools(&body)?;
     validate_tool_choice_requires_tools(&body)?;
     ensure_tools_supported(&state, &body, &provider_name, &canonical_model)?;
+    super::tools::ensure_response_format_valid(&body)?;
 
     // Translate body: if messages absent and input is a string, synthesize messages
     let mut body = body;
@@ -138,7 +144,11 @@ async fn responses_inner(
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: false,
         temperature,
-        max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        max_tokens: crate::router::model_capabilities::clamp_max_tokens(
+            &canonical_model,
+            body["max_tokens"].as_u64().map(|v| v as u32),
+            &state.settings.model_capabilities,
+        ),
         tools,
         tool_choice,
         // The Responses API nests the level as `reasoning.effort`; accept the
@@ -150,6 +160,7 @@ async fn responses_inner(
                 .or_else(|| body["reasoning_effort"].as_str()),
             &state.settings.model_capabilities,
         ),
+        response_format: super::tools::forwarded_response_format(&body),
         extra_params: serde_json::Value::Object(Default::default()),
         session_scope: Some(crate::providers::adapter::SessionScope {
             user_id: user.id,
@@ -197,13 +208,7 @@ async fn responses_inner(
 
     let latency_ms = start.elapsed().as_millis() as i64;
 
-    let cost = state.cost_calc.calculate_with_cache(
-        &canonical_model,
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.cache_read_tokens,
-        result.cache_write_tokens,
-    );
+    let cost = state.cost_calc.calculate_result(&canonical_model, &result);
 
     // Fire-and-forget cost logging
     record_responses_cost(
@@ -295,6 +300,7 @@ fn record_responses_cost(
             attribution_tags: attr_tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Chat,
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored =
@@ -323,6 +329,7 @@ fn record_responses_cost(
                 attribution_tags: attr_tags,
                 experiment_id: None,
                 experiment_variant: None,
+                call_kind: crate::db::models::CallKind::Chat,
                 tokens_estimated: false,
             };
             let _ = CostRepository::create(&*state.db, ledger).await;

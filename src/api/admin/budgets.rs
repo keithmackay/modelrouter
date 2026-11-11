@@ -86,7 +86,7 @@ fn add_rule_form_html(card_target: &str, scope_fields: &str) -> String {
             {scope_fields}
             <div>
                 <label style="display:block;font-size:0.8rem;margin-bottom:0.2rem;">Window</label>
-                <select name="window" onchange="var dr=this.closest('form').querySelector('.date-range-fields');if(dr)dr.style.display=this.value==='total'?'flex':'none';" style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
+                <select name="window" data-toggle-date-range style="padding:0.3rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;">
                     <option value="monthly">Monthly</option>
                     <option value="total">Total (date range)</option>
                 </select>

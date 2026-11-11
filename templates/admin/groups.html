@@ -5,7 +5,7 @@
 
 <div style="background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);padding:1.25rem;margin-bottom:2rem;">
     <h2 style="font-size:1rem;margin-bottom:1rem;">Create Group</h2>
-    <form hx-post="/admin/groups" hx-target="#group-form-result" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+    <form hx-post="/admin/groups" hx-target="#group-form-result" hx-swap="innerHTML" data-reset-after-request="successful">
         <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;">
             <div>
                 <label for="group-name" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.3rem;">Name *</label>
@@ -23,17 +23,10 @@
 
 <input type="search" id="group-filter" placeholder="Filter groups…" aria-label="Filter groups"
     style="padding:0.35rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;width:220px;margin-bottom:0.75rem;"
-    oninput="filterCards('groups-list', this.value)">
+    data-filter-cards="groups-list">
 
 <div id="groups-list">
     {{ groups_html | safe }}
 </div>
 
-<script>
-// Re-apply filter after HTMX injects new cards
-document.addEventListener('htmx:afterSwap', function() {
-    var inp = document.getElementById('group-filter');
-    if (inp) filterCards('groups-list', inp.value);
-});
-</script>
 {% endblock %}

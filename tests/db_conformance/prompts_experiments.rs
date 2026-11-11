@@ -49,6 +49,7 @@ async fn cutoff() -> String {
 
 fn prompt(user_id: i64) -> NewPrompt {
     NewPrompt {
+        call_kind: modelrouter::db::models::CallKind::Chat,
         user_id,
         session_id: None,
         request_model: "req".into(),
@@ -159,6 +160,7 @@ async fn prompt_create_round_trips_every_column() {
     each_backend(|db| async move {
         let uid = user(&db, "alice").await;
         let new = NewPrompt {
+            call_kind: modelrouter::db::models::CallKind::Chat,
             user_id: uid,
             session_id: None,
             request_model: "fast".into(),

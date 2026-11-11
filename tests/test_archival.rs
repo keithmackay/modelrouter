@@ -13,6 +13,7 @@ fn rows_to_ndjson_produces_one_line_per_row() {
             api_key_id: None, cache_hit: false, saved_usd: 0.0,
             attribution_correlation_id: None, attribution_tags: "{}".to_string(),
             experiment_id: None, experiment_variant: None, tokens_estimated: false,
+            call_kind: "chat".to_string(),
         },
         CostLedgerEntry {
             id: 2, user_id: 42, prompt_id: 8,
@@ -22,6 +23,7 @@ fn rows_to_ndjson_produces_one_line_per_row() {
             api_key_id: None, cache_hit: false, saved_usd: 0.0,
             attribution_correlation_id: None, attribution_tags: "{}".to_string(),
             experiment_id: None, experiment_variant: None, tokens_estimated: false,
+            call_kind: "chat".to_string(),
         },
     ];
     let ndjson = rows_to_ndjson(&rows);

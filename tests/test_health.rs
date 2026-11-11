@@ -18,19 +18,28 @@ use std::sync::Arc;
 /// carry a working adapter (deep-health capabilities probe "ok") or are empty
 /// (nothing configured — capabilities must read "skipped").
 async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
+    let llm = with_mocks.then(|| {
+        ProviderRegistry::new_with_mock(common::MockAdapter {
+            response: "pong".to_string(),
+        })
+    });
+    test_app_with_llm(cache, with_mocks, llm).await
+}
+
+/// `test_app`, with the LLM registry chosen by the caller (`None` = empty).
+async fn test_app_with_llm(
+    cache: CacheConfig,
+    with_mocks: bool,
+    llm: Option<ProviderRegistry>,
+) -> TestServer {
     let db = common::in_memory_db().await;
     let mut settings = Settings::default();
     settings.health.embedding_probe_model = "openai/text-embedding-3-small".to_string();
     let settings = Arc::new(settings);
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
 
-    let provider_registry = if with_mocks {
-        Arc::new(ProviderRegistry::new_with_mock(common::MockAdapter {
-            response: "pong".to_string(),
-        }))
-    } else {
-        Arc::new(ProviderRegistry::new(HashMap::new()))
-    };
+    let provider_registry =
+        Arc::new(llm.unwrap_or_else(|| ProviderRegistry::new(HashMap::new())));
     let embedding_registry = if with_mocks {
         Arc::new(EmbeddingRegistry::new_with_mock(
             common::MockEmbeddingAdapter { embedding: vec![0.1, 0.2] },
@@ -46,6 +55,8 @@ async fn test_app(cache: CacheConfig, with_mocks: bool) -> TestServer {
                 snippet: "s".to_string(),
                 score: None,
                 published_date: None,
+                publisher: None,
+                metadata_provenance: None,
             }],
         }))
     } else {
@@ -167,6 +178,8 @@ fn mock_search_registry_health(engines: &[&str]) -> SearchRegistry {
                             snippet: "s".to_string(),
                             score: None,
                             published_date: None,
+                            publisher: None,
+                            metadata_provenance: None,
                         }],
                     });
                 (e, adapter)
@@ -344,6 +357,58 @@ async fn deep_health_probes_all_capabilities_through_mock_providers() {
     // Caching enabled -> the same cache block as /health rides along.
     assert_eq!(body["cache"]["backend"], "memory");
     assert_eq!(body["cache"]["connected"], true);
+}
+
+/// An LLM adapter whose every completion fails with a fixed provider error.
+struct FailingLlmAdapter {
+    error: &'static str,
+}
+
+#[async_trait::async_trait]
+impl modelrouter::providers::adapter::ProviderAdapter for FailingLlmAdapter {
+    async fn complete(
+        &self,
+        _req: &modelrouter::providers::adapter::NormalizedRequest,
+    ) -> anyhow::Result<modelrouter::providers::adapter::CompletionResult> {
+        anyhow::bail!("{}", self.error)
+    }
+
+    async fn stream(
+        &self,
+        _req: &modelrouter::providers::adapter::NormalizedRequest,
+    ) -> anyhow::Result<modelrouter::providers::adapter::SseStream> {
+        anyhow::bail!("{}", self.error)
+    }
+}
+
+async fn deep_health_llm_with_error(error: &'static str) -> serde_json::Value {
+    let llm = ProviderRegistry::new_with_mock(FailingLlmAdapter { error });
+    let server = test_app_with_llm(CacheConfig::default(), true, Some(llm)).await;
+    server.get("/health/deep").await.json()
+}
+
+/// A reasoning model that spends the probe's output budget thinking is
+/// rejected with a token-limit 400, yet the call reached a working model.
+#[tokio::test]
+async fn deep_health_counts_an_output_limit_rejection_as_reachable() {
+    let body = deep_health_llm_with_error(
+        "Azure AI Foundry returned 400 Bad Request: Could not finish the message because \
+         max_tokens or model output limit was reached. Please try again with higher max_tokens.",
+    )
+    .await;
+    assert_eq!(body["capabilities"]["llm"]["status"], "ok", "{body}");
+    assert!(body["capabilities"]["llm"]["error"].is_null());
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn deep_health_still_fails_on_a_real_llm_error() {
+    let body = deep_health_llm_with_error("Azure AI Foundry returned 401 Unauthorized").await;
+    assert_eq!(body["capabilities"]["llm"]["status"], "failed", "{body}");
+    assert!(body["capabilities"]["llm"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("401"));
 }
 
 #[tokio::test]

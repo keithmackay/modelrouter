@@ -12,6 +12,21 @@ pub struct ModelSummaryRow {
     pub uncached_cost_usd: f64,
 }
 
+/// Spend of one (call kind, model) pair in a window, for the by-kind view of
+/// the cost page and the CLI: a decision on a model is its own line, apart
+/// from the chat calls on the same model.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct KindSummaryRow {
+    /// The stored `call_kind` (`unknown` on rows older than the column).
+    pub call_kind: String,
+    pub model: String,
+    pub total_cost_usd: f64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub request_count: i64,
+    pub uncached_cost_usd: f64,
+}
+
 /// Cache-hit aggregates for one grouping key.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CacheUsageSummary {
@@ -259,6 +274,10 @@ pub trait CostRepository: Send + Sync {
     async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64>;
     async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<crate::db::models::CostLedgerEntry>>;
     async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()>;
+    /// Delete usage rows with `created_at` before `cutoff_rfc3339`, the
+    /// retention tick's purge. The caller decides the cutoff; see
+    /// `db::retention` for how it is held above every budget window.
+    async fn purge_ledger_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64>;
     /// Sum spend for a user in [start, end) — both ISO 8601 UTC timestamps (inclusive start, exclusive end).
     async fn sum_for_user_between(&self, user_id: i64, start: &str, end: &str) -> anyhow::Result<f64>;
     /// Sum spend for a project since a timestamp (inclusive).
@@ -317,6 +336,15 @@ pub trait CostRepository: Send + Sync {
         filter_model: Option<&str>,
         since: &str,
     ) -> anyhow::Result<Vec<ModelSummaryRow>>;
+    /// Aggregate cost stats grouped by (call kind, model), with the same
+    /// filters as `summarize_by_model`, ordered by kind then spend.
+    async fn summarize_by_kind(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<KindSummaryRow>>;
     /// Per-row cost stats grouped by (user_id, model, project, api_key_id).
     /// Returns Vec of (user_id, model, project, api_key_id, cost_usd, tokens_in, tokens_out, request_count).
     /// Filters mirror cost_stats_grouped; adds an optional model filter.
@@ -391,6 +419,20 @@ pub trait CostRepository: Send + Sync {
     async fn arm_by_day(
         &self,
         filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    /// The arm's spend broken down by `call_kind` (`key` is the kind).
+    async fn arm_by_kind(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;
+    /// One attribution value's spend broken down by `call_kind`.
+    async fn attribution_by_kind(
+        &self,
+        filter: &AttributionFilter,
         start: &str,
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>>;

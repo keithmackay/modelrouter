@@ -161,14 +161,28 @@ pub fn build_store(config: &CacheConfig) -> Arc<dyn CacheStore> {
 
 // ── In-memory backend ─────────────────────────────────────────────────────────
 
+/// The clock a store stamps and judges entries with: whole seconds since the
+/// Unix epoch. Production reads the system clock; a test injects its own so an
+/// entry's lifetime is decided by the test, never by how long the host took to
+/// get between two requests (a 1-second TTL stamped at the end of a wall
+/// second expires at the next tick, however soon that is).
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 /// Per-process moka cache. Bounded by `cache.max_entries`, per-entry TTL.
 pub struct MemoryStore {
     inner: moka::future::Cache<String, CachedEntry>,
     evictions: Arc<AtomicU64>,
+    clock: Clock,
 }
 
 impl MemoryStore {
     pub fn new(config: &CacheConfig) -> Self {
+        Self::with_clock(config, Arc::new(now_secs))
+    }
+
+    /// A store that reads `clock` instead of the system time, for tests that
+    /// own the passage of time.
+    pub fn with_clock(config: &CacheConfig, clock: Clock) -> Self {
         let evictions = Arc::new(AtomicU64::new(0));
         let ev = evictions.clone();
         let inner = moka::future::Cache::builder()
@@ -184,7 +198,11 @@ impl MemoryStore {
                 }
             })
             .build();
-        Self { inner, evictions }
+        Self {
+            inner,
+            evictions,
+            clock,
+        }
     }
 }
 
@@ -212,7 +230,7 @@ impl MemoryStore {
 impl CacheStore for MemoryStore {
     async fn get(&self, key: &str) -> Option<CachedEntry> {
         let entry = self.inner.get(key).await?;
-        if entry.expires_at > 0 && entry.expires_at <= now_secs() {
+        if entry.expires_at > 0 && entry.expires_at <= (self.clock)() {
             // Expired but not yet evicted: drop it and report a miss.
             self.inner.invalidate(key).await;
             self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -225,7 +243,7 @@ impl CacheStore for MemoryStore {
         // Per-entry TTL lives on the entry rather than in a moka expiry policy,
         // so every backend enforces the same deadline the same way.
         let mut entry = entry;
-        entry.stored_at = now_secs();
+        entry.stored_at = (self.clock)();
         entry.expires_at = ttl.expires_at(entry.stored_at);
         self.inner.insert(key.to_string(), entry).await;
     }
@@ -1014,5 +1032,32 @@ mod tests {
         // Clean up ONLY the scratch namespace.
         assert!(store.purge_all().await >= 1);
         assert_eq!(store.entry_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn memory_store_judges_a_finite_ttl_by_its_own_clock() {
+        use std::sync::atomic::AtomicI64;
+        let now = Arc::new(AtomicI64::new(1_700_000_000));
+        let reads = now.clone();
+        let store = MemoryStore::with_clock(
+            &CacheConfig::default(),
+            Arc::new(move || reads.load(Ordering::Relaxed)),
+        );
+        let entry = CachedEntry {
+            class: "completion".to_string(),
+            model: "m".to_string(),
+            payload: serde_json::json!({}),
+            original_cost_usd: 0.0,
+            stored_at: 0,
+            expires_at: 0,
+            namespace: None,
+        };
+        store.put("k", entry, secs(1)).await;
+        let stored = store.get("k").await.expect("fresh entry is a hit");
+        assert_eq!((stored.stored_at, stored.expires_at), (1_700_000_000, 1_700_000_001));
+        // The same second, however long it took to get here: still a hit.
+        assert!(store.get("k").await.is_some());
+        now.store(1_700_000_001, Ordering::Relaxed);
+        assert!(store.get("k").await.is_none(), "expired at its deadline");
     }
 }

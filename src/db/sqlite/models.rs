@@ -95,7 +95,7 @@ impl ModelRepository for SqliteDb {
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, ModelRow>(
-            &format!("SELECT {MODEL_COLS} FROM models WHERE id = ?")
+            sqlx::AssertSqlSafe(format!("SELECT {MODEL_COLS} FROM models WHERE id = ?"))
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -105,7 +105,7 @@ impl ModelRepository for SqliteDb {
 
     async fn list_models(&self) -> anyhow::Result<Vec<Model>> {
         let rows = sqlx::query_as::<_, ModelRow>(
-            &format!("SELECT {MODEL_COLS} FROM models ORDER BY provider, name")
+            sqlx::AssertSqlSafe(format!("SELECT {MODEL_COLS} FROM models ORDER BY provider, name"))
         )
         .fetch_all(&self.pool)
         .await?;
@@ -114,7 +114,7 @@ impl ModelRepository for SqliteDb {
 
     async fn get_model(&self, id: i64) -> anyhow::Result<Option<Model>> {
         let row = sqlx::query_as::<_, ModelRow>(
-            &format!("SELECT {MODEL_COLS} FROM models WHERE id = ?")
+            sqlx::AssertSqlSafe(format!("SELECT {MODEL_COLS} FROM models WHERE id = ?"))
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -157,18 +157,18 @@ impl ModelRepository for SqliteDb {
     }
 
     async fn list_provider_states(&self) -> anyhow::Result<Vec<ProviderState>> {
-        let rows = sqlx::query_as::<_, ProviderStateRow>(&format!(
+        let rows = sqlx::query_as::<_, ProviderStateRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {PROVIDER_STATE_COLS} FROM provider_states ORDER BY provider"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(ProviderState::from).collect())
     }
 
     async fn get_provider_state(&self, provider: &str) -> anyhow::Result<Option<ProviderState>> {
-        let row = sqlx::query_as::<_, ProviderStateRow>(&format!(
+        let row = sqlx::query_as::<_, ProviderStateRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {PROVIDER_STATE_COLS} FROM provider_states WHERE provider = ?"
-        ))
+        )))
         .bind(provider)
         .fetch_optional(&self.pool)
         .await?;

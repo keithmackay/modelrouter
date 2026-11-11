@@ -139,6 +139,85 @@ pub struct NewSession {
     pub project: Option<String>,
 }
 
+/// The kind of call a prompt-log or ledger row records, so spend and usage
+/// can be read per kind: a decision is not a chat completion on the same
+/// model, and an embedding is neither. Stored as text in `call_kind` on
+/// `prompts` and `cost_ledger` (migration 037); rows written before the
+/// column existed read [`UNKNOWN_CALL_KIND`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    /// Chat completions, the Responses API and the Messages API.
+    Chat,
+    Embedding,
+    Search,
+    Image,
+    /// Transcription and speech.
+    Audio,
+    /// `POST /v1/decisions`.
+    Decision,
+    /// `POST /v1/rerank`: a query against a batch of documents, priced per search unit.
+    Rerank,
+    /// `POST /v1/systemone` typed judgments.
+    Judgment,
+    /// The deep health probes' priced calls.
+    Health,
+}
+
+/// What a row written before `call_kind` existed reads as.
+pub const UNKNOWN_CALL_KIND: &str = "unknown";
+
+impl CallKind {
+    pub const ALL: [CallKind; 9] = [
+        CallKind::Chat,
+        CallKind::Embedding,
+        CallKind::Search,
+        CallKind::Image,
+        CallKind::Audio,
+        CallKind::Decision,
+        CallKind::Rerank,
+        CallKind::Judgment,
+        CallKind::Health,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallKind::Chat => "chat",
+            CallKind::Embedding => "embedding",
+            CallKind::Search => "search",
+            CallKind::Image => "image",
+            CallKind::Audio => "audio",
+            CallKind::Decision => "decision",
+            CallKind::Rerank => "rerank",
+            CallKind::Judgment => "judgment",
+            CallKind::Health => "health",
+        }
+    }
+
+    /// The kind a stored value names, or `None` for `unknown` and anything else.
+    pub fn parse(value: &str) -> Option<CallKind> {
+        CallKind::ALL.into_iter().find(|k| k.as_str() == value.trim())
+    }
+
+    /// The label a report shows for a stored value: the kind, or `unknown`.
+    pub fn label(value: &str) -> &str {
+        match CallKind::parse(value) {
+            Some(kind) => kind.as_str(),
+            None => UNKNOWN_CALL_KIND,
+        }
+    }
+}
+
+impl std::fmt::Display for CallKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub(crate) fn unknown_call_kind() -> String {
+    UNKNOWN_CALL_KIND.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Prompt {
     pub id: i64,
@@ -188,6 +267,10 @@ pub struct Prompt {
     #[sqlx(default)]
     #[serde(default)]
     pub experiment_variant: Option<String>,
+    /// See [`CallKind`]; `unknown` on rows older than the column.
+    #[sqlx(default)]
+    #[serde(default = "unknown_call_kind")]
+    pub call_kind: String,
     pub created_at: String,
 }
 
@@ -310,6 +393,8 @@ pub struct NewPrompt {
     pub attribution_tags: String,
     pub experiment_id: Option<i64>,
     pub experiment_variant: Option<String>,
+    /// What kind of call this row records; every route sets it.
+    pub call_kind: CallKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -357,6 +442,10 @@ pub struct CostLedgerEntry {
     #[sqlx(default)]
     #[serde(default)]
     pub tokens_estimated: bool,
+    /// See [`CallKind`]; `unknown` on rows older than the column.
+    #[sqlx(default)]
+    #[serde(default = "unknown_call_kind")]
+    pub call_kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +464,8 @@ pub struct NewCostLedgerEntry {
     pub experiment_id: Option<i64>,
     pub experiment_variant: Option<String>,
     pub tokens_estimated: bool,
+    /// What kind of call this row records; every route sets it.
+    pub call_kind: CallKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -549,6 +640,49 @@ pub struct ModelAlias {
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One scoped alias override: `alias` resolves to `provider/model` for
+/// requests whose attribution tags carry `tag_key = tag_value`. `target` is
+/// the expression the operator wrote; `provider` and `model` are what it
+/// resolved to when written. `expires_at` is unix seconds, 0 meaning never.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedAlias {
+    pub tag_key: String,
+    pub tag_value: String,
+    pub alias: String,
+    pub target: String,
+    pub provider: String,
+    pub model: String,
+    pub expires_at: i64,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    /// Request parameters the override sets for this alias (validated against
+    /// the pinned model's parameter schema when written); empty for none.
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One alias of a scope being written: the alias, its pinned target and the
+/// parameters it sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewScopedAlias {
+    pub alias: String,
+    pub target: String,
+    pub provider: String,
+    pub model: String,
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A stored `params` column: a JSON object, else (logged) none.
+pub fn parse_scoped_params(raw: &str) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => {
+            tracing::warn!(raw, "scoped alias params are not a JSON object; ignoring them");
+            serde_json::Map::new()
+        }
+    }
 }
 
 /// A capability the router learned from a provider rejecting a parameter.

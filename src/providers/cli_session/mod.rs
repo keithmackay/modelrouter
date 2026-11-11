@@ -560,6 +560,7 @@ impl ProviderAdapter for CliSessionAdapter {
             temperature: None,
             max_tokens: None,
             timeout_secs: Some(self.timeout.as_secs()),
+            response_format_forwarded: false,
             reasoning: None,
         }
     }

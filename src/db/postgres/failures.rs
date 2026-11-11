@@ -15,6 +15,14 @@ const FAILURE_COLUMNS: &str = "id, user_id, api_key_id, endpoint, request_model,
 
 #[async_trait]
 impl FailureRepository for PostgresDb {
+    async fn purge_failures_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM request_failures WHERE created_at < $1")
+            .bind(cutoff_rfc3339)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn create(&self, failure: NewRequestFailure) -> anyhow::Result<RequestFailure> {
         let now = now_utc();
         let row = sqlx::query_as::<_, RequestFailure>(
@@ -52,10 +60,10 @@ impl FailureRepository for PostgresDb {
     }
 
     async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<RequestFailure>> {
-        let rows = sqlx::query_as::<_, RequestFailure>(&format!(
+        let rows = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -79,11 +87,33 @@ impl FailureRepository for PostgresDb {
         Ok(rows)
     }
 
+    async fn list_by_endpoint(&self, endpoint: &str, limit: i64, offset: i64) -> anyhow::Result<Vec<RequestFailure>> {
+        let rows = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM request_failures WHERE endpoint = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            FAILURE_COLUMNS
+        )))
+        .bind(endpoint)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn count_by_endpoint(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT endpoint, COUNT(*) FROM request_failures GROUP BY endpoint ORDER BY COUNT(*) DESC, endpoint ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<RequestFailure>> {
-        let row = sqlx::query_as::<_, RequestFailure>(&format!(
+        let row = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures WHERE id = $1",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -91,10 +121,10 @@ impl FailureRepository for PostgresDb {
     }
 
     async fn find_by_correlation_id(&self, correlation_id: &str) -> anyhow::Result<Vec<RequestFailure>> {
-        let rows = sqlx::query_as::<_, RequestFailure>(&format!(
+        let rows = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures WHERE attribution_correlation_id = $1 ORDER BY created_at DESC",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(correlation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -113,7 +143,7 @@ impl FailureRepository for PostgresDb {
             n + 1,
             n + 2
         );
-        let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in binds {
             q = q.bind(b);
         }

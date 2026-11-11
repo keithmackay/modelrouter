@@ -30,6 +30,7 @@ async fn user(db: &Db, name: &str) -> i64 {
 
 fn ledger(user_id: i64, model: &str, project: Option<&str>, cost_usd: f64) -> NewCostLedgerEntry {
     NewCostLedgerEntry {
+        call_kind: modelrouter::db::models::CallKind::Chat,
         user_id,
         prompt_id: None,
         model: model.into(),
@@ -224,6 +225,7 @@ async fn recent_prompts_newest_first_with_filters() {
         let alice = user(&db, "alice").await;
         let bob = user(&db, "bob").await;
         let prompt = |user_id: i64, model: &str, cache_read_tokens: i64| NewPrompt {
+            call_kind: modelrouter::db::models::CallKind::Chat,
             user_id,
             session_id: None,
             request_model: model.into(),

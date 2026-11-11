@@ -12,6 +12,7 @@
 //! panels, and `modelrouter report compare`. The dashboard and CLI must show
 //! the same numbers, so neither computes anything of its own.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -27,7 +28,7 @@ use crate::db::repositories::costs::{
 };
 use crate::db::repositories::experiments::{ExperimentRepository, ExperimentStatusFilter};
 use crate::db::repositories::failures::FailureRepository;
-use crate::db::repositories::prompts::{LatencySummary, PromptRepository};
+use crate::db::repositories::prompts::{DecisionAnswerRow, LatencySummary, PromptRepository};
 use crate::router::cost::CostCalculator;
 use crate::router::experiments::is_valid_label;
 
@@ -319,6 +320,11 @@ pub struct ArmMetrics {
     pub unpriced: bool,
     pub unpriced_models: Vec<String>,
     pub by_day: Vec<AttributionBreakdownRow>,
+    /// Spend by call kind (`key` is the kind): a decision is not a chat call
+    /// on the same model.
+    pub by_kind: Vec<AttributionBreakdownRow>,
+    /// Requests of kind `decision` in the arm.
+    pub decision_requests: i64,
 }
 
 /// B minus A. `pct` is `None` when A is zero.
@@ -506,6 +512,13 @@ pub struct Comparison {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttft_note: Option<&'static str>,
     pub caveats: [&'static str; 2],
+    /// Per question name, both arms' decision answers and their agreement,
+    /// when either arm made decision calls whose content was retained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_answers: Option<Vec<QuestionAgreement>>,
+    /// Why `decision_answers` is absent although decision calls ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_answers_note: Option<&'static str>,
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -551,6 +564,20 @@ pub async fn build_comparison(
     let ttft = TtftComparison::between(&a, &b);
     let ttft_note = ttft.is_none().then_some(TTFT_NOTE);
     let quality = if experiment.is_some() { CAVEAT_QUALITY_VARIANT } else { CAVEAT_QUALITY };
+    // Decision answers per question, when either arm made decision calls.
+    let (decision_answers, decision_answers_note) = if a.decision_requests > 0 || b.decision_requests > 0 {
+        let (rows_a, rows_b) = tokio::try_join!(
+            PromptRepository::decision_answers_for_arm(&*sources.prompt_db, &q.arm_a, &q.start, &q.end, DECISION_ANSWER_LIMIT),
+            PromptRepository::decision_answers_for_arm(&*sources.prompt_db, &q.arm_b, &q.start, &q.end, DECISION_ANSWER_LIMIT),
+        )?;
+        if rows_a.is_empty() && rows_b.is_empty() {
+            (None, Some(DECISION_ANSWERS_NOT_RETAINED))
+        } else {
+            (Some(compare_question_stats(&rows_a, &rows_b)), None)
+        }
+    } else {
+        (None, None)
+    };
     Ok(Comparison {
         dimension: q.dimension,
         key: q.key,
@@ -565,6 +592,8 @@ pub async fn build_comparison(
         ttft,
         ttft_note,
         caveats: [quality, CAVEAT_STREAMING],
+        decision_answers,
+        decision_answers_note,
     })
 }
 
@@ -604,10 +633,11 @@ async fn arm_metrics(
     start: &str,
     end: &str,
 ) -> anyhow::Result<ArmMetrics> {
-    let (totals, by_model, by_day, latency, ttft, attempt_totals, failures) = tokio::try_join!(
+    let (totals, by_model, by_day, by_kind, latency, ttft, attempt_totals, failures) = tokio::try_join!(
         CostRepository::arm_totals(&*sources.db, filter, start, end),
         CostRepository::arm_by_model(&*sources.db, filter, start, end),
         CostRepository::arm_by_day(&*sources.db, filter, start, end),
+        CostRepository::arm_by_kind(&*sources.db, filter, start, end),
         PromptRepository::latency_summary(&*sources.prompt_db, filter, start, end),
         PromptRepository::ttft_summary(&*sources.prompt_db, filter, start, end),
         PromptRepository::attempts_summary(&*sources.prompt_db, filter, start, end),
@@ -650,8 +680,141 @@ async fn arm_metrics(
         unpriced: !unpriced_models.is_empty(),
         unpriced_models,
         by_day,
+        decision_requests: by_kind
+            .iter()
+            .filter(|row| row.key == crate::db::models::CallKind::Decision.as_str())
+            .map(|row| row.totals.requests)
+            .sum(),
+        by_kind,
     })
 }
+
+/// Retained decision rows read per arm for the per-question comparison; the
+/// newest first, so a long-running experiment compares its recent answers.
+const DECISION_ANSWER_LIMIT: i64 = 2000;
+
+/// One arm's answers to one question name, aggregated over its retained
+/// decision rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct QuestionArm {
+    /// Answers seen for this question in the arm.
+    pub n: i64,
+    /// Mean `probability` over predicate answers, when any.
+    pub mean_probability: Option<f64>,
+    /// Mean `score` over score answers, when any.
+    pub mean_score: Option<f64>,
+    /// The most frequent `choice`, when any (ties: the first alphabetically).
+    pub top_choice: Option<String>,
+}
+
+/// A and B's answers to one question, with the agreement measure the
+/// question's type allows: a probability delta, a score delta, or whether the
+/// top choices match.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuestionAgreement {
+    pub name: String,
+    /// `predicate`, `choice`, `score`, or `unknown` when the answers carried none.
+    pub kind: String,
+    pub a: QuestionArm,
+    pub b: QuestionArm,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probability_delta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_delta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice_match: Option<bool>,
+}
+
+#[derive(Default)]
+struct QuestionAccumulator {
+    kind: Option<String>,
+    n: i64,
+    probability_sum: f64,
+    probability_n: i64,
+    score_sum: f64,
+    score_n: i64,
+    choices: BTreeMap<String, i64>,
+}
+
+/// Per question name, the arm's answers folded into [`QuestionArm`]. Reads
+/// the `answers` content the decisions route stored (`{"answers": [...]}`,
+/// each with `name` and `type` and a `probability`, `choice` or `score`);
+/// rows that do not parse are skipped, never fatal.
+pub fn question_stats(rows: &[DecisionAnswerRow]) -> BTreeMap<String, (String, QuestionArm)> {
+    let mut acc: BTreeMap<String, QuestionAccumulator> = BTreeMap::new();
+    for row in rows {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&row.answers) else { continue };
+        let Some(answers) = body.get("answers").and_then(|a| a.as_array()) else { continue };
+        for answer in answers {
+            let Some(name) = answer.get("name").and_then(|n| n.as_str()) else { continue };
+            let entry = acc.entry(name.to_string()).or_default();
+            entry.n += 1;
+            if let Some(kind) = answer.get("type").and_then(|t| t.as_str()) {
+                entry.kind.get_or_insert_with(|| kind.to_string());
+            }
+            if let Some(p) = answer.get("probability").and_then(|p| p.as_f64()) {
+                entry.probability_sum += p;
+                entry.probability_n += 1;
+            }
+            if let Some(s) = answer.get("score").and_then(|s| s.as_f64()) {
+                entry.score_sum += s;
+                entry.score_n += 1;
+            }
+            if let Some(c) = answer.get("choice").and_then(|c| c.as_str()) {
+                *entry.choices.entry(c.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    acc.into_iter()
+        .map(|(name, a)| {
+            let kind = a.kind.unwrap_or_else(|| "unknown".to_string());
+            let top_choice = a.choices.iter().max_by(|x, y| x.1.cmp(y.1).then(y.0.cmp(x.0))).map(|(c, _)| c.clone());
+            let arm = QuestionArm {
+                n: a.n,
+                mean_probability: (a.probability_n > 0).then(|| a.probability_sum / a.probability_n as f64),
+                mean_score: (a.score_n > 0).then(|| a.score_sum / a.score_n as f64),
+                top_choice,
+            };
+            (name, (kind, arm))
+        })
+        .collect()
+}
+
+/// Every question either arm answered, with the agreement measure its type
+/// allows. A question only one arm answered still appears, with the other
+/// arm empty and no delta.
+pub fn compare_question_stats(a: &[DecisionAnswerRow], b: &[DecisionAnswerRow]) -> Vec<QuestionAgreement> {
+    let (sa, sb) = (question_stats(a), question_stats(b));
+    let names: std::collections::BTreeSet<&String> = sa.keys().chain(sb.keys()).collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let (ka, arm_a) = sa.get(name).cloned().unwrap_or_else(|| ("unknown".to_string(), QuestionArm::default()));
+            let (kb, arm_b) = sb.get(name).cloned().unwrap_or_else(|| ("unknown".to_string(), QuestionArm::default()));
+            let kind = if ka != "unknown" { ka } else { kb };
+            let probability_delta = match (arm_a.mean_probability, arm_b.mean_probability) {
+                (Some(x), Some(y)) => Some(y - x),
+                _ => None,
+            };
+            let score_delta = match (arm_a.mean_score, arm_b.mean_score) {
+                (Some(x), Some(y)) => Some(y - x),
+                _ => None,
+            };
+            let choice_match = match (&arm_a.top_choice, &arm_b.top_choice) {
+                (Some(x), Some(y)) => Some(x == y),
+                _ => None,
+            };
+            QuestionAgreement { name: name.clone(), kind, a: arm_a, b: arm_b, probability_delta, score_delta, choice_match }
+        })
+        .collect()
+}
+
+/// The note shown when decision calls ran in an arm but no answers were
+/// retained to compare.
+pub const DECISION_ANSWERS_NOT_RETAINED: &str =
+    "Decision calls ran in this window, but the prompt log retained no answers for them (storage \
+     policy: content is not stored). Create the experiment with retain_content to compare answers \
+     per question.";
 
 // ── REST API ──────────────────────────────────────────────────────────────────
 
@@ -979,7 +1142,64 @@ fn metric_rows(c: &Comparison) -> Vec<MetricRow> {
             b: fmt_retried(b),
             delta: "—".into(),
         },
+        // Decision calls are counted apart: a decision on a model is not a
+        // chat completion on it, and an experiment over decision models is
+        // judged on them.
+        MetricRow {
+            label: "Decision calls".into(),
+            a: a.decision_requests.to_string(),
+            b: b.decision_requests.to_string(),
+            delta: fmt_delta(&Some(Delta::between(a.decision_requests as f64, b.decision_requests as f64)), fmt_count),
+        },
     ]
+}
+
+/// One row of the panel's "Decision answers by question" table, formatted.
+#[derive(Debug, Serialize)]
+struct DecisionAnswerDisplayRow {
+    name: String,
+    kind: String,
+    a: String,
+    b: String,
+    agreement: String,
+}
+
+fn fmt_question_arm(arm: &QuestionArm) -> String {
+    let value = if let Some(p) = arm.mean_probability {
+        format!("{p:.2}")
+    } else if let Some(s) = arm.mean_score {
+        format!("{s:.2}")
+    } else if let Some(c) = &arm.top_choice {
+        c.clone()
+    } else {
+        "—".to_string()
+    };
+    format!("{value} ({})", arm.n)
+}
+
+fn decision_answer_rows(c: &Comparison) -> Vec<DecisionAnswerDisplayRow> {
+    c.decision_answers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|qa| DecisionAnswerDisplayRow {
+            name: qa.name.clone(),
+            kind: qa.kind.clone(),
+            a: fmt_question_arm(&qa.a),
+            b: fmt_question_arm(&qa.b),
+            agreement: if let Some(d) = qa.probability_delta {
+                format!("Δ {d:+.2}")
+            } else if let Some(d) = qa.score_delta {
+                format!("Δ {d:+.2}")
+            } else {
+                match qa.choice_match {
+                    Some(true) => "same choice".to_string(),
+                    Some(false) => "different choice".to_string(),
+                    None => "—".to_string(),
+                }
+            },
+        })
+        .collect()
 }
 
 /// Total attempts over the rows that tracked them, or a dash when none did.
@@ -1065,12 +1285,14 @@ pub async fn get_compare_panels(
         Err(e) => return Err(e.into()),
     };
     let rows = metric_rows(&comparison);
+    let decision_rows = decision_answer_rows(&comparison);
     let (bars_json, daily_json, latency_json) = chart_json(&comparison);
     super::dashboard::render(
         "compare_panels.html",
         minijinja::context! {
             cmp => minijinja::Value::from_serialize(&comparison),
             rows => minijinja::Value::from_serialize(&rows),
+            decision_rows => minijinja::Value::from_serialize(&decision_rows),
             bars_json => bars_json,
             daily_json => daily_json,
             latency_json => latency_json,
@@ -1081,6 +1303,68 @@ pub async fn get_compare_panels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decision_row(answers: serde_json::Value) -> DecisionAnswerRow {
+        DecisionAnswerRow {
+            correlation_id: Some("run".into()),
+            request: r#"{"input":"doc","questions":[]}"#.into(),
+            answers: serde_json::json!({ "answers": answers }).to_string(),
+        }
+    }
+
+    #[test]
+    fn question_stats_fold_each_arms_answers_by_name_and_type() {
+        let rows = vec![
+            decision_row(serde_json::json!([
+                {"name": "refund", "type": "predicate", "probability": 0.9},
+                {"name": "tone", "type": "choice", "choice": "angry"},
+                {"name": "sev", "type": "score", "score": 4.0}
+            ])),
+            decision_row(serde_json::json!([
+                {"name": "refund", "type": "predicate", "probability": 0.7},
+                {"name": "tone", "type": "choice", "choice": "calm"},
+                {"name": "tone", "type": "choice", "choice": "angry"}
+            ])),
+            DecisionAnswerRow { correlation_id: None, request: String::new(), answers: "not json".into() },
+        ];
+        let stats = question_stats(&rows);
+        let (kind, refund) = &stats["refund"];
+        assert_eq!(kind, "predicate");
+        assert_eq!(refund.n, 2);
+        assert!((refund.mean_probability.unwrap() - 0.8).abs() < 1e-9);
+        let (kind, tone) = &stats["tone"];
+        assert_eq!(kind, "choice");
+        assert_eq!(tone.top_choice.as_deref(), Some("angry"));
+        assert_eq!(tone.n, 3);
+        assert_eq!(stats["sev"].1.mean_score, Some(4.0));
+    }
+
+    #[test]
+    fn compare_question_stats_reports_the_agreement_each_type_allows() {
+        let a = vec![decision_row(serde_json::json!([
+            {"name": "refund", "type": "predicate", "probability": 0.9},
+            {"name": "tone", "type": "choice", "choice": "angry"},
+            {"name": "only_a", "type": "score", "score": 1.0}
+        ]))];
+        let b = vec![decision_row(serde_json::json!([
+            {"name": "refund", "type": "predicate", "probability": 0.6},
+            {"name": "tone", "type": "choice", "choice": "angry"}
+        ]))];
+        let out = compare_question_stats(&a, &b);
+        let names: Vec<&str> = out.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, vec!["only_a", "refund", "tone"]);
+        let refund = out.iter().find(|q| q.name == "refund").unwrap();
+        assert!((refund.probability_delta.unwrap() + 0.3).abs() < 1e-9, "B minus A");
+        assert_eq!(refund.choice_match, None);
+        let tone = out.iter().find(|q| q.name == "tone").unwrap();
+        assert_eq!(tone.choice_match, Some(true));
+        let only_a = out.iter().find(|q| q.name == "only_a").unwrap();
+        assert_eq!(only_a.b.n, 0);
+        assert_eq!(only_a.score_delta, None);
+        assert_eq!(only_a.kind, "score");
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json[1]["a"]["mean_probability"], 0.9);
+    }
 
     fn q(dimension: &str, key: &str, a: &str, b: &str, window: &str) -> CompareQuery {
         CompareQuery {

@@ -683,7 +683,7 @@ fn key_group_html(group_id: i64, active: Option<&KeyView>, disabled_keys: &[KeyV
         let arrow = if expanded { "▼" } else { "▶" };
         let label = if sub_count == 1 { "1 old key".to_string() } else { format!("{} old keys", sub_count) };
         format!(
-            " <button id=\"toggle-{gid}\" type=\"button\" onclick=\"toggleGroup('{gid}')\" \
+            " <button id=\"toggle-{gid}\" type=\"button\" data-toggle-group=\"{gid}\" \
             class=\"btn btn-secondary\" data-count=\"{sub_count}\">{arrow} {label}</button>"
         )
     } else {
@@ -760,8 +760,7 @@ fn key_header_row_html(view: &KeyView, group_id: &str, is_active: bool, toggle_h
             <code style=\"color:green;font-family:monospace;font-size:0.85rem;background:#f0fff0;\
             padding:0.2rem 0.4rem;border-radius:3px;border:1px solid #c3e6cb;\">{raw_e}</code>\
             <button type=\"button\" title=\"Copy to clipboard\" \
-            onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{var b=this;\
-            b.textContent='✓';setTimeout(function(){{b.textContent='⧉'}},1500)}}.bind(this))\" \
+            data-copy=\"{raw_e}\" data-copied-label=\"✓\" data-copy-label=\"⧉\" \
             style=\"background:none;border:1px solid #aaa;border-radius:3px;padding:0.1rem 0.35rem;\
             cursor:pointer;font-size:0.85rem;color:#555;\">⧉</button>{mailto_html}</span>"
         )
@@ -974,15 +973,10 @@ pub async fn post_create_key(
               <button class=\"btn btn-secondary\" \
                 hx-post=\"/admin/keys/{gid}/rotate\" \
                 hx-target=\"#key-group-{gid}\" hx-swap=\"outerHTML\" \
-                onclick=\"document.getElementById('key-form-message').innerHTML=''\"\
+                data-clear-html=\"key-form-message\"\
               >Rotate existing key</button>\
             </div>\
-            <script>(function(){{\
-              var el=document.getElementById('key-group-{gid}');\
-              if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});\
-              el.classList.add('row-highlight');\
-              setTimeout(function(){{el.classList.remove('row-highlight');}},2500);}}\
-            }})();</script>",
+            <span hidden data-scroll-highlight=\"key-group-{gid}\"></span>",
             user = he(&user_name),
             proj = he(proj_label),
             status = status_tag,
@@ -1060,21 +1054,11 @@ pub async fn post_create_key(
         <span>✓ Key created for <strong>{user}</strong>{proj_str}. Copy it now — it won't be shown again:</span>\
         <code style=\"font-family:monospace;background:#f0fff0;padding:0.2rem 0.4rem;\
         border-radius:3px;border:1px solid #c3e6cb;\">{raw_e}</code>\
-        <button type=\"button\" onclick=\"navigator.clipboard.writeText('{raw_e}').then(function(){{\
-        var b=this;b.textContent='✓ Copied';setTimeout(function(){{b.textContent='⧉ Copy'}},1500)\
-        }}.bind(this))\" class=\"btn btn-secondary\">⧉ Copy</button>\
+        <button type=\"button\" data-copy=\"{raw_e}\" data-copied-label=\"✓ Copied\" data-copy-label=\"⧉ Copy\" \
+        class=\"btn btn-secondary\">⧉ Copy</button>\
         {mailto_btn}\
         </div>\
-        <template id=\"__new_group__\">{tbody}</template>\
-        <script>(function(){{\
-        var t=document.getElementById('__new_group__');\
-        var el=t.content.firstElementChild.cloneNode(true);\
-        var table=document.getElementById('keys-table');\
-        var first=table.querySelector('tbody');\
-        table.insertBefore(el,first||null);\
-        htmx.process(el);\
-        t.remove();\
-        }})();</script>",
+        <template data-prepend-into=\"keys-table\">{tbody}</template>",
         user = he(&user.name),
         proj_str = proj_str,
         raw_e = raw_e,
@@ -1175,6 +1159,8 @@ pub struct PageQuery {
 pub struct FailuresQuery {
     pub page: Option<u32>,
     pub correlation_id: Option<String>,
+    /// Keep the page to one endpoint (`/v1/decisions`, ...).
+    pub endpoint: Option<String>,
 }
 
 pub async fn get_prompts(
@@ -1238,6 +1224,7 @@ pub async fn get_prompts(
             store_prompts => storage.store_prompts,
             store_prompt_content => storage.store_prompt_content,
             prompt_retention_days => storage.prompt_retention_days,
+            storage_locked => storage.locked,
         },
     )
 }
@@ -1261,12 +1248,18 @@ pub async fn post_storage_settings(
 ) -> Result<axum::response::Redirect, DashboardError> {
     use crate::db::repositories::app_settings::AppSettingsRepository;
 
+    if state.storage.load().locked {
+        return Err(DashboardError::BadRequest(
+            "The storage policy is locked in the config file and cannot be changed here.".to_string(),
+        ));
+    }
     let cfg = crate::config::schema::StorageConfig {
         store_prompts: form.store_prompts.is_some(),
         store_prompt_content: form.store_prompt_content.is_some(),
         prompt_retention_days: form.prompt_retention_days.unwrap_or(0),
         // Restart-scoped, not in the form — carry the current value through.
         prompt_db_path: state.storage.load().prompt_db_path.clone(),
+        locked: false,
     };
     let json = serde_json::to_string(&cfg).map_err(|_| DashboardError::Internal)?;
     AppSettingsRepository::set_setting(&*state.db, "storage", &json)
@@ -1295,8 +1288,13 @@ pub async fn get_failures(
 
     // If a correlation_id is provided, filter to just those failures;
     // otherwise list the latest batch.
+    let endpoint_filter = q.endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()).map(str::to_string);
     let failures = if let Some(ref cid) = q.correlation_id {
         FailureRepository::find_by_correlation_id(&*state.db, cid)
+            .await
+            .map_err(|_| DashboardError::Internal)?
+    } else if let Some(ref endpoint) = endpoint_filter {
+        FailureRepository::list_by_endpoint(&*state.db, endpoint, per_page, offset)
             .await
             .map_err(|_| DashboardError::Internal)?
     } else {
@@ -1314,6 +1312,14 @@ pub async fn get_failures(
     let stage_items: Vec<minijinja::Value> = by_stage
         .into_iter()
         .map(|(stage, count)| minijinja::context! { stage => stage, count => count })
+        .collect();
+    // Failures per endpoint (the call kind): a decisions failure is read apart
+    // from a chat failure on the same model.
+    let by_endpoint: Vec<minijinja::Value> = FailureRepository::count_by_endpoint(&*state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(endpoint, count)| minijinja::context! { endpoint => endpoint, count => count })
         .collect();
 
     let page_items: Vec<minijinja::Value> = failures
@@ -1344,6 +1350,8 @@ pub async fn get_failures(
             page => page,
             has_next => has_next,
             correlation_id => q.correlation_id,
+            by_endpoint => by_endpoint,
+            endpoint => endpoint_filter,
         },
     )
 }
@@ -1585,6 +1593,30 @@ pub async fn get_cost(
     let key_display = build_key_display_map(&all_keys, &user_map);
 
     // ── Query ───────────────────────────────────────────────────────────────
+    // Spend by call kind: a decision is not a chat call on the same model.
+    // The key filter does not apply to this view (it is per model, not per key).
+    let by_kind: Vec<minijinja::Value> = CostRepository::summarize_by_kind(
+        &*state.db,
+        effective_user_ids.as_deref(),
+        filter_project,
+        filter_model,
+        &window_since,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| {
+        minijinja::context! {
+            call_kind => crate::db::models::CallKind::label(&r.call_kind).to_string(),
+            model => r.model,
+            uncached_cost_usd => r.uncached_cost_usd,
+            total_cost_usd => r.total_cost_usd,
+            request_count => r.request_count,
+            tokens_in => r.tokens_in,
+            tokens_out => r.tokens_out,
+        }
+    })
+    .collect();
     let raw_rows = CostRepository::cost_rows_grouped(
         &*state.db,
         effective_user_ids.as_deref(),
@@ -1717,6 +1749,7 @@ pub async fn get_cost(
             projects     => projects,
             models       => models,
             key_options  => key_options,
+            by_kind      => by_kind,
             cache_hit_pct   => (cache_total.hit_rate() * 100.0).round(),
             cache_hits      => cache_total.hits,
             cache_requests  => cache_total.requests,

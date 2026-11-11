@@ -33,9 +33,9 @@ impl ExperimentRepository for SqliteDb {
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let row = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -43,9 +43,9 @@ impl ExperimentRepository for SqliteDb {
     }
 
     async fn get(&self, id: i64) -> anyhow::Result<Option<Experiment>> {
-        let row = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let row = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -58,9 +58,9 @@ impl ExperimentRepository for SqliteDb {
             ExperimentStatusFilter::Active => "status = 'active'",
             ExperimentStatusFilter::Closed => "status = 'closed'",
         };
-        let rows = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let rows = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE {predicate} ORDER BY id DESC"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Experiment::try_from).collect()
@@ -93,9 +93,9 @@ impl ExperimentRepository for SqliteDb {
 
     async fn all_retaining_open_or_within_window(&self, now: &str) -> anyhow::Result<Vec<Experiment>> {
         let now = chrono::DateTime::parse_from_rfc3339(now)?.with_timezone(&chrono::Utc);
-        let rows = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let rows = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE retain_content = 1 ORDER BY id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         let all: Vec<Experiment> = rows.into_iter().map(Experiment::try_from).collect::<Result<_, _>>()?;
@@ -103,10 +103,10 @@ impl ExperimentRepository for SqliteDb {
     }
 
     async fn closed_retaining(&self) -> anyhow::Result<Vec<Experiment>> {
-        let rows = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let rows = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments \
              WHERE retain_content = 1 AND status = 'closed' ORDER BY id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Experiment::try_from).collect()

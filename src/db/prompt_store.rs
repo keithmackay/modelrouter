@@ -85,6 +85,7 @@ mod tests {
             attribution_tags: "[]".into(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Chat,
         }
     }
 

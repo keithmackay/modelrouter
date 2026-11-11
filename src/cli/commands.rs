@@ -68,6 +68,27 @@ pub enum Commands {
     Cache(CacheArgs),
     /// Manage controlled experiments (spec §7a)
     Experiment(ExperimentArgs),
+    /// Database housekeeping
+    Db(DbArgs),
+}
+
+// ── Database subcommands ──────────────────────────────────────────────────────
+
+#[derive(Args)]
+pub struct DbArgs {
+    #[command(subcommand)]
+    pub command: DbCommands,
+}
+
+#[derive(Subcommand)]
+pub enum DbCommands {
+    /// Compact the SQLite database file and switch it to incremental
+    /// auto-vacuum, so the hourly retention tick can return freed space to
+    /// the file system from then on. One full VACUUM: it rewrites the file
+    /// (free disk of about the file's size is needed) and holds the write
+    /// lock while it runs, so run it in a quiet window. A file already in
+    /// incremental mode is compacted again. Postgres needs nothing here.
+    Vacuum,
 }
 
 // ── Experiment subcommands ────────────────────────────────────────────────────
@@ -492,6 +513,8 @@ pub enum AttributionBreakdown {
     Model,
     /// One row per calendar day, plus a totals row
     Day,
+    /// One row per call kind (chat, embedding, search, decision, ...), plus a totals row
+    Kind,
 }
 
 #[derive(Args)]
@@ -528,7 +551,8 @@ pub enum ReportCommands {
         /// with --tag.
         #[arg(long, conflicts_with = "tag")]
         correlation_id: Option<String>,
-        /// Break the attribution report down by `model` or `day`
+        /// Break the attribution report down by `model`, `day` or `kind`
+        /// (the call kind: a decision is not a chat call on the same model)
         #[arg(long, default_value = "model")]
         by: AttributionBreakdown,
         /// Time window: daily | weekly | monthly | alltime  [default: monthly]

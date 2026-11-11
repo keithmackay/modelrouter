@@ -47,7 +47,7 @@ async fn build_test_server_with_db(
 
     let state = AppState {
         live_settings: Arc::new(arc_swap::ArcSwap::from_pointee((*settings).clone())),
-        storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        storage: Arc::new(arc_swap::ArcSwap::from_pointee(settings.storage.clone())),
         prompt_db: db.clone(),
         settings,
         db: db.clone(),
@@ -380,6 +380,7 @@ async fn seed_compare_ledger(
                 attribution_tags: tags.to_string(),
                 experiment_id: None,
                 experiment_variant: None,
+                call_kind: modelrouter::db::models::CallKind::Chat,
                 tokens_estimated: false,
             },
         )
@@ -737,6 +738,7 @@ async fn seed_experiment_ledger(
             attribution_tags: "{}".to_string(),
             experiment_id: Some(experiment),
             experiment_variant: Some(variant.to_string()),
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )
@@ -1579,6 +1581,7 @@ async fn overview_page_renders_spend_totals() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     }).await.unwrap();
 
@@ -1638,6 +1641,7 @@ async fn prompts_page_paging_works() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
         }).await.unwrap();
     }
 
@@ -1693,6 +1697,7 @@ async fn prompt_detail_route_returns_content() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
     }).await.unwrap();
 
     let token = viewer_jwt(&settings);
@@ -1729,6 +1734,36 @@ async fn storage_settings_persist_through_post() {
         .await;
 
     assert_eq!(resp.status_code(), 303, "storage settings should redirect after save");
+}
+
+#[tokio::test]
+async fn a_locked_storage_policy_cannot_be_changed_from_the_dashboard() {
+    use modelrouter::db::repositories::app_settings::AppSettingsRepository;
+    let raw_db = Arc::new(common::in_memory_db().await);
+    let mut settings = Settings::default();
+    settings.storage.locked = true;
+    settings.storage.prompt_retention_days = 30;
+    let settings = Arc::new(settings);
+    let token = viewer_jwt(&settings);
+    let server = build_test_server_with_db(raw_db.clone(), settings).await;
+
+    let resp = server
+        .post("/admin/storage-settings")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .form(&[("store_prompts", "on"), ("store_prompt_content", "on"), ("prompt_retention_days", "0")])
+        .await;
+    assert_eq!(resp.status_code(), 400, "a locked policy refuses the form: {}", resp.text());
+    assert!(
+        AppSettingsRepository::get_setting(&*raw_db, "storage").await.unwrap().is_none(),
+        "nothing is saved to override the file"
+    );
+
+    let page = server
+        .get("/admin/prompts")
+        .add_header(session_cookie(&token).0, session_cookie(&token).1)
+        .await;
+    assert_eq!(page.status_code(), 200);
+    assert!(page.text().contains("Locked in the config file"), "the page says the policy is locked");
 }
 
 // ── Cost page ─────────────────────────────────────────────────────────────────
@@ -2146,6 +2181,7 @@ async fn cost_page_with_project_filter() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     }).await.unwrap();
     // A rerun of the same call served from the response cache.
@@ -2165,6 +2201,7 @@ async fn cost_page_with_project_filter() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )
@@ -2223,6 +2260,7 @@ async fn reports_panels_list_uncached_spend_by_user_model_and_project() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     };
     CostRepository::create(&raw_db, entry()).await.unwrap();
@@ -2311,6 +2349,7 @@ async fn cost_page_headline_and_token_columns_follow_the_filters() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     };
     CostRepository::create(&raw_db, entry(ann.id, "proj-a", 0.25))
@@ -2946,6 +2985,7 @@ async fn cost_page_intersects_the_user_and_group_filters() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         })
         .await
@@ -3019,6 +3059,7 @@ async fn cost_page_with_an_unknown_group_yields_no_rows() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     })
     .await
@@ -3077,6 +3118,7 @@ async fn cost_page_accepts_the_project_model_and_key_filters() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     })
     .await
@@ -3135,6 +3177,7 @@ async fn overview_warns_about_a_user_near_their_budget_limit() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         })
         .await
@@ -3272,6 +3315,7 @@ async fn prompts_page_labels_an_author_with_their_email() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
         })
         .await
         .unwrap();

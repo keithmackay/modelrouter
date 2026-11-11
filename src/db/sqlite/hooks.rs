@@ -25,6 +25,14 @@ impl From<HookMetricRow> for HookMetric {
 
 #[async_trait]
 impl HookRepository for SqliteDb {
+    async fn purge_metrics_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM hook_metrics WHERE invoked_at < ?")
+            .bind(cutoff_rfc3339)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn has_permission(&self, hook_name: &str, capability: &str) -> anyhow::Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM hook_permissions WHERE hook_name = ? AND capability = ? LIMIT 1",

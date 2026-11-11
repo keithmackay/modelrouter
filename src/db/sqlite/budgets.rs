@@ -127,34 +127,34 @@ impl BudgetRepository for SqliteDb {
                     project, window_start, window_end";
         let rows = match scope {
             BudgetScope::Global => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {} FROM budget_rules \
                      WHERE user_id IS NULL AND group_name IS NULL AND project IS NULL AND api_key_id IS NULL \
                      ORDER BY id", cols
-                ))
+                )))
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::Project(name) => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {} FROM budget_rules WHERE project = ? ORDER BY id", cols
-                ))
+                )))
                 .bind(name)
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::User(user_id) => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {} FROM budget_rules WHERE user_id = ? ORDER BY id", cols
-                ))
+                )))
                 .bind(user_id)
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::Group(group_name) => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {} FROM budget_rules WHERE group_name = ? ORDER BY id", cols
-                ))
+                )))
                 .bind(group_name)
                 .fetch_all(&self.pool)
                 .await?

@@ -71,6 +71,39 @@
     </div>
     <button type="submit" class="btn btn-primary">Filter</button>
 </form>
+{% if by_kind %}
+<h3 style="margin:1rem 0 0.25rem;">By call kind</h3>
+<p style="font-size:0.85rem;color:#666;margin:0 0 0.5rem;">
+    Each kind of call on its own line: chat, embedding, search, image, audio, decision, judgment and health probes.
+    Rows written before the kind was recorded read <code>unknown</code>. The key filter does not apply here.
+</p>
+<table>
+    <thead>
+        <tr>
+            <th>Kind</th>
+            <th>Model</th>
+            <th title="Cost had nothing come from the response cache">Uncached (USD)</th>
+            <th>Cost (USD)</th>
+            <th>Requests</th>
+            <th>Tokens In</th>
+            <th>Tokens Out</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for k in by_kind %}
+        <tr>
+            <td><code>{{ k.call_kind }}</code></td>
+            <td>{{ k.model }}</td>
+            <td>{{ k.uncached_cost_usd|money }}</td>
+            <td>{{ k.total_cost_usd|money }}</td>
+            <td>{{ k.request_count }}</td>
+            <td>{{ k.tokens_in }}</td>
+            <td>{{ k.tokens_out }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
 <table>
     <thead>
         <tr>

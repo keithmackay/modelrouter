@@ -12,6 +12,8 @@ pub mod learned_capabilities;
 pub mod fallback;
 pub mod load_balancer;
 pub mod model_capabilities;
+pub mod model_parameters;
 pub mod declarative_policy;
 pub mod policy;
 pub mod retry;
+pub mod scoped_aliases;
