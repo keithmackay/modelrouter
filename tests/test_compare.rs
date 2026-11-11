@@ -112,6 +112,8 @@ async fn build_app() -> (TestServer, Arc<dyn DatabaseProvider>, Arc<Settings>) {
                 snippet: "Example description".to_string(),
                 score: Some(0.9),
                 published_date: None,
+                publisher: None,
+                metadata_provenance: None,
             }],
         })),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
@@ -236,6 +238,7 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
             attribution_tags: s.tags.to_string(),
             experiment_id: s.experiment_id(),
             experiment_variant: s.experiment_variant(),
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )
@@ -266,6 +269,7 @@ async fn seed_cache_hit(
             attribution_tags: s.tags.to_string(),
             experiment_id: s.experiment_id(),
             experiment_variant: s.experiment_variant(),
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )
@@ -319,6 +323,7 @@ async fn seed_prompt_measured(
             attribution_tags: s.tags.to_string(),
             experiment_id: s.experiment_id(),
             experiment_variant: s.experiment_variant(),
+            call_kind: modelrouter::db::models::CallKind::Chat,
         },
     )
     .await
@@ -485,7 +490,13 @@ async fn provider_dimension_matches_the_expected_document() {
             "unpriced": true, "unpriced_models": ["m1"],
             "by_day": [{ "key": day, "cost_usd": 2.0, "saved_usd": 0.0,
                          "uncached_cost_usd": 2.0, "tokens_in": 40,
-                         "tokens_out": 80, "requests": 4, "cache_hits": 0 }]
+                         "tokens_out": 80, "requests": 4, "cache_hits": 0 }],
+            // Every seeded row is a chat call, so the by-kind breakdown is the
+            // arm's totals under one key and no decision call was made.
+            "by_kind": [{ "key": "chat", "cost_usd": 2.0, "saved_usd": 0.0,
+                          "uncached_cost_usd": 2.0, "tokens_in": 40,
+                          "tokens_out": 80, "requests": 4, "cache_hits": 0 }],
+            "decision_requests": 0
         },
         "b": {
             "value": "p2", "label": "provider=p2",
@@ -502,7 +513,11 @@ async fn provider_dimension_matches_the_expected_document() {
             "unpriced": true, "unpriced_models": ["m2"],
             "by_day": [{ "key": day, "cost_usd": 0.25, "saved_usd": 0.0,
                          "uncached_cost_usd": 0.25, "tokens_in": 40,
-                         "tokens_out": 80, "requests": 1, "cache_hits": 0 }]
+                         "tokens_out": 80, "requests": 1, "cache_hits": 0 }],
+            "by_kind": [{ "key": "chat", "cost_usd": 0.25, "saved_usd": 0.0,
+                          "uncached_cost_usd": 0.25, "tokens_in": 40,
+                          "tokens_out": 80, "requests": 1, "cache_hits": 0 }],
+            "decision_requests": 0
         },
         "delta": {
             "requests": { "abs": -3.0, "pct": -75.0 },

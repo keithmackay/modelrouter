@@ -4,7 +4,7 @@ use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{
-    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository,
+    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository, DecisionAnswerRow,
 };
 use super::costs::arm_predicate;
 use super::{SqliteDb, now_utc};
@@ -20,12 +20,39 @@ const TTFT_SAMPLE: &str = "ttft_ms IS NOT NULL AND ttft_ms > 0";
 /// `purge_older_than_except`, well under SQLite's bound-parameter limit.
 const PURGE_ID_CHUNK: usize = 500;
 
+impl SqliteDb {
+    /// Delete the prompt rows matching `created_at < cutoff <predicate>`
+    /// after detaching the usage rows that point at them, in short
+    /// batches (`SqliteDb::delete_in_batches`). `cost_ledger.prompt_id` references `prompts(id)` with no
+    /// `ON DELETE`, and foreign keys are enforced, so a bare DELETE failed on
+    /// the first prompt that had a usage row and the prompt log was never
+    /// pruned. Usage rows have their own retention (`[retention]
+    /// cost_ledger_days`); here they only lose the link. `ids` bind the
+    /// placeholders `predicate` carries, after the cutoff.
+    async fn delete_prompts_detaching_ledger(
+        &self,
+        predicate: &str,
+        cutoff_rfc3339: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<u64> {
+        let where_sql = format!("created_at < ? {predicate}");
+        self.delete_in_batches(
+            "prompts",
+            &where_sql,
+            cutoff_rfc3339,
+            ids,
+            Some("UPDATE cost_ledger SET prompt_id = NULL WHERE prompt_id IN ({ids})"),
+        )
+        .await
+    }
+}
+
 /// Columns selected when reading a prompt row back.
 const PROMPT_COLUMNS: &str = "id, user_id, session_id, request_model, routed_model, provider, \
                               messages, response, finish_reason, prompt_tokens, completion_tokens, \
                               cache_read_tokens, cache_write_tokens, cost_usd, latency_ms, ttft_ms, \
                               attempts, tags, project, attribution_correlation_id, attribution_tags, \
-                              experiment_id, experiment_variant, created_at";
+                              experiment_id, experiment_variant, call_kind, created_at";
 
 #[async_trait]
 impl PromptRepository for SqliteDb {
@@ -38,8 +65,8 @@ impl PromptRepository for SqliteDb {
                 cache_read_tokens, cache_write_tokens,
                 cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                 attribution_correlation_id, attribution_tags,
-                experiment_id, experiment_variant, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                experiment_id, experiment_variant, call_kind, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -63,15 +90,16 @@ impl PromptRepository for SqliteDb {
         .bind(&prompt.attribution_tags)
         .bind(prompt.experiment_id)
         .bind(&prompt.experiment_variant)
+        .bind(prompt.call_kind.as_str())
         .bind(&now)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, Prompt>(&format!(
+        let row = sqlx::query_as::<_, Prompt>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM prompts WHERE id = ?",
             PROMPT_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -79,10 +107,10 @@ impl PromptRepository for SqliteDb {
     }
 
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<Prompt>> {
-        let row = sqlx::query_as::<_, Prompt>(&format!(
+        let row = sqlx::query_as::<_, Prompt>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM prompts WHERE id = ?",
             PROMPT_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -90,10 +118,10 @@ impl PromptRepository for SqliteDb {
     }
 
     async fn list_by_user(&self, user_id: i64, limit: i64) -> anyhow::Result<Vec<Prompt>> {
-        let rows = sqlx::query_as::<_, Prompt>(&format!(
+        let rows = sqlx::query_as::<_, Prompt>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM prompts WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
             PROMPT_COLUMNS
-        ))
+        )))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -102,10 +130,10 @@ impl PromptRepository for SqliteDb {
     }
 
     async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<Prompt>> {
-        let rows = sqlx::query_as::<_, Prompt>(&format!(
+        let rows = sqlx::query_as::<_, Prompt>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM prompts ORDER BY created_at DESC LIMIT ? OFFSET ?",
             PROMPT_COLUMNS
-        ))
+        )))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -123,11 +151,7 @@ impl PromptRepository for SqliteDb {
     async fn purge_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
         // created_at is uniformly RFC3339 UTC (now_utc), so string comparison
         // orders correctly — no parsing needed at purge time.
-        let result = sqlx::query("DELETE FROM prompts WHERE created_at < ?")
-            .bind(cutoff_rfc3339)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        self.delete_prompts_detaching_ledger("", cutoff_rfc3339, &[]).await
     }
 
     async fn purge_older_than_except(
@@ -143,13 +167,9 @@ impl PromptRepository for SqliteDb {
         // keeps the statement correct when the list has to be chunked (a
         // `NOT IN` split across chunks would delete a protected row in the
         // chunk that does not name it).
-        let result = sqlx::query(
-            "DELETE FROM prompts WHERE created_at < ? AND experiment_id IS NULL",
-        )
-        .bind(cutoff_rfc3339)
-        .execute(&self.pool)
-        .await?;
-        let mut deleted = result.rows_affected();
+        let mut deleted = self
+            .delete_prompts_detaching_ledger("AND experiment_id IS NULL", cutoff_rfc3339, &[])
+            .await?;
 
         let stamped: Vec<(i64,)> = sqlx::query_as(
             "SELECT DISTINCT experiment_id FROM prompts \
@@ -165,14 +185,13 @@ impl PromptRepository for SqliteDb {
             .collect();
         for chunk in expendable.chunks(PURGE_ID_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
-            let sql = format!(
-                "DELETE FROM prompts WHERE created_at < ? AND experiment_id IN ({placeholders})"
-            );
-            let mut q = sqlx::query(&sql).bind(cutoff_rfc3339);
-            for id in chunk {
-                q = q.bind(id);
-            }
-            deleted += q.execute(&self.pool).await?.rows_affected();
+            deleted += self
+                .delete_prompts_detaching_ledger(
+                    &format!("AND experiment_id IN ({placeholders})"),
+                    cutoff_rfc3339,
+                    chunk,
+                )
+                .await?;
         }
         Ok(deleted)
     }
@@ -223,13 +242,38 @@ impl PromptRepository for SqliteDb {
              WHERE {predicate} AND created_at >= ? AND created_at < ? \
                AND attempts IS NOT NULL"
         );
-        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b.clone());
         }
         let (requests_tracked, attempts, retried_requests) =
             q.bind(start).bind(end).fetch_one(&self.pool).await?;
         Ok(AttemptsSummary { requests_tracked, attempts, retried_requests })
+    }
+
+    async fn decision_answers_for_arm(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DecisionAnswerRow>> {
+        let (predicate, binds) = arm_predicate(filter, "routed_model");
+        let sql = format!(
+            "SELECT attribution_correlation_id, messages, response FROM prompts \
+             WHERE {predicate} AND created_at >= ? AND created_at < ? \
+               AND call_kind = 'decision' AND response IS NOT NULL \
+             ORDER BY created_at DESC LIMIT ?"
+        );
+        let mut q = sqlx::query_as::<_, (Option<String>, String, String)>(sqlx::AssertSqlSafe(sql.as_str()));
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let rows = q.bind(start).bind(end).bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(correlation_id, request, answers)| DecisionAnswerRow { correlation_id, request, answers })
+            .collect())
     }
 
     async fn experiment_run_latency(
@@ -243,7 +287,7 @@ impl PromptRepository for SqliteDb {
              ORDER BY user_id ASC, attribution_correlation_id ASC",
             LATENCY_SAMPLE
         );
-        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(&sql)
+        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -289,7 +333,7 @@ impl SqliteDb {
         );
 
         let sql = format!("SELECT COUNT(*), AVG({column}) FROM prompts WHERE {where_clause}");
-        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b.clone());
         }
@@ -315,7 +359,7 @@ impl SqliteDb {
             let last_sql = last_sql.clone();
             let binds = binds.clone();
             async move {
-                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+                let mut q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql.as_str()));
                 for b in &binds {
                     q = q.bind(b.clone());
                 }
@@ -328,7 +372,7 @@ impl SqliteDb {
                 if let Some((v,)) = row {
                     return anyhow::Ok(Some(v));
                 }
-                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
+                let mut q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(last_sql.as_str()));
                 for b in binds {
                     q = q.bind(b);
                 }
@@ -391,6 +435,7 @@ mod tests {
                 attribution_tags: "{}".to_string(),
                 experiment_id: None,
                 experiment_variant: None,
+                call_kind: crate::db::models::CallKind::Chat,
             },
         )
         .await
@@ -433,6 +478,7 @@ mod tests {
                 attribution_tags: "{}".to_string(),
                 experiment_id: None,
                 experiment_variant: None,
+                call_kind: crate::db::models::CallKind::Chat,
             },
         )
         .await
@@ -610,6 +656,7 @@ mod tests {
                 attribution_tags: "{}".to_string(),
                 experiment_id: None,
                 experiment_variant: None,
+                call_kind: crate::db::models::CallKind::Chat,
             },
         )
         .await
@@ -633,6 +680,60 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+    }
+
+    async fn insert_decision_prompt(db: &SqliteDb, model: &str, run: &str, answers: Option<&str>, kind: crate::db::models::CallKind) {
+        PromptRepository::create(
+            db,
+            NewPrompt {
+                user_id: 1,
+                session_id: None,
+                request_model: "decide".to_string(),
+                routed_model: model.to_string(),
+                provider: "foundry".to_string(),
+                messages: r#"{"input":"doc","questions":[{"name":"q1"}]}"#.to_string(),
+                response: answers.map(str::to_string),
+                finish_reason: None,
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: 0.01,
+                latency_ms: Some(5),
+                ttft_ms: None,
+                attempts: Some(1),
+                tags: "[]".to_string(),
+                project: None,
+                attribution_correlation_id: Some(run.to_string()),
+                attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+                call_kind: kind,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn decision_answers_for_arm_returns_retained_decision_rows_only() {
+        use crate::db::models::CallKind;
+        let db = make_db().await;
+        insert_decision_prompt(&db, "dec-1", "r", Some(r#"{"answers":[{"name":"q1","probability":0.9}]}"#), CallKind::Decision).await;
+        // Redacted content (no response) and a chat row on the same model are left out.
+        insert_decision_prompt(&db, "dec-1", "r", None, CallKind::Decision).await;
+        insert_decision_prompt(&db, "dec-1", "r", Some(r#"{"answers":[]}"#), CallKind::Chat).await;
+        // Another model is another arm.
+        insert_decision_prompt(&db, "dec-2", "r", Some(r#"{"answers":[]}"#), CallKind::Decision).await;
+
+        let rows = db.decision_answers_for_arm(&model("dec-1"), "2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].correlation_id.as_deref(), Some("r"));
+        assert!(rows[0].request.contains("\"q1\""));
+        assert!(rows[0].answers.contains("0.9"));
+        // The correlation-id arm sees both models' retained rows, bounded by the limit.
+        let both = db.decision_answers_for_arm(&ArmFilter::Attribution(AttributionFilter::CorrelationId("r".into())), "2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 1).await.unwrap();
+        assert_eq!(both.len(), 1);
     }
 
     #[tokio::test]
@@ -711,6 +812,91 @@ mod tests {
     const OLD: &str = "2026-01-01T00:00:00Z";
     const NEW: &str = "2026-03-15T00:00:00Z";
     const CUTOFF: &str = "2026-03-01T00:00:00Z";
+
+    async fn insert_ledger_row(db: &SqliteDb, prompt_id: Option<i64>, created_at: &str) -> i64 {
+        let r = sqlx::query(
+            "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, cost_usd, created_at) \
+             VALUES (1, ?, 'X', 'p', 0.01, ?)",
+        )
+        .bind(prompt_id)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        r.last_insert_rowid()
+    }
+
+    async fn ledger_link(db: &SqliteDb, ledger_id: i64) -> Option<i64> {
+        let row: (Option<i64>,) = sqlx::query_as("SELECT prompt_id FROM cost_ledger WHERE id = ?")
+            .bind(ledger_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        row.0
+    }
+
+    /// A logged prompt has a ledger row pointing at it. The purge must delete the
+    /// prompt anyway (a foreign-key failure would roll the whole purge back on
+    /// every tick) and keep the ledger row's cost, unlinked.
+    #[tokio::test]
+    async fn purge_deletes_prompts_that_ledger_rows_reference_and_keeps_the_cost() {
+        let db = make_db().await;
+        let old = insert_stamped_row(&db, None, OLD).await;
+        let new = insert_stamped_row(&db, None, NEW).await;
+        let old_cost = insert_ledger_row(&db, Some(old), OLD).await;
+        let new_cost = insert_ledger_row(&db, Some(new), NEW).await;
+
+        assert_eq!(db.purge_older_than(CUTOFF).await.unwrap(), 1);
+        assert!(!exists(&db, old).await);
+        assert!(exists(&db, new).await);
+        assert_eq!(ledger_link(&db, old_cost).await, None, "the old cost row is kept, unlinked");
+        assert_eq!(ledger_link(&db, new_cost).await, Some(new));
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_except_unlinks_ledger_rows_of_every_deleted_prompt() {
+        let db = make_db().await;
+        let plain = insert_stamped_row(&db, None, OLD).await;
+        let kept = insert_stamped_row(&db, Some(7), OLD).await;
+        let gone = insert_stamped_row(&db, Some(9), OLD).await;
+        let plain_cost = insert_ledger_row(&db, Some(plain), OLD).await;
+        let kept_cost = insert_ledger_row(&db, Some(kept), OLD).await;
+        let gone_cost = insert_ledger_row(&db, Some(gone), OLD).await;
+
+        assert_eq!(db.purge_older_than_except(CUTOFF, &[7]).await.unwrap(), 2);
+        assert!(exists(&db, kept).await);
+        assert_eq!(ledger_link(&db, plain_cost).await, None);
+        assert_eq!(ledger_link(&db, gone_cost).await, None);
+        assert_eq!(ledger_link(&db, kept_cost).await, Some(kept));
+    }
+
+    /// More old rows than one batch: every batch commits on its own and the
+    /// purge carries on until nothing old is left.
+    #[tokio::test]
+    async fn purge_runs_in_batches_until_nothing_old_is_left() {
+        let db = make_db().await;
+        let total = crate::db::sqlite::PURGE_BATCH * 2 + 7;
+        for _ in 0..total {
+            let id = insert_stamped_row(&db, None, OLD).await;
+            insert_ledger_row(&db, Some(id), OLD).await;
+        }
+        let new = insert_stamped_row(&db, None, NEW).await;
+
+        assert_eq!(db.purge_older_than(CUTOFF).await.unwrap() as usize, total);
+        assert!(exists(&db, new).await);
+        let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM prompts WHERE created_at < ?")
+            .bind(CUTOFF)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left.0, 0);
+        let linked: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cost_ledger WHERE prompt_id IS NOT NULL")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(linked.0, 0, "no ledger row points at a deleted prompt");
+        assert_eq!(db.purge_older_than(CUTOFF).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn purge_older_than_except_spares_the_listed_experiments() {

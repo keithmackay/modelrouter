@@ -6,11 +6,16 @@ use tracing::Instrument;
 
 use super::router_meta::{CallCost, RouterMeta, TimingMeta, TokenMeta};
 use super::tools::{
-    assistant_message, ensure_tools_supported, forwarded_tools, request_has_tools,
-    validate_tool_choice_requires_tools,
+    assistant_message, ensure_response_format_valid, ensure_tools_supported, forwarded_response_format,
+    forwarded_tools, request_has_tools, validate_tool_choice_requires_tools,
 };
 use crate::{
-    api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
+    api::{
+        app::AppState,
+        auth::AuthenticatedUser,
+        error::ApiError,
+        request_lifecycle::{LifecycleStream, UpstreamCall},
+    },
     config::schema::StorageConfig,
     db::{
         models::{NewCostLedgerEntry, NewPrompt},
@@ -103,6 +108,8 @@ async fn chat_completions_inner(
     // `skip_log`: an experiment retaining content locally does not widen what
     // leaves the router.
     let global_storage = state.storage.load();
+    // A locked policy that keeps no content wins over a retaining binding.
+    let retain_content = retain_content && global_storage.allows_forced_content();
     let skip_log = x_no_log || !global_storage.store_prompts;
     let write_prompt = !x_no_log && (global_storage.store_prompts || retain_content);
     // The storage policy the prompt row is redacted under: the operator's,
@@ -123,31 +130,25 @@ async fn chat_completions_inner(
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
     let messages_for_complexity = body["messages"].as_array().cloned().unwrap_or_default();
-    let model = match &binding {
-        // The overlay wins where it names the requested model; a name it does
-        // not map routes as usual (and is still stamped). Neither is downgraded.
-        Some(b) => b
-            .overlay
-            .get(&requested_model)
-            .cloned()
-            .unwrap_or_else(|| requested_model.clone()),
-        None => state
-            .complexity_router
-            .maybe_downgrade(&requested_model, &messages_for_complexity),
-    };
-    if let Some(b) = &binding {
-        tracing::info!(
-            experiment_id = b.experiment_id,
-            variant = b.variant.as_str(),
-            requested_model = requested_model.as_str(),
-            model = model.as_str(),
-            "request bound to experiment variant"
-        );
+    let RoutedName { model, pinned, params } = route_requested_name(
+        &state,
+        binding.as_ref(),
+        &attribution,
+        &requested_model,
+        &messages_for_complexity,
+    );
+    // A scoped override's parameters overwrite the caller's, so every request
+    // it routes runs with them.
+    let mut body = body;
+    if let Some(params) = &params {
+        crate::router::model_parameters::apply_parameters(&mut body, params);
     }
-    // What the rows record as the request model. Under a binding that is the
-    // name the caller sent: the overlay is the experiment's doing, and the
-    // comparison later runs on the caller's name.
-    let logged_model = if binding.is_some() {
+    let body = body;
+    // What the rows record as the request model. Under a binding or a scoped
+    // override that is the name the caller sent: the pin is the router's
+    // doing, and comparisons later run on the caller's name. The ledger's
+    // model column records what actually answered.
+    let logged_model = if pinned {
         requested_model.clone()
     } else {
         model.clone()
@@ -210,8 +211,8 @@ async fn chat_completions_inner(
     // consults the pool and neither reads nor writes an affinity pin: the
     // variant already fixed the model.
     let (provider_name, canonical_model) =
-        resolve_provider_and_model(&state, binding.is_some(), &model)?;
-    let session_for_affinity = body["session_id"].as_str().filter(|_| binding.is_none());
+        resolve_provider_and_model(&state, pinned, &model)?;
+    let session_for_affinity = body["session_id"].as_str().filter(|_| !pinned);
     let (provider_name, canonical_model) = apply_session_affinity(
         &state,
         &headers,
@@ -231,6 +232,9 @@ async fn chat_completions_inner(
     // Tools capability gate (issue #88): reject only when the resolved
     // adapter cannot forward tools.
     ensure_tools_supported(&state, &body, &provider_name, &canonical_model)?;
+    // A structured-output request is forwarded where the adapter accepts it and
+    // reported as dropped elsewhere; only a malformed one is refused here.
+    ensure_response_format_valid(&body)?;
 
     let span = tracing::Span::current();
     span.record("model", canonical_model.as_str());
@@ -243,7 +247,7 @@ async fn chat_completions_inner(
     // cached answer says nothing about the pinned model. Streamed and plain
     // requests share entries; `stream` is not part of the key. The caller's
     // `x-modelrouter-cache` header can widen or narrow that per request.
-    let cache_plan = if binding.is_none() && state.policy.cache_enabled(&user, &canonical_model) {
+    let cache_plan = if !pinned && state.policy.cache_enabled(&user, &canonical_model) {
         state
             .response_cache
             .completion_plan(cache_directives.mode, &body)
@@ -275,8 +279,16 @@ async fn chat_completions_inner(
         }
     }
 
-    let norm_req =
-        build_normalized_request(&body, canonical_model.clone(), &model, &state.settings.model_capabilities);
+    // Tier timeouts key on the caller's name: a pinned request still asked
+    // for `deep` and gets deep's timeout, not the default one.
+    let timeout_name = if pinned { &requested_model } else { &model };
+    let norm_req = build_normalized_request(
+        &body,
+        canonical_model.clone(),
+        timeout_name,
+        &state.settings.model_capabilities,
+        state.router.learned_capabilities(),
+    );
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -291,12 +303,41 @@ async fn chat_completions_inner(
             .provider_registry
             .get(&provider_name)
             .map_err(ApiError::ProviderError)?;
-        let sse_stream = adapter.stream(&norm_req).await.map_err(|e| {
+        note_learned_temperature_strip(&state, &body, &norm_req);
+        let mut upstream = UpstreamCall::start(
+            &request_id,
+            attribution.correlation_id.as_deref(),
+            &provider_name,
+            &canonical_model,
+            true,
+        );
+        let first_try = adapter.stream(&norm_req).await;
+        let stream_result = match first_try {
+            Err(e) => match crate::router::model_capabilities::temperature_rejection_retry(&norm_req, &e) {
+                Some(retry) => {
+                    crate::router::learned_capabilities::record_temperature_rejection(
+                        state.router.learned_capabilities(),
+                        &*state.db,
+                        &norm_req.model,
+                        &e,
+                    )
+                    .await;
+                    adapter.stream(&retry).await
+                }
+                None => Err(e),
+            },
+            ok => ok,
+        };
+        let sse_stream = stream_result.map_err(|e| {
+            upstream.finish("failed", Some(&e.to_string()));
             state
                 .circuit_breaker
                 .record_provider_failure(&provider_name, &e);
             ApiError::ProviderError(e)
         })?;
+        upstream.headers();
+        let sse_stream: crate::providers::adapter::SseStream =
+            Box::pin(LifecycleStream::new(sse_stream, upstream));
         state.circuit_breaker.record_success(&provider_name);
         let settings = completion_settings(adapter.effective_settings(&norm_req), &norm_req, &body);
 
@@ -355,10 +396,12 @@ async fn chat_completions_inner(
         &state,
         &user,
         &body,
-        binding.is_some(),
+        pinned,
         provider_name.clone(),
         canonical_model.clone(),
         &model,
+        &request_id,
+        attribution.correlation_id.as_deref(),
     )
     .await?;
 
@@ -381,13 +424,9 @@ async fn chat_completions_inner(
     // `model` must all name the answering model — a row priced at the primary's
     // rate for tokens the fallback produced misstates spend.
     let latency_ms = start.elapsed().as_millis() as i64;
-    let cost = state.cost_calc.calculate_with_cache(
-        &current_model,
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.cache_read_tokens,
-        result.cache_write_tokens,
-    );
+    let cost = state.cost_calc.calculate_result(&current_model, &result);
+    let no_cache_cost = state.cost_calc.calculate_result_no_cache(&current_model, &result);
+    let priced = state.cost_calc.has_price(&current_model);
 
     span.record("cost.usd", cost);
     span.record("tokens.prompt", result.prompt_tokens as u64);
@@ -448,7 +487,7 @@ async fn chat_completions_inner(
         settings,
         tokens: Some(completion_tokens(&result)),
         results: None,
-        cost: CallCost::spent(cost),
+        cost: CallCost::spent(cost).with_no_cache_cost(no_cache_cost).priced_if(priced),
         timing: TimingMeta {
             total_ms: received.elapsed().as_millis() as i64,
             latency_ms,
@@ -459,10 +498,13 @@ async fn chat_completions_inner(
         },
     };
     let mut response = Json(build_openai_response(request_id, &result, &meta)).into_response();
-    response.headers_mut().insert(
-        CACHE_HEADER,
-        axum::http::HeaderValue::from_static(cache_plan.miss_header().unwrap_or("MISS")),
-    );
+    // No header when the cache was not involved: that is a plain response,
+    // not a miss.
+    if let Some(outcome) = cache_plan.miss_header() {
+        response
+            .headers_mut()
+            .insert(CACHE_HEADER, axum::http::HeaderValue::from_static(outcome));
+    }
     Ok(response)
 }
 
@@ -577,6 +619,67 @@ fn check_session_rate_limit(state: &AppState, body: &Value) -> Result<(), ApiErr
 /// Operator-disabled pool entries are skipped when selecting (issue #5). A
 /// bound request never consults the pool: a pool picks per request, and an
 /// experiment must pin one concrete model.
+/// The name a request routes with, and whether it is pinned.
+pub(crate) struct RoutedName {
+    pub model: String,
+    /// True under an experiment binding or a scoped override: the model is
+    /// fixed, so the adaptive layers (complexity downgrade, load balancer,
+    /// session affinity, response cache, fallback) stand aside.
+    pub pinned: bool,
+    /// Request parameters a scoped override sets, if any.
+    pub params: Option<serde_json::Map<String, Value>>,
+}
+
+/// Resolve the requested name: an experiment variant's overlay first, then a
+/// scoped override for the request's attribution tags, then the ordinary
+/// path (complexity downgrade, then aliases).
+pub(crate) fn route_requested_name(
+    state: &AppState,
+    binding: Option<&crate::router::experiments::Binding>,
+    attribution: &crate::api::attribution::Attribution,
+    requested_model: &str,
+    messages: &[Value],
+) -> RoutedName {
+    if let Some(b) = binding {
+        if let Some(target) = b.overlay.get(requested_model) {
+            tracing::info!(
+                experiment_id = b.experiment_id,
+                variant = b.variant.as_str(),
+                requested_model,
+                model = target.as_str(),
+                "request bound to experiment variant"
+            );
+            return RoutedName { model: target.clone(), pinned: true, params: None };
+        }
+    }
+    let scoped = state
+        .router
+        .scoped_aliases()
+        .target_for(&attribution.tags, requested_model, chrono::Utc::now().timestamp());
+    if let Some(s) = scoped {
+        let model = s.expression();
+        tracing::info!(
+            tag_key = s.tag_key.as_str(),
+            tag_value = s.tag_value.as_str(),
+            requested_model,
+            model = model.as_str(),
+            "request routed by scoped alias override"
+        );
+        let params = (!s.params.is_empty()).then_some(s.params);
+        return RoutedName { model, pinned: true, params };
+    }
+    if binding.is_some() {
+        // A name the overlay does not map routes as usual (and is still
+        // stamped), but is never downgraded.
+        return RoutedName { model: requested_model.to_string(), pinned: true, params: None };
+    }
+    RoutedName {
+        model: state.complexity_router.maybe_downgrade(requested_model, messages),
+        pinned: false,
+        params: None,
+    }
+}
+
 fn resolve_provider_and_model(
     state: &AppState,
     bound: bool,
@@ -673,13 +776,8 @@ async fn try_serve_cached_completion(
         "response cache hit"
     );
     // What the call would have cost. Recorded as a saving, not as spend.
-    let avoided_cost = state.cost_calc.calculate_with_cache(
-        canonical_model,
-        cached.prompt_tokens,
-        cached.completion_tokens,
-        cached.cache_read_tokens,
-        cached.cache_write_tokens,
-    );
+    let avoided_cost = state.cost_calc.calculate_result(canonical_model, &cached);
+    let no_cache_cost = state.cost_calc.calculate_result_no_cache(canonical_model, &cached);
     record_cache_hit(
         state,
         CacheHitCtx {
@@ -707,6 +805,7 @@ async fn try_serve_cached_completion(
         canonical_model.to_string(),
         request_model,
         &state.settings.model_capabilities,
+        state.router.learned_capabilities(),
     );
     let settings = match state.provider_registry.get(provider_name) {
         Ok(adapter) => completion_settings(adapter.effective_settings(&norm_req), &norm_req, body),
@@ -722,7 +821,7 @@ async fn try_serve_cached_completion(
         settings,
         tokens: Some(completion_tokens(&cached)),
         results: None,
-        cost: CallCost::cache_hit(avoided_cost),
+        cost: CallCost::cache_hit(avoided_cost).with_no_cache_cost(no_cache_cost).priced_if(state.cost_calc.has_price(canonical_model)),
         timing: TimingMeta {
             total_ms: received.elapsed().as_millis() as i64,
             latency_ms: 0,
@@ -798,6 +897,8 @@ async fn complete_with_retry_and_fallback(
     provider_name: String,
     canonical_model: String,
     requested_model: &str,
+    request_id: &str,
+    correlation_id: Option<&str>,
 ) -> Result<ProviderCallOutcome, ApiError> {
     let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model;
@@ -840,9 +941,38 @@ async fn complete_with_retry_and_fallback(
                     current_model.clone(),
                     requested_model,
                     &state.settings.model_capabilities,
+                    state.router.learned_capabilities(),
                 );
+                note_learned_temperature_strip(state, body, &req);
                 let adapter = adapter.clone();
-                async move { adapter.complete(&req).await }.instrument(tracing::info_span!(
+                let router = state.router.clone();
+                let db = state.db.clone();
+                // A non-streamed response's headers arrive with its body, so
+                // only start and finish are logged.
+                let mut upstream =
+                    UpstreamCall::start(request_id, correlation_id, &current_provider, &current_model, false);
+                async move {
+                    let learned = router.learned_capabilities();
+                    let outcome = match adapter.complete(&req).await {
+                        Err(e) => match crate::router::model_capabilities::temperature_rejection_retry(&req, &e) {
+                            Some(retry) => {
+                                crate::router::learned_capabilities::record_temperature_rejection(
+                                    learned, &*db, &req.model, &e,
+                                )
+                                .await;
+                                adapter.complete(&retry).await
+                            }
+                            None => Err(e),
+                        },
+                        ok => ok,
+                    };
+                    match &outcome {
+                        Ok(_) => upstream.finish("completed", None),
+                        Err(e) => upstream.finish("failed", Some(&e.to_string())),
+                    }
+                    outcome
+                }
+                .instrument(tracing::info_span!(
                     "modelrouter.provider_call",
                     "provider.name" = current_provider.as_str()
                 ))
@@ -857,6 +987,7 @@ async fn complete_with_retry_and_fallback(
                     current_model.clone(),
                     requested_model,
                     &state.settings.model_capabilities,
+                    state.router.learned_capabilities(),
                 );
                 let settings = completion_settings(adapter.effective_settings(&req), &req, body);
                 break (r, provider_ms, settings);
@@ -1030,6 +1161,7 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
             attribution_tags: ctx.attribution_tags.clone(),
             experiment_id: ctx.experiment_id,
             experiment_variant: ctx.experiment_variant.clone(),
+            call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: false,
         };
 
@@ -1057,6 +1189,7 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
                 attribution_tags: ctx.attribution_tags.clone(),
                 experiment_id: ctx.experiment_id,
                 experiment_variant: ctx.experiment_variant.clone(),
+                call_kind: crate::db::models::CallKind::Chat,
             };
             crate::db::prompt_store::redact_prompt_content(&ctx.effective_storage, &mut prompt);
             match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
@@ -1244,6 +1377,7 @@ pub(crate) fn record_cache_hit(
             attribution_tags: ctx.attribution.tags_json(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: false,
         };
 
@@ -1277,6 +1411,7 @@ pub(crate) fn record_cache_hit(
                 attribution_tags: ctx.attribution.tags_json(),
                 experiment_id: None,
                 experiment_variant: None,
+                call_kind: crate::db::models::CallKind::Chat,
             };
             let mut prompt = prompt;
             crate::db::prompt_store::redact_prompt_content(&state.storage.load(), &mut prompt);
@@ -1340,6 +1475,9 @@ pub struct ReportedUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub cached_tokens: u32,
+    /// `prompt_tokens_details.cache_creation_tokens`: prompt tokens written to
+    /// the provider's prompt cache (Anthropic), also part of `prompt_tokens`.
+    pub cache_write_tokens: u32,
     /// `completion_tokens_details.reasoning_tokens`, when reported.
     pub reasoning_tokens: Option<u32>,
 }
@@ -1396,6 +1534,9 @@ pub fn parse_sse_chunk(chunk: &[u8]) -> SseChunkInfo {
                 cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or(0) as u32,
+                cache_write_tokens: usage["prompt_tokens_details"]["cache_creation_tokens"]
+                    .as_u64()
+                    .unwrap_or(0) as u32,
                 reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
                     .as_u64()
                     .map(|n| n as u32),
@@ -1426,11 +1567,14 @@ struct StreamSettlement {
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_read_tokens: u32,
+    cache_write_tokens: u32,
     reasoning_tokens: Option<u32>,
     /// True when the provider never reported usage and the counts above are
     /// the character-count estimate.
     tokens_estimated: bool,
     cost: f64,
+    /// `cost` with no prompt cache (`CostCalculator::calculate_no_cache`).
+    no_cache_cost: f64,
     latency_ms: i64,
     ttft_ms: Option<i64>,
 }
@@ -1523,15 +1667,7 @@ impl StreamLogger {
                     result.content = content
                 }
             }
-            let cost = ctx.state.cost_calc.calculate_with_cache(
-                &ctx.canonical_model,
-                result
-                    .prompt_tokens
-                    .saturating_sub(result.cache_read_tokens),
-                result.completion_tokens,
-                result.cache_read_tokens,
-                0,
-            );
+            let cost = ctx.state.cost_calc.calculate_result(&ctx.canonical_model, &result);
             ctx.state
                 .response_cache
                 .put_completion(
@@ -1560,12 +1696,13 @@ impl StreamLogger {
     /// character-count estimate, flagged as such.
     fn settle(&self, finish_reason: String) -> StreamSettlement {
         let content = self.acc.content.clone();
-        let (prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens, tokens_estimated) =
+        let (prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, tokens_estimated) =
             match self.acc.usage {
                 Some(u) => (
                     u.prompt_tokens,
                     u.completion_tokens,
                     u.cached_tokens,
+                    u.cache_write_tokens,
                     u.reasoning_tokens,
                     false,
                 ),
@@ -1573,28 +1710,31 @@ impl StreamLogger {
                     (self.ctx.messages_json.chars().count() / 4) as u32,
                     (content.chars().count() / 4) as u32,
                     0,
+                    0,
                     None,
                     true,
                 ),
             };
-        // `calculate_with_cache` wants the non-cached share of the prompt;
-        // OpenAI's `prompt_tokens` includes the cached tokens.
-        let cost = self.ctx.state.cost_calc.calculate_with_cache(
+        // OpenAI's `prompt_tokens` includes cache reads and writes.
+        let cost = self.ctx.state.cost_calc.calculate_whole_prompt(
             &self.ctx.canonical_model,
-            prompt_tokens.saturating_sub(cache_read_tokens),
+            prompt_tokens,
             completion_tokens,
             cache_read_tokens,
-            0,
+            cache_write_tokens,
         );
+        let no_cache_cost = self.ctx.state.cost_calc.calculate(&self.ctx.canonical_model, prompt_tokens, completion_tokens);
         StreamSettlement {
             content,
             finish_reason,
             prompt_tokens,
             completion_tokens,
             cache_read_tokens,
+            cache_write_tokens,
             reasoning_tokens,
             tokens_estimated,
             cost,
+            no_cache_cost,
             latency_ms: self.ctx.start.elapsed().as_millis() as i64,
             ttft_ms: self.acc.ttft_ms,
         }
@@ -1675,6 +1815,7 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
         attribution_tags: attr_tags.clone(),
         experiment_id: ctx.experiment_id,
         experiment_variant: ctx.experiment_variant.clone(),
+        call_kind: crate::db::models::CallKind::Chat,
         tokens_estimated: s.tokens_estimated,
     };
 
@@ -1694,7 +1835,7 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
             prompt_tokens: s.prompt_tokens as i64,
             completion_tokens: s.completion_tokens as i64,
             cache_read_tokens: s.cache_read_tokens as i64,
-            cache_write_tokens: 0,
+            cache_write_tokens: s.cache_write_tokens as i64,
             cost_usd: s.cost,
             latency_ms: Some(s.latency_ms),
             ttft_ms: s.ttft_ms,
@@ -1706,6 +1847,7 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
             attribution_tags: attr_tags,
             experiment_id: ctx.experiment_id,
             experiment_variant: ctx.experiment_variant.clone(),
+            call_kind: crate::db::models::CallKind::Chat,
         };
         crate::db::prompt_store::redact_prompt_content(&ctx.storage, &mut prompt);
         match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
@@ -1771,12 +1913,13 @@ fn stream_meta(ctx: &StreamLogCtx, s: &StreamSettlement) -> RouterMeta {
         settings: ctx.settings.clone(),
         tokens: Some(TokenMeta {
             cache_read: s.cache_read_tokens,
+            cache_write: s.cache_write_tokens,
             reasoning: s.reasoning_tokens,
             estimated: s.tokens_estimated,
             ..TokenMeta::new(s.prompt_tokens, s.completion_tokens)
         }),
         results: None,
-        cost: CallCost::spent(s.cost),
+        cost: CallCost::spent(s.cost).with_no_cache_cost(s.no_cache_cost).priced_if(ctx.state.cost_calc.has_price(&ctx.canonical_model)),
         timing: TimingMeta {
             total_ms: ctx.received.elapsed().as_millis() as i64,
             latency_ms: s.latency_ms,
@@ -1834,11 +1977,28 @@ fn insert_before_done(chunk: &[u8], event: &str) -> bytes::Bytes {
     bytes::Bytes::from(out)
 }
 
+/// Count a dispatch whose `temperature` was removed because of a learned
+/// entry (the admin API reports the count per model).
+fn note_learned_temperature_strip(
+    state: &AppState,
+    body: &Value,
+    req: &crate::providers::adapter::NormalizedRequest,
+) {
+    let learned = state.router.learned_capabilities();
+    if body["temperature"].is_number()
+        && req.temperature.is_none()
+        && learned.temperature(&req.model) == Some(false)
+    {
+        learned.note_stripped(&req.model);
+    }
+}
+
 fn build_normalized_request(
     body: &Value,
     model: String,
     requested_model: &str,
     capabilities: &[crate::config::schema::ModelCapabilityEntry],
+    learned: &crate::router::learned_capabilities::LearnedCapabilities,
 ) -> crate::providers::adapter::NormalizedRequest {
     // Drop sampling parameters the resolved model rejects. Callers address a
     // routing alias and cannot know what it resolves to, so forwarding
@@ -1848,7 +2008,7 @@ fn build_normalized_request(
     // covers every provider from one place.
     let temperature = body["temperature"].as_f64().filter(|_| {
         let supported =
-            crate::router::model_capabilities::supports_temperature(&model, capabilities);
+            crate::router::model_capabilities::temperature_allowed(&model, capabilities, learned);
         if !supported {
             tracing::debug!(
                 model = model.as_str(),
@@ -1867,7 +2027,11 @@ fn build_normalized_request(
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         stream: body["stream"].as_bool().unwrap_or(false),
         temperature,
-        max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        max_tokens: crate::router::model_capabilities::clamp_max_tokens(
+            &model_for_reasoning,
+            body["max_tokens"].as_u64().map(|v| v as u32),
+            capabilities,
+        ),
         tools,
         tool_choice,
         // Resolved against the model the request actually reaches, like
@@ -1878,6 +2042,7 @@ fn build_normalized_request(
             body["reasoning_effort"].as_str(),
             capabilities,
         ),
+        response_format: forwarded_response_format(body),
         extra_params: serde_json::Value::Object(Default::default()),
     }
 }
@@ -1967,6 +2132,12 @@ fn completion_settings(
     if body["reasoning_effort"].is_string() && effective.reasoning.is_none() {
         dropped.push("reasoning_effort");
     }
+    // A structured-output request the resolved adapter does not forward is
+    // reported, so a caller that validates the answer itself knows the
+    // provider was never asked for the shape.
+    if req.response_format.is_some() && !effective.response_format_forwarded {
+        dropped.push("response_format");
+    }
     serde_json::json!({
         "temperature": effective.temperature,
         "reasoning": effective.reasoning,
@@ -1975,6 +2146,7 @@ fn completion_settings(
         "stream": req.stream,
         "tools": req.tools.as_ref().map(Vec::len),
         "tool_choice": req.tool_choice,
+        "response_format": req.response_format.as_ref().map(|rf| rf["type"].clone()),
         "dropped": dropped,
     })
 }
@@ -2176,6 +2348,7 @@ mod openai_response_tests {
             tools: Some(vec![serde_json::json!({}), serde_json::json!({})]),
             tool_choice: Some(serde_json::json!("auto")),
             reasoning: None,
+            response_format: None,
             extra_params: serde_json::json!({}),
         }
     }
@@ -2187,6 +2360,7 @@ mod openai_response_tests {
             temperature: Some(0.3),
             max_tokens: Some(4096),
             timeout_secs: Some(600),
+            response_format_forwarded: false,
         };
         let body = serde_json::json!({"temperature": 0.3});
         let s = completion_settings(effective, &norm_req(Some(0.3)), &body);
@@ -2243,9 +2417,22 @@ mod tools_request_tests {
             "tools": [{"type": "function", "function": {"name": "f"}}],
             "tool_choice": "auto",
         });
-        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default());
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         assert_eq!(req.tool_choice, Some(json!("auto")));
+    }
+
+    #[test]
+    fn max_tokens_above_the_resolved_models_ceiling_is_clamped() {
+        // An alias caller sized max_tokens for the largest model it might reach.
+        let body = json!({"messages": [], "max_tokens": 128000});
+        let req = build_normalized_request(&body, "foundry/gpt-4.1".to_string(), "balanced", &[], &Default::default());
+        assert_eq!(req.max_tokens, Some(32768));
+        // Below the ceiling, and for a model with no known ceiling, it passes through.
+        let body = json!({"messages": [], "max_tokens": 900});
+        assert_eq!(build_normalized_request(&body, "foundry/gpt-4.1".to_string(), "fast", &[], &Default::default()).max_tokens, Some(900));
+        let body = json!({"messages": [], "max_tokens": 128000});
+        assert_eq!(build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default()).max_tokens, Some(128000));
     }
 
     #[test]
@@ -2254,12 +2441,12 @@ mod tools_request_tests {
             "messages": [],
             "tool_choice": "none",
         });
-        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default());
         assert!(req.tools.is_none());
         assert!(req.tool_choice.is_none());
 
         let body = json!({"messages": [], "tools": []});
-        let req = build_normalized_request(&body, "m".to_string(), "m", &[]);
+        let req = build_normalized_request(&body, "m".to_string(), "m", &[], &Default::default());
         assert!(req.tools.is_none());
     }
 
@@ -2272,6 +2459,7 @@ mod tools_request_tests {
             "anthropic/claude-sonnet-5".to_string(),
             "balanced",
             &[],
+            &Default::default(),
         );
         let r = req.reasoning.expect("reasoning control resolved");
         assert!(r.disable_thinking);
@@ -2282,6 +2470,7 @@ mod tools_request_tests {
             "anthropic/claude-haiku-4-5".to_string(),
             "fast",
             &[],
+            &Default::default(),
         );
         assert!(req.reasoning.is_none());
     }
@@ -2294,6 +2483,7 @@ mod tools_request_tests {
             "anthropic/claude-sonnet-5".to_string(),
             "balanced",
             &[],
+            &Default::default(),
         );
         assert!(req.reasoning.is_none());
     }
@@ -2317,9 +2507,17 @@ mod sse_chunk_tests {
         assert_eq!(info.finish_reason.as_deref(), Some("stop"));
         assert_eq!(
             info.usage,
-            Some(ReportedUsage { prompt_tokens: 12, completion_tokens: 2, cached_tokens: 4, reasoning_tokens: None })
+            Some(ReportedUsage { prompt_tokens: 12, completion_tokens: 2, cached_tokens: 4, cache_write_tokens: 0, reasoning_tokens: None })
         );
         assert!(info.done);
+    }
+
+    #[test]
+    fn reads_cache_writes_from_prompt_tokens_details() {
+        let chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":350,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":10,\"cache_creation_tokens\":300}}}\n\n";
+        let usage = parse_sse_chunk(chunk.as_bytes()).usage.unwrap();
+        assert_eq!(usage.cached_tokens, 10);
+        assert_eq!(usage.cache_write_tokens, 300);
     }
 
     #[test]
@@ -2477,5 +2675,124 @@ mod stream_cost_chunk_tests {
             std::str::from_utf8(&out).unwrap(),
             "data: {}\n\ndata: {\"cost\":1}\n\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod cached_prompt_pricing_parity_tests {
+    use super::parse_sse_chunk;
+    use crate::providers::adapter::CompletionResult;
+    use crate::providers::anthropic::{completion_from_response, AnthropicSseTranslator};
+    use crate::router::cost::CostCalculator;
+
+    const MODEL: &str = "claude-sonnet-4-6";
+
+    /// What Anthropic bills: uncached input, output, cache reads and cache writes, each at its rate.
+    fn anthropic_price(calc: &CostCalculator) -> f64 {
+        calc.calculate_with_cache(MODEL, 40, 7, 1000, 300)
+    }
+
+    fn streamed_cost(calc: &CostCalculator) -> f64 {
+        let mut t = AnthropicSseTranslator::new();
+        let chunks: Vec<_> = [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":40,"cache_read_input_tokens":1000,"cache_creation_input_tokens":300,"output_tokens":1}}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]
+        .iter()
+        .filter_map(|l| t.translate_line(l))
+        .collect();
+        let usage = chunks
+            .iter()
+            .filter_map(|c| parse_sse_chunk(c).usage)
+            .last()
+            .expect("the final chunk carries usage");
+        calc.calculate_whole_prompt(MODEL, usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens, usage.cache_write_tokens)
+    }
+
+    fn non_streamed(body: serde_json::Value, parse: fn(serde_json::Value) -> anyhow::Result<CompletionResult>) -> CompletionResult {
+        parse(body).unwrap()
+    }
+
+    fn body() -> serde_json::Value {
+        serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 40, "output_tokens": 7, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 300}
+        })
+    }
+
+    #[test]
+    fn a_cached_claude_response_costs_the_same_streamed_and_non_streamed() {
+        let calc = CostCalculator::default();
+        let expected = anthropic_price(&calc);
+        assert!(expected > 0.0);
+        let direct = non_streamed(body(), completion_from_response);
+        let vertex = non_streamed(body(), crate::providers::vertex::claude::parse_response);
+        for (path, cost) in [
+            ("streamed", streamed_cost(&calc)),
+            ("non-streamed direct", calc.calculate_result(MODEL, &direct)),
+            ("non-streamed vertex", calc.calculate_result(MODEL, &vertex)),
+        ] {
+            assert!((cost - expected).abs() < 1e-12, "{path}: {cost} != {expected}");
+        }
+    }
+
+    #[test]
+    fn non_streamed_claude_results_report_the_whole_prompt() {
+        for r in [non_streamed(body(), completion_from_response), non_streamed(body(), crate::providers::vertex::claude::parse_response)] {
+            assert_eq!((r.prompt_tokens, r.cache_read_tokens, r.cache_write_tokens), (1340, 1000, 300));
+            assert_eq!(r.uncached_prompt_tokens(), 40);
+        }
+    }
+
+    #[test]
+    fn a_cached_openai_shaped_result_is_not_billed_twice_for_its_cache_reads() {
+        // OpenAI-shaped adapters report the whole prompt; the cache reads must
+        // not also be priced at the input rate.
+        let calc = CostCalculator::default();
+        let r = CompletionResult { prompt_tokens: 1040, completion_tokens: 7, cache_read_tokens: 1000, ..Default::default() };
+        let cost = calc.calculate_result(MODEL, &r);
+        assert!((cost - calc.calculate_with_cache(MODEL, 40, 7, 1000, 0)).abs() < 1e-12, "{cost}");
+        assert!((calc.calculate_result_no_cache(MODEL, &r) - calc.calculate(MODEL, 1040, 7)).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod response_format_request_tests {
+    use super::{build_normalized_request, completion_settings};
+    use crate::providers::adapter::EffectiveSettings;
+    use serde_json::json;
+
+    fn normalized(body: &serde_json::Value) -> crate::providers::adapter::NormalizedRequest {
+        let learned = crate::router::learned_capabilities::LearnedCapabilities::default();
+        build_normalized_request(body, "m".into(), "balanced", &[], &learned)
+    }
+
+    #[test]
+    fn normalized_request_carries_a_valid_response_format_and_nothing_else() {
+        let schema = json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}}});
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], "response_format": schema});
+        assert_eq!(normalized(&body).response_format, Some(schema));
+        let none = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(normalized(&none).response_format, None);
+    }
+
+    #[test]
+    fn settings_report_the_mode_sent_and_name_a_drop() {
+        let body = json!({"response_format": {"type": "json_object"}});
+        let req = normalized(&body);
+        let forwarded = EffectiveSettings { response_format_forwarded: true, ..Default::default() };
+        let s = completion_settings(forwarded, &req, &body);
+        assert_eq!(s["response_format"], "json_object");
+        assert_eq!(s["dropped"], json!([]));
+
+        let dropped = completion_settings(EffectiveSettings::default(), &req, &body);
+        assert_eq!(dropped["dropped"], json!(["response_format"]));
+
+        let plain = completion_settings(EffectiveSettings::default(), &normalized(&json!({})), &json!({}));
+        assert!(plain["response_format"].is_null());
+        assert_eq!(plain["dropped"], json!([]));
     }
 }

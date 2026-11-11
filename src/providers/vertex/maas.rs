@@ -37,6 +37,10 @@ pub fn translate_request(req: &NormalizedRequest, model: &str, streaming: bool) 
     if let Some(tc) = &req.tool_choice {
         body["tool_choice"] = tc.clone();
     }
+    // OpenAI-compatible endpoint: `response_format` passes through verbatim.
+    if let Some(rf) = &req.response_format {
+        body["response_format"] = rf.clone();
+    }
     body
 }
 
@@ -97,6 +101,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             extra_params: serde_json::Value::Null,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", false);
@@ -120,10 +125,33 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             extra_params: serde_json::Value::Null,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", true);
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+}
+
+#[cfg(test)]
+mod response_format_tests {
+    use super::translate_request;
+    use crate::providers::adapter::NormalizedRequest;
+    use serde_json::json;
+
+    #[test]
+    fn the_openai_compatible_endpoint_takes_the_response_format_verbatim() {
+        let rf = json!({"type": "json_object"});
+        let req = NormalizedRequest {
+            model: "vertex/mistralai/mistral-medium-3".into(),
+            request_model: "balanced".into(),
+            messages: vec![json!({"role": "user", "content": "x"})],
+            response_format: Some(rf.clone()),
+            ..Default::default()
+        };
+        assert_eq!(translate_request(&req, "mistralai/mistral-medium-3", false)["response_format"], rf);
+        let plain = NormalizedRequest { response_format: None, ..req };
+        assert!(translate_request(&plain, "mistralai/mistral-medium-3", false).get("response_format").is_none());
     }
 }

@@ -33,10 +33,10 @@ impl OutcomeRepository for SqliteDb {
         .execute(&self.pool)
         .await?;
 
-        let row = sqlx::query_as::<_, RunOutcome>(&format!(
+        let row = sqlx::query_as::<_, RunOutcome>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM run_outcomes \
              WHERE user_id = ? AND attribution_correlation_id = ?"
-        ))
+        )))
         .bind(outcome.user_id)
         .bind(&outcome.attribution_correlation_id)
         .fetch_one(&self.pool)
@@ -45,10 +45,10 @@ impl OutcomeRepository for SqliteDb {
     }
 
     async fn get(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<Option<RunOutcome>> {
-        let row = sqlx::query_as::<_, RunOutcome>(&format!(
+        let row = sqlx::query_as::<_, RunOutcome>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM run_outcomes \
              WHERE user_id = ? AND attribution_correlation_id = ?"
-        ))
+        )))
         .bind(user_id)
         .bind(correlation_id)
         .fetch_optional(&self.pool)
@@ -57,10 +57,10 @@ impl OutcomeRepository for SqliteDb {
     }
 
     async fn for_experiment(&self, experiment_id: i64) -> anyhow::Result<Vec<RunOutcome>> {
-        let rows = sqlx::query_as::<_, RunOutcome>(&format!(
+        let rows = sqlx::query_as::<_, RunOutcome>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM run_outcomes WHERE experiment_id = ? \
              ORDER BY user_id, attribution_correlation_id"
-        ))
+        )))
         .bind(experiment_id)
         .fetch_all(&self.pool)
         .await?;

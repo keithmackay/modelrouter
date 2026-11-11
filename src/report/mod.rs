@@ -147,7 +147,7 @@ pub async fn cost_by_user_window(
                    ORDER BY SUM(cl.cost_usd) DESC");
 
     type Row = (i64, String, String, String, Option<i64>, String, String, f64, f64, i64, i64, i64);
-    let mut q = sqlx::query_as::<_, Row>(&sql);
+    let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
     q = q.bind(&window_start);
     if let Some(v) = user_name { q = q.bind(v); }
     if let Some(v) = project   { q = q.bind(v); }
@@ -218,7 +218,7 @@ pub async fn usage_by_model(
         where_clause
     );
 
-    let mut q = sqlx::query_as::<_, (String, String, i64, i64, i64, f64)>(&base_query);
+    let mut q = sqlx::query_as::<_, (String, String, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(base_query.as_str()));
     q = q.bind(since);
     if let Some(m) = model {
         q = q.bind(m);
@@ -583,7 +583,7 @@ pub async fn fetch_usage_rows(
             f64,
             f64,
         ),
-    >(&sql);
+    >(sqlx::AssertSqlSafe(sql.as_str()));
     for val in &bind_values {
         q = q.bind(val);
     }

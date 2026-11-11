@@ -8,6 +8,14 @@ use super::{PostgresDb, now_utc};
 
 #[async_trait]
 impl AuditRepository for PostgresDb {
+    async fn purge_audit_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM audit_log WHERE created_at < $1")
+            .bind(cutoff_rfc3339)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn create(&self, entry: NewAuditLogEntry) -> anyhow::Result<AuditLogEntry> {
         let now = now_utc();
         let row = sqlx::query_as::<_, AuditLogEntry>(

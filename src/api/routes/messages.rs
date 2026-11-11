@@ -55,6 +55,7 @@ async fn log_messages_cost(
         attribution_tags: attribution.tags_json(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: crate::db::models::CallKind::Chat,
     };
     // Storage policy (issue #4): the prompt row is optional; the cost row is not.
     let stored = match crate::db::prompt_store::apply_storage_policy(&state.storage.load(), prompt) {
@@ -81,6 +82,7 @@ async fn log_messages_cost(
         attribution_tags: attribution.tags_json(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: crate::db::models::CallKind::Chat,
         tokens_estimated: false,
     };
     if let Err(e) = CostRepository::create(&*state.db, ledger).await {
@@ -150,7 +152,11 @@ async fn anthropic_messages_inner(
         .unwrap_or(&state.settings.routing.default_model)
         .to_string();
     let messages_for_complexity = body["messages"].as_array().cloned().unwrap_or_default();
-    let model = state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity);
+    // A scoped alias override pins the model; otherwise the usual downgrade.
+    let model = state
+        .router
+        .scoped_name(&attribution.tags, &requested_model)
+        .unwrap_or_else(|| state.complexity_router.maybe_downgrade(&requested_model, &messages_for_complexity));
     let stream = body["stream"].as_bool().unwrap_or(false);
 
     // Policy check
@@ -526,6 +532,7 @@ async fn anthropic_messages_inner(
             attribution_tags: attr_tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Chat,
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
@@ -553,6 +560,7 @@ async fn anthropic_messages_inner(
                     attribution_tags: attr_tags.clone(),
                     experiment_id: None,
                     experiment_variant: None,
+                    call_kind: crate::db::models::CallKind::Chat,
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
@@ -612,13 +620,7 @@ fn store_streamed_message(
         return;
     };
     let usage = message_as_completion(&message);
-    let cost = state.cost_calc.calculate_with_cache(
-        canonical_model,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.cache_read_tokens,
-        usage.cache_write_tokens,
-    );
+    let cost = state.cost_calc.calculate_result(canonical_model, &usage);
     let state = state.clone();
     let model = canonical_model.to_string();
     tokio::spawn(async move {
@@ -651,13 +653,7 @@ fn serve_cached_message(
         "response cache hit"
     );
     let usage = message_as_completion(&message);
-    let avoided_cost = state.cost_calc.calculate_with_cache(
-        canonical_model,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.cache_read_tokens,
-        usage.cache_write_tokens,
-    );
+    let avoided_cost = state.cost_calc.calculate_result(canonical_model, &usage);
     record_cache_hit(
         state,
         CacheHitCtx {

@@ -13,18 +13,25 @@ const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, 
                               tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
                               cache_hit, saved_usd, attribution_correlation_id, \
                               attribution_tags, experiment_id, experiment_variant, \
-                              tokens_estimated";
+                              tokens_estimated, call_kind";
 
 #[async_trait]
 impl CostRepository for SqliteDb {
+    async fn purge_ledger_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        // Batched (`SqliteDb::delete_in_batches`): one DELETE over the whole
+        // table would hold SQLite's write lock for its whole run.
+        self.delete_in_batches("cost_ledger", "created_at < ?", cutoff_rfc3339, &[], None).await
+    }
+
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
         let now = now_utc();
         let result = sqlx::query(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
-                                        experiment_id, experiment_variant, tokens_estimated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        experiment_id, experiment_variant, tokens_estimated,
+                                        call_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -41,14 +48,15 @@ impl CostRepository for SqliteDb {
         .bind(entry.experiment_id)
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
+        .bind(entry.call_kind.as_str())
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+        let row = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM cost_ledger WHERE id = ?",
             LEDGER_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -64,8 +72,9 @@ impl CostRepository for SqliteDb {
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
-                                        experiment_id, experiment_variant, tokens_estimated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#,
+                                        experiment_id, experiment_variant, tokens_estimated,
+                                        call_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -82,14 +91,15 @@ impl CostRepository for SqliteDb {
         .bind(entry.experiment_id)
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
+        .bind(entry.call_kind.as_str())
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+        let row = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM cost_ledger WHERE id = ?",
             LEDGER_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -107,7 +117,7 @@ impl CostRepository for SqliteDb {
         if filter_model.is_some() {
             sql.push_str(" AND model = ?");
         }
-        let mut q = sqlx::query_as::<_, (i64, i64, f64)>(&sql).bind(since);
+        let mut q = sqlx::query_as::<_, (i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str())).bind(since);
         if let Some(m) = filter_model {
             q = q.bind(m.to_string());
         }
@@ -187,7 +197,7 @@ impl CostRepository for SqliteDb {
         sql.push_str(" GROUP BY user_id, model, project, api_key_id");
 
         type Row = (i64, String, Option<String>, Option<i64>, i64, i64, f64);
-        let mut q = sqlx::query_as::<_, Row>(&sql).bind(since);
+        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str())).bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
         }
@@ -260,10 +270,10 @@ impl CostRepository for SqliteDb {
     }
 
     async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
-        let rows = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+        let rows = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM cost_ledger WHERE created_at < ? ORDER BY created_at ASC LIMIT 10000",
             LEDGER_COLUMNS
-        ))
+        )))
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await?;
@@ -274,7 +284,7 @@ impl CostRepository for SqliteDb {
         for chunk in ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!("DELETE FROM cost_ledger WHERE id IN ({})", placeholders);
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk { q = q.bind(id); }
             q.execute(&self.pool).await?;
         }
@@ -356,7 +366,7 @@ impl CostRepository for SqliteDb {
         }
         sql.push_str(" GROUP BY user_id HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0");
 
-        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
@@ -468,7 +478,7 @@ impl CostRepository for SqliteDb {
         }
         sql.push_str(" GROUP BY day ORDER BY day ASC");
 
-        let mut q = sqlx::query_as::<_, (String, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(start).bind(end);
         if let Some(p) = filter_project { q = q.bind(p.to_string()); }
         if let Some(m) = filter_model { q = q.bind(m.to_string()); }
@@ -509,7 +519,7 @@ impl CostRepository for SqliteDb {
         }
         sql.push_str(" GROUP BY model HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0 ORDER BY SUM(cost_usd) DESC");
 
-        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(since);
         if let Some(p) = filter_project { q = q.bind(p.to_string()); }
         if let Some(m) = filter_model { q = q.bind(m.to_string()); }
@@ -517,6 +527,59 @@ impl CostRepository for SqliteDb {
         Ok(rows
             .into_iter()
             .map(|(model, cost, ti, to, rc, saved)| ModelSummaryRow {
+                model,
+                total_cost_usd: cost,
+                tokens_in: ti,
+                tokens_out: to,
+                request_count: rc,
+                uncached_cost_usd: cost + saved,
+            })
+            .collect())
+    }
+
+    async fn summarize_by_kind(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<crate::db::repositories::costs::KindSummaryRow>> {
+        use crate::db::repositories::costs::KindSummaryRow;
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+        let mut sql = "SELECT call_kind, model, \
+                              COALESCE(SUM(cost_usd), 0.0), \
+                              COALESCE(SUM(tokens_in), 0), \
+                              COALESCE(SUM(tokens_out), 0), \
+                              COUNT(*), \
+                              COALESCE(SUM(saved_usd), 0.0) \
+                       FROM cost_ledger \
+                       WHERE created_at >= ?"
+            .to_string();
+        if filter_project.is_some() {
+            sql.push_str(" AND project = ?");
+        }
+        if filter_model.is_some() {
+            sql.push_str(" AND model = ?");
+        }
+        if let Some(ids) = filter_user_ids {
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        sql.push_str(" GROUP BY call_kind, model ORDER BY call_kind ASC, SUM(cost_usd) DESC, model ASC");
+
+        let mut q = sqlx::query_as::<_, (String, String, f64, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
+        q = q.bind(since);
+        if let Some(p) = filter_project { q = q.bind(p.to_string()); }
+        if let Some(m) = filter_model { q = q.bind(m.to_string()); }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(call_kind, model, cost, ti, to, rc, saved)| KindSummaryRow {
+                call_kind,
                 model,
                 total_cost_usd: cost,
                 tokens_in: ti,
@@ -568,7 +631,7 @@ impl CostRepository for SqliteDb {
                        ORDER BY SUM(cost_usd) DESC");
 
         type Row = (i64, String, Option<String>, Option<i64>, f64, i64, i64, i64);
-        let mut q = sqlx::query_as::<_, Row>(&sql);
+        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
@@ -656,6 +719,25 @@ impl CostRepository for SqliteDb {
         self.by_model_where(&predicate, binds, start, end).await
     }
 
+    async fn arm_by_kind(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = arm_predicate(filter, "model");
+        self.by_kind_where(&predicate, binds, start, end).await
+    }
+
+    async fn attribution_by_kind(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        self.arm_by_kind(&ArmFilter::Attribution(filter.clone()), start, end).await
+    }
+
     async fn arm_by_day(
         &self,
         filter: &ArmFilter,
@@ -678,7 +760,7 @@ impl CostRepository for SqliteDb {
              GROUP BY experiment_variant ORDER BY experiment_variant ASC",
             EXPERIMENT_TOTALS_SELECT
         );
-        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(&sql)
+        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -704,7 +786,7 @@ impl CostRepository for SqliteDb {
             EXPERIMENT_TOTALS_SELECT
         );
         type Row = (String, String, i64, f64, f64, i64, i64, i64);
-        let rows = sqlx::query_as::<_, Row>(&sql)
+        let rows = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -736,7 +818,7 @@ impl CostRepository for SqliteDb {
             RUN_VARIANT_SUBQUERY, EXPERIMENT_TOTALS_SELECT, RUN_ROWS_WHERE
         );
         type Row = (i64, String, String, i64, i64, f64, f64, i64, i64, i64, String, String);
-        let rows = sqlx::query_as::<_, Row>(&sql)
+        let rows = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .bind(experiment_id)
             .bind(limit)
@@ -769,7 +851,7 @@ impl CostRepository for SqliteDb {
              ORDER BY user_id ASC, attribution_correlation_id ASC",
             RUN_VARIANT_SUBQUERY, RUN_ROWS_WHERE
         );
-        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(&sql)
+        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .bind(experiment_id)
             .fetch_all(&self.pool)
@@ -847,7 +929,7 @@ impl SqliteDb {
             "SELECT {} FROM cost_ledger WHERE {} AND created_at >= ? AND created_at < ?",
             TOTALS_SELECT, predicate
         );
-        let mut query = sqlx::query_as::<_, TotalsRow>(&sql);
+        let mut query = sqlx::query_as::<_, TotalsRow>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in binds {
             query = query.bind(b);
         }
@@ -866,6 +948,22 @@ impl SqliteDb {
             "SELECT model, {} FROM cost_ledger \
              WHERE {} AND created_at >= ? AND created_at < ? \
              GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
+            TOTALS_SELECT, predicate
+        );
+        self.breakdown_query(&sql, binds, start, end).await
+    }
+
+    async fn by_kind_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let sql = format!(
+            "SELECT call_kind, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ? AND created_at < ? \
+             GROUP BY call_kind ORDER BY SUM(cost_usd) DESC, call_kind ASC",
             TOTALS_SELECT, predicate
         );
         self.breakdown_query(&sql, binds, start, end).await
@@ -894,7 +992,7 @@ impl SqliteDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
-        let mut query = sqlx::query_as::<_, BreakdownRow>(sql);
+        let mut query = sqlx::query_as::<_, BreakdownRow>(sqlx::AssertSqlSafe(sql));
         for b in binds {
             query = query.bind(b);
         }
@@ -1240,6 +1338,57 @@ mod tests {
         assert_eq!(days[1].totals.requests, 2);
     }
 
+    async fn insert_kind_row(db: &SqliteDb, model: &str, kind: crate::db::models::CallKind, run: &str, cost_usd: f64) {
+        CostRepository::create(
+            db,
+            NewCostLedgerEntry {
+                user_id: 1,
+                prompt_id: None,
+                model: model.to_string(),
+                provider: "p1".to_string(),
+                project: None,
+                tokens_in: 10,
+                tokens_out: 5,
+                cost_usd,
+                api_key_id: None,
+                attribution_correlation_id: Some(run.to_string()),
+                attribution_tags: "{}".to_string(),
+                experiment_id: None,
+                experiment_variant: None,
+                tokens_estimated: false,
+                call_kind: kind,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn by_kind_queries_keep_a_decision_apart_from_chat_on_the_same_model() {
+        use crate::db::models::CallKind;
+        let db = arm_db().await;
+        insert_kind_row(&db, "M", CallKind::Chat, "r", 2.0).await;
+        insert_kind_row(&db, "M", CallKind::Chat, "r", 2.0).await;
+        insert_kind_row(&db, "M", CallKind::Decision, "r", 1.0).await;
+        insert_kind_row(&db, "N", CallKind::Embedding, "other", 0.5).await;
+        // A row older than the column reads `unknown`, never a kind it was not.
+        insert_arm_row(&db, "M", "p1", Some("r"), "{}", 0, 3.0, "2026-03-02T00:00:00Z").await;
+
+        let far = ("2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+        let by_kind = db.arm_by_kind(&run("r"), far.0, far.1).await.unwrap();
+        let keys: Vec<(&str, i64, f64)> = by_kind.iter().map(|r| (r.key.as_str(), r.totals.requests, r.totals.cost_usd)).collect();
+        assert_eq!(keys, vec![("chat", 2, 4.0), ("unknown", 1, 3.0), ("decision", 1, 1.0)]);
+
+        let summary = db.summarize_by_kind(None, None, None, far.0).await.unwrap();
+        let rows: Vec<(&str, &str, i64)> = summary.iter().map(|r| (r.call_kind.as_str(), r.model.as_str(), r.request_count)).collect();
+        assert_eq!(rows, vec![("chat", "M", 2), ("decision", "M", 1), ("embedding", "N", 1), ("unknown", "M", 1)]);
+        // The model filter narrows every kind to that model.
+        let only_n = db.summarize_by_kind(None, None, Some("N"), far.0).await.unwrap();
+        assert_eq!(only_n.len(), 1);
+        assert_eq!(only_n[0].call_kind, "embedding");
+        assert_eq!(only_n[0].uncached_cost_usd, 0.5);
+    }
+
     #[tokio::test]
     async fn arm_by_model_orders_by_spend_desc() {
         let db = arm_db().await;
@@ -1371,6 +1520,7 @@ mod tests {
             attribution_tags: "{}".into(),
             experiment_id: Some(4),
             experiment_variant: Some("control".into()),
+            call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: true,
         };
         let row = db.create(entry.clone()).await.unwrap();
@@ -1522,4 +1672,24 @@ mod tests {
         assert_eq!(rows, [(1, "b", 1)], "run `none` has no bound row and is not counted");
         assert!(db.experiment_unbound_requests(8).await.unwrap().is_empty());
     }
+    /// #6081's ledger retention deletes in batches (`delete_in_batches`): more
+    /// old rows than one batch are all deleted, newer ones kept.
+    #[tokio::test]
+    async fn ledger_purge_runs_in_batches_until_nothing_old_is_left() {
+        let db = make_db().await;
+        sqlx::query("INSERT OR IGNORE INTO users (id, name, created_at) VALUES (1, 'test', '2025-01-01T00:00:00Z')")
+            .execute(&db.pool).await.unwrap();
+        let total = crate::db::sqlite::PURGE_BATCH * 2 + 3;
+        for _ in 0..total {
+            sqlx::query("INSERT INTO cost_ledger (user_id, model, provider, cost_usd, created_at) VALUES (1, 'X', 'p', 0.01, '2026-01-01T00:00:00Z')")
+                .execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO cost_ledger (user_id, model, provider, cost_usd, created_at) VALUES (1, 'X', 'p', 0.01, '2026-03-15T00:00:00Z')")
+            .execute(&db.pool).await.unwrap();
+        let n = CostRepository::purge_ledger_older_than(&db, "2026-03-01T00:00:00Z").await.unwrap();
+        assert_eq!(n as usize, total);
+        let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cost_ledger").fetch_one(&db.pool).await.unwrap();
+        assert_eq!(left.0, 1);
+    }
+
 }

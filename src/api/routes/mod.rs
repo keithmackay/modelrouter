@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod completions;
+pub mod decisions;
 pub mod mcp;
 pub mod images;
 pub mod responses;
@@ -10,6 +11,7 @@ pub mod health;
 pub mod messages;
 pub mod models;
 pub mod prometheus;
+pub mod rerank;
 pub mod search;
 pub mod systemone;
 pub mod tools;

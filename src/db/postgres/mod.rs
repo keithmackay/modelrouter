@@ -1,6 +1,7 @@
 #![cfg(feature = "postgres")]
 
 mod aliases;
+mod learned_capabilities;
 mod groups;
 mod users;
 mod admin_users;
@@ -13,6 +14,7 @@ mod failures;
 mod budgets;
 mod audit;
 mod hooks;
+mod maintenance;
 mod rate_limits;
 mod api_keys;
 mod mcp_servers;

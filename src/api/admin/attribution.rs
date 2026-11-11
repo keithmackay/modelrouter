@@ -69,6 +69,8 @@ pub struct AttributionReport {
     pub hit_rate: f64,
     pub by_model: Vec<crate::db::repositories::costs::AttributionBreakdownRow>,
     pub by_day: Vec<crate::db::repositories::costs::AttributionBreakdownRow>,
+    /// Spend by call kind (`key` is the kind): decisions apart from chat.
+    pub by_kind: Vec<crate::db::repositories::costs::AttributionBreakdownRow>,
 }
 
 /// Build the report. Shared by the REST endpoint, the dashboard panel and the
@@ -82,6 +84,7 @@ pub async fn build_report(
     let totals = CostRepository::attribution_totals(&*state.db, filter, &start, &end).await?;
     let by_model = CostRepository::attribution_by_model(&*state.db, filter, &start, &end).await?;
     let by_day = CostRepository::attribution_by_day(&*state.db, filter, &start, &end).await?;
+    let by_kind = CostRepository::attribution_by_kind(&*state.db, filter, &start, &end).await?;
     Ok(AttributionReport {
         filter: filter.label(),
         window: window.to_string(),
@@ -91,6 +94,7 @@ pub async fn build_report(
         totals,
         by_model,
         by_day,
+        by_kind,
     })
 }
 

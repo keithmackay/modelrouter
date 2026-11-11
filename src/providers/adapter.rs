@@ -29,6 +29,13 @@ pub struct NormalizedRequest {
     /// [`crate::router::model_capabilities::resolve_reasoning`]). `None` means
     /// send no reasoning control and let the provider default apply.
     pub reasoning: Option<ReasoningControl>,
+    /// OpenAI-shaped `response_format` (`{"type":"json_object"}` or
+    /// `{"type":"json_schema","json_schema":{...}}`), forwarded verbatim to
+    /// adapters whose providers take the OpenAI wire shape, translated for
+    /// Gemini, and dropped (reported in `x_router.settings.dropped`) by the
+    /// rest. `None` when the caller sent none. Validated at the door
+    /// (`forwarded_response_format`); never a routing input.
+    pub response_format: Option<serde_json::Value>,
     pub extra_params: serde_json::Value,
 }
 
@@ -48,6 +55,10 @@ pub struct ReasoningControl {
 #[serde(default)]
 pub struct CompletionResult {
     pub content: String,
+    /// The whole prompt, cache reads and cache writes included (OpenAI's
+    /// `prompt_tokens`). Adapters for wire formats that report only the
+    /// uncached share (Anthropic's `input_tokens`) add the cache tokens back,
+    /// so every path prices the same response the same way.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub finish_reason: String,
@@ -80,6 +91,14 @@ impl CompletionResult {
     pub fn is_cached(&self) -> bool {
         self.cache_read_tokens > 0
     }
+
+    /// The prompt tokens billed at the standard input rate: the whole prompt
+    /// less cache reads and cache writes.
+    pub fn uncached_prompt_tokens(&self) -> u32 {
+        self.prompt_tokens
+            .saturating_sub(self.cache_read_tokens)
+            .saturating_sub(self.cache_write_tokens)
+    }
 }
 
 pub type SseStream = Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send>>;
@@ -98,6 +117,15 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// Whether this adapter forwards the caller's `response_format` to
+    /// `model`. Defaults to `false`: unlike tools, a dropped structured-output
+    /// request still yields a usable answer (the caller validates the shape
+    /// itself), so the router forwards where it can and reports the drop in
+    /// `x_router.settings.dropped` instead of refusing the request.
+    fn supports_response_format(&self, _model: &str) -> bool {
+        false
+    }
+
     /// The settings this adapter actually sends the provider for `req`, after
     /// router resolution AND the adapter's own defaults (e.g. the Anthropic
     /// `max_tokens` floor) — reported back to the caller in the response's
@@ -110,6 +138,7 @@ pub trait ProviderAdapter: Send + Sync {
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             timeout_secs: None,
+            response_format_forwarded: false,
         }
     }
 
@@ -134,4 +163,8 @@ pub struct EffectiveSettings {
     /// The reasoning control the adapter actually sent. `None` when the
     /// request carried none, or the adapter does not translate one.
     pub reasoning: Option<ReasoningControl>,
+    /// Whether the caller's `response_format` reached the provider (forwarded
+    /// or translated). `false` when the request carried none or the adapter
+    /// does not forward one; the settings report names the drop.
+    pub response_format_forwarded: bool,
 }

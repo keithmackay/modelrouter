@@ -40,6 +40,7 @@ modelrouter webhook delete --id <id>
 modelrouter webhook enable --id <id>
 modelrouter webhook disable --id <id>
 modelrouter admin hash-password
+modelrouter db vacuum   (compact the SQLite file and switch it to incremental auto-vacuum; quiet window)
 modelrouter install-service  (macOS/Linux)
 ```
 
@@ -55,7 +56,7 @@ modelrouter install-service  (macOS/Linux)
 |---|---|
 | `GET /health` | Liveness check |
 | `GET /v1/models` | List available models |
-| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); forwards `tools`/`tool_choice` to tool-capable backends (translated for Anthropic-shaped upstreams); `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
+| `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); forwards `tools`/`tool_choice` to tool-capable backends (translated for Anthropic-shaped upstreams); forwards `response_format` to OpenAI-shaped backends and as Gemini's JSON mime type, reporting a drop elsewhere; `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
 | `POST /v1/systemone` | TypeSafe System One passthrough (typed Choice/Score/Noul judgments); router adds the `[providers.typesafe]` key; policy/pricing key `systemone/{model}`; upstream 429/529/422 pass through, upstream 401/403 → 502 |
 | `POST /v1/feedback` | Report a run's outcome by attribution correlation id (API key) |
 | `GET /admin/users` | List users (admin JWT required) |
@@ -73,6 +74,13 @@ modelrouter install-service  (macOS/Linux)
 | `GET /admin/experiments` | Experiments page (admin dashboard); `POST` creates from the form (superadmin session) |
 | `POST /admin/experiments/:id/close` | Close from the dashboard (superadmin session) |
 | `GET /admin/experiments/:id/panels` | Results panels for one experiment (admin dashboard) |
+| `GET /admin/api/scoped-aliases` | List scoped alias overrides, `?tag_key=&tag_value=` (admin JWT required) |
+| `PUT /admin/api/scoped-aliases/:tag_key/:tag_value` | Replace one scope's overrides `{aliases:{alias: target \| {target, params}}, expires_at}`; targets pinned and priced, `params` validated against the pinned model's parameter schema and applied to chat completions the scope routes (superadmin JWT required) |
+| `DELETE /admin/api/scoped-aliases/:tag_key/:tag_value` | Clear one scope (superadmin JWT required) |
+| `GET /admin/api/models/available` | Each configured provider's catalog, with `priced`, `price` (rates per million tokens, null when unpriced) and `parameters` (the model's parameter schema: name, type, range or enum, default) per model (admin JWT required) |
+| `GET /admin/api/models/parameters?target=` | What a target (alias or provider/model) resolves to now, its `price` (null when unpriced) and its parameter schema (admin JWT required) |
+| `GET /admin/api/model-capabilities/learned` | Model capabilities learned from provider rejections, with when and why (admin JWT required) |
+| `DELETE /admin/api/model-capabilities/learned/:model` | Clear one learned capability (superadmin JWT required) |
 | `GET /admin/webhooks` | Webhook management page (admin dashboard) |
 | `GET /admin/api/webhooks` | List webhook backends (admin JWT required) |
 | `POST /admin/api/webhooks` | Create webhook backend (superadmin JWT required) |
@@ -90,9 +98,11 @@ Dashboard (web UI) at `/admin` uses cookie-based sessions.
 ## Model Routing
 
 Models are resolved in this order:
-1. Alias lookup from `routing.model_aliases` in config
-2. Split on `/` — e.g. `anthropic/claude-opus-4-5` routes to the `anthropic` provider
-3. Fall back to `routing.default_provider`
+1. An experiment variant's overlay (bound requests), then a scoped alias override whose tag the request's attribution carries
+2. Runtime aliases (`model_aliases` table), then aliases on enabled model rows
+3. Alias lookup from `routing.model_aliases` in config
+4. Split on `/` — e.g. `anthropic/claude-opus-4-5` routes to the `anthropic` provider
+5. Fall back to `routing.default_provider`
 
 ## Privacy: no downstream application names
 

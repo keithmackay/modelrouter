@@ -33,6 +33,10 @@ pub trait FailureRepository: Send + Sync {
     async fn count_by_stage(&self) -> anyhow::Result<Vec<(String, i64)>>;
     /// Retrieve a single failure by its primary key, for detail-drill surfaces
     /// a downstream caller may build.
+    /// Failures of one endpoint (`/v1/decisions`, `/v1/chat/completions`, ...), newest first.
+    async fn list_by_endpoint(&self, endpoint: &str, limit: i64, offset: i64) -> anyhow::Result<Vec<RequestFailure>>;
+    /// Failure counts per endpoint, most first.
+    async fn count_by_endpoint(&self) -> anyhow::Result<Vec<(String, i64)>>;
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<RequestFailure>>;
     /// List all failures matching a given correlation id, enabling drill-down
     /// from a downstream caller's trace.
@@ -51,4 +55,7 @@ pub trait FailureRepository: Send + Sync {
         &self,
         experiment_id: i64,
     ) -> anyhow::Result<Vec<ExperimentRunFailures>>;
+    /// Delete failure rows with `created_at` before `cutoff_rfc3339` (the
+    /// retention tick). Returns the number deleted.
+    async fn purge_failures_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64>;
 }

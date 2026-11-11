@@ -77,30 +77,47 @@ struct OpenAIPromptTokensDetails {
     cached_tokens: u32,
 }
 
-#[async_trait::async_trait]
-impl ProviderAdapter for OpenAICompatAdapter {
-    async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
-        let url = format!("{}/chat/completions", self.api_base);
-
+impl OpenAICompatAdapter {
+    /// The chat-completions body, the same for both transports except the
+    /// stream fields. Same wire shape on both sides: tools pass through
+    /// verbatim and the tool_call deltas stream back untranslated (issue #88);
+    /// `response_format` passes through verbatim too.
+    pub fn build_body(req: &NormalizedRequest, stream: bool) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
-            "stream": false,
+            "stream": stream,
         });
-
+        // The router owns usage capture (issue #84): always request the
+        // final usage chunk so the streaming ledger records
+        // provider-counted tokens, independent of the client's shape.
+        if stream {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
         if let Some(temp) = req.temperature {
             body["temperature"] = serde_json::json!(temp);
         }
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
         }
-        // Same wire shape on both sides: tools pass through verbatim (issue #88).
         if let Some(tools) = &req.tools {
             body["tools"] = serde_json::json!(tools);
         }
         if let Some(tc) = &req.tool_choice {
             body["tool_choice"] = tc.clone();
         }
+        if let Some(rf) = &req.response_format {
+            body["response_format"] = rf.clone();
+        }
+        body
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderAdapter for OpenAICompatAdapter {
+    async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
+        let url = format!("{}/chat/completions", self.api_base);
+        let body = Self::build_body(req, false);
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let dispatched = std::time::Instant::now();
@@ -146,31 +163,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
 
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
         let url = format!("{}/chat/completions", self.api_base);
-
-        let mut body = serde_json::json!({
-            "model": req.model,
-            "messages": req.messages,
-            "stream": true,
-            // The router owns usage capture (issue #84): always request the
-            // final usage chunk so the streaming ledger records
-            // provider-counted tokens, independent of the client's shape.
-            "stream_options": {"include_usage": true},
-        });
-
-        if let Some(temp) = req.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(max) = req.max_tokens {
-            body["max_tokens"] = serde_json::json!(max);
-        }
-        // Same wire shape on both sides: tools pass through verbatim, and the
-        // tool_call deltas stream back to the client untranslated (issue #88).
-        if let Some(tools) = &req.tools {
-            body["tools"] = serde_json::json!(tools);
-        }
-        if let Some(tc) = &req.tool_choice {
-            body["tool_choice"] = tc.clone();
-        }
+        let body = Self::build_body(req, true);
 
         let timeout_secs = self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs);
         let resp = self
@@ -206,8 +199,13 @@ impl ProviderAdapter for OpenAICompatAdapter {
 
     /// Temperature and `max_tokens` are forwarded as normalized; the timeout
     /// is the tier-resolved ceiling this adapter applies to the call.
+    fn supports_response_format(&self, _model: &str) -> bool {
+        true
+    }
+
     fn effective_settings(&self, req: &NormalizedRequest) -> EffectiveSettings {
         EffectiveSettings {
+            response_format_forwarded: req.response_format.is_some(),
             reasoning: None,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
@@ -252,6 +250,8 @@ impl crate::providers::catalog::ProviderCatalog for OpenAICompatAdapter {
                 provider: String::new(),
                 name: id.to_string(),
                 display_name: None,
+                kind: crate::providers::catalog::CatalogKind::Chat,
+                source: None,
             })
             .collect())
     }
@@ -445,6 +445,7 @@ mod tier_timeout_tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             extra_params: serde_json::Value::Null,
         }
     }
@@ -501,5 +502,36 @@ mod tier_timeout_tests {
             format!("{err:#}").to_lowercase().contains("time"),
             "expected a timeout-shaped error (proving no tier ceiling was mistakenly applied), got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod response_format_body_tests {
+    use super::OpenAICompatAdapter;
+    use crate::providers::adapter::NormalizedRequest;
+    use serde_json::json;
+
+    fn req(response_format: Option<serde_json::Value>) -> NormalizedRequest {
+        NormalizedRequest {
+            model: "m".into(),
+            request_model: "balanced".into(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            temperature: Some(0.1),
+            response_format,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn both_transports_carry_the_response_format_verbatim_and_omit_it_when_absent() {
+        let rf = json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}}});
+        let non_stream = OpenAICompatAdapter::build_body(&req(Some(rf.clone())), false);
+        assert_eq!(non_stream["response_format"], rf);
+        assert_eq!(non_stream["stream"], false);
+        assert!(non_stream.get("stream_options").is_none());
+        let stream = OpenAICompatAdapter::build_body(&req(Some(rf.clone())), true);
+        assert_eq!(stream["response_format"], rf);
+        assert_eq!(stream["stream_options"]["include_usage"], true);
+        assert!(OpenAICompatAdapter::build_body(&req(None), false).get("response_format").is_none());
     }
 }

@@ -18,6 +18,15 @@
 //!   experiment. A window of `0` days means never. This half runs regardless
 //!   of `retention_days`, and one failing experiment does not stop the rest.
 //!
+//! [`run_table_retention_tick`] is the tick's other job: `[retention]` for
+//! the per-request tables the prompt-log policy does not cover (usage rows,
+//! failures, hook metrics, the audit trail), each with its own opt-in day
+//! count, followed by a space-reclaim pass. The usage-row cutoff is clamped
+//! so it never cuts under a budget: not inside the current calendar month
+//! (monthly budgets and reports read it), and not past the `window_start`
+//! of any `total` budget rule; a `total` rule with no start holds the whole
+//! ledger. A retention can therefore never make a budget under-count.
+//!
 //! The experiment list and the outcomes live in the main database; the
 //! prompt rows live in the prompt store, which is the same database unless
 //! `[storage] prompt_db_path` is set. The tick takes the two separately so
@@ -26,6 +35,15 @@
 use crate::db::repositories::experiments::{retention_window_open, ExperimentRepository};
 use crate::db::repositories::outcomes::OutcomeRepository;
 use crate::db::repositories::prompts::PromptRepository;
+use crate::config::schema::RetentionConfig;
+use crate::db::models::BudgetRule;
+use crate::db::repositories::audit::AuditRepository;
+use crate::db::repositories::budgets::BudgetRepository;
+use crate::db::repositories::costs::CostRepository;
+use crate::db::repositories::failures::FailureRepository;
+use crate::db::repositories::hooks::HookRepository;
+use crate::db::repositories::maintenance::{MaintenanceRepository, ReclaimOutcome};
+use crate::router::policy::window_start_at;
 
 /// How the global sweep of one tick ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +200,265 @@ async fn expire_closed(
     (expired, failures)
 }
 
+/// The repositories the table tick needs: the budget rules (to hold the
+/// usage-row cutoff above them), the four tables, and the engine's reclaim.
+pub trait RetentionStore:
+    BudgetRepository + CostRepository + FailureRepository + HookRepository + AuditRepository + MaintenanceRepository
+{
+}
+
+impl<T: ?Sized> RetentionStore for T where
+    T: BudgetRepository + CostRepository + FailureRepository + HookRepository + AuditRepository + MaintenanceRepository
+{
+}
+
+/// The three tables with a plain `created_at`-style cutoff (usage rows have
+/// their own path, for the budget clamp).
+#[derive(Debug, Clone, Copy)]
+enum PlainTable {
+    RequestFailures,
+    HookMetrics,
+    AuditLog,
+}
+
+impl PlainTable {
+    fn name(self) -> &'static str {
+        match self {
+            PlainTable::RequestFailures => "request_failures",
+            PlainTable::HookMetrics => "hook_metrics",
+            PlainTable::AuditLog => "audit_log",
+        }
+    }
+}
+
+/// What held the usage-row cutoff earlier than the configured retention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerFloor {
+    /// The start of the current calendar month: monthly budgets and reports
+    /// read from there whenever they are created.
+    CalendarMonth,
+    /// A `total` budget rule reads from its `window_start`.
+    BudgetRule { rule_id: i64, window_start: String },
+}
+
+/// Why no usage row was deleted this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerHold {
+    /// A `total` budget rule with no `window_start` reads the ledger from
+    /// the epoch. Delete the rule or give it a start to let retention run.
+    Unbounded { rule_id: i64 },
+    /// A `total` rule's `window_start` is not a date the tick can read, so
+    /// it cannot tell what the rule reads and keeps everything.
+    Unparseable { rule_id: i64, window_start: String },
+    /// The budget rules could not be read, so the floor is unknown.
+    RulesUnreadable(String),
+}
+
+/// How one table's purge ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TablePurge {
+    /// Retention `0`: the table is kept forever.
+    Disabled,
+    /// Rows before `cutoff` were deleted.
+    Purged { deleted: u64, cutoff: String },
+    /// Usage rows only: a budget rule holds the whole ledger, nothing deleted.
+    Held(LedgerHold),
+    /// The DELETE failed; retried next tick.
+    Failed(String),
+}
+
+/// Everything one table tick did, for the log line and for tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRetentionReport {
+    pub cost_ledger: TablePurge,
+    /// Set when the usage-row cutoff was moved earlier than
+    /// `cost_ledger_days` asked for, and what moved it.
+    pub ledger_clamped: Option<LedgerFloor>,
+    pub request_failures: TablePurge,
+    pub hook_metrics: TablePurge,
+    pub audit_log: TablePurge,
+    /// The space-reclaim pass; `Err` carries the engine's message.
+    pub reclaim: Result<ReclaimOutcome, String>,
+}
+
+impl TableRetentionReport {
+    /// Rows deleted across the four tables.
+    pub fn deleted(&self) -> u64 {
+        [&self.cost_ledger, &self.request_failures, &self.hook_metrics, &self.audit_log]
+            .into_iter()
+            .map(|t| match t {
+                TablePurge::Purged { deleted, .. } => *deleted,
+                _ => 0,
+            })
+            .sum()
+    }
+}
+
+/// Run one `[retention]` tick at `now` against `store`, then reclaim space.
+/// Never panics and never returns an error: each table reports its own
+/// outcome, so one failing table does not stop the others.
+pub async fn run_table_retention_tick<S: RetentionStore + ?Sized>(
+    store: &S,
+    policy: &RetentionConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> TableRetentionReport {
+    let (cost_ledger, ledger_clamped) = purge_cost_ledger(store, policy.cost_ledger_days, now).await;
+    let request_failures =
+        purge_table(store, PlainTable::RequestFailures, policy.request_failures_days, now).await;
+    let hook_metrics = purge_table(store, PlainTable::HookMetrics, policy.hook_metrics_days, now).await;
+    let audit_log = purge_table(store, PlainTable::AuditLog, policy.audit_log_days, now).await;
+
+    let reclaim = match store.reclaim_space().await {
+        Ok(outcome) => {
+            match &outcome {
+                ReclaimOutcome::IncrementalVacuum { freed_pages } if *freed_pages > 0 => {
+                    tracing::info!(freed_pages, "retention: free pages returned to the file system");
+                }
+                ReclaimOutcome::NotIncremental { free_pages } if *free_pages > 0 => {
+                    tracing::info!(
+                        free_pages,
+                        "retention: the database file is not in incremental auto-vacuum mode, so it keeps \
+                         its free pages for reuse and does not shrink; `modelrouter db vacuum` converts it"
+                    );
+                }
+                _ => {}
+            }
+            Ok(outcome)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "retention: space reclaim failed");
+            Err(e.to_string())
+        }
+    };
+
+    TableRetentionReport { cost_ledger, ledger_clamped, request_failures, hook_metrics, audit_log, reclaim }
+}
+
+/// `now - days`, or `None` for a span the clock cannot represent (treated
+/// as keep forever, like the prompt sweep).
+fn cutoff_for(days: u64, now: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+    i64::try_from(days)
+        .ok()
+        .and_then(chrono::Duration::try_days)
+        .and_then(|d| now.checked_sub_signed(d))
+}
+
+async fn purge_table<S: RetentionStore + ?Sized>(
+    store: &S,
+    table: PlainTable,
+    days: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> TablePurge {
+    if days == 0 {
+        return TablePurge::Disabled;
+    }
+    let Some(cutoff) = cutoff_for(days, now) else {
+        return TablePurge::Disabled;
+    };
+    let cutoff = cutoff.to_rfc3339();
+    let purged = match table {
+        PlainTable::RequestFailures => store.purge_failures_older_than(&cutoff).await,
+        PlainTable::HookMetrics => store.purge_metrics_older_than(&cutoff).await,
+        PlainTable::AuditLog => store.purge_audit_older_than(&cutoff).await,
+    };
+    let table = table.name();
+    match purged {
+        Ok(deleted) => {
+            if deleted > 0 {
+                tracing::info!(table, deleted, retention_days = days, %cutoff, "retention purge");
+            }
+            TablePurge::Purged { deleted, cutoff }
+        }
+        Err(e) => {
+            tracing::warn!(table, error = %e, "retention purge failed");
+            TablePurge::Failed(e.to_string())
+        }
+    }
+}
+
+/// The earliest moment any budget still reads the usage rows from: the
+/// start of the current calendar month, lowered to the `window_start` of
+/// every `total` rule. `Err` names the rule that holds the whole ledger.
+fn ledger_floor(
+    rules: &[BudgetRule],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(chrono::DateTime<chrono::Utc>, LedgerFloor), LedgerHold> {
+    let month = chrono::DateTime::parse_from_rfc3339(&window_start_at("monthly", now))
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .map_err(|e| LedgerHold::RulesUnreadable(format!("month start unreadable: {e}")))?;
+    let mut floor = (month, LedgerFloor::CalendarMonth);
+    for rule in rules {
+        if rule.window != "total" {
+            // daily, weekly and monthly windows all start inside the month.
+            continue;
+        }
+        let Some(start) = rule.window_start.as_deref() else {
+            return Err(LedgerHold::Unbounded { rule_id: rule.id });
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(start)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .or_else(|_| {
+                chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                    .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc())
+            });
+        let Ok(start_at) = parsed else {
+            return Err(LedgerHold::Unparseable { rule_id: rule.id, window_start: start.to_string() });
+        };
+        if start_at < floor.0 {
+            floor = (start_at, LedgerFloor::BudgetRule { rule_id: rule.id, window_start: start.to_string() });
+        }
+    }
+    Ok(floor)
+}
+
+async fn purge_cost_ledger<S: RetentionStore + ?Sized>(
+    store: &S,
+    days: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (TablePurge, Option<LedgerFloor>) {
+    if days == 0 {
+        return (TablePurge::Disabled, None);
+    }
+    let Some(wanted) = cutoff_for(days, now) else {
+        return (TablePurge::Disabled, None);
+    };
+    let rules = match store.list_all().await {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!(error = %e, "retention: budget rules unreadable, keeping every usage row this tick");
+            return (TablePurge::Held(LedgerHold::RulesUnreadable(e.to_string())), None);
+        }
+    };
+    let (floor, floor_source) = match ledger_floor(&rules, now) {
+        Ok(floor) => floor,
+        Err(hold) => {
+            tracing::info!(?hold, "retention: a budget rule holds the usage rows, nothing deleted");
+            return (TablePurge::Held(hold), None);
+        }
+    };
+    let (cutoff, clamped) = if floor < wanted { (floor, Some(floor_source)) } else { (wanted, None) };
+    let cutoff_str = cutoff.to_rfc3339();
+    match store.purge_ledger_older_than(&cutoff_str).await {
+        Ok(deleted) => {
+            if deleted > 0 {
+                tracing::info!(
+                    table = "cost_ledger",
+                    deleted,
+                    retention_days = days,
+                    cutoff = %cutoff_str,
+                    clamped_by = ?clamped,
+                    "retention purge"
+                );
+            }
+            (TablePurge::Purged { deleted, cutoff: cutoff_str }, clamped)
+        }
+        Err(e) => {
+            tracing::warn!(table = "cost_ledger", error = %e, "retention purge failed");
+            (TablePurge::Failed(e.to_string()), clamped)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -299,6 +576,45 @@ mod tests {
         assert!(prompt(&db, old_unretained).await.is_none());
         assert!(prompt(&db, old_retained).await.is_some());
         assert!(prompt(&db, fresh).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_purge_detaches_usage_rows_from_the_prompts_it_deletes() {
+        let db = memory_db().await;
+        let open = seed(&db, true, 0, None).await;
+        let old = insert_prompt(&db, None, "2026-01-01T00:00:00Z").await;
+        let old_protected = insert_prompt(&db, Some(open), "2026-01-01T00:00:00Z").await;
+        let fresh = insert_prompt(&db, None, "2026-09-10T00:00:00Z").await;
+        for prompt_id in [old, old_protected, fresh] {
+            sqlx::query(
+                "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, cost_usd, created_at) \
+                 VALUES (1, ?, 'model-b', 'mock', 0.03, (SELECT created_at FROM prompts WHERE id = ?))",
+            )
+            .bind(prompt_id)
+            .bind(prompt_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // Foreign keys are enforced on this pool, so without the detach the
+        // DELETE fails on the first referenced prompt.
+        let (fk,): (i64,) = sqlx::query_as("PRAGMA foreign_keys").fetch_one(&db.pool).await.unwrap();
+        assert_eq!(fk, 1);
+
+        let report = run_retention_tick(&db, &db, &db, 30, now()).await;
+        assert_eq!(report.sweep, SweepOutcome::Purged { deleted: 1, protected: vec![open] });
+        assert!(prompt(&db, old).await.is_none());
+        assert!(prompt(&db, old_protected).await.is_some());
+        assert!(prompt(&db, fresh).await.is_some());
+
+        // Every usage row survives; only the deleted prompt's link is gone.
+        let links: Vec<Option<i64>> = sqlx::query_scalar("SELECT prompt_id FROM cost_ledger ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(links, vec![None, Some(old_protected), Some(fresh)]);
+        assert_eq!(CostRepository::sum_for_user_since(&db, 1, "1970-01-01T00:00:00Z").await.unwrap(), 0.09);
     }
 
     #[tokio::test]
@@ -432,5 +748,337 @@ mod tests {
         // Notes wait for the content to go.
         assert!(OutcomeRepository::get(&main, 1, "run-1").await.unwrap().unwrap().note.is_some());
         assert!(OutcomeRepository::get(&main, 1, "run-2").await.unwrap().unwrap().note.is_some());
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use crate::db::models::NewBudgetRule;
+    use crate::db::sqlite::SqliteDb;
+
+    const NOW: &str = "2026-09-10T12:00:00Z";
+    const MONTH_START: &str = "2026-09-01T00:00:00+00:00";
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(NOW).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    async fn memory_db() -> SqliteDb {
+        let db = SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        sqlx::query("INSERT OR IGNORE INTO users (id, name, created_at) VALUES (1, 'test', '2025-01-01T00:00:00Z')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn ledger_row(db: &SqliteDb, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, cost_usd, created_at) \
+             VALUES (1, NULL, 'm', 'p', 1.0, ?)",
+        )
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn failure_row(db: &SqliteDb, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO request_failures (endpoint, request_model, stage, error_message, attempts, attribution_tags, created_at) \
+             VALUES ('/v1/chat/completions', 'm', 'provider', 'boom', 1, '{}', ?)",
+        )
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn hook_row(db: &SqliteDb, invoked_at: &str) {
+        sqlx::query("INSERT INTO hook_metrics (hook_name, invoked_at, duration_ms, success) VALUES ('h', ?, 3, 1)")
+            .bind(invoked_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn audit_row(db: &SqliteDb, created_at: &str) {
+        sqlx::query("INSERT INTO audit_log (actor_name, action, created_at) VALUES ('op', 'test', ?)")
+            .bind(created_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn count(db: &SqliteDb, table: &str) -> i64 {
+        let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}"))).fetch_one(&db.pool).await.unwrap();
+        n
+    }
+
+    async fn ledger_dates(db: &SqliteDb) -> Vec<String> {
+        sqlx::query_scalar("SELECT created_at FROM cost_ledger ORDER BY created_at")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn total_rule(db: &SqliteDb, window_start: Option<&str>) -> i64 {
+        BudgetRepository::create(
+            db,
+            NewBudgetRule {
+                user_id: None,
+                group_name: None,
+                api_key_id: None,
+                tag: None,
+                window: "total".to_string(),
+                limit_usd: Some(500.0),
+                limit_tokens: None,
+                model_allow: vec![],
+                model_deny: vec![],
+                rate_rpm: None,
+                max_concurrent: None,
+                project: None,
+                window_start: window_start.map(str::to_string),
+                window_end: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    fn policy(cost: u64, failures: u64, hooks: u64, audit: u64) -> RetentionConfig {
+        RetentionConfig {
+            cost_ledger_days: cost,
+            request_failures_days: failures,
+            hook_metrics_days: hooks,
+            audit_log_days: audit,
+        }
+    }
+
+    fn purged(report: &TablePurge) -> (u64, &str) {
+        match report {
+            TablePurge::Purged { deleted, cutoff } => (*deleted, cutoff.as_str()),
+            other => panic!("expected a purge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_keeps_every_table() {
+        let db = memory_db().await;
+        for at in ["2020-01-01T00:00:00Z", "2026-09-10T11:00:00Z"] {
+            ledger_row(&db, at).await;
+            failure_row(&db, at).await;
+            hook_row(&db, at).await;
+            audit_row(&db, at).await;
+        }
+        let report = run_table_retention_tick(&db, &RetentionConfig::default(), now()).await;
+        assert_eq!(report.cost_ledger, TablePurge::Disabled);
+        assert_eq!(report.request_failures, TablePurge::Disabled);
+        assert_eq!(report.hook_metrics, TablePurge::Disabled);
+        assert_eq!(report.audit_log, TablePurge::Disabled);
+        assert_eq!(report.ledger_clamped, None);
+        assert_eq!(report.deleted(), 0);
+        assert!(report.reclaim.is_ok(), "{:?}", report.reclaim);
+        for table in ["cost_ledger", "request_failures", "hook_metrics", "audit_log"] {
+            assert_eq!(count(&db, table).await, 2, "{table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_table_keeps_its_own_window() {
+        let db = memory_db().await;
+        // One row just inside and one just outside each table's window.
+        ledger_row(&db, "2026-06-13T00:00:00Z").await; // 89 days: kept at 90
+        ledger_row(&db, "2026-06-11T00:00:00Z").await; // 91 days: gone
+        failure_row(&db, "2026-08-12T00:00:00Z").await; // 29 days: kept at 30
+        failure_row(&db, "2026-08-10T00:00:00Z").await; // 31 days: gone
+        hook_row(&db, "2026-09-04T00:00:00Z").await; // 6 days: kept at 7
+        hook_row(&db, "2026-09-02T00:00:00Z").await; // 8 days: gone
+        audit_row(&db, "2025-09-11T00:00:00Z").await; // 364 days: kept at 365
+        audit_row(&db, "2025-09-09T00:00:00Z").await; // 366 days: gone
+
+        let report = run_table_retention_tick(&db, &policy(90, 30, 7, 365), now()).await;
+        assert_eq!(purged(&report.cost_ledger), (1, "2026-06-12T12:00:00+00:00"));
+        assert_eq!(purged(&report.request_failures), (1, "2026-08-11T12:00:00+00:00"));
+        assert_eq!(purged(&report.hook_metrics), (1, "2026-09-03T12:00:00+00:00"));
+        assert_eq!(purged(&report.audit_log), (1, "2025-09-10T12:00:00+00:00"));
+        assert_eq!(report.ledger_clamped, None, "90 days reaches past the month start");
+        assert_eq!(report.deleted(), 4);
+        for table in ["cost_ledger", "request_failures", "hook_metrics", "audit_log"] {
+            assert_eq!(count(&db, table).await, 1, "{table}");
+        }
+        // Idempotent: the next tick finds nothing older.
+        let again = run_table_retention_tick(&db, &policy(90, 30, 7, 365), now()).await;
+        assert_eq!(again.deleted(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_usage_cutoff_never_enters_the_current_month() {
+        let db = memory_db().await;
+        ledger_row(&db, "2026-08-31T23:00:00Z").await; // last month: gone
+        ledger_row(&db, "2026-09-01T06:00:00Z").await; // this month, 9 days old: kept at 1 day
+        ledger_row(&db, "2026-09-10T11:00:00Z").await;
+
+        let report = run_table_retention_tick(&db, &policy(1, 0, 0, 0), now()).await;
+        assert_eq!(purged(&report.cost_ledger), (1, MONTH_START));
+        assert_eq!(report.ledger_clamped, Some(LedgerFloor::CalendarMonth));
+        assert_eq!(ledger_dates(&db).await, vec!["2026-09-01T06:00:00Z", "2026-09-10T11:00:00Z"]);
+    }
+
+    #[tokio::test]
+    async fn a_total_rule_holds_the_usage_rows_back_to_its_start() {
+        let db = memory_db().await;
+        let id = total_rule(&db, Some("2026-03-01T00:00:00Z")).await;
+        ledger_row(&db, "2026-02-28T00:00:00Z").await; // before the rule's start: gone
+        ledger_row(&db, "2026-03-15T00:00:00Z").await; // the rule reads it: kept at 30 days
+        ledger_row(&db, "2026-09-09T00:00:00Z").await;
+
+        let report = run_table_retention_tick(&db, &policy(30, 0, 0, 0), now()).await;
+        assert_eq!(purged(&report.cost_ledger), (1, "2026-03-01T00:00:00+00:00"));
+        assert_eq!(
+            report.ledger_clamped,
+            Some(LedgerFloor::BudgetRule { rule_id: id, window_start: "2026-03-01T00:00:00Z".to_string() })
+        );
+        assert_eq!(ledger_dates(&db).await, vec!["2026-03-15T00:00:00Z", "2026-09-09T00:00:00Z"]);
+    }
+
+    #[tokio::test]
+    async fn daily_and_weekly_rules_hold_nothing_past_the_month() {
+        let db = memory_db().await;
+        for window in ["daily", "weekly", "monthly"] {
+            BudgetRepository::create(
+                &db,
+                NewBudgetRule {
+                    user_id: Some(1),
+                    group_name: None,
+                    api_key_id: None,
+                    tag: None,
+                    window: window.to_string(),
+                    limit_usd: Some(5.0),
+                    limit_tokens: None,
+                    model_allow: vec![],
+                    model_deny: vec![],
+                    rate_rpm: None,
+                    max_concurrent: None,
+                    project: None,
+                    window_start: None,
+                    window_end: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        ledger_row(&db, "2026-08-31T23:00:00Z").await;
+        let report = run_table_retention_tick(&db, &policy(1, 0, 0, 0), now()).await;
+        assert_eq!(purged(&report.cost_ledger), (1, MONTH_START));
+        assert_eq!(report.ledger_clamped, Some(LedgerFloor::CalendarMonth));
+    }
+
+    #[tokio::test]
+    async fn a_total_rule_without_a_start_holds_the_whole_ledger() {
+        let db = memory_db().await;
+        let id = total_rule(&db, None).await;
+        ledger_row(&db, "2020-01-01T00:00:00Z").await;
+        failure_row(&db, "2020-01-01T00:00:00Z").await;
+
+        let report = run_table_retention_tick(&db, &policy(30, 30, 0, 0), now()).await;
+        assert_eq!(report.cost_ledger, TablePurge::Held(LedgerHold::Unbounded { rule_id: id }));
+        assert_eq!(report.ledger_clamped, None);
+        assert_eq!(count(&db, "cost_ledger").await, 1, "nothing deleted under an unbounded rule");
+        // The other tables are not held by a budget.
+        assert_eq!(purged(&report.request_failures).0, 1);
+        assert_eq!(count(&db, "request_failures").await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_window_start_holds_the_ledger_and_names_the_rule() {
+        let db = memory_db().await;
+        let id = total_rule(&db, Some("last tuesday")).await;
+        ledger_row(&db, "2020-01-01T00:00:00Z").await;
+        let report = run_table_retention_tick(&db, &policy(30, 0, 0, 0), now()).await;
+        assert_eq!(
+            report.cost_ledger,
+            TablePurge::Held(LedgerHold::Unparseable { rule_id: id, window_start: "last tuesday".to_string() })
+        );
+        assert_eq!(count(&db, "cost_ledger").await, 1);
+
+        // A plain date is a start the tick can read.
+        let dated = total_rule(&db, Some("2019-06-01")).await;
+        BudgetRepository::delete(&db, id).await.unwrap();
+        let report = run_table_retention_tick(&db, &policy(30, 0, 0, 0), now()).await;
+        assert_eq!(purged(&report.cost_ledger), (0, "2019-06-01T00:00:00+00:00"));
+        assert_eq!(
+            report.ledger_clamped,
+            Some(LedgerFloor::BudgetRule { rule_id: dated, window_start: "2019-06-01".to_string() })
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_budget_rules_keep_the_usage_rows_and_purge_the_rest() {
+        let db = memory_db().await;
+        ledger_row(&db, "2020-01-01T00:00:00Z").await;
+        hook_row(&db, "2020-01-01T00:00:00Z").await;
+        audit_row(&db, "2020-01-01T00:00:00Z").await;
+        sqlx::query("DROP TABLE budget_rules").execute(&db.pool).await.unwrap();
+
+        let report = run_table_retention_tick(&db, &policy(30, 0, 7, 7), now()).await;
+        assert!(matches!(report.cost_ledger, TablePurge::Held(LedgerHold::RulesUnreadable(_))), "{:?}", report.cost_ledger);
+        assert_eq!(count(&db, "cost_ledger").await, 1);
+        assert_eq!(purged(&report.hook_metrics).0, 1);
+        assert_eq!(purged(&report.audit_log).0, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_table_is_reported_and_the_others_still_run() {
+        let db = memory_db().await;
+        failure_row(&db, "2020-01-01T00:00:00Z").await;
+        hook_row(&db, "2020-01-01T00:00:00Z").await;
+        sqlx::query("DROP TABLE hook_metrics").execute(&db.pool).await.unwrap();
+
+        let report = run_table_retention_tick(&db, &policy(0, 7, 7, 7), now()).await;
+        assert!(matches!(report.hook_metrics, TablePurge::Failed(ref e) if e.contains("hook_metrics")), "{:?}", report.hook_metrics);
+        assert_eq!(purged(&report.request_failures).0, 1);
+        assert_eq!(purged(&report.audit_log).0, 0);
+        assert!(report.reclaim.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_absurd_retention_keeps_the_table() {
+        let db = memory_db().await;
+        ledger_row(&db, "2020-01-01T00:00:00Z").await;
+        let report = run_table_retention_tick(&db, &policy(u64::MAX, u64::MAX, 0, 0), now()).await;
+        assert_eq!(report.cost_ledger, TablePurge::Disabled);
+        assert_eq!(report.request_failures, TablePurge::Disabled);
+        assert_eq!(count(&db, "cost_ledger").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_file_database_reclaims_what_the_purges_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("router.db");
+        let db = SqliteDb::connect(path.to_str().unwrap()).await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        let payload = "x".repeat(4000);
+        for i in 0..300 {
+            sqlx::query("INSERT INTO audit_log (actor_name, action, target, created_at) VALUES ('op', 'test', ?, ?)")
+                .bind(&payload)
+                .bind(format!("2020-01-01T00:{:02}:{:02}Z", i / 60, i % 60))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let (pages_before, _) = db.page_count_and_size().await.unwrap();
+        let report = run_table_retention_tick(&db, &policy(0, 0, 0, 30), now()).await;
+        assert_eq!(purged(&report.audit_log).0, 300);
+        assert!(
+            matches!(report.reclaim, Ok(ReclaimOutcome::IncrementalVacuum { freed_pages }) if freed_pages > 0),
+            "{:?}",
+            report.reclaim
+        );
+        let (pages_after, _) = db.page_count_and_size().await.unwrap();
+        assert!(pages_after < pages_before, "{pages_after} < {pages_before}");
     }
 }

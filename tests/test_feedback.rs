@@ -74,6 +74,8 @@ async fn build_app() -> (TestServer, Arc<dyn DatabaseProvider>) {
                 snippet: "Example description".to_string(),
                 score: Some(0.9),
                 published_date: None,
+                publisher: None,
+                metadata_provenance: None,
             }],
         })),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
@@ -149,6 +151,7 @@ async fn seed_ledger(
             attribution_tags: "{}".to_string(),
             experiment_id: stamp.map(|(id, _)| id),
             experiment_variant: stamp.map(|(_, v)| v.to_string()),
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )

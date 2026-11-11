@@ -216,6 +216,7 @@ async fn budget_exceeded_returns_deny() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
         },
     )
     .await
@@ -238,6 +239,7 @@ async fn budget_exceeded_returns_deny() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )
@@ -318,6 +320,7 @@ async fn test_policy_token_limit_under_budget() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
         },
     )
     .await
@@ -340,6 +343,7 @@ async fn test_policy_token_limit_under_budget() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )
@@ -420,6 +424,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
         },
     )
     .await
@@ -442,6 +447,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )

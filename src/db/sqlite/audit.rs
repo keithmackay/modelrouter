@@ -6,6 +6,12 @@ use super::{SqliteDb, now_utc};
 
 #[async_trait]
 impl AuditRepository for SqliteDb {
+    async fn purge_audit_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        // Batched (`SqliteDb::delete_in_batches`): one DELETE over the whole
+        // table would hold SQLite's write lock for its whole run.
+        self.delete_in_batches("audit_log", "created_at < ?", cutoff_rfc3339, &[], None).await
+    }
+
     async fn create(&self, entry: NewAuditLogEntry) -> anyhow::Result<AuditLogEntry> {
         let now = now_utc();
         let result = sqlx::query(

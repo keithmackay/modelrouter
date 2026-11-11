@@ -15,19 +15,30 @@ const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END)
 
 #[async_trait]
 impl CostRepository for PostgresDb {
+    async fn purge_ledger_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        // created_at is RFC3339 UTC throughout, so the string comparison
+        // orders correctly, the same rule the prompt purge relies on.
+        let result = sqlx::query("DELETE FROM cost_ledger WHERE created_at < $1")
+            .bind(cutoff_rfc3339)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
         let now = now_utc();
         let row = sqlx::query_as::<_, CostLedgerEntry>(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
-                                        experiment_id, experiment_variant, tokens_estimated)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                                        experiment_id, experiment_variant, tokens_estimated,
+                                        call_kind)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
                          cache_hit, saved_usd,
                          attribution_correlation_id, attribution_tags,
-                         experiment_id, experiment_variant, tokens_estimated"#,
+                         experiment_id, experiment_variant, tokens_estimated, call_kind"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -44,6 +55,7 @@ impl CostRepository for PostgresDb {
         .bind(entry.experiment_id)
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
+        .bind(entry.call_kind.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -57,13 +69,14 @@ impl CostRepository for PostgresDb {
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
-                                        experiment_id, experiment_variant, tokens_estimated)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15)
+                                        experiment_id, experiment_variant, tokens_estimated,
+                                        call_kind)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16)
                RETURNING id, user_id, prompt_id, model, provider, project,
                          tokens_in, tokens_out, cost_usd, created_at, api_key_id,
                          cache_hit, saved_usd,
                          attribution_correlation_id, attribution_tags,
-                         experiment_id, experiment_variant, tokens_estimated"#,
+                         experiment_id, experiment_variant, tokens_estimated, call_kind"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -80,6 +93,7 @@ impl CostRepository for PostgresDb {
         .bind(entry.experiment_id)
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
+        .bind(entry.call_kind.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -98,7 +112,7 @@ impl CostRepository for PostgresDb {
         if filter_model.is_some() {
             sql.push_str(" AND model = $2");
         }
-        let mut q = sqlx::query_as::<_, (i64, i64, f64)>(&sql).bind(since);
+        let mut q = sqlx::query_as::<_, (i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str())).bind(since);
         if let Some(m) = filter_model {
             q = q.bind(m.to_string());
         }
@@ -117,7 +131,7 @@ impl CostRepository for PostgresDb {
              GROUP BY day ORDER BY day ASC",
             CACHE_HIT_SUM
         );
-        Ok(sqlx::query_as::<_, (String, i64, i64)>(&sql)
+        Ok(sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(start)
             .bind(end)
             .fetch_all(&self.pool)
@@ -134,7 +148,7 @@ impl CostRepository for PostgresDb {
              GROUP BY model ORDER BY 2 DESC, model ASC",
             CACHE_HIT_SUM
         );
-        let rows = sqlx::query_as::<_, (String, i64, i64, f64)>(&sql)
+        let rows = sqlx::query_as::<_, (String, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(since)
             .fetch_all(&self.pool)
             .await?;
@@ -188,7 +202,7 @@ impl CostRepository for PostgresDb {
         sql.push_str(" GROUP BY user_id, model, project, api_key_id");
 
         type Row = (i64, String, Option<String>, Option<i64>, i64, i64, f64);
-        let mut q = sqlx::query_as::<_, Row>(&sql).bind(since);
+        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str())).bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
         }
@@ -358,7 +372,7 @@ impl CostRepository for PostgresDb {
         }
         sql.push_str(" GROUP BY user_id HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0");
 
-        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, f64, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
@@ -398,6 +412,63 @@ impl CostRepository for PostgresDb {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn summarize_by_kind(
+        &self,
+        filter_user_ids: Option<&[i64]>,
+        filter_project: Option<&str>,
+        filter_model: Option<&str>,
+        since: &str,
+    ) -> anyhow::Result<Vec<crate::db::repositories::costs::KindSummaryRow>> {
+        use crate::db::repositories::costs::KindSummaryRow;
+        if let Some(ids) = filter_user_ids {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+        let mut sql = "SELECT call_kind, model, \
+                              COALESCE(SUM(cost_usd), 0.0), \
+                              COALESCE(SUM(tokens_in), 0), \
+                              COALESCE(SUM(tokens_out), 0), \
+                              COUNT(*), \
+                              COALESCE(SUM(saved_usd), 0.0) \
+                       FROM cost_ledger \
+                       WHERE created_at >= $1"
+            .to_string();
+        let mut param = 2usize;
+        if filter_project.is_some() {
+            sql.push_str(&format!(" AND project = ${}", param));
+            param += 1;
+        }
+        if filter_model.is_some() {
+            sql.push_str(&format!(" AND model = ${}", param));
+            param += 1;
+        }
+        let _ = param;
+        if let Some(ids) = filter_user_ids {
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND user_id IN ({})", list));
+        }
+        sql.push_str(" GROUP BY call_kind, model ORDER BY call_kind ASC, SUM(cost_usd) DESC, model ASC");
+
+        let mut q = sqlx::query_as::<_, (String, String, f64, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
+        q = q.bind(since);
+        if let Some(p) = filter_project { q = q.bind(p.to_string()); }
+        if let Some(m) = filter_model { q = q.bind(m.to_string()); }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(call_kind, model, cost, ti, to, rc, saved)| KindSummaryRow {
+                call_kind,
+                model,
+                total_cost_usd: cost,
+                tokens_in: ti,
+                tokens_out: to,
+                request_count: rc,
+                uncached_cost_usd: cost + saved,
+            })
+            .collect())
     }
 
     async fn cost_rows_grouped(
@@ -448,7 +519,7 @@ impl CostRepository for PostgresDb {
                        ORDER BY SUM(cost_usd) DESC");
 
         type Row = (i64, String, Option<String>, Option<i64>, f64, i64, i64, i64);
-        let mut q = sqlx::query_as::<_, Row>(&sql);
+        let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(since);
         if let Some(p) = filter_project {
             q = q.bind(p.to_string());
@@ -536,7 +607,7 @@ impl CostRepository for PostgresDb {
         let _ = param;
         sql.push_str(" GROUP BY day ORDER BY day ASC");
 
-        let mut q = sqlx::query_as::<_, (String, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(start).bind(end);
         if let Some(p) = filter_project { q = q.bind(p.to_string()); }
         if let Some(m) = filter_model { q = q.bind(m.to_string()); }
@@ -581,7 +652,7 @@ impl CostRepository for PostgresDb {
         let _ = param;
         sql.push_str(" GROUP BY model HAVING SUM(cost_usd) > 0 OR COUNT(*) > 0 ORDER BY SUM(cost_usd) DESC");
 
-        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64, f64)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, f64, i64, i64, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
         q = q.bind(since);
         if let Some(p) = filter_project { q = q.bind(p.to_string()); }
         if let Some(m) = filter_model { q = q.bind(m.to_string()); }
@@ -663,6 +734,25 @@ impl CostRepository for PostgresDb {
         self.by_model_where(&predicate, binds, start, end).await
     }
 
+    async fn arm_by_kind(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let (predicate, binds) = arm_predicate(filter, "model");
+        self.by_kind_where(&predicate, binds, start, end).await
+    }
+
+    async fn attribution_by_kind(
+        &self,
+        filter: &AttributionFilter,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        self.arm_by_kind(&ArmFilter::Attribution(filter.clone()), start, end).await
+    }
+
     async fn arm_by_day(
         &self,
         filter: &ArmFilter,
@@ -685,7 +775,7 @@ impl CostRepository for PostgresDb {
              GROUP BY experiment_variant ORDER BY experiment_variant ASC",
             EXPERIMENT_TOTALS_SELECT
         );
-        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(&sql)
+        let rows = sqlx::query_as::<_, ExperimentTotalsRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -711,7 +801,7 @@ impl CostRepository for PostgresDb {
             EXPERIMENT_TOTALS_SELECT
         );
         type Row = (String, String, i64, f64, f64, i64, i64, i64);
-        let rows = sqlx::query_as::<_, Row>(&sql)
+        let rows = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -745,7 +835,7 @@ impl CostRepository for PostgresDb {
             RUN_VARIANT_SUBQUERY, EXPERIMENT_TOTALS_SELECT, RUN_ROWS_WHERE
         );
         type Row = (i64, String, String, i64, i64, f64, f64, i64, i64, i64, String, String);
-        let rows = sqlx::query_as::<_, Row>(&sql)
+        let rows = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .bind(limit)
             .bind(offset)
@@ -777,7 +867,7 @@ impl CostRepository for PostgresDb {
              ORDER BY user_id ASC, attribution_correlation_id ASC",
             RUN_VARIANT_SUBQUERY, RUN_ROWS_WHERE
         );
-        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(&sql)
+        let rows = sqlx::query_as::<_, (i64, String, String, i64, i64, String, String)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -858,7 +948,7 @@ impl PostgresDb {
             n + 1,
             n + 2
         );
-        let mut q = sqlx::query_as::<_, TotalsRow>(&sql);
+        let mut q = sqlx::query_as::<_, TotalsRow>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in binds {
             q = q.bind(b);
         }
@@ -878,6 +968,26 @@ impl PostgresDb {
             "SELECT model, {} FROM cost_ledger \
              WHERE {} AND created_at >= ${} AND created_at < ${} \
              GROUP BY model ORDER BY SUM(cost_usd) DESC, model ASC",
+            totals_select(),
+            predicate,
+            n + 1,
+            n + 2
+        );
+        self.breakdown_query(&sql, binds, start, end).await
+    }
+
+    async fn by_kind_where(
+        &self,
+        predicate: &str,
+        binds: Vec<String>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
+        let n = binds.len();
+        let sql = format!(
+            "SELECT call_kind, {} FROM cost_ledger \
+             WHERE {} AND created_at >= ${} AND created_at < ${} \
+             GROUP BY call_kind ORDER BY SUM(cost_usd) DESC, call_kind ASC",
             totals_select(),
             predicate,
             n + 1,
@@ -915,7 +1025,7 @@ impl PostgresDb {
         start: &str,
         end: &str,
     ) -> anyhow::Result<Vec<AttributionBreakdownRow>> {
-        let mut q = sqlx::query_as::<_, BreakdownRow>(sql);
+        let mut q = sqlx::query_as::<_, BreakdownRow>(sqlx::AssertSqlSafe(sql));
         for b in binds {
             q = q.bind(b);
         }

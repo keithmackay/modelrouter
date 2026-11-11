@@ -13,7 +13,7 @@ const SELECT_COLS: &str = "user_id, attribution_correlation_id, outcome, score, 
 impl OutcomeRepository for PostgresDb {
     async fn upsert(&self, outcome: NewRunOutcome) -> anyhow::Result<RunOutcome> {
         let now = now_utc();
-        let row = sqlx::query_as::<_, RunOutcome>(&format!(
+        let row = sqlx::query_as::<_, RunOutcome>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO run_outcomes (user_id, attribution_correlation_id, outcome, score, rating, \
              note, experiment_id, experiment_variant, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) \
@@ -22,7 +22,7 @@ impl OutcomeRepository for PostgresDb {
                  note = EXCLUDED.note, experiment_id = EXCLUDED.experiment_id, \
                  experiment_variant = EXCLUDED.experiment_variant, updated_at = EXCLUDED.updated_at \
              RETURNING {SELECT_COLS}"
-        ))
+        )))
         .bind(outcome.user_id)
         .bind(&outcome.attribution_correlation_id)
         .bind(&outcome.outcome)
@@ -38,10 +38,10 @@ impl OutcomeRepository for PostgresDb {
     }
 
     async fn get(&self, user_id: i64, correlation_id: &str) -> anyhow::Result<Option<RunOutcome>> {
-        let row = sqlx::query_as::<_, RunOutcome>(&format!(
+        let row = sqlx::query_as::<_, RunOutcome>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM run_outcomes \
              WHERE user_id = $1 AND attribution_correlation_id = $2"
-        ))
+        )))
         .bind(user_id)
         .bind(correlation_id)
         .fetch_optional(&self.pool)
@@ -50,10 +50,10 @@ impl OutcomeRepository for PostgresDb {
     }
 
     async fn for_experiment(&self, experiment_id: i64) -> anyhow::Result<Vec<RunOutcome>> {
-        let rows = sqlx::query_as::<_, RunOutcome>(&format!(
+        let rows = sqlx::query_as::<_, RunOutcome>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM run_outcomes WHERE experiment_id = $1 \
              ORDER BY user_id, attribution_correlation_id"
-        ))
+        )))
         .bind(experiment_id)
         .fetch_all(&self.pool)
         .await?;

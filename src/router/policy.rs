@@ -605,7 +605,14 @@ mod tests {
 }
 
 fn window_start_for(window: &str) -> String {
-    let now = chrono::Utc::now();
+    window_start_at(window, chrono::Utc::now())
+}
+
+/// Start of the budget window `window` ("daily", "weekly", "monthly";
+/// anything else is monthly) that contains `now`, RFC3339. The retention
+/// tick uses it to keep the cost ledger at least as long as any budget
+/// reads it, so it takes the clock rather than reading it.
+pub fn window_start_at(window: &str, now: chrono::DateTime<chrono::Utc>) -> String {
     match window {
         "daily" => now
             .date_naive()

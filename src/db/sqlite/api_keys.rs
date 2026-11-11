@@ -44,7 +44,7 @@ impl From<ApiKeyRow> for ApiKey {
 impl ApiKeyRepository for SqliteDb {
     async fn find_api_key_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<ApiKey>> {
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            &format!("{SELECT} WHERE key_hash = ? AND enabled = 1")
+            sqlx::AssertSqlSafe(format!("{SELECT} WHERE key_hash = ? AND enabled = 1"))
         )
         .bind(key_hash)
         .fetch_optional(&self.pool)
@@ -54,7 +54,7 @@ impl ApiKeyRepository for SqliteDb {
 
     async fn list_api_keys_for_user(&self, user_id: i64) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            &format!("{SELECT} WHERE user_id = ? ORDER BY id")
+            sqlx::AssertSqlSafe(format!("{SELECT} WHERE user_id = ? ORDER BY id"))
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -79,7 +79,7 @@ impl ApiKeyRepository for SqliteDb {
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, ApiKeyRow>(
-            &format!("{SELECT} WHERE id = ?")
+            sqlx::AssertSqlSafe(format!("{SELECT} WHERE id = ?"))
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -97,7 +97,7 @@ impl ApiKeyRepository for SqliteDb {
 
     async fn list_all_api_keys(&self) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
-            &format!("{SELECT} ORDER BY enabled DESC, created_at DESC")
+            sqlx::AssertSqlSafe(format!("{SELECT} ORDER BY enabled DESC, created_at DESC"))
         )
         .fetch_all(&self.pool)
         .await?;
@@ -124,10 +124,10 @@ impl ApiKeyRepository for SqliteDb {
     async fn find_key_by_user_project(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Option<ApiKey>> {
         let row = match project {
             Some(p) => sqlx::query_as::<_, ApiKeyRow>(
-                &format!("{SELECT} WHERE user_id = ? AND project = ? LIMIT 1")
+                sqlx::AssertSqlSafe(format!("{SELECT} WHERE user_id = ? AND project = ? LIMIT 1"))
             ).bind(user_id).bind(p).fetch_optional(&self.pool).await?,
             None => sqlx::query_as::<_, ApiKeyRow>(
-                &format!("{SELECT} WHERE user_id = ? AND project IS NULL LIMIT 1")
+                sqlx::AssertSqlSafe(format!("{SELECT} WHERE user_id = ? AND project IS NULL LIMIT 1"))
             ).bind(user_id).fetch_optional(&self.pool).await?,
         };
         Ok(row.map(ApiKey::from))
@@ -146,10 +146,10 @@ impl ApiKeyRepository for SqliteDb {
     async fn list_keys_for_group(&self, user_id: i64, project: Option<&str>) -> anyhow::Result<Vec<ApiKey>> {
         let rows = match project {
             Some(p) => sqlx::query_as::<_, ApiKeyRow>(
-                &format!("{SELECT} WHERE user_id = ? AND project = ? ORDER BY enabled DESC, created_at DESC")
+                sqlx::AssertSqlSafe(format!("{SELECT} WHERE user_id = ? AND project = ? ORDER BY enabled DESC, created_at DESC"))
             ).bind(user_id).bind(p).fetch_all(&self.pool).await?,
             None => sqlx::query_as::<_, ApiKeyRow>(
-                &format!("{SELECT} WHERE user_id = ? AND project IS NULL ORDER BY enabled DESC, created_at DESC")
+                sqlx::AssertSqlSafe(format!("{SELECT} WHERE user_id = ? AND project IS NULL ORDER BY enabled DESC, created_at DESC"))
             ).bind(user_id).fetch_all(&self.pool).await?,
         };
         Ok(rows.into_iter().map(ApiKey::from).collect())

@@ -2,7 +2,8 @@
 name = "modelrouter"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91"
+license = "MIT"
+rust-version = "1.94"
 
 [[bin]]
 name = "modelrouter"
@@ -42,12 +43,16 @@ otel = [
 [dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
-# Advisory note: rsa 0.9.x (RUSTSEC-2023-0071, Marvin-class timing, no fixed
-# release) appears in Cargo.lock via sqlx-mysql, but no feature of this crate
-# enables the mysql driver (sqlite + optional postgres only), so the code is
-# never compiled into any built configuration. Re-check if a mysql feature is
-# ever added or when sqlx ships an rsa with the fix.
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "migrate", "macros", "chrono", "uuid"] }
+# sqlx 0.9: the runtime and TLS features are separate (the 0.8 combination
+# feature `runtime-tokio-native-tls` no longer exists), and the SQLite surface
+# is opt-in per API: `sqlite-bundled` compiles the bundled C library (the
+# libsqlite3-sys range 0.9 selects, 0.39+, carries the 2026 SQLite fixes) and
+# `sqlite-unlock-notify` keeps the busy-handler behaviour 0.8 built in. The
+# extension-loading and deserialize APIs are not enabled: nothing here calls
+# them. The lock still lists the optional mysql driver, as any lock does, but
+# in 0.9 it pulls rsa only behind its `mysql-rsa` feature, so rsa 0.9
+# (RUSTSEC-2023-0071) has left the lock.
+sqlx = { version = "0.9", features = ["sqlite-bundled", "sqlite-unlock-notify", "runtime-tokio", "tls-native-tls", "migrate", "macros", "chrono", "uuid"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
 config = "0.14"
@@ -122,3 +127,9 @@ opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 # guarantee before it is ever built. Do not change without reading §4c.
 # `unwind` is already the release default, so this pin is behaviourally inert.
 panic = "unwind"
+
+[patch.crates-io]
+# sqlx-sqlite 0.9.0 as published, with its libsqlite3-sys range widened to
+# <0.40.0 so the lock can take 0.39.x (SQLite 3.54, CVE-2026-119375 fixed).
+# See patches/sqlx-sqlite/README.md; delete once sqlx 0.9.1 or later ships the range.
+sqlx-sqlite = { path = "patches/sqlx-sqlite" }

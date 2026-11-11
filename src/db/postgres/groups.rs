@@ -60,7 +60,7 @@ impl From<GroupMembershipRow> for GroupMembership {
 impl GroupRepository for PostgresDb {
     async fn list_groups(&self) -> anyhow::Result<Vec<Group>> {
         let rows = sqlx::query_as::<_, GroupRow>(
-            &format!("{SELECT_GROUP} ORDER BY priority DESC, id ASC"),
+            sqlx::AssertSqlSafe(format!("{SELECT_GROUP} ORDER BY priority DESC, id ASC"),)
         )
         .fetch_all(&self.pool)
         .await?;
@@ -69,7 +69,7 @@ impl GroupRepository for PostgresDb {
 
     async fn get_group(&self, id: i64) -> anyhow::Result<Option<Group>> {
         let row = sqlx::query_as::<_, GroupRow>(
-            &format!("{SELECT_GROUP} WHERE id = $1"),
+            sqlx::AssertSqlSafe(format!("{SELECT_GROUP} WHERE id = $1"),)
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -79,7 +79,7 @@ impl GroupRepository for PostgresDb {
 
     async fn find_group_by_name(&self, name: &str) -> anyhow::Result<Option<Group>> {
         let row = sqlx::query_as::<_, GroupRow>(
-            &format!("{SELECT_GROUP} WHERE name = $1"),
+            sqlx::AssertSqlSafe(format!("{SELECT_GROUP} WHERE name = $1"),)
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -129,7 +129,7 @@ impl GroupRepository for PostgresDb {
 
     async fn list_memberships(&self, group_id: i64) -> anyhow::Result<Vec<GroupMembership>> {
         let rows = sqlx::query_as::<_, GroupMembershipRow>(
-            &format!("{SELECT_MEMBERSHIP} WHERE gm.group_id = $1 ORDER BY gm.id ASC"),
+            sqlx::AssertSqlSafe(format!("{SELECT_MEMBERSHIP} WHERE gm.group_id = $1 ORDER BY gm.id ASC"),)
         )
         .bind(group_id)
         .fetch_all(&self.pool)
@@ -143,9 +143,9 @@ impl GroupRepository for PostgresDb {
         user_id: i64,
     ) -> anyhow::Result<Option<GroupMembership>> {
         let row = sqlx::query_as::<_, GroupMembershipRow>(
-            &format!(
+            sqlx::AssertSqlSafe(format!(
                 "{SELECT_MEMBERSHIP} WHERE gm.group_id = $1 AND gm.user_id = $2 AND gm.disabled_at IS NULL"
-            ),
+            ),)
         )
         .bind(group_id)
         .bind(user_id)

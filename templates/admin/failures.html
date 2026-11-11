@@ -31,6 +31,20 @@
     {% endif %}
 </div>
 
+{% if by_endpoint %}
+<div style="display:flex; gap:0.5rem; margin:0 0 1rem; flex-wrap:wrap; align-items:center;">
+    <span style="font-size:0.8rem; color:#666; text-transform:uppercase; letter-spacing:0.05em;">By endpoint:</span>
+    {% for e in by_endpoint %}
+    <a href="/admin/failures?endpoint={{ e.endpoint }}" style="font-size:0.85rem; padding:0.2rem 0.6rem; border:1px solid #ddd; border-radius:12px; text-decoration:none; {% if endpoint == e.endpoint %}background:#1a5276; color:#fff;{% else %}background:#fff; color:#333;{% endif %}">
+        <code style="color:inherit;">{{ e.endpoint }}</code> {{ e.count }}
+    </a>
+    {% endfor %}
+    {% if endpoint %}
+    <a href="/admin/failures" style="font-size:0.85rem;">Clear</a>
+    {% endif %}
+</div>
+{% endif %}
+
 <table>
     <thead>
         <tr>

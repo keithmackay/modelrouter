@@ -18,12 +18,12 @@ impl ExperimentRepository for PostgresDb {
         let now = now_utc();
         let variants = serde_json::to_string(&new.variants)?;
         let allowed = serde_json::to_string(&new.allowed_user_ids)?;
-        let row = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let row = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO experiments (name, variants, allowed_user_ids, status, feed_learning, \
              expires_at, created_at, closed_at, retain_content, content_retention_days) \
              VALUES ($1, $2, $3, 'active', $4, $5, $6, NULL, $7, $8) \
              RETURNING {SELECT_COLS}"
-        ))
+        )))
         .bind(&new.name)
         .bind(&variants)
         .bind(&allowed)
@@ -38,9 +38,9 @@ impl ExperimentRepository for PostgresDb {
     }
 
     async fn get(&self, id: i64) -> anyhow::Result<Option<Experiment>> {
-        let row = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let row = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -53,9 +53,9 @@ impl ExperimentRepository for PostgresDb {
             ExperimentStatusFilter::Active => "status = 'active'",
             ExperimentStatusFilter::Closed => "status = 'closed'",
         };
-        let rows = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let rows = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE {predicate} ORDER BY id DESC"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Experiment::try_from).collect()
@@ -88,9 +88,9 @@ impl ExperimentRepository for PostgresDb {
 
     async fn all_retaining_open_or_within_window(&self, now: &str) -> anyhow::Result<Vec<Experiment>> {
         let now = chrono::DateTime::parse_from_rfc3339(now)?.with_timezone(&chrono::Utc);
-        let rows = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let rows = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments WHERE retain_content ORDER BY id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         let all: Vec<Experiment> = rows.into_iter().map(Experiment::try_from).collect::<Result<_, _>>()?;
@@ -98,10 +98,10 @@ impl ExperimentRepository for PostgresDb {
     }
 
     async fn closed_retaining(&self) -> anyhow::Result<Vec<Experiment>> {
-        let rows = sqlx::query_as::<_, ExperimentRow>(&format!(
+        let rows = sqlx::query_as::<_, ExperimentRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {SELECT_COLS} FROM experiments \
              WHERE retain_content AND status = 'closed' ORDER BY id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Experiment::try_from).collect()

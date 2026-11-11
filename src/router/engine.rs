@@ -21,6 +21,10 @@ pub struct RequestRouter {
     db_aliases: Arc<ArcSwap<HashMap<String, String>>>,
     /// Models and providers an operator has taken out of rotation (issue #5).
     availability: Arc<ArcSwap<AvailabilityMap>>,
+    /// Capabilities learned from provider rejections, loaded from the DB.
+    learned: Arc<crate::router::learned_capabilities::LearnedCapabilities>,
+    /// Alias overrides scoped to one attribution tag, loaded from the DB.
+    scoped: Arc<crate::router::scoped_aliases::ScopedAliases>,
 }
 
 impl RequestRouter {
@@ -29,7 +33,28 @@ impl RequestRouter {
             settings,
             db_aliases: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             availability: Arc::new(ArcSwap::from_pointee(AvailabilityMap::default())),
+            learned: Arc::default(),
+            scoped: Arc::default(),
         }
+    }
+
+    /// Alias overrides scoped to one attribution tag. Consulted before the
+    /// global aliases for requests whose tags carry a scope's tag.
+    pub fn scoped_aliases(&self) -> &crate::router::scoped_aliases::ScopedAliases {
+        &self.scoped
+    }
+
+    /// The pinned `provider/model` a live scoped override gives `requested`
+    /// under these attribution tags, if any.
+    pub fn scoped_name(&self, tags: &std::collections::BTreeMap<String, String>, requested: &str) -> Option<String> {
+        self.scoped
+            .target_for(tags, requested, chrono::Utc::now().timestamp())
+            .map(|t| t.expression())
+    }
+
+    /// Capabilities learned from provider rejections.
+    pub fn learned_capabilities(&self) -> &crate::router::learned_capabilities::LearnedCapabilities {
+        &self.learned
     }
 
     /// Replace the live DB alias map (called after DB model writes).

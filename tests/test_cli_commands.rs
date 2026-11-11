@@ -1484,6 +1484,44 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Poll `child` for exit, returning `true` once it has, `false` if `timeout`
+/// elapses first. Does not reap stdout/stderr, so it only suits a child that
+/// cannot fill its pipe buffers before exiting.
+fn wait_for_exit(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll child for exit").is_some() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn wait_for_exit_true_once_the_child_has_already_finished() {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn `true`");
+    assert!(wait_for_exit(&mut child, std::time::Duration::from_secs(5)));
+}
+
+#[test]
+fn wait_for_exit_false_on_a_child_that_outlives_the_timeout() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn `sleep 5`");
+    assert!(!wait_for_exit(
+        &mut child,
+        std::time::Duration::from_millis(100)
+    ));
+    child.kill().expect("clean up the still-running sleep");
+    child.wait().expect("reap killed sleep");
+}
+
 /// Run a CLI subcommand under a pty, feeding `stdin_data` to its terminal.
 ///
 /// Returns `(success, transcript)`. The transcript is the pty session, so
@@ -1534,13 +1572,23 @@ fn run_cli_pty(config: &PathBuf, args: &[&str], stdin_data: &str) -> (bool, Stri
         .expect("pty stdin")
         .write_all(stdin_data.as_bytes())
         .expect("write password to pty");
-    // BSD `script` forwards its own stdin to the pty master as it arrives;
-    // closing our pipe immediately after the write can race ahead of that
-    // forwarding and deliver EOF to the child's /dev/tty read before the
-    // typed bytes do (observed directly: `printf ... | script -qe /dev/null
-    // /bin/cat` prints `^D` before the echoed input without this delay).
-    // util-linux `script` doesn't need it, but the delay is harmless there.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // BSD `script` forwards its own stdin to the pty master as it arrives, not
+    // on our pipe's EOF — so the command never needs our stdin to close at
+    // all. It needs only the bytes we already wrote, which it reads from
+    // /dev/tty, not from its own stdin. A fixed sleep before closing was a
+    // guess at how long that forwarding takes; under load it can still be too
+    // short, which is exactly the premature-EOF race this is fixing. Instead,
+    // wait for the one event that actually proves the forwarded bytes already
+    // did their job: the command has used them and exited. Only then close
+    // our end, which by that point can no longer race anything.
+    //
+    // This does not drain stdout/stderr while polling, so it would deadlock
+    // against a child that fills the OS pipe buffer (64KiB+) before exiting;
+    // every command under test here prints at most a few lines.
+    assert!(
+        wait_for_exit(&mut child, std::time::Duration::from_secs(10)),
+        "pty child never exited after receiving its input"
+    );
     drop(child.stdin.take());
 
     let out = child.wait_with_output().expect("wait for pty child");
