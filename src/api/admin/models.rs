@@ -657,6 +657,28 @@ static CATALOG_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<CatalogCache
     std::sync::OnceLock::new();
 const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// GET /admin/api/pricing — the effective pricing table `CostCalculator`
+/// costs requests with: built-in rates with config `[[pricing]]` entries
+/// applied, in USD per million tokens, sorted by model key.
+///
+/// Each row's cache rates are the rates actually charged; `*_defaulted` is
+/// `true` when the entry sets no such rate and the `defaults` multiplier of
+/// the input rate applies. See the README's pricing section for how a
+/// requested model name is matched to a row.
+pub async fn get_pricing(
+    State(state): State<AppState>,
+    _session: AdminSession,
+) -> axum::Json<serde_json::Value> {
+    use crate::router::cost::{CACHE_READ_DISCOUNT, CACHE_WRITE_PREMIUM};
+    axum::Json(serde_json::json!({
+        "defaults": {
+            "cache_read_multiplier": CACHE_READ_DISCOUNT,
+            "cache_write_multiplier": CACHE_WRITE_PREMIUM,
+        },
+        "models": state.cost_calc.price_table(),
+    }))
+}
+
 #[derive(serde::Deserialize)]
 pub struct AvailableModelsQuery {
     #[serde(default)]
@@ -762,7 +784,7 @@ mod tests {
                     "supported": true,
                     "models": [
                         { "provider": "vertex", "name": "anthropic/claude-haiku-4-5" },
-                        { "provider": "vertex", "name": "anthropic/claude-sonnet-5" }
+                        { "provider": "vertex", "name": "anthropic/unpriced-model" }
                     ]
                 },
                 "azure": { "supported": false }
@@ -773,7 +795,7 @@ mod tests {
 
         let models = value["providers"]["vertex"]["models"].as_array().unwrap();
         assert_eq!(models[0]["priced"], serde_json::json!(true));
-        // claude-sonnet-5 is not in the built-in table -- exactly the gap
+        // unpriced-model is not in the built-in table -- exactly the gap
         // this stamp exists to surface before an experiment create call does.
         assert_eq!(models[1]["priced"], serde_json::json!(false));
         // An unsupported provider has no `models` array; must not panic.

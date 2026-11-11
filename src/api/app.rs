@@ -257,6 +257,7 @@ pub fn build_router(state: AppState) -> axum::Router {
             get(crate::api::admin::compare::get_compare),
         )
         .route("/admin/api/models/available", get(crate::api::admin::models::get_available_models))
+        .route("/admin/api/pricing", get(crate::api::admin::models::get_pricing))
         .route("/admin/api/cache/stats", get(crate::api::admin::cache::get_cache_stats))
         .route("/admin/api/cache/purge", post(crate::api::admin::cache::post_cache_purge))
         .route(
