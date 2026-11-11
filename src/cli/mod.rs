@@ -709,7 +709,14 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             }
 
             extensions
-                .start(crate::extensions::StartContext { pool: state.pool.clone() })
+                // The extension seam takes the SQLite pool; on another backend it starts without one.
+                .start(crate::extensions::StartContext {
+                    pool: state.pool.as_ref().and_then(|p| match p {
+                        crate::report::ReportPool::Sqlite(pool) => Some(pool.clone()),
+                        #[cfg(feature = "postgres")]
+                        crate::report::ReportPool::Postgres(_) => None,
+                    }),
+                })
                 .await?;
             if !extensions.is_empty() {
                 let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
@@ -1212,7 +1219,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                             if window == "alltime" { "all" } else { window.as_str() },
                         );
                         let by_kind = CostRepository::summarize_by_kind(
-                            &db, None, project.as_deref(), model.as_deref(), &since,
+                            &*db, None, project.as_deref(), model.as_deref(), &since,
                         ).await?;
                         if !by_kind.is_empty() {
                             println!();

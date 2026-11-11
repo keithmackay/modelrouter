@@ -81,7 +81,8 @@ impl ReportPool {
     async fn fetch_all<R: ReportRow>(&self, sql: &str, args: &[Arg]) -> Result<Vec<R>> {
         match self {
             ReportPool::Sqlite(pool) => {
-                let mut q = sqlx::query_as::<_, R>(sql);
+                // sqlx 0.9 wants an owned or 'static statement; the SQL is built by this module.
+                let mut q = sqlx::query_as::<_, R>(sqlx::AssertSqlSafe(sql.to_string()));
                 for arg in args {
                     q = match arg {
                         Arg::Text(v) => q.bind(v.clone()),
@@ -93,7 +94,7 @@ impl ReportPool {
             #[cfg(feature = "postgres")]
             ReportPool::Postgres(pool) => {
                 let sql = numbered_placeholders(sql);
-                let mut q = sqlx::query_as::<_, R>(&sql);
+                let mut q = sqlx::query_as::<_, R>(sqlx::AssertSqlSafe(sql));
                 for arg in args {
                     q = match arg {
                         Arg::Text(v) => q.bind(v.clone()),
