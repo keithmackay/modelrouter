@@ -140,6 +140,7 @@ fn static_adapter(config: &ProviderConfig) -> FoundryAdapter {
 
 fn req(model: &str) -> NormalizedRequest {
     NormalizedRequest {
+        session_scope: None,
         model: model.to_string(),
         request_model: "deep".to_string(),
         messages: vec![

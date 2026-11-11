@@ -52,6 +52,7 @@ async fn api_key(db: &Db, user_id: i64, hash: &str, project: Option<&str>) -> i6
 /// A ledger entry with neutral defaults; scenarios override what they test.
 fn entry(user_id: i64, model: &str, cost_usd: f64) -> NewCostLedgerEntry {
     NewCostLedgerEntry {
+        call_kind: modelrouter::db::models::CallKind::Chat,
         user_id,
         prompt_id: None,
         model: model.into(),
