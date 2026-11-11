@@ -18,7 +18,7 @@ use opentelemetry_sdk::{
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::config::schema::{LogFormat, TelemetryConfig};
+use crate::config::schema::{LoggingConfig, TelemetryConfig};
 use sampler::SmartSampler;
 
 /// Holds pipeline handles. All pipelines are flushed and shut down on Drop.
@@ -46,8 +46,12 @@ impl Drop for TelemetryShutdownGuard {
 }
 
 /// Build all three OTel pipelines and install the layered tracing subscriber.
-/// Returns a guard; drop it to flush on shutdown.
-pub fn init_telemetry(config: &TelemetryConfig, log_format: LogFormat) -> Result<TelemetryShutdownGuard> {
+/// Returns the telemetry guard and the log output's guard; drop them to
+/// flush on shutdown.
+pub fn init_telemetry(
+    config: &TelemetryConfig,
+    logging: &LoggingConfig,
+) -> Result<(TelemetryShutdownGuard, crate::logging::LogGuard)> {
     let resource = Resource::builder()
         .with_service_name(config.service_name.clone())
         .build();
@@ -113,14 +117,17 @@ pub fn init_telemetry(config: &TelemetryConfig, log_format: LogFormat) -> Result
     let tracer = trace_provider.tracer(config.service_name.clone());
     let otel_trace_layer = OpenTelemetryLayer::new(tracer);
 
+    let (output, log_guard) = crate::logging::output_layer(logging)?;
     // try_init() instead of init() so tests don't panic on duplicate subscriber
     tracing_subscriber::registry()
         .with(crate::logging::env_filter())
-        .with(crate::logging::fmt_layer(log_format, std::io::stdout))
+        .with(output)
         .with(otel_trace_layer)
         .with(log_bridge)
         .try_init()
         .ok(); // ok to fail if subscriber already set (e.g. in tests)
 
-    Ok(TelemetryShutdownGuard { meter_provider, log_provider, trace_provider })
+    crate::logging::warn_on_low_free_space(logging);
+
+    Ok((TelemetryShutdownGuard { meter_provider, log_provider, trace_provider }, log_guard))
 }

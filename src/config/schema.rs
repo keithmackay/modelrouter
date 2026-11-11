@@ -519,14 +519,106 @@ impl GatewayBootstrapConfig {
     }
 }
 
-/// `[logging]` — how log lines are written to stdout.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+/// `[logging]`: the log format, and an optional rotating file sink.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoggingConfig {
     /// `text` (default) or `json`. With `json`, every line is one JSON object
     /// with the event's fields at the top level, for log collectors that
     /// index by field. Env: `MODELROUTER_LOGGING__FORMAT`.
     #[serde(default)]
     pub format: LogFormat,
+    /// Log file path. Unset (the default) writes to stdout only. Set, the
+    /// router writes this file itself and rotates and prunes it, so the
+    /// logs stay bounded without an external logrotate.
+    #[serde(default)]
+    pub file: Option<std::path::PathBuf>,
+    /// When the file rotates: `daily` (default, at UTC midnight), `hourly`,
+    /// or `size` (only when it reaches `max_size_mb`). Every mode also
+    /// rotates at `max_size_mb`, so a burst cannot outgrow one period.
+    #[serde(default)]
+    pub rotate: LogRotation,
+    /// Size at which the active file rotates, in MiB. Default 50.
+    #[serde(default = "default_log_max_size_mb")]
+    pub max_size_mb: u64,
+    /// Rotated files kept beside the active one; older ones are deleted.
+    /// Default 7. The logs use at most `(max_files + 1) × max_size_mb`.
+    #[serde(default = "default_log_max_files")]
+    pub max_files: usize,
+    /// Also write to stdout. Defaults to true without `file` and false
+    /// with it, because a captured stdout is the unbounded file that
+    /// `file` exists to replace.
+    #[serde(default)]
+    pub stdout: Option<bool>,
+    /// At startup, warn when the log volume has less free space than this,
+    /// in MiB. Default 512; 0 turns the check off.
+    #[serde(default = "default_log_min_free_mb")]
+    pub min_free_mb: u64,
+}
+
+fn default_log_max_size_mb() -> u64 { 50 }
+fn default_log_max_files() -> usize { 7 }
+fn default_log_min_free_mb() -> u64 { 512 }
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::default(),
+            file: None,
+            rotate: LogRotation::default(),
+            max_size_mb: default_log_max_size_mb(),
+            max_files: default_log_max_files(),
+            stdout: None,
+            min_free_mb: default_log_min_free_mb(),
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Whether log lines also go to stdout.
+    pub fn stdout_enabled(&self) -> bool {
+        self.stdout.unwrap_or(self.file.is_none())
+    }
+
+    /// Refuse a `[logging]` section that cannot bound its own output.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let Some(file) = &self.file else { return Ok(()) };
+        if file.as_os_str().is_empty() || file.file_name().is_none() {
+            anyhow::bail!(
+                "logging.file = {:?} names no file; give a path such as \
+                 /var/log/modelrouter/modelrouter.log. Refusing to start.",
+                file
+            );
+        }
+        if file.is_dir() {
+            anyhow::bail!(
+                "logging.file = {} is a directory; give a file path inside it. Refusing to start.",
+                file.display()
+            );
+        }
+        if self.max_size_mb == 0 {
+            anyhow::bail!(
+                "logging.max_size_mb = 0: the log file would rotate on every line. \
+                 Use 1 or more. Refusing to start."
+            );
+        }
+        if self.max_files == 0 {
+            anyhow::bail!(
+                "logging.max_files = 0 would delete each file as it rotates. \
+                 Keep at least 1. Refusing to start."
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[logging] rotate`: when the log file starts a new file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogRotation {
+    #[default]
+    Daily,
+    Hourly,
+    Size,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]

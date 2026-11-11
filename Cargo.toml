@@ -108,6 +108,7 @@ opentelemetry-otlp             = { version = "0.32", features = ["grpc-tonic", "
 opentelemetry-appender-tracing = { version = "0.32", optional = true }
 tracing-opentelemetry          = { version = "0.33", optional = true }
 redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
+tracing-appender = "0.2"
 
 [dev-dependencies]
 toml = "0.8"
@@ -133,3 +134,6 @@ panic = "unwind"
 # <0.40.0 so the lock can take 0.39.x (SQLite 3.54, CVE-2026-119375 fixed).
 # See patches/sqlx-sqlite/README.md; delete once sqlx 0.9.1 or later ships the range.
 sqlx-sqlite = { path = "patches/sqlx-sqlite" }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

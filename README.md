@@ -1184,6 +1184,55 @@ run, the tick logs the free page count with that hint. On Postgres the
 purges are the same and autovacuum reclaims the space; the command does
 nothing there.
 
+### Log output and rotation
+
+Neither log mode grows without bound, as long as the one you use is set up
+for it.
+
+**stdout (the default).** With `[logging] file` unset the router writes to
+stdout only, as it always has. Whatever captures stdout must bound it:
+
+- Docker: `--log-opt max-size=50m --log-opt max-file=5` (or the same keys
+  under `logging.options` in Compose, or in `daemon.json` for every container).
+- Kubernetes: the kubelet rotates container logs at `containerLogMaxSize`
+  (default 10Mi) and keeps `containerLogMaxFiles` (default 5).
+- systemd: the journal is capped by `SystemMaxUse=` in `journald.conf`. A unit
+  that sends stdout to a file (`StandardOutput=append:`) is not capped by
+  anything; use the file sink instead.
+
+A shell redirect (`modelrouter serve >> router.log`) or a supervisor that
+appends to a file has no cap either. That is what the file sink is for.
+
+**File sink.** Set a path and the router writes, rotates and prunes the file
+itself, with no external logrotate:
+
+```toml
+[logging]
+file = "/var/log/modelrouter/modelrouter.log"
+rotate = "daily"      # "daily" (UTC midnight), "hourly", or "size"
+max_size_mb = 50      # every mode also rotates at this size
+max_files = 7         # rotated files kept; older ones are deleted
+format = "text"       # or "json"
+```
+
+A rotation renames the file to `modelrouter.log.<UTC timestamp>` and opens a
+new one; the oldest rotated files beyond `max_files` are deleted then and at
+startup. Only names in that exact form are deleted, so nothing else in the
+directory is touched. The logs therefore use at most
+`(max_files + 1) × max_size_mb`, 400 MiB with the defaults. Lines go through
+a background writer, so a slow disk does not stall requests. Lines are never
+dropped: when the queue is full, logging waits for the writer. Lines are
+never split across two files, and file lines carry no terminal colour codes.
+
+With `file` set, stdout is off unless `stdout = true`, because a captured
+stdout is the unbounded file this replaces. At startup the router creates
+the directory if needed and refuses to start if it cannot open the file for
+writing. It also warns, without failing, when the volume has less free space
+than `min_free_mb` (default 512; `0` turns the check off). The warning names
+the path, the free bytes and the floor. A single-instance SQLite deployment
+usually keeps its database on the same volume, and a full volume fails
+database writes as well as logging.
+
 ### Response cache
 
 The router can serve identical requests from a cache instead of calling the

@@ -665,6 +665,23 @@ rotation_overlap_mins = 15
 #
 # [logging]
 # format = "json"
+#
+# Log file. Unset (the default) writes to stdout only; bound that with the
+# container runtime or service manager (see "Log output and rotation" in the
+# README). Set, the router writes the file itself, rotates it and deletes the
+# oldest rotated files, so the logs never use more than
+# (max_files + 1) x max_size_mb. Rotated files are named
+# <file>.<UTC timestamp>, e.g. modelrouter.log.20261111T000000.000000Z.
+#
+# file = "/var/log/modelrouter/modelrouter.log"
+# rotate = "daily"        # "daily" (UTC midnight), "hourly", or "size"; every
+#                         # mode also rotates when the file reaches max_size_mb
+# max_size_mb = 50
+# max_files = 7           # rotated files kept beside the active one (at least 1)
+# stdout = false          # also write to stdout; default true without `file`,
+#                         # false with it
+# min_free_mb = 512       # warn at startup when the log volume has less free
+#                         # space than this; 0 turns the check off
 
 
 # Retention for the per-request tables the prompt log does not cover, in

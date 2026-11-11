@@ -13,6 +13,7 @@ pub fn load_from_path(path: &str) -> Result<Settings> {
         .try_deserialize::<Settings>()?;
     settings.validate_provider_credentials()?;
     settings.cache.validate()?;
+    settings.logging.validate()?;
     Ok(settings)
 }
 
@@ -43,6 +44,7 @@ pub fn load(path: Option<PathBuf>) -> Result<Settings> {
         .try_deserialize::<Settings>()?;
     settings.validate_provider_credentials()?;
     settings.cache.validate()?;
+    settings.logging.validate()?;
 
     Ok(settings)
 }

@@ -318,15 +318,16 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
 
             // Initialise tracing subscriber. The otel feature provides a richer layered
             // subscriber; without it we install a basic fmt subscriber.
+            // The guard keeps the log file writer running; hold it until exit.
             #[cfg(not(feature = "otel"))]
-            crate::logging::init(settings.logging.format);
+            let _log_guard = crate::logging::init(&settings.logging)?;
             #[cfg(feature = "otel")]
-            let _telemetry_guard = {
+            let (_telemetry_guard, _log_guard) = {
                 if settings.telemetry.enabled {
-                    Some(crate::telemetry::init_telemetry(&settings.telemetry, settings.logging.format)?)
+                    let (t, l) = crate::telemetry::init_telemetry(&settings.telemetry, &settings.logging)?;
+                    (Some(t), l)
                 } else {
-                    crate::logging::init(settings.logging.format);
-                    None
+                    (None, crate::logging::init(&settings.logging)?)
                 }
             };
 
