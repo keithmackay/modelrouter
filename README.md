@@ -43,6 +43,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
 - **Controlled experiments** — create an experiment with named variants, put `x-modelrouter-experiment: <id>[:<label>]` on each chat completion, report outcomes with `POST /v1/feedback`, and read per-variant and per-run cost, tokens, turns, latency, failures and outcomes back as JSON, from the CLI, or on `/admin/experiments`; bound requests are pinned to their variant's priced model with no downgrade, pool, cache or fallback
 - **Request cost attribution** — tag any metered call with your own correlation id and free-form tags (`attribution` in the request body, or `X-Attribution-*` headers); the router persists them on the prompt and cost-ledger rows and reports spend *and* cache savings per tag, so a consuming app can drop its own cost accounting. Attribution never affects routing or the cache key
+- **Subscription mode** — send Anthropic, OpenAI and Gemini chat traffic through `claude -p`, `codex exec` and `gemini` on their subscription logins, resuming one CLI session per conversation, and meter it like API traffic ([details](#subscription-mode-chat-through-the-vendor-clis))
 - **Session stickiness** — include `session_id` in any request to pin the session to the winning provider; automatically re-pins on model change; opt out per-request with `X-Session-Lb: true`
 - **Prompt logging control** — set `X-No-Log: true` on any request to skip prompt history and callback dispatch while preserving cost tracking for budget enforcement
 - **Chinese model providers** — built-in pricing for DeepSeek, Qwen (Tongyi), and Doubao; all are OpenAI-compatible and configured as standard providers
@@ -210,8 +211,8 @@ docker run -d --name modelrouter --restart unless-stopped \
   container is unreachable through the published port.
 - `MODELROUTER_DATABASE__PATH` puts the SQLite file on the `/data` volume; the default
   (`~/.modelrouter/router.db`) lives in the container's filesystem and is lost with it.
-- `/host/config/config.toml` must exist first — generate one with `modelrouter init` on the
-  host (it writes `~/.modelrouter/config.toml`) and copy it over.
+- `/host/config/config.toml` must exist first — generate it with
+  `modelrouter --config /host/config/config.toml init`.
 - `-p 127.0.0.1:8080:8080` keeps the proxy and admin dashboard off the network; drop the
   `127.0.0.1:` to expose them.
 - The release images are distroless (no shell), so run other commands as arguments:
@@ -937,14 +938,11 @@ postgres_url = "postgres://modelrouter:secret@db-host:5432/modelrouter"
 
 or `MODELROUTER_DATABASE__POSTGRES_URL=postgres://…` (an empty value switches it back
 off). `serve`, `migrate`, and the `user`, `admin`, `key`, `budget`, `group`, `model`,
-`alias`, `provider`, `webhook` and `experiment` commands all use it, and each one applies
+`alias`, `provider`, `webhook`, `experiment`, `report` and `audit` commands all use it, and each one applies
 the Postgres migrations (`migrations/postgres/`) before running. A binary built without
 the feature refuses to start when `postgres_url` is set, rather than quietly using SQLite.
 
-Not on Postgres yet: the CLI reports that query SQLite directly (`report cost` without
-`--tag`/`--correlation-id`, `report usage`, `report prompts`, `report audit`,
-`report hooks`, `audit`) exit with an error naming the command, and the dashboard's hook
-latency panel is empty. The dashboard's own cost, usage and audit pages work. A dedicated
+Every CLI command, report and dashboard page works on either backend. A dedicated
 prompt-log file (`storage.prompt_db_path`) is always SQLite.
 
 **Docker Compose.** `docker-compose.postgres.yml` is an overlay that adds a `postgres:17`
@@ -970,6 +968,64 @@ Postgres schema per test:
 MODELROUTER_TEST_POSTGRES_URL=postgres://modelrouter:$MODELROUTER_PG_PASSWORD@127.0.0.1:5438/modelrouter_test \
   cargo test --features postgres --test test_db_conformance
 ```
+
+### Subscription mode: chat through the vendor CLIs
+
+With `[subscription]` enabled, chat traffic for Anthropic, OpenAI and Gemini
+models is answered by the vendor's own CLI in headless mode, on that CLI's
+subscription login, instead of the HTTP API. The router still authenticates,
+applies policy and budgets, and meters every call, so subscription usage is
+tracked per user, project and model just like API usage.
+
+```toml
+[subscription]
+enabled = true
+providers = ["anthropic", "openai", "gemini"]   # which providers to redirect
+```
+
+| Provider | CLI | Metered as |
+|---|---|---|
+| `anthropic` | `claude -p --output-format json` | `claude-cli` |
+| `openai` | `codex exec --json` (read-only sandbox) | `codex-cli` |
+| `gemini` | `gemini --output-format json` | `gemini-cli` |
+
+It covers `/v1/chat/completions` (streamed or not, plus fallback chains and
+load-balancer pools), `/v1/responses` and `/v1/messages`. Embeddings, images and
+search keep using the APIs.
+
+**Sessions.** Each CLI keeps a conversation it can resume. The router remembers
+which session holds which transcript. When a request's messages continue a
+conversation the router has answered, it resumes that session and sends only the
+new user turn, so the CLI's prompt cache keeps working. A first turn, an edited
+history or a restart starts a new session and replays the transcript as text.
+Sessions are kept per user, API-key project, CLI and model. Each user/project
+gets its own working directory under `work_dir`, and a session is forgotten after
+`session_idle_secs` without use. Two concurrent requests never share a session.
+
+**Accounting.** Ledger rows carry the CLI's provider name with the token counts
+the CLI reports, priced at the model's API rate. Cost reports therefore show
+what the subscription usage would have cost through the API; budgets count it
+the same way. A model without a pricing entry is recorded at $0.
+
+**Limits.**
+- Text only: tool definitions, tool calls, images and documents are refused with
+  a 400 (the CLIs run with their own tools disabled or sandboxed).
+- `temperature`, `max_tokens` and `reasoning_effort` are not passed to the CLIs.
+- A streamed request is answered in one piece once the CLI finishes.
+- Each CLI adds its own instructions to the prompt: Claude is given the caller's
+  system prompt (or a neutral one) in place of Claude Code's; Codex keeps its
+  built-in agent instructions, about 18k input tokens per new session.
+- The vendor's API-key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `GEMINI_API_KEY`, …) are removed from the CLI's environment, so calls cannot
+  fall back to API billing.
+- Which models work depends on the subscription: Codex on a ChatGPT login, for
+  example, refuses models that plan does not include, and the router returns
+  the CLI's message.
+
+**Where it can run.** The CLIs must be installed and logged in as the user
+modelrouter runs as. That makes it a host deployment (`modelrouter serve` or
+`install-service`): the Docker images contain no CLIs or logins, and Claude
+Code's macOS login lives in the keychain.
 
 ### Prompt-log storage
 
@@ -1527,7 +1583,7 @@ modelrouter report cost --group team-alpha --project myapp --window alltime --fo
 
 ### API
 
-All `/v1/*` endpoints accept `Authorization: Bearer <api-key>`.
+All `/v1/*` endpoints except `GET /v1/models` require `Authorization: Bearer <api-key>`.
 
 ```bash
 # List available models

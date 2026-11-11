@@ -84,7 +84,7 @@ modelrouter install-service  (macOS/Linux)
 
 ## Authentication
 
-All `/v1/*` endpoints require `Authorization: Bearer <api-key>`.
+All `/v1/*` endpoints except `GET /v1/models` require `Authorization: Bearer <api-key>`.
 
 Admin REST endpoints require a JWT obtained from `POST /admin/login`.
 Dashboard (web UI) at `/admin` uses cookie-based sessions.

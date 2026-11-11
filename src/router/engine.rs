@@ -93,6 +93,17 @@ impl RequestRouter {
         Resolution { provider, model, substituted }
     }
 
+    /// The provider that actually serves chat traffic resolved to
+    /// `(provider, model)`: under `[subscription]`, a covered API provider is
+    /// replaced by its CLI (`anthropic` → `claude-cli`, …). Only chat
+    /// dispatch applies this; embeddings, images and search keep the API.
+    pub fn for_chat(&self, (provider, model): (String, String)) -> (String, String) {
+        match crate::providers::cli_session::subscription_provider(&self.settings.subscription, &provider) {
+            Some(cli) => (cli.to_string(), model),
+            None => (provider, model),
+        }
+    }
+
     pub fn resolve(&self, requested_model: &str) -> (String, String) {
         let (provider, model, _) = self.resolve_inner(requested_model);
         (provider, model)

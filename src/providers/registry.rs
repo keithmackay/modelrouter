@@ -2,13 +2,17 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
+use crate::config::schema::{ProviderConfig, SubscriptionConfig, TierTimeoutsConfig};
 use crate::providers::adapter::ProviderAdapter;
 
 pub struct ProviderRegistry {
     adapters: DashMap<String, Arc<dyn ProviderAdapter>>,
     configs: HashMap<String, ProviderConfig>,
     tier_timeouts: TierTimeoutsConfig,
+    /// `[subscription]`, when enabled: the CLI providers (`claude-cli`, …)
+    /// exist only then, so a caller cannot make the router run a local CLI
+    /// unless the operator turned the mode on.
+    subscription: Option<SubscriptionConfig>,
 }
 
 impl ProviderRegistry {
@@ -24,12 +28,34 @@ impl ProviderRegistry {
             adapters: DashMap::new(),
             configs,
             tier_timeouts,
+            subscription: None,
         }
+    }
+
+    /// Serve the CLI providers named by `[subscription]` when it is enabled.
+    pub fn with_subscription(mut self, cfg: SubscriptionConfig) -> Self {
+        self.subscription = cfg.enabled.then_some(cfg);
+        self
     }
 
     pub fn get(&self, provider_name: &str) -> anyhow::Result<Arc<dyn ProviderAdapter>> {
         if let Some(adapter) = self.adapters.get(provider_name) {
             return Ok(adapter.clone());
+        }
+
+        if let Some(tool) = crate::providers::cli_session::Tool::from_provider_name(provider_name) {
+            let cfg = self.subscription.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown provider: {provider_name} (the CLI providers need [subscription] enabled = true)"
+                )
+            })?;
+            let entry = self
+                .adapters
+                .entry(provider_name.to_string())
+                .or_insert_with(|| {
+                    Arc::new(crate::providers::cli_session::CliSessionAdapter::new(tool, cfg))
+                });
+            return Ok(entry.clone());
         }
 
         // Fall back to first available adapter (useful in tests)
@@ -150,6 +176,7 @@ impl ProviderRegistry {
             adapters: DashMap::new(),
             configs: HashMap::new(),
             tier_timeouts: TierTimeoutsConfig::default(),
+            subscription: None,
         };
         let mock_arc: Arc<dyn ProviderAdapter> = Arc::new(mock);
         registry.adapters.insert("__mock__".to_string(), mock_arc);

@@ -208,6 +208,7 @@ async fn probe_llm(state: &AppState) -> CapabilityReport {
         tool_choice: None,
         reasoning: None,
         extra_params: json!({}),
+        session_scope: None,
     };
     let started = Instant::now();
     let report = match adapter.complete(&req).await {

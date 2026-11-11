@@ -15,14 +15,20 @@ pub fn load_from_path(path: &str) -> Result<Settings> {
     Ok(settings)
 }
 
+/// The config file a command uses: `--config`, else `MODELROUTER_CONFIG`,
+/// else `~/.modelrouter/config.toml`.
+pub fn config_path(path: Option<PathBuf>) -> PathBuf {
+    path.or_else(|| std::env::var("MODELROUTER_CONFIG").ok().map(PathBuf::from))
+        .unwrap_or_else(default_config_path)
+}
+
+/// `~/.modelrouter/config.toml`.
+pub fn default_config_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".modelrouter/config.toml")
+}
+
 pub fn load(path: Option<PathBuf>) -> Result<Settings> {
-    let config_path = path
-        .or_else(|| std::env::var("MODELROUTER_CONFIG").ok().map(PathBuf::from))
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".modelrouter/config.toml")
-        });
+    let config_path = config_path(path);
 
     let settings = Config::builder()
         .add_source(File::from(config_path).required(false))

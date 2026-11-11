@@ -260,6 +260,7 @@ mod gemini_tests {
             tool_choice: None,
             reasoning: None,
             extra_params: json!({}),
+            session_scope: None,
         }
     }
 
@@ -417,6 +418,7 @@ mod claude_tests {
             tool_choice: None,
             reasoning: None,
             extra_params: json!({}),
+            session_scope: None,
         }
     }
 

@@ -8,6 +8,8 @@ use modelrouter::api::app::DatabaseProvider;
 pub struct Backend {
     pub name: &'static str,
     pub db: Arc<dyn DatabaseProvider>,
+    /// The same database as a raw pool, for `modelrouter::report`.
+    pub reports: modelrouter::report::ReportPool,
     #[cfg(feature = "postgres")]
     _schema: Option<PgSchema>,
 }
@@ -35,6 +37,18 @@ where
     }
 }
 
+/// [`each_backend`] for scenarios that also read through the SQL reports.
+pub async fn each_backend_with_reports<F, Fut>(scenario: F)
+where
+    F: Fn(Arc<dyn DatabaseProvider>, modelrouter::report::ReportPool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for backend in backends().await {
+        eprintln!("-- backend: {}", backend.name);
+        scenario(backend.db.clone(), backend.reports.clone()).await;
+    }
+}
+
 async fn sqlite() -> Backend {
     let db = modelrouter::db::sqlite::SqliteDb::connect(":memory:")
         .await
@@ -44,6 +58,7 @@ async fn sqlite() -> Backend {
         .expect("migrate sqlite");
     Backend {
         name: "sqlite",
+        reports: modelrouter::report::ReportPool::from(&db.pool),
         db: Arc::new(db),
         #[cfg(feature = "postgres")]
         _schema: None,
@@ -111,6 +126,7 @@ async fn postgres() -> Option<Backend> {
 
     Some(Backend {
         name: "postgres",
+        reports: modelrouter::report::ReportPool::from(pool.clone()),
         db: Arc::new(modelrouter::db::postgres::PostgresDb { pool }),
         _schema: Some(PgSchema { url, name }),
     })

@@ -81,7 +81,14 @@ pub fn context_from_request(
         .and_then(|b| b.overlay.get(&request_model).cloned())
         .unwrap_or_else(|| request_model.clone());
     let (provider, routed_model) = {
-        let (p, m) = state.router.resolve(&effective_model);
+        let resolved = state.router.resolve(&effective_model);
+        // Chat dispatch may hand the provider to its subscription CLI;
+        // embeddings never do.
+        let (p, m) = if endpoint == "/v1/chat/completions" {
+            state.router.for_chat(resolved)
+        } else {
+            resolved
+        };
         (Some(p), Some(m))
     };
 

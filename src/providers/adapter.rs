@@ -30,6 +30,17 @@ pub struct NormalizedRequest {
     /// send no reasoning control and let the provider default apply.
     pub reasoning: Option<ReasoningControl>,
     pub extra_params: serde_json::Value,
+    /// Who is asking, for adapters that keep per-caller state (the CLI
+    /// session adapters). `None` for internal calls such as health probes.
+    pub session_scope: Option<SessionScope>,
+}
+
+/// The caller a request belongs to: its user and the project of the API key
+/// it authenticated with.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct SessionScope {
+    pub user_id: i64,
+    pub project: Option<String>,
 }
 
 /// A provider-neutral reasoning directive, resolved per model so an adapter

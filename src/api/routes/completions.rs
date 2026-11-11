@@ -209,8 +209,9 @@ async fn chat_completions_inner(
     // Load balancer pools, then session stickiness. A bound request never
     // consults the pool and neither reads nor writes an affinity pin: the
     // variant already fixed the model.
-    let (provider_name, canonical_model) =
-        resolve_provider_and_model(&state, binding.is_some(), &model)?;
+    let (provider_name, canonical_model) = state
+        .router
+        .for_chat(resolve_provider_and_model(&state, binding.is_some(), &model)?);
     let session_for_affinity = body["session_id"].as_str().filter(|_| binding.is_none());
     let (provider_name, canonical_model) = apply_session_affinity(
         &state,
@@ -275,8 +276,13 @@ async fn chat_completions_inner(
         }
     }
 
-    let norm_req =
+    let mut norm_req =
         build_normalized_request(&body, canonical_model.clone(), &model, &state.settings.model_capabilities, state.router.learned_capabilities());
+    norm_req.session_scope = Some(crate::providers::adapter::SessionScope {
+        user_id: user.id,
+        project: attribution.project_or(user.api_key_project.clone()),
+    });
+    let norm_req = norm_req;
 
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     let start = Instant::now();
@@ -377,6 +383,7 @@ async fn chat_completions_inner(
         provider_name.clone(),
         canonical_model.clone(),
         &model,
+        norm_req.session_scope.clone(),
     )
     .await?;
 
@@ -817,6 +824,7 @@ async fn complete_with_retry_and_fallback(
     provider_name: String,
     canonical_model: String,
     requested_model: &str,
+    scope: Option<crate::providers::adapter::SessionScope>,
 ) -> Result<ProviderCallOutcome, ApiError> {
     let retry_policy = crate::router::retry::RetryPolicy::from_config(&state.settings.retry);
     let mut current_model = canonical_model;
@@ -854,13 +862,14 @@ async fn complete_with_retry_and_fallback(
             &mut attempts,
             &current_provider,
             || {
-                let req = build_normalized_request(
+                let mut req = build_normalized_request(
                     body,
                     current_model.clone(),
                     requested_model,
                     &state.settings.model_capabilities,
                     state.router.learned_capabilities(),
                 );
+                req.session_scope = scope.clone();
                 note_learned_temperature_strip(state, body, &req);
                 let adapter = adapter.clone();
                 let router = state.router.clone();
@@ -1188,7 +1197,7 @@ async fn next_available_fallback_with_policy(
     let mut cursor = current_model.to_string();
     for _ in 0..MAX_FALLBACK_HOPS {
         let next_model = state.fallback.next_after(&cursor)?;
-        let (next_provider, next_canonical) = state.router.resolve(&next_model);
+        let (next_provider, next_canonical) = state.router.for_chat(state.router.resolve(&next_model));
 
         // Check operator availability first
         if !state.router.is_available(&next_provider, &next_canonical) {
@@ -1936,6 +1945,7 @@ fn build_normalized_request(
             capabilities,
         ),
         extra_params: serde_json::Value::Object(Default::default()),
+        session_scope: None,
     }
 }
 
@@ -2234,6 +2244,7 @@ mod openai_response_tests {
             tool_choice: Some(serde_json::json!("auto")),
             reasoning: None,
             extra_params: serde_json::json!({}),
+            session_scope: None,
         }
     }
 

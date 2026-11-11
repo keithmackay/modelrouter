@@ -90,6 +90,7 @@ async fn azure_stream_body_always_requests_usage() {
         tool_choice: None,
         reasoning: None,
         extra_params: serde_json::json!({}),
+        session_scope: None,
     };
     let mut stream = adapter.stream(&req).await.unwrap();
     while let Some(c) = stream.next().await {
@@ -143,6 +144,7 @@ async fn openai_compat_stream_body_always_requests_usage() {
         tool_choice: None,
         reasoning: None,
         extra_params: serde_json::json!({}),
+        session_scope: None,
     };
     let mut stream = adapter.stream(&req).await.unwrap();
     while let Some(c) = stream.next().await {
@@ -203,6 +205,7 @@ async fn azure_entra_mode_sends_a_bearer_token_and_no_key() {
         tool_choice: None,
         reasoning: None,
         extra_params: serde_json::json!({}),
+        session_scope: None,
     };
     let config = ProviderConfig {
         api_base: Some(base.clone()),

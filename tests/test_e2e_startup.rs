@@ -23,8 +23,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_modelrouter");
 /// does not lead into a refusal. Reverting the fix that makes `init` generate a
 /// real secret fails here.
 ///
-/// `init` ignores `--config` and always writes to the home directory, so this
-/// overrides `HOME` rather than touching the developer's real install.
+/// Runs `init` with no `--config` against a throwaway `HOME`, so it writes
+/// the default path without touching the developer's real install.
 #[tokio::test]
 #[ignore = "e2e: spawns the real binary"]
 async fn init_then_serve_starts() {
@@ -32,6 +32,7 @@ async fn init_then_serve_starts() {
     let out = Command::new(BIN)
         .arg("init")
         .env("HOME", home.path())
+        .env_remove("MODELROUTER_CONFIG")
         .output()
         .expect("run init");
     assert!(

@@ -161,6 +161,46 @@ fn config_template_with_generated_secret() -> String {
     )
 }
 
+/// Write a fresh config to `path`, asking before replacing an existing file.
+/// Returns `false` when the operator declines the overwrite.
+///
+/// A parent directory this creates is made owner-only, since the config holds
+/// API keys and the database usually lives beside it; an existing directory
+/// keeps its permissions.
+fn init_config(path: &std::path::Path, answers: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
+    use std::io::Write;
+
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+    }
+    let existed = path.exists();
+    if existed {
+        print!("Config already exists at {}. Overwrite? [y/N] ", path.display());
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        answers.read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            return Ok(false);
+        }
+    }
+    std::fs::write(path, config_template_with_generated_secret())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let verb = if existed { "Overwrote" } else { "Created" };
+    println!("{verb} config at {}", path.display());
+    Ok(true)
+}
+
 /// Returns a future that completes when SIGTERM or SIGINT is received.
 ///
 /// On Unix, listens for both SIGTERM (sent by orchestrators) and SIGINT (Ctrl-C).
@@ -199,56 +239,23 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Init => {
             println!("modelrouter v{}", env!("CARGO_PKG_VERSION"));
             println!();
-            let config_dir = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".modelrouter");
-            tokio::fs::create_dir_all(&config_dir).await?;
-            // Set config dir to owner-only so the DB and config (which holds API keys)
-            // are not readable by other OS users on shared servers.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o700);
-                std::fs::set_permissions(&config_dir, perms)?;
-            }
-            let config_path = config_dir.join("config.toml");
-            if config_path.exists() {
-                print!(
-                    "Config already exists at {}. Overwrite? [y/N] ",
-                    config_path.display()
-                );
-                use std::io::Write;
-                std::io::stdout().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if input.trim().eq_ignore_ascii_case("y") {
-                    tokio::fs::write(&config_path, config_template_with_generated_secret()).await?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let perms = std::fs::Permissions::from_mode(0o600);
-                        std::fs::set_permissions(&config_path, perms)?;
-                    }
-                    println!("Overwrote config at {}", config_path.display());
-                } else {
-                    println!("Aborted.");
-                    return Ok(());
-                }
-            } else {
-                tokio::fs::write(&config_path, config_template_with_generated_secret()).await?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o600);
-                    std::fs::set_permissions(&config_path, perms)?;
-                }
-                println!("Created config at {}", config_path.display());
+            let config_path = crate::config::config_path(cli.config.clone());
+            if !init_config(&config_path, &mut std::io::stdin().lock())? {
+                println!("Aborted.");
+                return Ok(());
             }
             println!();
             println!("Next steps:");
+            // Name the file in the next steps when it is not the default, so
+            // the commands shown run against the config just written.
+            let flag = if config_path == crate::config::default_config_path() {
+                String::new()
+            } else {
+                format!(" --config {}", config_path.display())
+            };
             println!("  1. Edit {} to add your provider API keys", config_path.display());
-            println!("  2. Run: modelrouter migrate");
-            println!("  3. Run: modelrouter serve");
+            println!("  2. Run: modelrouter{flag} migrate");
+            println!("  3. Run: modelrouter{flag} serve");
             println!("  4. Test: curl http://localhost:8080/health");
         }
         Commands::Serve { host, port } => {
@@ -289,10 +296,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Init DB: Postgres when database.postgres_url is set, else SQLite.
             let main_db = crate::db::open(&settings.database).await?;
             tracing::info!(
-                backend = if main_db.sqlite.is_some() { "sqlite" } else { "postgres" },
+                backend = main_db.reports.backend(),
                 "database ready"
             );
-            let pool = main_db.sqlite.as_ref().map(|lite| lite.pool.clone());
+            let pool = Some(main_db.reports.clone());
             let db = main_db.db.clone();
 
             // Sync hook permissions from config into DB
@@ -382,7 +389,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
                     settings.providers.clone(),
                     settings.tier_timeouts.clone(),
-                ),
+                )
+                .with_subscription(settings.subscription.clone()),
             );
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
                 settings.routing.fallback_chains.clone(),
@@ -1073,7 +1081,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                     let rows = crate::report::cost_by_user_window(
-                        main_db.sqlite_pool("`report cost`")?, &window,
+                        &main_db.reports, &window,
                         user.as_deref(),
                         project.as_deref(),
                         group.as_deref(),
@@ -1166,7 +1174,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         _ => UsageScope::Global,
                     };
 
-                    let rows = fetch_usage_rows(main_db.sqlite_pool("`report usage`")?, &scope, &window, &granularity).await?;
+                    let rows = fetch_usage_rows(&main_db.reports, &scope, &window, &granularity).await?;
 
                     match format {
                         OutputFormat::Json => {
@@ -1343,7 +1351,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 ReportCommands::Prompts { user, limit, since, format } => {
                     let rows = crate::report::recent_prompts(
-                        main_db.sqlite_pool("`report prompts`")?,
+                        &main_db.reports,
                         user.as_deref(),
                         limit,
                         since.as_deref(),
@@ -1368,11 +1376,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 ReportCommands::Audit { actor, tail, format } => {
                     let rows =
-                        crate::report::recent_audit(main_db.sqlite_pool("`report audit`")?, actor.as_deref(), tail).await?;
+                        crate::report::recent_audit(&main_db.reports, actor.as_deref(), tail).await?;
                     print_audit_rows(rows, format);
                 }
                 ReportCommands::Hooks { format } => {
-                    let rows = crate::report::hook_latency_stats(main_db.sqlite_pool("`report hooks`")?).await?;
+                    let rows = crate::report::hook_latency_stats(&main_db.reports).await?;
                     print_rows(
                         &rows,
                         &["Hook", "Invocations", "Success %", "Avg ms", "p50 ms", "p95 ms", "p99 ms"],
@@ -1395,7 +1403,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Audit { tail, format } => {
             let settings = crate::config::load(cli.config)?;
             let main_db = crate::db::open(&settings.database).await?;
-            let rows = crate::report::recent_audit(main_db.sqlite_pool("`audit`")?, None, tail).await?;
+            let rows = crate::report::recent_audit(&main_db.reports, None, tail).await?;
             print_audit_rows(rows, format);
         }
         Commands::InstallService => {
@@ -2335,6 +2343,70 @@ mod attribution_cli_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_template_parses_and_defines_no_hooks() {
+        // The template is what `init` writes: an active example hook would run
+        // a script that does not exist, and a fail-closed pipeline hook would
+        // reject every request.
+        let settings: crate::config::schema::Settings = config::Config::builder()
+            .add_source(config::File::from_str(CONFIG_TEMPLATE, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(settings.hooks.lifecycle.is_empty());
+        assert!(settings.hooks.pipeline.is_empty());
+    }
+
+    #[test]
+    fn init_config_creates_an_owner_only_directory_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/dir/config.toml");
+        assert!(init_config(&path, &mut std::io::Cursor::new("")).unwrap());
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains(crate::config::schema::PLACEHOLDER_JWT_SECRET));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+        }
+    }
+
+    #[test]
+    fn init_config_leaves_an_existing_directory_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = tmp.path().join("config.toml");
+        assert!(init_config(&path, &mut std::io::Cursor::new("")).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+    }
+
+    #[test]
+    fn init_config_asks_before_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "keep me").unwrap();
+
+        assert!(!init_config(&path, &mut std::io::Cursor::new("n\n")).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        assert!(!init_config(&path, &mut std::io::Cursor::new("")).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+
+        assert!(init_config(&path, &mut std::io::Cursor::new("Y\n")).unwrap());
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
     use super::*;
     use crate::api::admin::compare::{build_comparison, CompareQuery, CompareSources};
     use crate::db::models::{NewCostLedgerEntry, NewPrompt};
