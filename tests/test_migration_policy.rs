@@ -151,6 +151,59 @@ fn every_migration_is_expand_only_or_marked() {
     );
 }
 
+/// The numeric version a migration file name starts with, as sqlx parses it:
+/// the digits before the first `_`.
+fn version_prefix(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?;
+    name.split_once('_')?.0.parse().ok()
+}
+
+/// Versions claimed by more than one file in one directory, with the files.
+fn duplicate_versions(files: &[PathBuf]) -> Vec<String> {
+    let mut by_version: std::collections::BTreeMap<(String, i64), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for path in files {
+        let rel = repo_relative(path);
+        let dir = rel.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
+        let version = version_prefix(path).unwrap_or_else(|| panic!("{rel}: no numeric version prefix"));
+        by_version.entry((dir, version)).or_default().push(rel);
+    }
+    by_version
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|((dir, version), names)| format!("{dir} version {version}: {}", names.join(", ")))
+        .collect()
+}
+
+/// sqlx keys migrations by version. Two files with one version in the same
+/// directory either fail the migrator outright (the second insert into
+/// `_sqlx_migrations` collides) or fail every later start on the checksum.
+#[test]
+fn every_migration_version_is_unique_per_directory() {
+    let duplicates = duplicate_versions(&migration_files());
+    assert!(
+        duplicates.is_empty(),
+        "more than one migration file claims the same version; give the newer one the next \
+         free number (see migrations/README.md):\n  {}",
+        duplicates.join("\n  ")
+    );
+}
+
+#[test]
+fn duplicate_versions_are_detected() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let files = [
+        root.join("migrations/postgres/035_a.sql"),
+        root.join("migrations/postgres/035_b.sql"),
+        root.join("migrations/035_a.sql"),
+        root.join("migrations/postgres/036_c.sql"),
+    ];
+    let found = duplicate_versions(&files);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("migrations/postgres version 35"), "{found:?}");
+    assert!(found[0].contains("035_a.sql") && found[0].contains("035_b.sql"), "{found:?}");
+}
+
 /// The allowlist may only shrink. Each entry must exist and still be
 /// destructive, so a rewritten or deleted file is noticed here.
 #[test]

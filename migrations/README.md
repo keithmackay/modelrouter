@@ -12,6 +12,23 @@ applied a migration refuses to start if the file changed. Add a new file
 instead. (One narrow exception for comment-only edits lives in
 `src/db/migrations.rs`; do not reach for it.)
 
+## One file per version
+
+sqlx keys migrations by the number before the first `_`. Two files with the
+same number in one directory break the migrator: a fresh database applies
+the first and fails inserting the second into `_sqlx_migrations`, and a
+migrated one fails every later start on the checksum. Before adding a file,
+take the next free number in that directory after rebasing, not the number
+that was free when the branch started.
+
+If a duplicate does land, keep the file that matches the other backend's
+migration of that number, replay the others as new guarded migrations, and
+list the files that lost their version in `RETIRED_POSTGRES_MIGRATIONS`
+(`src/db/migrations.rs`) so a database that recorded one of them gives the
+version back instead of refusing to start. The PostgreSQL 035/037 duplicates
+were resolved this way: `035_scoped_aliases` and `037_prompts_experiments_fixes`
+kept their numbers, and the parity files and `037_call_kind` became 041-043.
+
 ## Expand only
 
 A rolling upgrade runs the previous binary against the new schema until the
