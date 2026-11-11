@@ -16,6 +16,7 @@ mod failures;
 mod budgets;
 mod audit;
 mod hooks;
+mod maintenance;
 mod rate_limits;
 mod mcp_servers;
 mod models;
@@ -41,6 +42,12 @@ impl SqliteDb {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", expanded))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // Incremental auto-vacuum lets the retention tick return the
+            // space deleted rows free to the file system
+            // (`MaintenanceRepository::reclaim_space`). The pragma takes
+            // effect only on a file created by this open: an existing file
+            // keeps its mode until `modelrouter db vacuum` converts it.
+            .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental)
             .foreign_keys(true);
         let pool = SqlitePool::connect_with(opts).await?;
         Ok(Self { pool })

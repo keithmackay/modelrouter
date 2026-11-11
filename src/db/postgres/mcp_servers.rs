@@ -94,7 +94,7 @@ impl McpServerRepository for PostgresDb {
             param_idx
         );
 
-        let mut q = sqlx::query_as::<_, McpServerRow>(&sql);
+        let mut q = sqlx::query_as::<_, McpServerRow>(sqlx::AssertSqlSafe(sql.as_str()));
         if let Some(v) = &name        { q = q.bind(v); }
         if let Some(v) = &url         { q = q.bind(v); }
         if let Some(v) = &description { q = q.bind(v); }

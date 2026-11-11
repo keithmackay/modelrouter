@@ -11,6 +11,7 @@ pub struct AppMetrics {
     pub requests_total: CounterVec,
     pub tokens_total: CounterVec,
     pub cost_usd_total: CounterVec,
+    pub policy_rejected_total: CounterVec,
 }
 
 #[cfg(feature = "prometheus")]
@@ -36,7 +37,14 @@ impl AppMetrics {
         )?;
         registry.register(Box::new(cost_usd_total.clone()))?;
 
-        Ok(Self { registry, requests_total, tokens_total, cost_usd_total })
+        let policy_rejected_total = CounterVec::new(
+            Opts::new("policy_rejected_total", "Rules a request extension applied (block, redact or monitor)")
+                .namespace("modelrouter"),
+            &["extension", "rule", "category", "action", "project"],
+        )?;
+        registry.register(Box::new(policy_rejected_total.clone()))?;
+
+        Ok(Self { registry, requests_total, tokens_total, cost_usd_total, policy_rejected_total })
     }
 
     pub fn record_request(&self, model: &str, provider: &str, status: &str) {
@@ -50,5 +58,9 @@ impl AppMetrics {
 
     pub fn record_cost(&self, model: &str, provider: &str, cost: f64) {
         self.cost_usd_total.with_label_values(&[model, provider]).inc_by(cost);
+    }
+
+    pub fn record_policy_rejected(&self, extension: &str, rule: &str, category: &str, action: &str, project: &str) {
+        self.policy_rejected_total.with_label_values(&[extension, rule, category, action, project]).inc();
     }
 }

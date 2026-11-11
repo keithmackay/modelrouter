@@ -14,6 +14,14 @@ const FAILURE_COLUMNS: &str = "id, user_id, api_key_id, endpoint, request_model,
 
 #[async_trait]
 impl FailureRepository for SqliteDb {
+    async fn purge_failures_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM request_failures WHERE created_at < ?")
+            .bind(cutoff_rfc3339)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn create(&self, failure: NewRequestFailure) -> anyhow::Result<RequestFailure> {
         let now = now_utc();
         let result = sqlx::query(
@@ -45,10 +53,10 @@ impl FailureRepository for SqliteDb {
         .await?;
 
         let id = result.last_insert_rowid();
-        let row = sqlx::query_as::<_, RequestFailure>(&format!(
+        let row = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures WHERE id = ?",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -56,10 +64,10 @@ impl FailureRepository for SqliteDb {
     }
 
     async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<RequestFailure>> {
-        let rows = sqlx::query_as::<_, RequestFailure>(&format!(
+        let rows = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures ORDER BY created_at DESC LIMIT ? OFFSET ?",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -83,11 +91,33 @@ impl FailureRepository for SqliteDb {
         Ok(rows)
     }
 
+    async fn list_by_endpoint(&self, endpoint: &str, limit: i64, offset: i64) -> anyhow::Result<Vec<RequestFailure>> {
+        let rows = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM request_failures WHERE endpoint = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            FAILURE_COLUMNS
+        )))
+        .bind(endpoint)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn count_by_endpoint(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT endpoint, COUNT(*) FROM request_failures GROUP BY endpoint ORDER BY COUNT(*) DESC, endpoint ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn find_by_id(&self, id: i64) -> anyhow::Result<Option<RequestFailure>> {
-        let row = sqlx::query_as::<_, RequestFailure>(&format!(
+        let row = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures WHERE id = ?",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -95,10 +125,10 @@ impl FailureRepository for SqliteDb {
     }
 
     async fn find_by_correlation_id(&self, correlation_id: &str) -> anyhow::Result<Vec<RequestFailure>> {
-        let rows = sqlx::query_as::<_, RequestFailure>(&format!(
+        let rows = sqlx::query_as::<_, RequestFailure>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM request_failures WHERE attribution_correlation_id = ? ORDER BY created_at DESC",
             FAILURE_COLUMNS
-        ))
+        )))
         .bind(correlation_id)
         .fetch_all(&self.pool)
         .await?;
@@ -114,7 +144,7 @@ impl FailureRepository for SqliteDb {
              WHERE {} AND created_at >= ? AND created_at < ?",
             predicate
         );
-        let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in binds {
             q = q.bind(b);
         }
@@ -288,6 +318,36 @@ mod tests {
         assert_eq!(row.experiment_id, Some(4));
         assert_eq!(row.experiment_variant.as_deref(), Some("control"));
         assert_eq!(db.list(10, 0).await.unwrap()[0].experiment_id, Some(4));
+
+        // Failures are read per endpoint: a decisions failure apart from a chat one.
+        for endpoint in ["/v1/decisions", "/v1/decisions"] {
+            db.create(crate::db::models::NewRequestFailure {
+                user_id: Some(1),
+                api_key_id: None,
+                endpoint: endpoint.into(),
+                request_model: "D".into(),
+                routed_model: None,
+                provider: None,
+                stage: crate::db::models::FailureStage::Resolve,
+                status_code: Some(400),
+                error_message: "refused".into(),
+                attempts: 1,
+                latency_ms: None,
+                project: None,
+                attribution_correlation_id: None,
+                attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
+            })
+            .await
+            .unwrap();
+        }
+        let counts = db.count_by_endpoint().await.unwrap();
+        assert_eq!(counts, vec![("/v1/decisions".to_string(), 2), ("/v1/chat/completions".to_string(), 1)]);
+        let decisions = db.list_by_endpoint("/v1/decisions", 10, 0).await.unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|f| f.endpoint == "/v1/decisions"));
+        assert!(db.list_by_endpoint("/v1/images/generations", 10, 0).await.unwrap().is_empty());
     }
 
     async fn insert_experiment_failure(

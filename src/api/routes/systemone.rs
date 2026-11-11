@@ -285,6 +285,7 @@ fn record_usage(
             attribution_tags: tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Judgment,
         };
         let stored = match crate::db::prompt_store::apply_storage_policy(&state.storage.load(), prompt) {
             Some(p) => match PromptRepository::create(&*state.prompt_db, p).await {
@@ -310,6 +311,7 @@ fn record_usage(
             attribution_tags: tags,
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Judgment,
             tokens_estimated: false,
         };
         if let Err(e) = CostRepository::create(&*state.db, ledger).await {

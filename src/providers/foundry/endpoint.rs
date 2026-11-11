@@ -53,6 +53,14 @@ const MODEL_INFERENCE_PATH: &str = "/models";
 /// Marks a Foundry project endpoint, which changes the Entra audience.
 const PROJECTS_SEGMENT: &str = "/api/projects/";
 
+/// The resource-level route that serves System One decision deployments.
+const SYSTEMONE_PATH: &str = "/providers/microsoft/v1/systemone";
+/// The Cohere rerank API on a Foundry resource: the rerankers Foundry serves
+/// speak Cohere's `v2/rerank`, which neither the OpenAI-compatible nor the
+/// Model Inference surface carries, so it hangs off the resource root under
+/// the provider's own path. `[providers.foundry] rerank_url` overrides it.
+pub const COHERE_RERANK_PATH: &str = "/providers/cohere/v2/rerank";
+
 /// api-version sent on the Model Inference surface, where the parameter is
 /// required. `2025-04-01` is the value used throughout the current REST
 /// reference samples; the OpenAPI document published in azure-rest-api-specs
@@ -209,6 +217,47 @@ impl FoundryEndpoint {
         self.with_api_version(format!("{}/embeddings", self.base))
     }
 
+    /// The Decisions API: `POST {base}/decisions`, on whichever surface the
+    /// endpoint resolved to, with the same api-version rule as chat.
+    pub fn decisions_url(&self) -> String {
+        self.with_api_version(format!("{}/decisions", self.base))
+    }
+
+    /// The resource's root: the configured endpoint without the surface path
+    /// (`/openai/v1` or `/models`) and without a project segment. The routes
+    /// a resource serves beside its data planes hang off it.
+    pub fn resource_root(&self) -> String {
+        let mut root = match self.surface {
+            FoundrySurface::OpenAIV1 => self.base.trim_end_matches(OPENAI_V1_PATH),
+            FoundrySurface::ModelInference => self.base.trim_end_matches(MODEL_INFERENCE_PATH),
+        }
+        .trim_end_matches('/')
+        .to_string();
+        if let Some(at) = root.find(PROJECTS_SEGMENT) {
+            root.truncate(at);
+        }
+        root
+    }
+
+    /// The System One route a resource serves for the decision deployments
+    /// that answer there rather than on `{base}/decisions`:
+    /// `POST {resource}/providers/microsoft/v1/systemone`, with the same
+    /// api-version rule as the surface the endpoint resolved to.
+    pub fn systemone_url(&self) -> String {
+        self.with_api_version(format!("{}{SYSTEMONE_PATH}", self.resource_root()))
+    }
+
+    /// Where a rerank request goes: `rerank_url` from config when set (any
+    /// host, trailing slash dropped: a serverless endpoint's own `/v2/rerank`),
+    /// else the resource root plus [`COHERE_RERANK_PATH`]. No `api-version`:
+    /// the Cohere API carries its own versioning in the path.
+    pub fn rerank_url(&self, configured: Option<&str>) -> String {
+        match configured.map(str::trim).filter(|u| !u.is_empty()) {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => format!("{}{COHERE_RERANK_PATH}", self.resource_root()),
+        }
+    }
+
     /// Model listing for catalog discovery.
     ///
     /// The Model Inference surface has no listing operation at all — only
@@ -289,6 +338,57 @@ mod tests {
             e.chat_url(),
             "https://res.services.ai.azure.com/openai/v1/chat/completions?api-version=preview"
         );
+    }
+
+    #[test]
+    fn the_rerank_url_hangs_off_the_resource_root_on_every_surface_unless_configured() {
+        let v1 = FoundryEndpoint::from_config(&config("https://res.services.ai.azure.com")).unwrap();
+        assert_eq!(v1.resource_root(), "https://res.services.ai.azure.com");
+        assert_eq!(v1.rerank_url(None), "https://res.services.ai.azure.com/providers/cohere/v2/rerank");
+        let mi = FoundryEndpoint::from_config(&config("https://res.services.ai.azure.com/models")).unwrap();
+        assert_eq!(mi.rerank_url(None), "https://res.services.ai.azure.com/providers/cohere/v2/rerank");
+        let mut with_project = config("https://res.services.ai.azure.com");
+        with_project.project = Some("proj".into());
+        let project = FoundryEndpoint::from_config(&with_project).unwrap();
+        assert_eq!(project.rerank_url(None), "https://res.services.ai.azure.com/providers/cohere/v2/rerank");
+        assert_eq!(v1.rerank_url(Some(" https://own.example/v2/rerank/ ")), "https://own.example/v2/rerank");
+        assert_eq!(v1.rerank_url(Some("  ")), "https://res.services.ai.azure.com/providers/cohere/v2/rerank");
+    }
+
+    #[test]
+    fn decisions_follow_the_surface_and_its_api_version_rule() {
+        let v1 = FoundryEndpoint::from_config(&config("https://res.openai.azure.com")).unwrap();
+        assert_eq!(v1.decisions_url(), "https://res.openai.azure.com/openai/v1/decisions");
+        let mi = FoundryEndpoint::from_config(&config("https://res.services.ai.azure.com/models")).unwrap();
+        assert_eq!(
+            mi.decisions_url(),
+            format!(
+                "https://res.services.ai.azure.com/models/decisions?api-version={}",
+                DEFAULT_MODEL_INFERENCE_API_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn the_systemone_route_hangs_off_the_resource_root_on_every_surface() {
+        let bare = FoundryEndpoint::from_config(&config("https://res.services.ai.azure.com/")).unwrap();
+        assert_eq!(bare.resource_root(), "https://res.services.ai.azure.com");
+        assert_eq!(bare.systemone_url(), "https://res.services.ai.azure.com/providers/microsoft/v1/systemone");
+        let v1 = FoundryEndpoint::from_config(&config("https://res.openai.azure.com/openai/v1")).unwrap();
+        assert_eq!(v1.systemone_url(), "https://res.openai.azure.com/providers/microsoft/v1/systemone");
+        let mi = FoundryEndpoint::from_config(&config("https://res.services.ai.azure.com/models")).unwrap();
+        assert_eq!(
+            mi.systemone_url(),
+            format!(
+                "https://res.services.ai.azure.com/providers/microsoft/v1/systemone?api-version={}",
+                DEFAULT_MODEL_INFERENCE_API_VERSION
+            )
+        );
+        let mut project = config("https://res.services.ai.azure.com");
+        project.project = Some("proj".into());
+        let project = FoundryEndpoint::from_config(&project).unwrap();
+        assert!(project.base().contains("/api/projects/proj"), "{}", project.base());
+        assert_eq!(project.resource_root(), "https://res.services.ai.azure.com");
     }
 
     #[test]

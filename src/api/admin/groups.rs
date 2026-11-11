@@ -253,24 +253,12 @@ pub async fn post_create_group(
         .map_err(|_| DashboardError::Internal)?;
     let card = group_card_html(&group, &[], &all_users);
 
-    // Inject new card into #groups-list via inline script (HTMX can't swap afterbegin on tbody reliably)
-    let card_json = serde_json::to_string(&card)
-        .map_err(|_| DashboardError::Internal)?
-        // Replace </script> sequences so they can't break out of the <script> block.
-        .replace("</", r"<\/");
-
+    // Inject the new card into #groups-list after the swap (HTMX cannot swap
+    // afterbegin reliably here): a <template> the console script prepends and
+    // processes, so the fragment carries no inline script.
     Ok(Html(format!(
-        r#"<div></div>
-        <script>
-            (function() {{
-                var list = document.getElementById('groups-list');
-                var tmp = document.createElement('div');
-                tmp.innerHTML = {card_json};
-                list.prepend(tmp.firstElementChild);
-                htmx.process(list.firstElementChild);
-            }})();
-        </script>"#,
-        card_json = card_json,
+        r#"<div></div><template data-prepend-child-into="groups-list">{card}</template>"#,
+        card = card,
     )))
 }
 

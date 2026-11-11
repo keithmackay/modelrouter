@@ -157,6 +157,7 @@ async fn image_generations_inner(
             attribution_tags: attr_tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Image,
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row is not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
@@ -184,6 +185,7 @@ async fn image_generations_inner(
                     attribution_tags: attr_tags.clone(),
                     experiment_id: None,
                     experiment_variant: None,
+                    call_kind: crate::db::models::CallKind::Image,
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {

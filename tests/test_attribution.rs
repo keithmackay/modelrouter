@@ -102,6 +102,8 @@ async fn build_app(cache: CacheConfig) -> (TestServer, Arc<dyn DatabaseProvider>
                 snippet: "Example description".to_string(),
                 score: Some(0.9),
                 published_date: None,
+                publisher: None,
+                metadata_provenance: None,
             }],
         })),
         load_balancer: Arc::new(modelrouter::router::load_balancer::LoadBalancer::new(
@@ -781,6 +783,7 @@ async fn health_probe_writes_empty_object_not_array() {
         attribution_tags: "{}".to_string(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
     };
     CostRepository::create(&db, entry).await.unwrap();

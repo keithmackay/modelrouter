@@ -4,8 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}modelrouter Admin{% endblock %}</title>
+    <meta name="htmx-config" content='{"allowEval":false}'>
     <script src="/static/htmx.js"></script>
     <script src="/static/d3.js"></script>
+    <script src="/static/admin.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; }
@@ -72,118 +74,5 @@
 <div class="container">
     {% block content %}{% endblock %}
 </div>
-<script>
-function filterCards(containerId, q) {
-    q = q.toLowerCase();
-    document.querySelectorAll('#' + containerId + ' > [id]').forEach(function(card) {
-        var h = card.querySelector('h3');
-        var text = (h ? h.textContent : card.textContent).toLowerCase();
-        card.style.display = (!q || text.includes(q)) ? '' : 'none';
-    });
-}
-
-function cellValue(cell) {
-    return cell ? (cell.getAttribute('data-sort-value') || cell.textContent.trim()) : '';
-}
-
-function initSortable(root) {
-    var tables = (root || document).querySelectorAll('table');
-    tables.forEach(function(table) {
-        // Add filter input above table if not already present
-        if (!table._filterInit) {
-            table._filterInit = true;
-            var wrapper = document.createElement('div');
-            wrapper.style.cssText = 'margin-bottom:0.5rem;';
-            var input = document.createElement('input');
-            input.type = 'search';
-            input.placeholder = 'Filter rows…';
-            input.style.cssText = 'padding:0.35rem 0.6rem;border:1px solid #ccc;border-radius:4px;font-size:0.85rem;width:220px;';
-            input.addEventListener('input', function() {
-                var q = input.value.toLowerCase();
-                table.querySelectorAll('tbody tr').forEach(function(row) {
-                    var text = row.textContent.toLowerCase();
-                    row.style.display = (!q || text.includes(q)) ? '' : 'none';
-                });
-            });
-            wrapper.appendChild(input);
-            table.parentNode.insertBefore(wrapper, table);
-        }
-
-        var ths = table.querySelectorAll('thead th');
-        ths.forEach(function(th, colIdx) {
-            if (th._sortInit) return;
-            th._sortInit = true;
-            th.addEventListener('click', function() {
-                var dir = th.getAttribute('data-sort-dir') === 'asc' ? 'desc' : 'asc';
-                ths.forEach(function(t) {
-                    t.removeAttribute('data-sort-dir');
-                    t.textContent = t.textContent.replace(/ [↑↓]$/, '');
-                });
-                th.setAttribute('data-sort-dir', dir);
-                th.textContent = th.textContent + (dir === 'asc' ? ' ↑' : ' ↓');
-
-                // Collect ALL rows from ALL tbodys, consolidate into first tbody
-                var tbodies = Array.from(table.querySelectorAll('tbody'));
-                if (!tbodies.length) return;
-                var rows = [];
-                tbodies.forEach(function(tb) {
-                    Array.from(tb.querySelectorAll('tr')).forEach(function(r) { rows.push(r); });
-                });
-                rows.sort(function(a, b) {
-                    var aVal = cellValue(a.querySelectorAll('td')[colIdx]);
-                    var bVal = cellValue(b.querySelectorAll('td')[colIdx]);
-                    var cmp;
-                    // Try date parse first (handles "YYYY-MM-DD HH:MM:SS" timestamps)
-                    var aDate = Date.parse(aVal.replace(' ', 'T'));
-                    var bDate = Date.parse(bVal.replace(' ', 'T'));
-                    if (!isNaN(aDate) && !isNaN(bDate)) {
-                        cmp = aDate - bDate;
-                    } else {
-                        // Strip currency symbols then try numeric
-                        var aNum = parseFloat(aVal.replace(/[^0-9.]/g, ''));
-                        var bNum = parseFloat(bVal.replace(/[^0-9.]/g, ''));
-                        cmp = (!isNaN(aNum) && !isNaN(bNum))
-                            ? aNum - bNum
-                            : aVal.localeCompare(bVal);
-                    }
-                    return dir === 'asc' ? cmp : -cmp;
-                });
-                var primary = tbodies[0];
-                rows.forEach(function(r) { primary.appendChild(r); });
-                // Remove now-empty extra tbodys
-                tbodies.slice(1).forEach(function(tb) {
-                    if (!tb.querySelector('tr')) tb.remove();
-                });
-            });
-        });
-    });
-}
-
-document.addEventListener('DOMContentLoaded', function() {
-    // Highlight active nav link
-    var path = window.location.pathname;
-    document.querySelectorAll('nav a[href]').forEach(function(a) {
-        var href = a.getAttribute('href');
-        if (href === '/admin' ? path === '/admin' : path.startsWith(href)) {
-            a.classList.add('active');
-        }
-    });
-
-    initSortable();
-    document.querySelectorAll('table').forEach(function(table) {
-        var ths = table.querySelectorAll('thead th');
-        ths.forEach(function(th) {
-            if (/created/i.test(th.textContent)) {
-                th.setAttribute('data-sort-dir', 'asc');
-                th.click();
-            }
-        });
-    });
-});
-
-document.addEventListener('htmx:afterSwap', function(evt) {
-    initSortable(evt.detail.target);
-});
-</script>
 </body>
 </html>

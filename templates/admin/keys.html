@@ -10,7 +10,7 @@
     {% for p in projects %}<option value="{{ p }}">{% endfor %}
 </datalist>
 
-<form hx-post="/admin/keys" hx-target="#key-form-message" hx-swap="innerHTML" hx-on::after-request="this.reset()" style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;">
+<form hx-post="/admin/keys" hx-target="#key-form-message" hx-swap="innerHTML" data-reset-after-request style="display:flex;gap:0.5rem;align-items:flex-end;margin-bottom:1rem;">
     <div>
         <label for="key-user-name" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">User *</label>
         <input type="text" name="user_name" id="key-user-name" required list="user-list" placeholder="alice" style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;">
@@ -40,18 +40,6 @@
 .row-highlight { animation: rowFlash 0.6s ease 3; }
 </style>
 
-<script>
-function toggleGroup(gid) {
-    var rows = document.querySelectorAll('.sub-' + gid);
-    var btn = document.getElementById('toggle-' + gid);
-    var show = rows.length > 0 && rows[0].style.display === 'none';
-    rows.forEach(function(r) { r.style.display = show ? 'table-row' : 'none'; });
-    if (btn) {
-        var count = btn.dataset.count;
-        btn.textContent = (show ? '▼ ' : '▶ ') + count + ' old key' + (count == 1 ? '' : 's');
-    }
-}
-</script>
 
 <table id="keys-table">
     <thead>

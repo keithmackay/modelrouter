@@ -8,7 +8,7 @@ use axum::{
 use serde_json::Value;
 use tracing::Instrument;
 
-use super::router_meta::{CallCost, RouterMeta, TimingMeta};
+use super::router_meta::{CallCost, RouterMeta, TimingMeta, TokenMeta};
 use crate::{
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     db::models::{NewCostLedgerEntry, NewPrompt},
@@ -16,9 +16,37 @@ use crate::{
     router::policy::PolicyDecision,
 };
 
-/// Fallback per-query price (USD) used when no `[[pricing]]` entry matches
-/// `search/{engine}`. Roughly Tavily's standard-tier list price.
-const DEFAULT_COST_PER_QUERY: f64 = 0.005;
+
+/// Dollars per query for `search/{engine}`: `[[pricing]]`, then the live price
+/// feed (CostCalculator::flat_rate). No fallback: an unpriced engine is
+/// recorded at $0, warned about once, and reported `priced: false` so a caller
+/// never mistakes it for free.
+fn search_rate(state: &AppState, pseudo_model: &str) -> Option<f64> {
+    let rate = state.cost_calc.flat_rate(pseudo_model);
+    if rate.is_none() {
+        state.cost_calc.note_unpriced(pseudo_model);
+    }
+    rate
+}
+
+/// Dollars for the grounding model call behind a search, as (actual, with no
+/// prompt cache), from the model price table. An unpriced model contributes
+/// nothing and is warned about once (`CostCalculator::note_unpriced`).
+fn grounding_token_cost(state: &AppState, usage: &crate::providers::search::SearchUsage) -> (f64, f64) {
+    if !state.cost_calc.has_price(&usage.model) {
+        state.cost_calc.note_unpriced(&usage.model);
+        return (0.0, 0.0);
+    }
+    let actual = state.cost_calc.calculate_whole_prompt(
+        &usage.model,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_input_tokens,
+        0,
+    );
+    let no_cache = state.cost_calc.calculate(&usage.model, usage.input_tokens, usage.output_tokens);
+    (actual, no_cache)
+}
 
 /// `max_results` is bounded to keep a single request from fanning out into an
 /// unbounded (and unbudgeted) amount of provider work.
@@ -112,6 +140,7 @@ fn resolve_engine(
 
 pub async fn search(
     State(state): State<AppState>,
+    extensions: Option<axum::Extension<crate::extensions::Extensions>>,
     user: AuthenticatedUser,
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
@@ -123,9 +152,38 @@ pub async fn search(
         "cost.usd" = tracing::field::Empty,
         "results.count" = tracing::field::Empty,
     );
-    search_inner(State(state), user, headers, Json(body))
+    let extensions = extensions.map(|axum::Extension(e)| e).unwrap_or_default();
+    search_inner(State(state), extensions, user, headers, Json(body))
         .instrument(span)
         .await
+}
+
+/// Every rule a request extension applied: a WARN line naming the rule, never
+/// the text it matched, and one count on each metrics backend.
+fn record_extension_hits(
+    #[allow(unused_variables)] state: &AppState,
+    ctx: &crate::extensions::RequestContext,
+    hits: &[(String, crate::extensions::RuleHit)],
+) {
+    let project = ctx.project.as_deref().unwrap_or("");
+    for (extension, hit) in hits {
+        tracing::warn!(
+            endpoint = ctx.endpoint,
+            extension = extension.as_str(),
+            rule = hit.rule.as_str(),
+            category = hit.category.as_str(),
+            action = hit.action.as_str(),
+            project,
+            correlation_id = ctx.correlation_id.as_deref().unwrap_or("-"),
+            "request extension applied a rule"
+        );
+        #[cfg(feature = "otel")]
+        crate::telemetry::metrics::record_policy_rejected(extension, &hit.rule, &hit.category, &hit.action, project);
+        #[cfg(feature = "prometheus")]
+        if let Some(ref metrics) = state.app_metrics {
+            metrics.record_policy_rejected(extension, &hit.rule, &hit.category, &hit.action, project);
+        }
+    }
 }
 
 /// Execute search with fallback chain. Returns (result, serving_engine, latency_ms).
@@ -162,6 +220,10 @@ async fn execute_search_with_fallback(
     engines_to_try.retain(|e| seen.insert(e.clone()));
 
     let mut last_error: Option<anyhow::Error> = None;
+    // A grounding miss (the engine ran, the provider billed, no citations):
+    // the chain is still walked, and when nothing answers, the miss is the
+    // outcome, metered, not a failure.
+    let mut last_miss: Option<SearchOutcome> = None;
     let mut attempts: i64 = 0;
 
     for (idx, candidate) in engines_to_try.iter().enumerate() {
@@ -227,6 +289,27 @@ async fn execute_search_with_fallback(
                 });
             }
             Err(e) => {
+                if let Some(miss) = crate::providers::search::GroundingMiss::find(&e) {
+                    tracing::info!(
+                        engine = candidate,
+                        detail = %miss.detail,
+                        "search engine ran but found no web citations; metered as a miss"
+                    );
+                    last_miss = Some(SearchOutcome {
+                        response: crate::providers::search::SearchResponse {
+                            results: Vec::new(),
+                            engine: candidate.clone(),
+                            answer: None,
+                            usage: miss.usage.clone(),
+                            grounding_miss: Some(miss.detail.clone()),
+                        },
+                        engine: candidate.clone(),
+                        latency_ms: start.elapsed().as_millis() as i64,
+                        attempts,
+                    });
+                    last_error = Some(e);
+                    continue;
+                }
                 // Classify the error: client errors (4xx except 429) surface
                 // immediately without failover; provider errors (5xx, 429,
                 // timeouts, connection failures) walk the chain.
@@ -258,6 +341,9 @@ async fn execute_search_with_fallback(
         }
     }
 
+    if let Some(miss) = last_miss {
+        return Ok(miss);
+    }
     let tried: Vec<_> = engines_to_try.iter().map(|s| s.as_str()).collect();
     Err(ApiError::ProviderError(
         last_error
@@ -273,6 +359,7 @@ async fn execute_search_with_fallback(
 
 async fn search_inner(
     State(state): State<AppState>,
+    extensions: crate::extensions::Extensions,
     user: AuthenticatedUser,
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
@@ -289,7 +376,7 @@ async fn search_inner(
     let cache_directives = crate::router::cache::CacheDirectives::from_headers(&headers)
         .map_err(ApiError::InvalidRequest)?;
 
-    let query = body["query"].as_str().unwrap_or("").to_string();
+    let mut query = body["query"].as_str().unwrap_or("").to_string();
     if query.trim().is_empty() {
         return Err(ApiError::InvalidRequest(
             "query must not be empty".to_string(),
@@ -311,6 +398,21 @@ async fn search_inner(
         Some(n) => Some(n as u32),
         None => None,
     };
+
+    // Opt-in: a grounding engine's generated answer is returned only when the
+    // caller asks, so existing callers keep the citations-only shape.
+    let include_answer = match body.get("include_answer") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ApiError::InvalidRequest(
+                "include_answer must be a boolean".to_string(),
+            ))
+        }
+    };
+
+    let mut research = parse_research_options(&body, include_answer)?;
+    let freshness = parse_freshness_field(&body)?;
 
     let engine = resolve_engine(&state, body["engine"].as_str())?;
     if !crate::providers::search_registry::is_supported_engine(&engine) {
@@ -339,6 +441,47 @@ async fn search_inner(
         }
     }
 
+    // ── Request extensions ───────────────────────────────────────────────────
+    // Before the cache and the provider, so a rewritten query is what is
+    // cached and sent, and a refused one is neither.
+    let mut extension_verdict: Option<crate::extensions::SearchVerdict> = None;
+    if !extensions.is_empty() {
+        let ctx = crate::extensions::RequestContext {
+            endpoint: "/v1/search",
+            user_id: user.id,
+            api_key_id: user.api_key_id,
+            project: attribution.project_or(user.api_key_project.clone()),
+            correlation_id: attribution.correlation_id.clone(),
+            tags: attribution.tags.clone(),
+        };
+        let mut text = crate::extensions::SearchText {
+            query: std::mem::take(&mut query),
+            instructions: research.instructions.take(),
+            context: research.context.take(),
+        };
+        let verdict = extensions.on_search(&ctx, &mut text).await;
+        record_extension_hits(&state, &ctx, &verdict.hits);
+        if let Some((extension, refusal)) = verdict.refusal.clone() {
+            let err = ApiError::Refused { status: refusal.status, body: refusal.body, reason: refusal.reason };
+            let mut failure = crate::api::failure_log::context_from_request("/v1/search", &state, &user, &headers, &body);
+            failure.request_model = requested_pseudo_model.clone();
+            failure.provider = Some(format!("extension:{extension}"));
+            failure.project = ctx.project.clone();
+            failure.latency_ms = Some(received.elapsed().as_millis() as i64);
+            crate::api::failure_log::record_failure(&state, failure, &err).await;
+            return Err(err);
+        }
+        query = text.query;
+        research.instructions = text.instructions;
+        research.context = text.context;
+        extension_verdict = Some(verdict);
+        if query.trim().is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "query is empty after request extensions rewrote it".to_string(),
+            ));
+        }
+    }
+
     // ── Response cache ───────────────────────────────────────────────────────
     // Search queries are deterministic enough to cache by default; the key is
     // engine + query + options, and the TTL is shorter than for completions.
@@ -349,7 +492,7 @@ async fn search_inner(
     };
     let cache_key = cache_plan
         .store()
-        .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results));
+        .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results, &research.cache_fields(include_answer, freshness.as_deref(), &engine)));
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(payload) = state
@@ -365,13 +508,8 @@ async fn search_inner(
             let results_returned = payload["results"].as_array().map(|r| r.len()).unwrap_or(0) as i64;
 
             // Recompute cost from the serving engine's pricing
-            let cost = state
-                .settings
-                .pricing
-                .iter()
-                .find(|p| p.model == cached_pseudo_model)
-                .map(|p| p.input_per_million)
-                .unwrap_or(DEFAULT_COST_PER_QUERY);
+            let rate = search_rate(&state, &cached_pseudo_model);
+            let cost = rate.unwrap_or(0.0);
 
             record_search_cache_hit(
                 &state,
@@ -392,13 +530,16 @@ async fn search_inner(
                 settings: search_settings(max_results),
                 tokens: None,
                 results: Some(results_returned),
-                cost: CallCost::cache_hit(cost),
+                cost: CallCost::cache_hit(cost).priced_if(rate.is_some()),
                 timing: TimingMeta {
                     total_ms: received.elapsed().as_millis() as i64,
                     ..TimingMeta::default()
                 },
             };
             body["usage"] = search_usage(results_returned, meta.cost);
+            if let Some(verdict) = &extension_verdict {
+                verdict.annotate(&mut body);
+            }
             meta.attach(&mut body);
             let mut response = Json(body).into_response();
             response.headers_mut().insert(
@@ -417,6 +558,11 @@ async fn search_inner(
     let req = SearchRequest {
         query: query.clone(),
         max_results,
+        include_answer,
+        instructions: research.instructions,
+        context: research.context,
+        max_follow_up_queries: research.max_follow_up_queries,
+        freshness,
     };
 
     let SearchOutcome {
@@ -433,13 +579,33 @@ async fn search_inner(
     // a flat per-unit dollar rate (here: dollars per query), not a
     // per-million-token rate. See config.example.toml for the documented unit.
     let serving_pseudo_model = format!("search/{}", serving_engine);
-    let cost = state
-        .settings
-        .pricing
-        .iter()
-        .find(|p| p.model == serving_pseudo_model)
-        .map(|p| p.input_per_million)
-        .unwrap_or(DEFAULT_COST_PER_QUERY);
+    let rate = search_rate(&state, &serving_pseudo_model);
+    // A grounding engine is a model call with a search tool: the platform bills
+    // its tokens beside the per-query fee, so the call's price is both. Tokens
+    // of a model the price table does not know are reported, warned about
+    // once, and not priced (the flat rate still stands).
+    let usage = result.usage.clone();
+    let (token_cost, token_cost_no_cache) = usage
+        .as_ref()
+        .map(|u| grounding_token_cost(&state, u))
+        .unwrap_or((0.0, 0.0));
+    let cost = rate.unwrap_or(0.0) + token_cost;
+    let cost_no_cache = rate.unwrap_or(0.0) + token_cost_no_cache;
+    let tokens_meta = usage.as_ref().map(|u| TokenMeta {
+        prompt: u.input_tokens,
+        completion: u.output_tokens,
+        total: u.input_tokens + u.output_tokens,
+        cache_read: u.cached_input_tokens,
+        cache_write: 0,
+        reasoning: u.reasoning_tokens,
+        estimated: false,
+    });
+    // The ledger's token columns: the grounding model's tokens when the engine
+    // reported them, else (plain search APIs) the result count, as before.
+    let (ledger_tokens_in, ledger_tokens_out) = usage
+        .as_ref()
+        .map(|u| (i64::from(u.input_tokens), i64::from(u.output_tokens)))
+        .unwrap_or((results_returned, 0));
 
     let span = tracing::Span::current();
     span.record("cost.usd", cost);
@@ -484,8 +650,8 @@ async fn search_inner(
             messages: "[]".to_string(), // search has no chat messages
             response: None,
             finish_reason: None,
-            prompt_tokens: results_returned,
-            completion_tokens: 0,
+            prompt_tokens: ledger_tokens_in,
+            completion_tokens: ledger_tokens_out,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cost_usd: cost,
@@ -498,6 +664,7 @@ async fn search_inner(
             attribution_tags: attr_tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Search,
         };
         // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&state_clone.storage.load(), prompt) {
@@ -517,14 +684,15 @@ async fn search_inner(
                     model: serving_pseudo_model_clone,
                     provider: engine_clone,
                     project: user_project.clone(),
-                    tokens_in: results_returned,
-                    tokens_out: 0,
+                    tokens_in: ledger_tokens_in,
+                    tokens_out: ledger_tokens_out,
                     cost_usd: cost,
                     api_key_id,
                     attribution_correlation_id: attr_correlation.clone(),
                     attribution_tags: attr_tags.clone(),
                     experiment_id: None,
                     experiment_variant: None,
+                    call_kind: crate::db::models::CallKind::Search,
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
@@ -538,9 +706,9 @@ async fn search_inner(
         model: serving_pseudo_model.clone(),
         provider: serving_engine.clone(),
         settings: search_settings(max_results),
-        tokens: None,
+        tokens: tokens_meta,
         results: Some(results_returned),
-        cost: CallCost::spent(cost),
+        cost: CallCost::spent(cost).priced_if(rate.is_some()).with_no_cache_cost(cost_no_cache),
         timing: TimingMeta {
             total_ms: received.elapsed().as_millis() as i64,
             latency_ms,
@@ -550,7 +718,7 @@ async fn search_inner(
             fallbacks: i64::from(serving_engine != engine),
         },
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "engine": serving_engine,
         // What the ledger row records as the model: the serving engine's
         // pseudo-model, so a caller can attribute the cost to what served it.
@@ -558,10 +726,22 @@ async fn search_inner(
         "results": result.results,
         "usage": search_usage(results_returned, meta.cost),
     });
+    // Absent, not null, when there is no answer: an engine that cannot produce
+    // one answers an `include_answer` request with the plain shape.
+    if let Some(answer) = &result.answer {
+        payload["answer"] = serde_json::json!(answer);
+    }
+    // A metered miss: the engine ran and the call was billed, but the model
+    // cited nothing, so there are no results. Named, so a caller can tell it
+    // from an engine that found an empty web.
+    if let Some(detail) = &result.grounding_miss {
+        payload["grounding"] = serde_json::json!({ "status": "no_citations", "detail": detail });
+    }
 
     // Cached without `x_router`: that describes this call, and a hit
-    // replaces it with its own.
-    if let Some(key) = cache_key {
+    // replaces it with its own. A miss is never cached: the next identical
+    // query must reach the engine again.
+    if let Some(key) = cache_key.filter(|_| result.grounding_miss.is_none()) {
         state
             .response_cache
             .put_search(
@@ -574,14 +754,105 @@ async fn search_inner(
             .await;
     }
 
-    let mut payload = payload;
+    // After the cache write: these describe this request, not the result.
+    if let Some(verdict) = &extension_verdict {
+        verdict.annotate(&mut payload);
+    }
     meta.attach(&mut payload);
     let mut response = Json(payload).into_response();
-    response.headers_mut().insert(
-        crate::api::routes::completions::CACHE_HEADER,
-        axum::http::HeaderValue::from_static(cache_plan.miss_header().unwrap_or("MISS")),
-    );
+    // No header when the cache was not involved: that is a plain response,
+    // not a miss.
+    if let Some(outcome) = cache_plan.miss_header() {
+        response.headers_mut().insert(
+            crate::api::routes::completions::CACHE_HEADER,
+            axum::http::HeaderValue::from_static(outcome),
+        );
+    }
     Ok(response)
+}
+
+/// Grounded-research options on a search request. Each refines the generated
+/// answer, so each needs `include_answer: true`: sent without it, the caller
+/// would be silently ignored.
+#[derive(Debug, Default)]
+struct ResearchOptions {
+    instructions: Option<String>,
+    context: Option<String>,
+    max_follow_up_queries: u32,
+}
+
+impl ResearchOptions {
+    /// What of the request shapes the payload, for the response-cache key.
+    fn cache_fields<'a>(
+        &'a self,
+        include_answer: bool,
+        freshness: Option<&'a str>,
+        engine: &str,
+    ) -> crate::router::cache::SearchAnswerKey<'a> {
+        crate::router::cache::SearchAnswerKey {
+            include_answer,
+            instructions: self.instructions.as_deref(),
+            context: self.context.as_deref(),
+            max_follow_up_queries: self.max_follow_up_queries,
+            freshness,
+            result_format: crate::providers::search_registry::result_format(engine),
+        }
+    }
+}
+
+/// The optional `freshness` age filter, in canonical form. Rejected rather
+/// than dropped when malformed: a caller asking for recent pages must not get
+/// unfiltered ones without knowing.
+fn parse_freshness_field(body: &Value) -> Result<Option<String>, ApiError> {
+    match body.get("freshness") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => crate::providers::search::parse_freshness(s).map(Some).ok_or_else(|| {
+            ApiError::InvalidRequest(
+                "freshness must be day, week, month, a date YYYY-MM-DD or a range \
+                 YYYY-MM-DD..YYYY-MM-DD"
+                    .to_string(),
+            )
+        }),
+        Some(_) => Err(ApiError::InvalidRequest("freshness must be a string".to_string())),
+    }
+}
+
+fn parse_research_options(body: &Value, include_answer: bool) -> Result<ResearchOptions, ApiError> {
+    let text_field = |name: &str| -> Result<Option<String>, ApiError> {
+        match body.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(ApiError::InvalidRequest(format!("{name} must be a string"))),
+        }
+    };
+    let options = ResearchOptions {
+        instructions: text_field("instructions")?,
+        context: text_field("context")?,
+        max_follow_up_queries: match body.get("max_follow_up_queries") {
+            None | Some(Value::Null) => 0,
+            Some(v) => match v.as_u64() {
+                Some(n) if n <= u64::from(crate::providers::search::MAX_FOLLOW_UP_QUERIES) => n as u32,
+                _ => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "max_follow_up_queries must be an integer from 0 to {}",
+                        crate::providers::search::MAX_FOLLOW_UP_QUERIES
+                    )))
+                }
+            },
+        },
+    };
+    let refines_answer =
+        options.instructions.is_some() || options.context.is_some() || options.max_follow_up_queries > 0;
+    if refines_answer && !include_answer {
+        return Err(ApiError::InvalidRequest(
+            "instructions, context and max_follow_up_queries shape the generated answer and need \
+             include_answer: true"
+                .to_string(),
+        ));
+    }
+    Ok(options)
 }
 
 /// The search `usage` object: results returned plus the ledger cost fields.
@@ -627,6 +898,7 @@ fn record_search_cache_hit(
         attribution_tags: attribution.tags_json(),
         experiment_id: None,
         experiment_variant: None,
+        call_kind: crate::db::models::CallKind::Search,
         tokens_estimated: false,
     };
     tokio::spawn(async move {

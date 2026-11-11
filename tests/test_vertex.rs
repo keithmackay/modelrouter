@@ -259,6 +259,7 @@ mod gemini_tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             extra_params: json!({}),
             session_scope: None,
         }
@@ -417,6 +418,7 @@ mod claude_tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            response_format: None,
             extra_params: json!({}),
             session_scope: None,
         }
@@ -860,6 +862,7 @@ mod search_tests {
         SearchRequest {
             query: query.to_string(),
             max_results,
+            ..Default::default()
         }
     }
 

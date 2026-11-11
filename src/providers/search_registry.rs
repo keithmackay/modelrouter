@@ -19,6 +19,22 @@ const SUPPORTED_ENGINES: &[&str] = &[
     "bing_grounding",
 ];
 
+/// Providers that serve only the search API. They have no model catalog, so
+/// anything that walks every configured provider for models (the catalog
+/// aggregation) must skip them rather than let them fall through to the
+/// OpenAI-compatible adapter, which would query a default `api_base` with an
+/// empty key and report the 401 as a provider failure.
+///
+/// Listed regardless of build features: a search engine compiled out of this
+/// binary still has no model catalog. Engines that also serve models
+/// (`vertex`) are deliberately absent.
+const SEARCH_ONLY_PROVIDERS: &[&str] = &["tavily", "bing_grounding"];
+
+/// Whether `provider` is a search-only provider, with no model catalog.
+pub fn is_search_only(provider: &str) -> bool {
+    SEARCH_ONLY_PROVIDERS.contains(&provider)
+}
+
 pub fn is_supported_engine(engine: &str) -> bool {
     SUPPORTED_ENGINES.contains(&engine)
 }
@@ -28,6 +44,17 @@ pub fn is_supported_engine(engine: &str) -> bool {
 /// time an engine is added behind a feature (as `bing_grounding` was).
 pub fn supported_engines() -> &'static [&'static str] {
     SUPPORTED_ENGINES
+}
+
+/// Version tag of how `engine` shapes its results, for engines that build
+/// results from model output (and so can change shape without the provider
+/// changing). `None` for engines that return the provider's results as is.
+pub fn result_format(engine: &str) -> Option<&'static str> {
+    match engine {
+        #[cfg(feature = "bing-grounding")]
+        "bing_grounding" => Some(crate::providers::bing_grounding::search::RESULT_FORMAT),
+        _ => None,
+    }
 }
 
 pub struct SearchRegistry {

@@ -6,13 +6,18 @@
 <form method="post" action="/admin/storage-settings"
       style="display:flex; align-items:center; gap:1.25rem; flex-wrap:wrap; padding:0.6rem 0.75rem; margin-bottom:1rem; background:#f9f9f9; border:1px solid #eee; border-radius:4px; font-size:0.85rem;">
     <strong>Storage settings</strong>
+    {% if storage_locked %}<fieldset disabled style="display:contents;">{% endif %}
     <label><input type="checkbox" name="store_prompts" {% if store_prompts %}checked{% endif %}> Store prompt log</label>
     <label><input type="checkbox" name="store_prompt_content" {% if store_prompt_content %}checked{% endif %}> Store message content (privacy-sensitive)</label>
     <label>Retention days (0 = keep forever):
         <input type="number" name="prompt_retention_days" min="0" value="{{ prompt_retention_days }}" style="width:5rem;">
     </label>
     <button type="submit" class="btn">Save</button>
+    {% if storage_locked %}</fieldset>
+    <span style="color:#888;">Locked in the config file: these settings cannot be changed here. Cost tracking is unaffected.</span>
+    {% else %}
     <span style="color:#888;">Saved settings override config.toml and apply immediately. Cost tracking is unaffected.</span>
+    {% endif %}
 </form>
 
 <table>

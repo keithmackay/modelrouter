@@ -101,7 +101,11 @@ async fn embeddings_inner(
             .get(&requested_model)
             .cloned()
             .unwrap_or_else(|| requested_model.clone()),
-        None => requested_model.clone(),
+        // A scoped alias override for the request's attribution tags.
+        None => state
+            .router
+            .scoped_name(&attribution.tags, &requested_model)
+            .unwrap_or_else(|| requested_model.clone()),
     };
     if let Some(b) = &binding {
         tracing::info!(
@@ -330,13 +334,15 @@ async fn embeddings_inner(
             attribution_tags: attr_tags.clone(),
             experiment_id,
             experiment_variant: experiment_variant.clone(),
+            call_kind: crate::db::models::CallKind::Embedding,
         };
         // Storage policy (issue #4): the prompt row is optional; the cost row
         // is not. A retaining experiment forces the prompt row on — its rows
         // are the experiment's evidence — same override as the chat path.
         let effective_storage = {
             let global = state_clone.storage.load();
-            if retain_content {
+            // A locked policy that keeps no content wins over a retaining binding.
+            if retain_content && global.allows_forced_content() {
                 crate::config::schema::StorageConfig {
                     store_prompts: true,
                     store_prompt_content: true,
@@ -371,6 +377,7 @@ async fn embeddings_inner(
                     attribution_tags: attr_tags.clone(),
                     experiment_id,
                     experiment_variant: experiment_variant.clone(),
+                    call_kind: crate::db::models::CallKind::Embedding,
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
@@ -424,7 +431,7 @@ async fn embeddings_inner(
         }),
         tokens: Some(TokenMeta::new(result.prompt_tokens, 0)),
         results: None,
-        cost: CallCost::spent(cost),
+        cost: CallCost::spent(cost).priced_if(state.cost_calc.has_price(&canonical_model)),
         timing: TimingMeta {
             total_ms: received.elapsed().as_millis() as i64,
             latency_ms,

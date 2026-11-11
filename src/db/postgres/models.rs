@@ -86,10 +86,10 @@ impl ModelRepository for PostgresDb {
     async fn create_model(&self, model: NewModel) -> anyhow::Result<Model> {
         let now = now_utc();
         let row = sqlx::query_as::<_, ModelRow>(
-            &format!(
+            sqlx::AssertSqlSafe(format!(
                 "INSERT INTO models (provider, name, alias, enabled, created_at) \
                  VALUES ($1, $2, $3, true, $4) RETURNING {MODEL_COLS}"
-            )
+            ))
         )
         .bind(&model.provider)
         .bind(&model.name)
@@ -102,7 +102,7 @@ impl ModelRepository for PostgresDb {
 
     async fn list_models(&self) -> anyhow::Result<Vec<Model>> {
         let rows = sqlx::query_as::<_, ModelRow>(
-            &format!("SELECT {MODEL_COLS} FROM models ORDER BY provider, name")
+            sqlx::AssertSqlSafe(format!("SELECT {MODEL_COLS} FROM models ORDER BY provider, name"))
         )
         .fetch_all(&self.pool)
         .await?;
@@ -111,7 +111,7 @@ impl ModelRepository for PostgresDb {
 
     async fn get_model(&self, id: i64) -> anyhow::Result<Option<Model>> {
         let row = sqlx::query_as::<_, ModelRow>(
-            &format!("SELECT {MODEL_COLS} FROM models WHERE id = $1")
+            sqlx::AssertSqlSafe(format!("SELECT {MODEL_COLS} FROM models WHERE id = $1"))
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -154,18 +154,18 @@ impl ModelRepository for PostgresDb {
     }
 
     async fn list_provider_states(&self) -> anyhow::Result<Vec<ProviderState>> {
-        let rows = sqlx::query_as::<_, ProviderStateRow>(&format!(
+        let rows = sqlx::query_as::<_, ProviderStateRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {PROVIDER_STATE_COLS} FROM provider_states ORDER BY provider"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(ProviderState::from).collect())
     }
 
     async fn get_provider_state(&self, provider: &str) -> anyhow::Result<Option<ProviderState>> {
-        let row = sqlx::query_as::<_, ProviderStateRow>(&format!(
+        let row = sqlx::query_as::<_, ProviderStateRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {PROVIDER_STATE_COLS} FROM provider_states WHERE provider = $1"
-        ))
+        )))
         .bind(provider)
         .fetch_optional(&self.pool)
         .await?;

@@ -189,6 +189,83 @@ fn table_supports_temperature(model: &str) -> bool {
         .any(|family| family_matches(base, family))
 }
 
+// ── Output ceilings ──────────────────────────────────────────────────────────
+//
+// A caller addressing an alias sizes `max_tokens` for the largest model the
+// alias might reach; a provider rejects a value above the resolved model's
+// completion ceiling outright ("max_tokens is too large: 128000. This model
+// supports at most 32768 completion tokens"). The router knows the resolved
+// model, so it clamps. Keyed like the temperature table (family match,
+// provider prefix and `@version` ignored) and overridable from config with
+// `max_output_tokens`.
+
+/// Completion-token ceilings by model family, from the providers' published
+/// model documentation.
+const MAX_OUTPUT_TOKENS: &[(&str, u32)] = &[
+    ("gpt-4.1", 32768),
+    ("gpt-4o", 16384),
+    ("gpt-5", 128000),
+    ("gpt-5.1", 128000),
+    ("gpt-5.2", 128000),
+    ("gpt-5.3", 128000),
+    ("gpt-5.4", 128000),
+    ("gpt-5.5", 128000),
+    ("gpt-5.6", 128000),
+    ("o1", 100000),
+    ("o3", 100000),
+    ("o4", 100000),
+];
+
+/// Families that take `max_completion_tokens` and reject `max_tokens` on the
+/// OpenAI-shaped surfaces (the reasoning generations). Every other model keeps
+/// `max_tokens`, which non-OpenAI deployments behind the same surface expect.
+const MAX_COMPLETION_TOKENS_FAMILIES: &[&str] = &["gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6", "gpt-6.1", "o1", "o3", "o4"];
+
+/// Whether `model` takes `max_completion_tokens` instead of `max_tokens`.
+pub fn uses_max_completion_tokens(model: &str) -> bool {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    MAX_COMPLETION_TOKENS_FAMILIES.iter().any(|family| family_matches(base, family))
+}
+
+/// The completion-token ceiling for `model`: a config entry, else the family
+/// table, else none (an unknown model is sent what the caller asked for).
+pub fn max_output_tokens(model: &str, overrides: &[ModelCapabilityEntry]) -> Option<u32> {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    let mut candidates = vec![key.as_str()];
+    if base != key {
+        candidates.push(base);
+    }
+    for candidate in &candidates {
+        for entry in overrides {
+            if normalize_model_key(&entry.model) == *candidate {
+                if let Some(cap) = entry.max_output_tokens {
+                    return Some(cap);
+                }
+            }
+        }
+    }
+    // A dated snapshot (`gpt-4.1-2025-04-14`) is a release of its family, which
+    // `family_matches` covers through the `-` boundary.
+    MAX_OUTPUT_TOKENS
+        .iter()
+        .find(|(family, _)| family_matches(base, family))
+        .map(|(_, cap)| *cap)
+}
+
+/// `requested` lowered to the model's ceiling when it is above it.
+pub fn clamp_max_tokens(model: &str, requested: Option<u32>, overrides: &[ModelCapabilityEntry]) -> Option<u32> {
+    let requested = requested?;
+    match max_output_tokens(model, overrides) {
+        Some(cap) if requested > cap => {
+            tracing::debug!(model, requested, cap, "clamping max_tokens to the model's completion ceiling");
+            Some(cap)
+        }
+        _ => Some(requested),
+    }
+}
+
 // ── Reasoning (thinking / effort) controls ──────────────────────────────────
 //
 // OpenAI-shaped callers express "how hard should the model think" as
@@ -251,6 +328,52 @@ const EFFORT_SUPPORTED: &[&str] = &[
     "claude-mythos-5",
     "claude-mythos-5-1",
 ];
+
+/// OpenAI-dialect reasoning models take `reasoning_effort` themselves, from a
+/// per-family set of levels. The router forwards it on the OpenAI-shaped
+/// surfaces only for these families; a level outside the set is clamped to
+/// the nearest one the model accepts (see [`resolve_reasoning`]).
+const OPENAI_REASONING_LEVELS: &[(&str, &[&str])] = &[
+    ("gpt-5", &["minimal", "low", "medium", "high"]),
+    ("gpt-5.1", &["low", "medium", "high"]),
+    ("gpt-5.2", &["low", "medium", "high"]),
+    ("gpt-5.3", &["low", "medium", "high"]),
+    ("gpt-5.4", &["low", "medium", "high"]),
+    ("gpt-5.5", &["low", "medium", "high"]),
+    ("gpt-5.6", &["low", "medium", "high"]),
+    ("gpt-6", &["low", "medium", "high"]),
+    ("gpt-6.1", &["low", "medium", "high"]),
+    ("o1", &["low", "medium", "high"]),
+    ("o3", &["low", "medium", "high"]),
+    ("o4", &["low", "medium", "high"]),
+];
+
+/// The `reasoning_effort` levels an OpenAI-dialect reasoning model accepts,
+/// lowest first, or `None` for every other model. The longest matching
+/// family wins, so `gpt-5.1` is not read as a `gpt-5` release.
+pub fn openai_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
+    let key = normalize_model_key(model);
+    let base = strip_version(&key);
+    OPENAI_REASONING_LEVELS
+        .iter()
+        .filter(|(family, _)| family_matches(base, family))
+        .max_by_key(|(family, _)| family.len())
+        .map(|(_, levels)| *levels)
+}
+
+/// Every reasoning level a caller may name, lowest first.
+const REASONING_SCALE: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// `requested` on an OpenAI-dialect model: the level itself when accepted,
+/// else the nearest accepted level on the scale. `None` when unrecognised.
+fn clamp_openai_level(levels: &'static [&'static str], requested: &str) -> Option<&'static str> {
+    let rank = REASONING_SCALE.iter().position(|l| *l == requested)?;
+    let rank_of = |level: &str| REASONING_SCALE.iter().position(|l| *l == level).unwrap_or(0);
+    levels
+        .iter()
+        .copied()
+        .min_by_key(|level| (rank_of(level) as i64 - rank as i64).abs() * 2 + i64::from(rank_of(level) < rank))
+}
 
 /// What a model accepts for controlling its reasoning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +457,13 @@ pub fn resolve_reasoning(
 ) -> Option<crate::providers::adapter::ReasoningControl> {
     use crate::providers::adapter::ReasoningControl;
     let requested = reasoning_effort?.trim().to_ascii_lowercase();
+    if let Some(levels) = openai_reasoning_levels(model) {
+        let level = clamp_openai_level(levels, &requested);
+        if level.is_none() {
+            tracing::warn!(model, reasoning_effort = requested.as_str(), "unrecognised reasoning_effort; forwarding no reasoning control");
+        }
+        return level.map(|effort| ReasoningControl { disable_thinking: false, effort: Some(effort) });
+    }
     let caps = thinking_capabilities(model, overrides);
     let effort = |level: &'static str| {
         caps.supports_effort.then(|| ReasoningControl {
@@ -370,6 +500,61 @@ pub fn resolve_reasoning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── max_output_tokens ───────────────────────────────────────────────────
+
+    #[test]
+    fn reasoning_families_take_max_completion_tokens() {
+        for m in ["gpt-5", "gpt-5.5", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol", "o3", "o4-mini", "foundry/o1"] {
+            assert!(uses_max_completion_tokens(m), "{m}");
+        }
+        for m in ["gpt-4.1", "gpt-4o", "DeepSeek-V4-Pro", "Mistral-Large-3", "grok-4.7"] {
+            assert!(!uses_max_completion_tokens(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn gpt_5_and_o_series_have_published_output_ceilings() {
+        assert_eq!(max_output_tokens("gpt-5", &[]), Some(128000));
+        assert_eq!(max_output_tokens("gpt-5.5", &[]), Some(128000));
+        assert_eq!(max_output_tokens("gpt-5.6-sol", &[]), Some(128000));
+        assert_eq!(max_output_tokens("o3", &[]), Some(100000));
+        assert_eq!(max_output_tokens("o4-mini", &[]), Some(100000));
+    }
+
+    #[test]
+    fn gpt_4_1_family_caps_output_at_32768_including_mini_nano_and_pins() {
+        for m in ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "foundry/gpt-4.1", "gpt-4.1-2025-04-14", "GPT-4.1@2025-04-14"] {
+            assert_eq!(max_output_tokens(m, &[]), Some(32768), "{m}");
+        }
+    }
+
+    #[test]
+    fn unknown_models_have_no_output_cap() {
+        assert_eq!(max_output_tokens("some-future-model", &[]), None);
+        assert_eq!(max_output_tokens("claude-opus-5-5", &[]), None);
+        // The `-` boundary: gpt-4.10 is not a gpt-4.1 release.
+        assert_eq!(max_output_tokens("gpt-4.10", &[]), None);
+    }
+
+    #[test]
+    fn a_config_entry_overrides_and_extends_the_output_cap_table() {
+        let raise = ModelCapabilityEntry { model: "gpt-4.1".into(), max_output_tokens: Some(16384), ..Default::default() };
+        let add = ModelCapabilityEntry { model: "my-deployment".into(), max_output_tokens: Some(4096), ..Default::default() };
+        let caps = [raise, add];
+        assert_eq!(max_output_tokens("gpt-4.1", &caps), Some(16384));
+        assert_eq!(max_output_tokens("foundry/my-deployment", &caps), Some(4096));
+        // An entry that only sets another capability leaves the table in force.
+        assert_eq!(max_output_tokens("gpt-4.1-mini", &[entry("gpt-4.1-mini", Some(true))]), Some(32768));
+    }
+
+    #[test]
+    fn clamp_max_tokens_lowers_only_a_request_above_the_cap() {
+        assert_eq!(clamp_max_tokens("gpt-4.1", Some(128000), &[]), Some(32768));
+        assert_eq!(clamp_max_tokens("gpt-4.1", Some(1000), &[]), Some(1000));
+        assert_eq!(clamp_max_tokens("gpt-4.1", None, &[]), None);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", Some(128000), &[]), Some(128000));
+    }
 
     fn entry(model: &str, supports_temperature: Option<bool>) -> ModelCapabilityEntry {
         ModelCapabilityEntry { model: model.to_string(), supports_temperature, ..Default::default() }
@@ -631,6 +816,24 @@ mod tests {
         assert_eq!(resolve_reasoning("claude-fable-5-1", Some("none"), &overrides), DISABLED);
         // Other fields keep their built-in values.
         assert!(thinking_capabilities("claude-fable-5-1", &overrides).supports_effort);
+    }
+
+    #[test]
+    fn openai_reasoning_families_take_their_own_levels_and_clamp_the_rest() {
+        assert_eq!(openai_reasoning_levels("foundry/gpt-5"), Some(&["minimal", "low", "medium", "high"][..]));
+        assert_eq!(openai_reasoning_levels("gpt-5.1-mini"), Some(&["low", "medium", "high"][..]));
+        assert_eq!(openai_reasoning_levels("o4-mini"), Some(&["low", "medium", "high"][..]));
+        assert_eq!(openai_reasoning_levels("gpt-4.1"), None);
+        assert_eq!(openai_reasoning_levels("claude-opus-5-5"), None);
+        assert_eq!(resolve_reasoning("gpt-5", Some("minimal"), &[]), eff("minimal"));
+        assert_eq!(resolve_reasoning("gpt-5", Some("none"), &[]), eff("minimal"));
+        assert_eq!(resolve_reasoning("o3", Some("minimal"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("o3", Some("none"), &[]), eff("low"));
+        assert_eq!(resolve_reasoning("o3", Some("medium"), &[]), eff("medium"));
+        assert_eq!(resolve_reasoning("o3", Some("max"), &[]), eff("high"));
+        assert_eq!(resolve_reasoning("gpt-5.5", Some("xhigh"), &[]), eff("high"));
+        assert_eq!(resolve_reasoning("o3", Some("extreme"), &[]), None);
+        assert_eq!(resolve_reasoning("gpt-4.1", Some("high"), &[]), None);
     }
 
     #[test]

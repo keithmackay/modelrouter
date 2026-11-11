@@ -75,7 +75,7 @@
       <td style="white-space:nowrap;">
         <form action="/admin/webhooks/{{ w.id }}/delete" method="POST" style="display:inline;">
           <button type="submit" class="btn btn-danger" style="font-size:0.8rem;padding:0.25rem 0.5rem"
-            onclick="return confirm('Delete this webhook?')">Delete</button>
+            data-confirm="Delete this webhook?">Delete</button>
         </form>
         {% if w.enabled %}
           <form action="/admin/webhooks/{{ w.id }}/disable" method="POST" style="display:inline;">

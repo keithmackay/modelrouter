@@ -6,7 +6,7 @@ use crate::db::models::{NewPrompt, Prompt};
 use crate::db::prompt_store::CONTENT_NOT_STORED;
 use crate::db::repositories::costs::ArmFilter;
 use crate::db::repositories::prompts::{
-    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository,
+    AttemptsSummary, ExperimentRunLatency, LatencySummary, PromptRepository, DecisionAnswerRow,
 };
 use super::costs::arm_predicate;
 use super::{PostgresDb, now_utc};
@@ -22,6 +22,43 @@ const TTFT_SAMPLE: &str = "ttft_ms IS NOT NULL AND ttft_ms > 0";
 /// `purge_older_than_except`.
 const PURGE_ID_CHUNK: usize = 500;
 
+impl PostgresDb {
+    /// Delete the prompt rows matching `created_at < cutoff <predicate>`
+    /// after detaching the usage rows that point at them, in one
+    /// transaction. `cost_ledger.prompt_id` references `prompts(id)` with no
+    /// `ON DELETE`, and foreign keys are enforced, so a bare DELETE failed on
+    /// the first prompt that had a usage row and the prompt log was never
+    /// pruned. Usage rows have their own retention (`[retention]
+    /// cost_ledger_days`); here they only lose the link. `ids` bind the
+    /// placeholders `predicate` carries, after the cutoff.
+    async fn delete_prompts_detaching_ledger(
+        &self,
+        predicate: &str,
+        cutoff_rfc3339: &str,
+        ids: &[i64],
+    ) -> anyhow::Result<u64> {
+        let where_sql = format!("created_at < $1 {predicate}");
+        let detach = format!(
+            "UPDATE cost_ledger SET prompt_id = NULL \
+             WHERE prompt_id IN (SELECT id FROM prompts WHERE {where_sql})"
+        );
+        let delete = format!("DELETE FROM prompts WHERE {where_sql}");
+        let mut tx = self.pool.begin().await?;
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(detach.as_str())).bind(cutoff_rfc3339);
+        for id in ids {
+            q = q.bind(id);
+        }
+        q.execute(&mut *tx).await?;
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(delete.as_str())).bind(cutoff_rfc3339);
+        for id in ids {
+            q = q.bind(id);
+        }
+        let deleted = q.execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(deleted)
+    }
+}
+
 #[async_trait]
 impl PromptRepository for PostgresDb {
     async fn create(&self, prompt: NewPrompt) -> anyhow::Result<Prompt> {
@@ -33,15 +70,15 @@ impl PromptRepository for PostgresDb {
                 cache_read_tokens, cache_write_tokens,
                 cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                 attribution_correlation_id, attribution_tags,
-                experiment_id, experiment_variant, created_at
+                experiment_id, experiment_variant, call_kind, created_at
                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20, $21, $22, $23)
+                         $17, $18, $19, $20, $21, $22, $23, $24)
                RETURNING id, user_id, session_id, request_model, routed_model, provider,
                          messages, response, finish_reason, prompt_tokens, completion_tokens,
                          cache_read_tokens, cache_write_tokens,
                          cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                          attribution_correlation_id, attribution_tags,
-                      experiment_id, experiment_variant, created_at"#,
+                      experiment_id, experiment_variant, call_kind, created_at"#,
         )
         .bind(prompt.user_id)
         .bind(prompt.session_id)
@@ -65,6 +102,7 @@ impl PromptRepository for PostgresDb {
         .bind(&prompt.attribution_tags)
         .bind(prompt.experiment_id)
         .bind(&prompt.experiment_variant)
+        .bind(prompt.call_kind.as_str())
         .bind(&now)
         .fetch_one(&self.pool)
         .await?;
@@ -131,11 +169,7 @@ impl PromptRepository for PostgresDb {
     async fn purge_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
         // created_at is uniformly RFC3339 UTC (now_utc), so string comparison
         // orders correctly — no parsing needed at purge time.
-        let result = sqlx::query("DELETE FROM prompts WHERE created_at < $1")
-            .bind(cutoff_rfc3339)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        self.delete_prompts_detaching_ledger("", cutoff_rfc3339, &[]).await
     }
 
     async fn purge_older_than_except(
@@ -151,13 +185,9 @@ impl PromptRepository for PostgresDb {
         // keeps the statement correct when the list has to be chunked (a
         // `NOT IN` split across chunks would delete a protected row in the
         // chunk that does not name it).
-        let result = sqlx::query(
-            "DELETE FROM prompts WHERE created_at < $1 AND experiment_id IS NULL",
-        )
-        .bind(cutoff_rfc3339)
-        .execute(&self.pool)
-        .await?;
-        let mut deleted = result.rows_affected();
+        let mut deleted = self
+            .delete_prompts_detaching_ledger("AND experiment_id IS NULL", cutoff_rfc3339, &[])
+            .await?;
 
         let stamped: Vec<(i64,)> = sqlx::query_as(
             "SELECT DISTINCT experiment_id FROM prompts \
@@ -176,14 +206,13 @@ impl PromptRepository for PostgresDb {
                 .map(|i| format!("${}", i + 2))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
-                "DELETE FROM prompts WHERE created_at < $1 AND experiment_id IN ({placeholders})"
-            );
-            let mut q = sqlx::query(&sql).bind(cutoff_rfc3339);
-            for id in chunk {
-                q = q.bind(id);
-            }
-            deleted += q.execute(&self.pool).await?.rows_affected();
+            deleted += self
+                .delete_prompts_detaching_ledger(
+                    &format!("AND experiment_id IN ({placeholders})"),
+                    cutoff_rfc3339,
+                    chunk,
+                )
+                .await?;
         }
         Ok(deleted)
     }
@@ -237,13 +266,42 @@ impl PromptRepository for PostgresDb {
             n + 1,
             n + 2
         );
-        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b.clone());
         }
         let (requests_tracked, attempts, retried_requests) =
             q.bind(start).bind(end).fetch_one(&self.pool).await?;
         Ok(AttemptsSummary { requests_tracked, attempts, retried_requests })
+    }
+
+    async fn decision_answers_for_arm(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DecisionAnswerRow>> {
+        let (predicate, binds) = arm_predicate(filter, "routed_model");
+        let n = binds.len();
+        let sql = format!(
+            "SELECT attribution_correlation_id, messages, response FROM prompts \
+             WHERE {predicate} AND created_at >= ${} AND created_at < ${} \
+               AND call_kind = 'decision' AND response IS NOT NULL \
+             ORDER BY created_at DESC LIMIT ${}",
+            n + 1,
+            n + 2,
+            n + 3
+        );
+        let mut q = sqlx::query_as::<_, (Option<String>, String, String)>(sqlx::AssertSqlSafe(sql.as_str()));
+        for b in &binds {
+            q = q.bind(b.clone());
+        }
+        let rows = q.bind(start).bind(end).bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(correlation_id, request, answers)| DecisionAnswerRow { correlation_id, request, answers })
+            .collect())
     }
 
     async fn experiment_run_latency(
@@ -259,7 +317,7 @@ impl PromptRepository for PostgresDb {
              ORDER BY user_id ASC, attribution_correlation_id COLLATE \"C\" ASC",
             LATENCY_SAMPLE
         );
-        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(&sql)
+        let rows = sqlx::query_as::<_, (i64, String, i64, Option<f64>)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(experiment_id)
             .fetch_all(&self.pool)
             .await?;
@@ -311,7 +369,7 @@ impl PostgresDb {
         let sql = format!(
             "SELECT COUNT(*), AVG({column})::float8 FROM prompts WHERE {where_clause}"
         );
-        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(sqlx::AssertSqlSafe(sql.as_str()));
         for b in &binds {
             q = q.bind(b.clone());
         }
@@ -338,7 +396,7 @@ impl PostgresDb {
             let last_sql = last_sql.clone();
             let binds = binds.clone();
             async move {
-                let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+                let mut q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql.as_str()));
                 for b in &binds {
                     q = q.bind(b.clone());
                 }
@@ -351,7 +409,7 @@ impl PostgresDb {
                 if let Some((v,)) = row {
                     return anyhow::Ok(Some(v));
                 }
-                let mut q = sqlx::query_as::<_, (i64,)>(&last_sql);
+                let mut q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(last_sql.as_str()));
                 for b in binds {
                     q = q.bind(b);
                 }

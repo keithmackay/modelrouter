@@ -4,6 +4,10 @@ pub mod catalog_registry;
 pub mod cli_session;
 pub mod credential_error;
 pub mod credentials;
+pub mod decision;
+pub mod decision_registry;
+pub mod rerank;
+pub mod rerank_registry;
 pub mod anthropic;
 /// Microsoft Entra ID audiences and token seam, shared by every Azure
 /// provider. Always compiled: the ungated `azure` provider can use Entra too.
@@ -26,6 +30,7 @@ pub mod registry;
 pub mod search;
 pub mod search_registry;
 pub mod sse_lines;
+pub mod stream_fallback;
 pub mod tavily;
 #[cfg(feature = "vertex")]
 pub mod vertex;

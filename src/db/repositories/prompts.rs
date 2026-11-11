@@ -57,6 +57,16 @@ pub struct ExperimentRunLatency {
     pub mean_ms: Option<f64>,
 }
 
+/// One decision call's retained content, for a per-question comparison of
+/// experiment arms: the request (`{"input", "questions"}`) and the answers
+/// (`{"answers": [...]}`) exactly as the decisions route stored them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DecisionAnswerRow {
+    pub correlation_id: Option<String>,
+    pub request: String,
+    pub answers: String,
+}
+
 #[async_trait]
 pub trait PromptRepository: Send + Sync {
     async fn create(&self, prompt: NewPrompt) -> anyhow::Result<Prompt>;
@@ -108,6 +118,15 @@ pub trait PromptRepository: Send + Sync {
         start: &str,
         end: &str,
     ) -> anyhow::Result<AttemptsSummary>;
+    /// The arm's decision rows whose content was retained (`call_kind =
+    /// decision`, `response` present), newest first, at most `limit`.
+    async fn decision_answers_for_arm(
+        &self,
+        filter: &ArmFilter,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DecisionAnswerRow>>;
     /// Latency samples and mean per run of an experiment, unpaginated; runs
     /// with no prompt rows are absent.
     async fn experiment_run_latency(

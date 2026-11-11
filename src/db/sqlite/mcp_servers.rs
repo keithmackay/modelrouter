@@ -95,7 +95,7 @@ impl McpServerRepository for SqliteDb {
             sets.join(", ")
         );
 
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         if let Some(v) = &name        { q = q.bind(v); }
         if let Some(v) = &url         { q = q.bind(v); }
         if let Some(v) = &description { q = q.bind(v); }

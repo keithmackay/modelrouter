@@ -143,7 +143,9 @@ impl ChatStreamCapture {
             cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"]
                 .as_u64()
                 .unwrap_or(0) as u32,
-            cache_write_tokens: 0,
+            cache_write_tokens: usage["prompt_tokens_details"]["cache_creation_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32,
             reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
                 .as_u64()
                 .map(|n| n as u32),
@@ -448,7 +450,10 @@ pub fn message_as_completion(message: &Value) -> CompletionResult {
         .collect::<String>();
     CompletionResult {
         content,
-        prompt_tokens: tokens("input_tokens"),
+        // `input_tokens` excludes cache reads and writes; `prompt_tokens` is the whole prompt.
+        prompt_tokens: tokens("input_tokens")
+            .saturating_add(tokens("cache_read_input_tokens"))
+            .saturating_add(tokens("cache_creation_input_tokens")),
         completion_tokens: tokens("output_tokens"),
         finish_reason: message["stop_reason"]
             .as_str()
@@ -700,8 +705,10 @@ mod tests {
                 r.cache_read_tokens,
                 r.cache_write_tokens
             ),
-            (7, 3, 2, 1)
+            // `prompt_tokens` is the whole prompt: input 7 + cache read 2 + cache write 1.
+            (10, 3, 2, 1)
         );
+        assert_eq!(r.uncached_prompt_tokens(), 7);
         assert_eq!(r.finish_reason, "end_turn");
     }
 }

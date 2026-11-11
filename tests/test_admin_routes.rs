@@ -385,6 +385,7 @@ async fn get_stats_admin_can_read() {
             attribution_tags: "{}".to_string(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
         },
     )

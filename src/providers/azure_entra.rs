@@ -34,6 +34,10 @@ pub const FOUNDRY_PROJECT_SCOPE: &str = "https://ai.azure.com/.default";
 /// Azure/azure-rest-api-specs.
 pub const COGNITIVE_SERVICES_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
 
+/// Scope for Azure Resource Manager (the management plane), used to list a
+/// Foundry account's deployments and their provisioning state.
+pub const MANAGEMENT_SCOPE: &str = "https://management.azure.com/.default";
+
 /// Back-compat alias for the scope `bing_grounding` has always requested.
 pub const FOUNDRY_SCOPE: &str = FOUNDRY_PROJECT_SCOPE;
 

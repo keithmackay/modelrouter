@@ -15,6 +15,7 @@
 //! - `auth` — Entra by default, `api-key` header on explicit opt-in
 //! - `adapter` — chat completions and streaming
 //! - `embed` — embeddings
+//! - `decide` — the Decisions API (typed questions over a document)
 //! - `catalog` — deployed-model discovery
 //!
 //! The Entra token source is shared with `bing_grounding` and lives in
@@ -23,9 +24,15 @@
 pub mod adapter;
 pub mod auth;
 pub mod catalog;
+pub mod claude;
+pub mod decide;
 pub mod embed;
 pub mod endpoint;
+pub mod rerank;
+pub mod retail_pricing;
 
 pub use adapter::FoundryAdapter;
+pub use decide::FoundryDecisionAdapter;
 pub use embed::FoundryEmbeddingAdapter;
+pub use rerank::FoundryRerankAdapter;
 pub use endpoint::{FoundryEndpoint, FoundrySurface};

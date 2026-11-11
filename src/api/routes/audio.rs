@@ -176,6 +176,7 @@ async fn speech_inner(
             attribution_tags: attr_tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Audio,
         };
         // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
@@ -203,6 +204,7 @@ async fn speech_inner(
                     attribution_tags: attr_tags.clone(),
                     experiment_id: None,
                     experiment_variant: None,
+                    call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
@@ -400,6 +402,7 @@ async fn transcriptions_inner(
             attribution_tags: attr_tags.clone(),
             experiment_id: None,
             experiment_variant: None,
+            call_kind: crate::db::models::CallKind::Audio,
         };
         // Storage policy (issue #4 gap, closed in #29): prompt row optional, cost row not.
         let stored = match crate::db::prompt_store::apply_storage_policy(&storage.load(), prompt) {
@@ -427,6 +430,7 @@ async fn transcriptions_inner(
                     attribution_tags: attr_tags.clone(),
                     experiment_id: None,
                     experiment_variant: None,
+                    call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {

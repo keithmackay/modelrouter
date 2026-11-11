@@ -43,6 +43,14 @@ pub fn translate_request(req: &NormalizedRequest) -> serde_json::Value {
     if let Some(m) = req.max_tokens {
         gen_config.insert("maxOutputTokens".into(), serde_json::json!(m));
     }
+    // Gemini's JSON mode: `json_object` and `json_schema` both become
+    // `responseMimeType: application/json`. The schema itself is not
+    // forwarded: Gemini takes an OpenAPI subset that rejects common JSON
+    // Schema keywords (`additionalProperties`, `$ref`), so the caller's own
+    // validation stays the contract and the provider is asked for JSON only.
+    if req.response_format.is_some() {
+        gen_config.insert("responseMimeType".into(), serde_json::json!("application/json"));
+    }
     if !gen_config.is_empty() {
         body["generationConfig"] = serde_json::Value::Object(gen_config);
     }
@@ -187,5 +195,39 @@ impl GeminiSseTranslator {
             });
         }
         Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", chunk))
+    }
+}
+
+#[cfg(test)]
+mod response_format_tests {
+    use super::translate_request;
+    use crate::providers::adapter::NormalizedRequest;
+    use serde_json::json;
+
+    fn req(response_format: Option<serde_json::Value>) -> NormalizedRequest {
+        NormalizedRequest {
+            model: "vertex/google/gemini-2.5-flash".into(),
+            request_model: "fast".into(),
+            messages: vec![json!({"role": "user", "content": "x"})],
+            response_format,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn json_mode_becomes_the_json_mime_type_and_the_schema_is_not_forwarded() {
+        let schema = json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object", "additionalProperties": false}}});
+        for rf in [json!({"type": "json_object"}), schema] {
+            let body = translate_request(&req(Some(rf)));
+            assert_eq!(body["generationConfig"]["responseMimeType"], "application/json");
+            assert!(body["generationConfig"].get("responseSchema").is_none());
+            assert!(body.get("response_format").is_none());
+        }
+    }
+
+    #[test]
+    fn no_request_means_no_generation_config_entry() {
+        let body = translate_request(&req(None));
+        assert!(body.get("generationConfig").is_none());
     }
 }

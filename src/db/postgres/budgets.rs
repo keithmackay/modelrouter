@@ -106,34 +106,34 @@ impl BudgetRepository for PostgresDb {
     async fn list_for_scope(&self, scope: &BudgetScope) -> anyhow::Result<Vec<BudgetRule>> {
         let rows = match scope {
             BudgetScope::Global => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {BUDGET_COLS} FROM budget_rules \
                      WHERE user_id IS NULL AND group_name IS NULL AND project IS NULL AND api_key_id IS NULL \
                      ORDER BY id"
-                ))
+                )))
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::Project(name) => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {BUDGET_COLS} FROM budget_rules WHERE project = $1 ORDER BY id"
-                ))
+                )))
                 .bind(name)
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::User(user_id) => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {BUDGET_COLS} FROM budget_rules WHERE user_id = $1 ORDER BY id"
-                ))
+                )))
                 .bind(user_id)
                 .fetch_all(&self.pool)
                 .await?
             }
             BudgetScope::Group(group_name) => {
-                sqlx::query_as::<_, BudgetRule>(&format!(
+                sqlx::query_as::<_, BudgetRule>(sqlx::AssertSqlSafe(format!(
                     "SELECT {BUDGET_COLS} FROM budget_rules WHERE group_name = $1 ORDER BY id"
-                ))
+                )))
                 .bind(group_name)
                 .fetch_all(&self.pool)
                 .await?
