@@ -2139,6 +2139,9 @@ pub struct CliToolConfig {
 impl CliToolConfig {
     fn named(command: &str) -> Self {
         Self { command: command.into(), args: Vec::new() }
+    }
+}
+
 #[cfg(test)]
 mod retention_config_tests {
     use super::*;
