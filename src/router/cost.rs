@@ -593,10 +593,10 @@ mod tests {
     #[test]
     fn no_cache_cost_prices_cached_prompt_tokens_at_the_input_rate() {
         let calc = CostCalculator::default();
-        // claude-sonnet-5-5: $2/M input, $10/M output, $0.20/M cache read, $2.50/M cache write.
+        // claude-sonnet-5-5: $2/M input, $10/M output, $0.10/M cache read, $2.50/M cache write.
         let actual = calc.calculate_with_cache("anthropic/claude-sonnet-5-5", 1_000_000, 100_000, 4_000_000, 500_000);
         let no_cache = calc.calculate_no_cache("anthropic/claude-sonnet-5-5", 1_000_000, 100_000, 4_000_000, 500_000);
-        assert!((actual - (2.0 + 1.0 + 0.8 + 1.25)).abs() < 1e-9, "actual: {actual}");
+        assert!((actual - (2.0 + 1.0 + 0.4 + 1.25)).abs() < 1e-9, "actual: {actual}");
         assert!((no_cache - (5.5 * 2.0 + 1.0)).abs() < 1e-9, "no cache: {no_cache}");
         // No cache activity: the two figures agree.
         assert_eq!(
