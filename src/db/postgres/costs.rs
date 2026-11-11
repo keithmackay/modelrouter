@@ -20,7 +20,7 @@ const LEDGER_COLUMNS: &str = "id, user_id, COALESCE(prompt_id, 0) AS prompt_id, 
                               tokens_estimated, call_kind";
 
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
-const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)";
+const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)::BIGINT";
 
 #[async_trait]
 impl CostRepository for PostgresDb {
