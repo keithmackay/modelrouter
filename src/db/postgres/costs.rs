@@ -276,10 +276,10 @@ impl CostRepository for PostgresDb {
     }
 
     async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<CostLedgerEntry>> {
-        let rows = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+        let rows = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM cost_ledger WHERE created_at < $1 ORDER BY created_at ASC LIMIT 10000",
             LEDGER_COLUMNS
-        ))
+        )))
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await?;
