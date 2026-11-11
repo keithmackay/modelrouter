@@ -412,6 +412,9 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 // purges freed is returned to the file system.
                 let tick_retention = settings.retention.clone();
                 tokio::spawn(async move {
+                    // The first purge waits out the startup window (migrations,
+                    // bootstrap, the first requests) instead of competing with it.
+                    tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
                     loop {
                         let retention_days = tick_storage.load().prompt_retention_days;
                         crate::db::retention::run_retention_tick(

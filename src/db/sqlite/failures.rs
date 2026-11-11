@@ -15,11 +15,9 @@ const FAILURE_COLUMNS: &str = "id, user_id, api_key_id, endpoint, request_model,
 #[async_trait]
 impl FailureRepository for SqliteDb {
     async fn purge_failures_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM request_failures WHERE created_at < ?")
-            .bind(cutoff_rfc3339)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        // Batched (`SqliteDb::delete_in_batches`): one DELETE over the whole
+        // table would hold SQLite's write lock for its whole run.
+        self.delete_in_batches("request_failures", "created_at < ?", cutoff_rfc3339, &[], None).await
     }
 
     async fn create(&self, failure: NewRequestFailure) -> anyhow::Result<RequestFailure> {
