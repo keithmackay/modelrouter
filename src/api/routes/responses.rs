@@ -83,7 +83,7 @@ async fn responses_inner(
     };
 
     // Route the model
-    let (provider_name, canonical_model) = state.router.resolve(&model);
+    let (provider_name, canonical_model) = state.router.for_chat(state.router.resolve(&model));
 
     // Operator disable gate (issue #5) — 403 naming the reason, never a provider call.
     state
@@ -151,6 +151,10 @@ async fn responses_inner(
             &state.settings.model_capabilities,
         ),
         extra_params: serde_json::Value::Object(Default::default()),
+        session_scope: Some(crate::providers::adapter::SessionScope {
+            user_id: user.id,
+            project: attribution.project_or(user.api_key_project.clone()),
+        }),
     };
 
     let start = Instant::now();

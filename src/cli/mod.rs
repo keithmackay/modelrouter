@@ -389,7 +389,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
                     settings.providers.clone(),
                     settings.tier_timeouts.clone(),
-                ),
+                )
+                .with_subscription(settings.subscription.clone()),
             );
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
                 settings.routing.fallback_chains.clone(),

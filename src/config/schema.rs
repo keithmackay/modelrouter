@@ -298,6 +298,10 @@ pub struct Settings {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub tier_timeouts: TierTimeoutsConfig,
+    /// Route Anthropic, OpenAI and Gemini chat traffic through the vendors'
+    /// own CLIs, on their subscription logins, instead of the HTTP APIs.
+    #[serde(default)]
+    pub subscription: SubscriptionConfig,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -1651,5 +1655,66 @@ mod tier_timeouts_tests {
         // the most generous (deep) tier ceiling.
         assert_eq!(default_timeout_secs(), 21600);
         assert_eq!(default_timeout_secs(), TierTimeoutsConfig::default().deep);
+    }
+}
+
+/// `[subscription]`: send chat traffic for the listed providers through the
+/// vendor's CLI in headless mode (`claude -p`, `codex exec`, `gemini`), so it
+/// runs on the CLI's subscription login and is metered here like API traffic.
+///
+/// A routed request is recorded under the CLI's provider name
+/// (`claude-cli`, `codex-cli`, `gemini-cli`) and priced at the model's API
+/// rate, which makes the ledger show what the subscription usage would have
+/// cost through the API.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SubscriptionConfig {
+    pub enabled: bool,
+    /// Providers whose chat traffic is redirected: `anthropic` → `claude-cli`,
+    /// `openai` → `codex-cli`, `gemini` → `gemini-cli`.
+    pub providers: Vec<String>,
+    /// Where each user/project gets a working directory for its CLI
+    /// sessions. `~` is expanded.
+    pub work_dir: String,
+    /// A conversation's CLI session is forgotten after this long unused; the
+    /// next turn then starts a new session with the transcript replayed.
+    pub session_idle_secs: u64,
+    /// Ceiling on one CLI invocation.
+    pub timeout_secs: u64,
+    /// CLI processes allowed to run at once, per CLI.
+    pub max_concurrent: usize,
+    pub claude: CliToolConfig,
+    pub codex: CliToolConfig,
+    pub gemini: CliToolConfig,
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            providers: vec!["anthropic".into(), "openai".into(), "gemini".into()],
+            work_dir: "~/.modelrouter/cli-sessions".into(),
+            session_idle_secs: 86_400,
+            timeout_secs: 1_800,
+            max_concurrent: 4,
+            claude: CliToolConfig::named("claude"),
+            codex: CliToolConfig::named("codex"),
+            gemini: CliToolConfig::named("gemini"),
+        }
+    }
+}
+
+/// One vendor CLI: the executable and any arguments placed before the ones
+/// the router adds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CliToolConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl CliToolConfig {
+    fn named(command: &str) -> Self {
+        Self { command: command.into(), args: Vec::new() }
     }
 }

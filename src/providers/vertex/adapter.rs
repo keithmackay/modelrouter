@@ -546,6 +546,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             extra_params: serde_json::Value::Null,
+            session_scope: None,
         }
     }
 

@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod catalog;
 pub mod catalog_registry;
+pub mod cli_session;
 pub mod credential_error;
 pub mod credentials;
 pub mod anthropic;

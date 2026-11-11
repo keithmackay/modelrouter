@@ -267,10 +267,33 @@ async fn anthropic_messages_inner(
         }
     }
 
-    // Fix 2: Always use the "anthropic" provider config for the Messages API
-    let anthropic_config = state.settings.providers.get("anthropic")
-        .ok_or_else(|| ApiError::ProviderError(anyhow::anyhow!("No 'anthropic' provider configured")))?
-        .clone();
+    // Under `[subscription]` the Messages API is answered by the Claude CLI
+    // instead of the Anthropic API (see `providers::cli_session`).
+    let via_cli = crate::providers::cli_session::subscription_provider(
+        &state.settings.subscription,
+        "anthropic",
+    );
+    if via_cli.is_some() && body["tools"].as_array().is_some_and(|t| !t.is_empty()) {
+        return Err(ApiError::InvalidRequest(
+            "this router sends /v1/messages through the Claude CLI ([subscription]), \
+             which cannot take caller-defined tools"
+                .into(),
+        ));
+    }
+    let provider_label = via_cli.unwrap_or("anthropic").to_string();
+
+    // Fix 2: Always use the "anthropic" provider config for the Messages API.
+    // The CLI path needs none, so a subscription-only deployment works
+    // without an [providers.anthropic] section.
+    let anthropic_config = match state.settings.providers.get("anthropic") {
+        Some(config) => config.clone(),
+        None if via_cli.is_some() => Default::default(),
+        None => {
+            return Err(ApiError::ProviderError(anyhow::anyhow!(
+                "No 'anthropic' provider configured"
+            )))
+        }
+    };
 
     let api_base = anthropic_config
         .api_base
@@ -294,7 +317,7 @@ async fn anthropic_messages_inner(
 
     let upstream_body = build_upstream_body(&body, &canonical_model);
 
-    if stream {
+    if stream && via_cli.is_none() {
         if state.circuit_breaker.is_open("anthropic") {
             tracing::warn!(provider = "anthropic", "circuit breaker open, skipping provider");
             return Err(ApiError::ProviderError(anyhow::anyhow!("circuit breaker open for anthropic")));
@@ -405,45 +428,52 @@ async fn anthropic_messages_inner(
         return Ok(response);
     }
 
-    // Non-streaming: proxy and return raw Anthropic JSON
-    if state.circuit_breaker.is_open("anthropic") {
-        tracing::warn!(provider = "anthropic", "circuit breaker open, skipping provider");
-        return Err(ApiError::ProviderError(anyhow::anyhow!("circuit breaker open for anthropic")));
-    }
-    let upstream_resp = client
-        .post(&upstream_url)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&upstream_body)
-        .send()
-        .await
-        .map_err(|e| {
-            state.circuit_breaker.record_failure("anthropic");
-            ApiError::ProviderError(e.into())
-        })?;
-
-    let latency_ms = start.elapsed().as_millis() as i64;
-
-    if !upstream_resp.status().is_success() {
-        let status = upstream_resp.status().as_u16();
-        let err_text = upstream_resp
-            .text()
+    // Non-streaming (and every CLI call): the response as an Anthropic
+    // `message`, from the API or built from the CLI's answer.
+    let (resp_json, latency_ms) = if let Some(cli) = via_cli {
+        let message = cli_message(&state, cli, &body, &canonical_model, &user, &attribution).await?;
+        (message, start.elapsed().as_millis() as i64)
+    } else {
+        if state.circuit_breaker.is_open("anthropic") {
+            tracing::warn!(provider = "anthropic", "circuit breaker open, skipping provider");
+            return Err(ApiError::ProviderError(anyhow::anyhow!("circuit breaker open for anthropic")));
+        }
+        let upstream_resp = client
+            .post(&upstream_url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&upstream_body)
+            .send()
             .await
-            .unwrap_or_else(|_| "upstream error".to_string());
-        state.circuit_breaker.record_upstream_status("anthropic", status);
-        return Err(ApiError::ProviderError(anyhow::anyhow!(
-            "Anthropic API error {}: {}",
-            status,
-            err_text
-        )));
-    }
-    state.circuit_breaker.record_success("anthropic");
+            .map_err(|e| {
+                state.circuit_breaker.record_failure("anthropic");
+                ApiError::ProviderError(e.into())
+            })?;
 
-    let resp_json: Value = upstream_resp
-        .json()
-        .await
-        .map_err(|e| ApiError::ProviderError(e.into()))?;
+        let latency_ms = start.elapsed().as_millis() as i64;
+
+        if !upstream_resp.status().is_success() {
+            let status = upstream_resp.status().as_u16();
+            let err_text = upstream_resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "upstream error".to_string());
+            state.circuit_breaker.record_upstream_status("anthropic", status);
+            return Err(ApiError::ProviderError(anyhow::anyhow!(
+                "Anthropic API error {}: {}",
+                status,
+                err_text
+            )));
+        }
+        state.circuit_breaker.record_success("anthropic");
+
+        let resp_json: Value = upstream_resp
+            .json()
+            .await
+            .map_err(|e| ApiError::ProviderError(e.into()))?;
+        (resp_json, latency_ms)
+    };
 
     // Extract usage from Anthropic response for cost logging
     let prompt_tokens = resp_json["usage"]["input_tokens"]
@@ -499,6 +529,7 @@ async fn anthropic_messages_inner(
     let user_id = user.id;
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
+    let provider_c = provider_label.clone();
 
     tokio::spawn(async move {
         use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
@@ -508,7 +539,7 @@ async fn anthropic_messages_inner(
             session_id: None,
             request_model: model_clone.clone(),
             routed_model: canonical_c.clone(),
-            provider: "anthropic".to_string(),
+            provider: provider_c.clone(),
             messages: messages_json.clone(),
             response: Some(response_content.clone()),
             finish_reason: Some(stop_reason),
@@ -543,7 +574,7 @@ async fn anthropic_messages_inner(
                     user_id,
                     prompt_id: stored.as_ref().map(|s| s.id),
                     model: canonical_c.clone(),
-                    provider: "anthropic".to_string(),
+                    provider: provider_c.clone(),
                     project: project.clone(),
                     tokens_in: prompt_tokens as i64,
                     tokens_out: completion_tokens as i64,
@@ -562,7 +593,7 @@ async fn anthropic_messages_inner(
                     trace_id: stored.as_ref().map(|s| s.id.to_string()).unwrap_or_else(|| "0".to_string()),
                     user_id,
                     model: canonical_c.clone(),
-                    provider: "anthropic".to_string(),
+                    provider: provider_c.clone(),
                     input: serde_json::from_str(&messages_json).unwrap_or(serde_json::Value::Null),
                     output: response_content.clone(),
                     prompt_tokens,
@@ -590,7 +621,21 @@ async fn anthropic_messages_inner(
         }
     });
 
-    let mut response = Json(resp_json).into_response();
+    let mut response = if stream {
+        // Only the CLI path reaches here streamed: replay its answer as the
+        // Messages event stream.
+        use axum::http::{header, StatusCode};
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(axum::body::Body::from(
+                crate::router::cache::stream::messages_replay_sse(&resp_json),
+            ))
+            .unwrap()
+    } else {
+        Json(resp_json).into_response()
+    };
     if let Some(outcome) = cache_plan.miss_header() {
         response
             .headers_mut()
@@ -693,4 +738,76 @@ fn serve_cached_message(
         .headers_mut()
         .insert(CACHE_HEADER, HeaderValue::from_static("HIT"));
     response
+}
+
+/// Answer a Messages request through a subscription CLI and shape the reply
+/// as an Anthropic `message`. Text content only: tool, image and document
+/// blocks are refused by the transcript reader.
+async fn cli_message(
+    state: &AppState,
+    provider: &str,
+    body: &Value,
+    canonical_model: &str,
+    user: &crate::db::models::User,
+    attribution: &crate::api::attribution::Attribution,
+) -> Result<Value, ApiError> {
+    let mut messages = Vec::new();
+    match &body["system"] {
+        Value::Null => {}
+        system => messages.push(serde_json::json!({"role": "system", "content": system})),
+    }
+    for m in body["messages"].as_array().into_iter().flatten() {
+        messages.push(serde_json::json!({"role": m["role"], "content": m["content"]}));
+    }
+    // Refuse what a CLI session cannot carry before spending a call on it.
+    crate::providers::cli_session::Transcript::from_chat_messages(&messages)
+        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+
+    let req = crate::providers::adapter::NormalizedRequest {
+        model: canonical_model.to_string(),
+        request_model: canonical_model.to_string(),
+        messages,
+        session_scope: Some(crate::providers::adapter::SessionScope {
+            user_id: user.id,
+            project: attribution.project_or(user.api_key_project.clone()),
+        }),
+        ..Default::default()
+    };
+    if state.circuit_breaker.is_open(provider) {
+        return Err(ApiError::ProviderError(anyhow::anyhow!("circuit breaker open for {provider}")));
+    }
+    let adapter = state.provider_registry.get(provider).map_err(ApiError::ProviderError)?;
+    let result = match adapter.complete(&req).await {
+        Ok(result) => {
+            state.circuit_breaker.record_success(provider);
+            result
+        }
+        Err(e) => {
+            state.circuit_breaker.record_failure(provider);
+            return Err(ApiError::ProviderError(e));
+        }
+    };
+    Ok(cli_result_as_message(&result, canonical_model))
+}
+
+/// A CLI completion as the Anthropic `message` object.
+fn cli_result_as_message(
+    result: &crate::providers::adapter::CompletionResult,
+    model: &str,
+) -> Value {
+    serde_json::json!({
+        "id": format!("msg_cli_{}", uuid::Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": result.content}],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": result.prompt_tokens,
+            "output_tokens": result.completion_tokens,
+            "cache_read_input_tokens": result.cache_read_tokens,
+            "cache_creation_input_tokens": result.cache_write_tokens,
+        },
+    })
 }

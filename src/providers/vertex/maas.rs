@@ -98,6 +98,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             extra_params: serde_json::Value::Null,
+            session_scope: None,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", false);
         assert_eq!(body["model"], "mistralai/mistral-medium-3");
@@ -121,6 +122,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             extra_params: serde_json::Value::Null,
+            session_scope: None,
         };
         let body = translate_request(&req, "mistralai/mistral-medium-3", true);
         assert_eq!(body["stream"], true);

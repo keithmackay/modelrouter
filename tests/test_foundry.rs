@@ -281,6 +281,7 @@ fn req(model: &str) -> NormalizedRequest {
         tool_choice: None,
         reasoning: None,
         extra_params: json!({}),
+        session_scope: None,
     }
 }
 
