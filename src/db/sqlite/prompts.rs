@@ -22,8 +22,8 @@ const PURGE_ID_CHUNK: usize = 500;
 
 impl SqliteDb {
     /// Delete the prompt rows matching `created_at < cutoff <predicate>`
-    /// after detaching the usage rows that point at them, in one
-    /// transaction. `cost_ledger.prompt_id` references `prompts(id)` with no
+    /// after detaching the usage rows that point at them, in short
+    /// batches (`SqliteDb::delete_in_batches`). `cost_ledger.prompt_id` references `prompts(id)` with no
     /// `ON DELETE`, and foreign keys are enforced, so a bare DELETE failed on
     /// the first prompt that had a usage row and the prompt log was never
     /// pruned. Usage rows have their own retention (`[retention]
@@ -36,24 +36,14 @@ impl SqliteDb {
         ids: &[i64],
     ) -> anyhow::Result<u64> {
         let where_sql = format!("created_at < ? {predicate}");
-        let detach = format!(
-            "UPDATE cost_ledger SET prompt_id = NULL \
-             WHERE prompt_id IN (SELECT id FROM prompts WHERE {where_sql})"
-        );
-        let delete = format!("DELETE FROM prompts WHERE {where_sql}");
-        let mut tx = self.pool.begin().await?;
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(detach.as_str())).bind(cutoff_rfc3339);
-        for id in ids {
-            q = q.bind(id);
-        }
-        q.execute(&mut *tx).await?;
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(delete.as_str())).bind(cutoff_rfc3339);
-        for id in ids {
-            q = q.bind(id);
-        }
-        let deleted = q.execute(&mut *tx).await?.rows_affected();
-        tx.commit().await?;
-        Ok(deleted)
+        self.delete_in_batches(
+            "prompts",
+            &where_sql,
+            cutoff_rfc3339,
+            ids,
+            Some("UPDATE cost_ledger SET prompt_id = NULL WHERE prompt_id IN ({ids})"),
+        )
+        .await
     }
 }
 
@@ -822,6 +812,91 @@ mod tests {
     const OLD: &str = "2026-01-01T00:00:00Z";
     const NEW: &str = "2026-03-15T00:00:00Z";
     const CUTOFF: &str = "2026-03-01T00:00:00Z";
+
+    async fn insert_ledger_row(db: &SqliteDb, prompt_id: Option<i64>, created_at: &str) -> i64 {
+        let r = sqlx::query(
+            "INSERT INTO cost_ledger (user_id, prompt_id, model, provider, cost_usd, created_at) \
+             VALUES (1, ?, 'X', 'p', 0.01, ?)",
+        )
+        .bind(prompt_id)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        r.last_insert_rowid()
+    }
+
+    async fn ledger_link(db: &SqliteDb, ledger_id: i64) -> Option<i64> {
+        let row: (Option<i64>,) = sqlx::query_as("SELECT prompt_id FROM cost_ledger WHERE id = ?")
+            .bind(ledger_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        row.0
+    }
+
+    /// A logged prompt has a ledger row pointing at it. The purge must delete the
+    /// prompt anyway (a foreign-key failure would roll the whole purge back on
+    /// every tick) and keep the ledger row's cost, unlinked.
+    #[tokio::test]
+    async fn purge_deletes_prompts_that_ledger_rows_reference_and_keeps_the_cost() {
+        let db = make_db().await;
+        let old = insert_stamped_row(&db, None, OLD).await;
+        let new = insert_stamped_row(&db, None, NEW).await;
+        let old_cost = insert_ledger_row(&db, Some(old), OLD).await;
+        let new_cost = insert_ledger_row(&db, Some(new), NEW).await;
+
+        assert_eq!(db.purge_older_than(CUTOFF).await.unwrap(), 1);
+        assert!(!exists(&db, old).await);
+        assert!(exists(&db, new).await);
+        assert_eq!(ledger_link(&db, old_cost).await, None, "the old cost row is kept, unlinked");
+        assert_eq!(ledger_link(&db, new_cost).await, Some(new));
+    }
+
+    #[tokio::test]
+    async fn purge_older_than_except_unlinks_ledger_rows_of_every_deleted_prompt() {
+        let db = make_db().await;
+        let plain = insert_stamped_row(&db, None, OLD).await;
+        let kept = insert_stamped_row(&db, Some(7), OLD).await;
+        let gone = insert_stamped_row(&db, Some(9), OLD).await;
+        let plain_cost = insert_ledger_row(&db, Some(plain), OLD).await;
+        let kept_cost = insert_ledger_row(&db, Some(kept), OLD).await;
+        let gone_cost = insert_ledger_row(&db, Some(gone), OLD).await;
+
+        assert_eq!(db.purge_older_than_except(CUTOFF, &[7]).await.unwrap(), 2);
+        assert!(exists(&db, kept).await);
+        assert_eq!(ledger_link(&db, plain_cost).await, None);
+        assert_eq!(ledger_link(&db, gone_cost).await, None);
+        assert_eq!(ledger_link(&db, kept_cost).await, Some(kept));
+    }
+
+    /// More old rows than one batch: every batch commits on its own and the
+    /// purge carries on until nothing old is left.
+    #[tokio::test]
+    async fn purge_runs_in_batches_until_nothing_old_is_left() {
+        let db = make_db().await;
+        let total = crate::db::sqlite::PURGE_BATCH * 2 + 7;
+        for _ in 0..total {
+            let id = insert_stamped_row(&db, None, OLD).await;
+            insert_ledger_row(&db, Some(id), OLD).await;
+        }
+        let new = insert_stamped_row(&db, None, NEW).await;
+
+        assert_eq!(db.purge_older_than(CUTOFF).await.unwrap() as usize, total);
+        assert!(exists(&db, new).await);
+        let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM prompts WHERE created_at < ?")
+            .bind(CUTOFF)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left.0, 0);
+        let linked: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cost_ledger WHERE prompt_id IS NOT NULL")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(linked.0, 0, "no ledger row points at a deleted prompt");
+        assert_eq!(db.purge_older_than(CUTOFF).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn purge_older_than_except_spares_the_listed_experiments() {

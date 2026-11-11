@@ -26,11 +26,9 @@ impl From<HookMetricRow> for HookMetric {
 #[async_trait]
 impl HookRepository for SqliteDb {
     async fn purge_metrics_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM hook_metrics WHERE invoked_at < ?")
-            .bind(cutoff_rfc3339)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        // Batched (`SqliteDb::delete_in_batches`): one DELETE over the whole
+        // table would hold SQLite's write lock for its whole run.
+        self.delete_in_batches("hook_metrics", "invoked_at < ?", cutoff_rfc3339, &[], None).await
     }
 
     async fn has_permission(&self, hook_name: &str, capability: &str) -> anyhow::Result<bool> {

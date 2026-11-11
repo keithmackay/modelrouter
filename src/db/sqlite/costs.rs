@@ -18,13 +18,9 @@ const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, 
 #[async_trait]
 impl CostRepository for SqliteDb {
     async fn purge_ledger_older_than(&self, cutoff_rfc3339: &str) -> anyhow::Result<u64> {
-        // created_at is RFC3339 UTC throughout, so the string comparison
-        // orders correctly, the same rule the prompt purge relies on.
-        let result = sqlx::query("DELETE FROM cost_ledger WHERE created_at < ?")
-            .bind(cutoff_rfc3339)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        // Batched (`SqliteDb::delete_in_batches`): one DELETE over the whole
+        // table would hold SQLite's write lock for its whole run.
+        self.delete_in_batches("cost_ledger", "created_at < ?", cutoff_rfc3339, &[], None).await
     }
 
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
@@ -1676,4 +1672,24 @@ mod tests {
         assert_eq!(rows, [(1, "b", 1)], "run `none` has no bound row and is not counted");
         assert!(db.experiment_unbound_requests(8).await.unwrap().is_empty());
     }
+    /// The ledger retention deletes in batches (`delete_in_batches`): more
+    /// old rows than one batch are all deleted, newer ones kept.
+    #[tokio::test]
+    async fn ledger_purge_runs_in_batches_until_nothing_old_is_left() {
+        let db = make_db().await;
+        sqlx::query("INSERT OR IGNORE INTO users (id, name, created_at) VALUES (1, 'test', '2025-01-01T00:00:00Z')")
+            .execute(&db.pool).await.unwrap();
+        let total = crate::db::sqlite::PURGE_BATCH * 2 + 3;
+        for _ in 0..total {
+            sqlx::query("INSERT INTO cost_ledger (user_id, model, provider, cost_usd, created_at) VALUES (1, 'X', 'p', 0.01, '2026-01-01T00:00:00Z')")
+                .execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO cost_ledger (user_id, model, provider, cost_usd, created_at) VALUES (1, 'X', 'p', 0.01, '2026-03-15T00:00:00Z')")
+            .execute(&db.pool).await.unwrap();
+        let n = CostRepository::purge_ledger_older_than(&db, "2026-03-01T00:00:00Z").await.unwrap();
+        assert_eq!(n as usize, total);
+        let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cost_ledger").fetch_one(&db.pool).await.unwrap();
+        assert_eq!(left.0, 1);
+    }
+
 }
