@@ -6,6 +6,7 @@ pub mod retention;
 pub mod sqlite;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod transfer;
 
 use std::sync::Arc;
 

@@ -68,7 +68,7 @@ pub enum Commands {
     Cache(CacheArgs),
     /// Manage controlled experiments (spec §7a)
     Experiment(ExperimentArgs),
-    /// Database housekeeping
+    /// Database housekeeping, export and import
     Db(DbArgs),
 }
 
@@ -89,6 +89,22 @@ pub enum DbCommands {
     /// lock while it runs, so run it in a quiet window. A file already in
     /// incremental mode is compacted again. Postgres needs nothing here.
     Vacuum,
+    /// Write every table of the configured store to a JSON file
+    Export {
+        /// Output file. Overwritten if it exists.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Load a JSON export into the configured store inside one transaction
+    Import {
+        /// File written by `db export`.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Import into a store that already holds rows. Without it a
+        /// non-empty target is refused.
+        #[arg(long)]
+        merge: bool,
+    },
 }
 
 // ── Experiment subcommands ────────────────────────────────────────────────────

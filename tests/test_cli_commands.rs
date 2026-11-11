@@ -2350,3 +2350,58 @@ fn init_honours_modelrouter_config() {
     assert!(out.status.success(), "init failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(target.exists());
 }
+
+// ── db export / db import ────────────────────────────────────────────────────
+
+/// A second config in the same tempdir pointing at a fresh SQLite file.
+fn sibling_config(config: &std::path::Path, db_name: &str) -> PathBuf {
+    let original = std::fs::read_to_string(config).expect("read config");
+    let fresh = config.with_file_name(db_name);
+    let rewritten: Vec<String> = original
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("path") {
+                format!("path = \"{}\"", fresh.display())
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let path = config.with_file_name(format!("{db_name}.toml"));
+    std::fs::write(&path, rewritten.join("\n") + "\n").expect("write config");
+    path
+}
+
+#[test]
+fn db_export_then_import_moves_users_and_keys_to_a_fresh_store() {
+    let (dir, config) = setup_db();
+    let (ok, _out, err) = run_cli(&config, &["user", "create", "--name", "mover"]);
+    assert!(ok, "{err}");
+    let (ok, out, err) = run_cli(&config, &["key", "create", "--user", "mover", "--project", "x"]);
+    assert!(ok, "{err}");
+    let key = common::e2e::extract_key(&out).expect("printed key");
+
+    let dump = dir.path().join("store.json");
+    let (ok, out, err) = run_cli(&config, &["db", "export", "--out", dump.to_str().unwrap()]);
+    assert!(ok, "{err}");
+    assert!(out.contains("users: 1 rows"), "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&dump).unwrap()).unwrap();
+    assert_eq!(parsed["format_version"], 1);
+    assert_eq!(parsed["source_backend"], "sqlite");
+    // `user create` issues a default key and `key create` a second one.
+    assert_eq!(parsed["tables"]["api_keys"]["rows"].as_array().unwrap().len(), 2);
+
+    let target = sibling_config(&config, "target.db");
+    let (ok, out, err) = run_cli(&target, &["db", "import", "--in", dump.to_str().unwrap()]);
+    assert!(ok, "{err}");
+    assert!(out.contains("users: 1 inserted, 1 total (verified)"), "{out}");
+    let (ok, out, _) = run_cli(&target, &["user", "list"]);
+    assert!(ok && out.contains("mover"), "{out}");
+    let (ok, out, _) = run_cli(&target, &["key", "list", "--user", "mover"]);
+    assert!(ok && out.contains(&key[..8]) || ok && out.contains("x"), "{out}");
+
+    // A second import into the now-populated target is refused, and says why.
+    let (ok, _out, err) = run_cli(&target, &["db", "import", "--in", dump.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("already holds rows") && err.contains("--merge"), "{err}");
+}
