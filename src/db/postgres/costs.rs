@@ -444,8 +444,8 @@ impl CostRepository for PostgresDb {
         }
         let mut sql = "SELECT call_kind, model, \
                               COALESCE(SUM(cost_usd), 0.0), \
-                              COALESCE(SUM(tokens_in), 0), \
-                              COALESCE(SUM(tokens_out), 0), \
+                              COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                              COALESCE(SUM(tokens_out), 0)::BIGINT, \
                               COUNT(*), \
                               COALESCE(SUM(saved_usd), 0.0) \
                        FROM cost_ledger \

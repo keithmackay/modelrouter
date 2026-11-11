@@ -590,6 +590,50 @@ async fn summarize_by_model_highest_spend_first() {
     .await;
 }
 
+/// Grouped by call kind, then model. PostgreSQL returns `SUM(BIGINT)` as
+/// `NUMERIC`, so the token sums must be cast for the row to decode (#154).
+#[tokio::test]
+async fn summarize_by_kind_groups_by_kind_then_model() {
+    use modelrouter::db::models::CallKind;
+    each_backend(|db| async move {
+        let alice = user(&db, "alice").await;
+        let bob = user(&db, "bob").await;
+        put(&db, NewCostLedgerEntry { project: Some("proj".into()), ..entry(alice, "m1", 1.0) }).await;
+        put(&db, entry(bob, "m2", 4.0)).await;
+        let late = put(&db, NewCostLedgerEntry { call_kind: CallKind::Decision, ..entry(alice, "m1", 2.0) }).await;
+        put_hit(&db, NewCostLedgerEntry { call_kind: CallKind::Decision, ..entry(alice, "m1", 8.0) }).await;
+
+        let rows = db.summarize_by_kind(None, None, None, EPOCH).await.unwrap();
+        let keys: Vec<(&str, &str, i64, i64, i64)> = rows
+            .iter()
+            .map(|r| (r.call_kind.as_str(), r.model.as_str(), r.tokens_in, r.tokens_out, r.request_count))
+            .collect();
+        // Kind ascending, then highest spend first within a kind.
+        assert_eq!(
+            keys,
+            [("chat", "m2", 10, 5, 1), ("chat", "m1", 10, 5, 1), ("decision", "m1", 20, 10, 2)]
+        );
+        assert!(close(rows[0].total_cost_usd, 4.0));
+        assert!(close(rows[2].total_cost_usd, 2.0));
+        assert!(close(rows[2].uncached_cost_usd, 10.0));
+
+        let proj = db.summarize_by_kind(None, Some("proj"), None, EPOCH).await.unwrap();
+        assert_eq!(proj.len(), 1);
+        assert_eq!((proj[0].call_kind.as_str(), proj[0].model.as_str()), ("chat", "m1"));
+        let m2 = db.summarize_by_kind(None, None, Some("m2"), EPOCH).await.unwrap();
+        assert_eq!(m2.len(), 1);
+        let alice_only = db.summarize_by_kind(Some(&[alice]), None, None, EPOCH).await.unwrap();
+        assert_eq!(alice_only.len(), 2);
+        let since = db.summarize_by_kind(None, None, None, &late.created_at).await.unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].call_kind, "decision");
+
+        assert!(db.summarize_by_kind(Some(&[]), None, None, EPOCH).await.unwrap().is_empty());
+        assert!(db.summarize_by_kind(None, None, None, FUTURE).await.unwrap().is_empty());
+    })
+    .await;
+}
+
 // ── Retention ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
