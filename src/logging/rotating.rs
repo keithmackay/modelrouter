@@ -139,7 +139,15 @@ impl RotatingFile {
             n += 1;
         }
         fs::rename(&self.path, &target)?;
-        self.file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        match OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(f) => self.file = f,
+            Err(e) => {
+                // Put the file back so the path keeps naming the file being
+                // written; otherwise lines would land in the rotated copy.
+                let _ = fs::rename(&target, &self.path);
+                return Err(e);
+            }
+        }
         self.size = 0;
         self.period = period_of(self.rotation, now);
         self.prune();
@@ -417,35 +425,31 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_failed_rotation_keeps_writing_and_waits_before_retrying() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log");
         let start = Utc.with_ymd_and_hms(2026, 11, 11, 12, 0, 0).unwrap();
         let (t, clock) = manual_clock(start);
         let mut w = RotatingFile::open_with_clock(&path, LogRotation::Size, 3, 5, clock).unwrap();
         w.write_all(b"abc").unwrap();
-        // A read-only directory refuses the rename (unless running as root).
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-        let denied = fs::File::create(dir.path().join("probe")).is_err();
+        // With the active file gone from the directory the rename fails for
+        // any user, root included, while the open handle still takes writes.
+        fs::remove_file(&path).unwrap();
         w.write_all(b"def").unwrap();
-        if denied {
-            assert!(w.retry_rotation_at.is_some(), "the failure is remembered");
-            *t.lock().unwrap() = start + chrono::Duration::seconds(30);
-            w.write_all(b"ghi").unwrap();
-            assert_eq!(w.retry_rotation_at, Some(start + chrono::Duration::seconds(60)));
-        }
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(w.retry_rotation_at, Some(start + chrono::Duration::seconds(60)));
+        // Within the minute: no retry, the line is still written.
+        *t.lock().unwrap() = start + chrono::Duration::seconds(30);
+        w.write_all(b"ghi").unwrap();
+        assert_eq!(w.retry_rotation_at, Some(start + chrono::Duration::seconds(60)));
+        assert!(rotated(dir.path()).is_empty());
+        // After it, with the path back, the retry succeeds and clears the back-off.
+        fs::write(&path, b"").unwrap();
         *t.lock().unwrap() = start + chrono::Duration::seconds(61);
         w.write_all(b"jkl").unwrap();
-        assert!(w.retry_rotation_at.is_none(), "a later rotation succeeds and clears it");
+        assert!(w.retry_rotation_at.is_none());
+        assert_eq!(rotated(dir.path()).len(), 1);
         assert_eq!(fs::read(&path).unwrap(), b"jkl");
-        if denied {
-            let r = rotated(dir.path());
-            assert_eq!(fs::read(dir.path().join(&r[0])).unwrap(), b"abcdefghi", "no line lost");
-        }
     }
 
     #[test]
