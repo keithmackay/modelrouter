@@ -17,7 +17,7 @@ const LEDGER_COLUMNS: &str = "id, user_id, COALESCE(prompt_id, 0) AS prompt_id, 
                               project, tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
                               cache_hit, saved_usd, attribution_correlation_id, \
                               attribution_tags, experiment_id, experiment_variant, \
-                              tokens_estimated";
+                              tokens_estimated, call_kind";
 
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
 const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)";
@@ -36,19 +36,15 @@ impl CostRepository for PostgresDb {
 
     async fn create(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
         let now = now_utc();
-        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+        let row = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(format!(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
                                         call_kind)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-               RETURNING id, user_id, prompt_id, model, provider, project,
-                         tokens_in, tokens_out, cost_usd, created_at, api_key_id,
-                         cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags,
-                         experiment_id, experiment_variant, tokens_estimated, call_kind"#,
-        )
+               RETURNING {LEDGER_COLUMNS}"#
+        )))
         .bind(entry.user_id)
         .bind(entry.prompt_id)
         .bind(&entry.model)
@@ -73,7 +69,7 @@ impl CostRepository for PostgresDb {
     async fn create_cache_hit(&self, entry: NewCostLedgerEntry) -> anyhow::Result<CostLedgerEntry> {
         let now = now_utc();
         // cost_usd is hard-coded to 0: a cache hit is usage, never spend.
-        let row = sqlx::query_as::<_, CostLedgerEntry>(&format!(
+        let row = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(format!(
             r#"INSERT INTO cost_ledger (user_id, prompt_id, model, provider, project,
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         cache_hit, saved_usd,
@@ -81,12 +77,8 @@ impl CostRepository for PostgresDb {
                                         experiment_id, experiment_variant, tokens_estimated,
                                         call_kind)
                VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16)
-               RETURNING id, user_id, prompt_id, model, provider, project,
-                         tokens_in, tokens_out, cost_usd, created_at, api_key_id,
-                         cache_hit, saved_usd,
-                         attribution_correlation_id, attribution_tags,
-                         experiment_id, experiment_variant, tokens_estimated, call_kind"#,
-        )
+               RETURNING {LEDGER_COLUMNS}"#
+        )))
         .bind(entry.user_id)
         .bind(entry.prompt_id)
         .bind(&entry.model)
