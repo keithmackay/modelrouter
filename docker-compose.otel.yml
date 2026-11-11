@@ -51,9 +51,14 @@ services:
     volumes:
       - phoenix-data:/phoenix   # traces survive a container restart
     ports:
-      - "6006:6006"   # Phoenix UI + OTLP HTTP
+      # Loopback only: auth is off below, so the UI must not be on the network.
+      - "127.0.0.1:6006:6006"   # Phoenix UI + OTLP HTTP
     environment:
       PHOENIX_WORKING_DIR: /phoenix
+      # Phoenix requires auth whenever it binds a non-loopback address, which
+      # in a container it always does; the collector sends no credentials, so
+      # every trace was rejected as Unauthenticated.
+      PHOENIX_ENABLE_AUTH: "false"
 
   prometheus:
     image: prom/prometheus:v2.52.0

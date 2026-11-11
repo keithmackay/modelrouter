@@ -34,13 +34,58 @@ fn launchctl_uid() -> String {
     })
 }
 
+/// The values `install-service` writes into the launchd plist.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct PlistValues {
+    binary: std::path::PathBuf,
+    config: std::path::PathBuf,
+    home: std::path::PathBuf,
+    log: std::path::PathBuf,
+    path: String,
+}
+
+/// Fill the plist template. launchd expands nothing, so each value is an
+/// absolute path, XML-escaped.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn render_plist(template: &str, v: &PlistValues) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+    template
+        .replace("{{BINARY}}", &esc(&v.binary.display().to_string()))
+        .replace("{{CONFIG}}", &esc(&v.config.display().to_string()))
+        .replace("{{HOME}}", &esc(&v.home.display().to_string()))
+        .replace("{{LOG}}", &esc(&v.log.display().to_string()))
+        .replace("{{PATH}}", &esc(&v.path))
+}
+
+/// Install a launchd agent that runs this binary with `config` (the path
+/// `--config`/`MODELROUTER_CONFIG` would select) and the installing shell's
+/// PATH, logging beside the config.
 #[cfg(target_os = "macos")]
-fn install_service() -> Result<()> {
+fn install_service(config: std::path::PathBuf) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let config = std::path::absolute(&config)?;
+    if !config.exists() {
+        anyhow::bail!(
+            "no config at {}; create one with `modelrouter --config {} init` first",
+            config.display(),
+            config.display()
+        );
+    }
+    let values = PlistValues {
+        binary: std::env::current_exe()?.canonicalize()?,
+        log: config.with_file_name("modelrouter.log"),
+        config,
+        home: home.clone(),
+        path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+    };
     let agents_dir = home.join("Library").join("LaunchAgents");
     std::fs::create_dir_all(&agents_dir)?;
     let plist_path = agents_dir.join("dev.modelrouter.plist");
-    std::fs::write(&plist_path, PLIST_CONTENT)?;
+    std::fs::write(&plist_path, render_plist(PLIST_CONTENT, &values))?;
+    println!("Runs {} with {}", values.binary.display(), values.config.display());
+    println!("Logs to {}", values.log.display());
     println!("Installed plist to {}", plist_path.display());
     let path_str = plist_path.to_str()
         .ok_or_else(|| anyhow::anyhow!("Path contains non-UTF-8 characters: {}", plist_path.display()))?;
@@ -76,7 +121,7 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_service() -> Result<()> {
+fn install_service(_config: std::path::PathBuf) -> Result<()> {
     let service_path = std::path::Path::new("/etc/systemd/system/modelrouter.service");
     std::fs::write(service_path, SYSTEMD_CONTENT)?;
     println!("Installed unit file to {}", service_path.display());
@@ -116,7 +161,7 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn install_service() -> Result<()> {
+fn install_service(_config: std::path::PathBuf) -> Result<()> {
     anyhow::bail!("install-service is only supported on macOS and Linux");
 }
 
@@ -1407,7 +1452,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_audit_rows(rows, format);
         }
         Commands::InstallService => {
-            install_service()?;
+            install_service(crate::config::config_path(cli.config.clone()))?;
         }
         Commands::UninstallService => {
             uninstall_service()?;
@@ -2343,6 +2388,26 @@ mod attribution_cli_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plist_is_filled_with_absolute_escaped_values() {
+        let template = include_str!("../../contrib/dev.modelrouter.plist");
+        let plist = render_plist(
+            template,
+            &PlistValues {
+                binary: "/opt/bin/modelrouter".into(),
+                config: "/Users/a&b/.modelrouter/config.toml".into(),
+                home: "/Users/a&b".into(),
+                log: "/Users/a&b/.modelrouter/modelrouter.log".into(),
+                path: "/opt/homebrew/bin:/usr/bin".into(),
+            },
+        );
+        assert!(!plist.contains("{{"), "unfilled placeholder:\n{plist}");
+        assert!(!plist.contains("${"), "launchd does not expand variables");
+        assert!(plist.contains("<string>/opt/bin/modelrouter</string>"));
+        assert!(plist.contains("<string>/Users/a&amp;b/.modelrouter/config.toml</string>"));
+        assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
+    }
+
     #[test]
     fn config_template_parses_and_defines_no_hooks() {
         // The template is what `init` writes: an active example hook would run
