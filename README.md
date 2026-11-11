@@ -1219,10 +1219,15 @@ A rotation renames the file to `modelrouter.log.<UTC timestamp>` and opens a
 new one; the oldest rotated files beyond `max_files` are deleted then and at
 startup. Only names in that exact form are deleted, so nothing else in the
 directory is touched. The logs therefore use at most
-`(max_files + 1) × max_size_mb`, 400 MiB with the defaults. Lines go through
-a background writer, so a slow disk does not stall requests. Lines are never
-dropped: when the queue is full, logging waits for the writer. Lines are
-never split across two files, and file lines carry no terminal colour codes.
+`(max_files + 1) × max_size_mb`, 400 MiB with the defaults. A background
+thread writes the file, so ordinary disk latency does not slow requests. The
+queue in front of it holds 128,000 lines. When the queue is full, as on a
+stalled disk, logging waits for room, so lines are not dropped while the
+router runs. At shutdown the writer gets about a second to empty the queue.
+Each line goes into one file whole, and file lines carry no terminal colour
+codes. A rotated file is named for the time it was rotated. Point one router
+at each log file: two processes sharing a file rotate and prune each other's
+files.
 
 With `file` set, stdout is off unless `stdout = true`, because a captured
 stdout is the unbounded file this replaces. At startup the router creates

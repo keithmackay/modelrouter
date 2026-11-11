@@ -85,3 +85,10 @@ fn caps_are_not_checked_when_there_is_no_file() {
     let cfg = LoggingConfig { max_files: 0, max_size_mb: 0, ..Default::default() };
     cfg.validate().unwrap();
 }
+
+#[test]
+fn stdout_off_without_a_file_is_refused_because_nothing_would_be_logged() {
+    let err = load("[logging]\nstdout = false\n").unwrap_err();
+    assert!(err.to_string().contains("discard every log line"), "{err}");
+    load("[logging]\nstdout = false\nfile = \"/tmp/mr-test.log\"\n").unwrap();
+}

@@ -581,7 +581,15 @@ impl LoggingConfig {
 
     /// Refuse a `[logging]` section that cannot bound its own output.
     pub fn validate(&self) -> anyhow::Result<()> {
-        let Some(file) = &self.file else { return Ok(()) };
+        let Some(file) = &self.file else {
+            if self.stdout == Some(false) {
+                anyhow::bail!(
+                    "logging.stdout = false with no logging.file would discard every log \
+                     line. Set logging.file, or leave stdout on. Refusing to start."
+                );
+            }
+            return Ok(());
+        };
         if file.as_os_str().is_empty() || file.file_name().is_none() {
             anyhow::bail!(
                 "logging.file = {:?} names no file; give a path such as \

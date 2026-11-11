@@ -34,6 +34,9 @@ pub struct RotatingFile {
     size: u64,
     period: Option<i64>,
     clock: Clock,
+    /// After a failed rotation, no retry before this, so a broken directory
+    /// produces one stderr line a minute rather than one per log line.
+    retry_rotation_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for RotatingFile {
@@ -115,12 +118,13 @@ impl RotatingFile {
             size,
             period: period_of(rotation, written),
             clock,
+            retry_rotation_at: None,
         };
         if size > 0 && this.period != period_of(rotation, now) {
             this.rotate(now)?;
         } else {
             this.period = period_of(rotation, now);
-            this.prune()?;
+            this.prune();
         }
         Ok(this)
     }
@@ -138,27 +142,41 @@ impl RotatingFile {
         self.file = OpenOptions::new().create(true).append(true).open(&self.path)?;
         self.size = 0;
         self.period = period_of(self.rotation, now);
-        self.prune()
+        self.prune();
+        Ok(())
     }
 
-    /// Delete the oldest rotated files beyond `max_files`.
-    fn prune(&self) -> io::Result<()> {
-        let mut rotated: Vec<String> = fs::read_dir(&self.dir)?
+    /// Delete the oldest rotated files beyond `max_files`. A failure here is
+    /// reported on stderr and never stops logging: a file already gone (a
+    /// second process pruned it) is not an error at all.
+    fn prune(&self) {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("modelrouter: could not list {} to prune old logs: {e}", self.dir.display());
+                return;
+            }
+        };
+        let mut rotated: Vec<String> = entries
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|name| is_rotated_name(&self.base, name))
             .collect();
         if rotated.len() <= self.max_files {
-            return Ok(());
+            return;
         }
         // Timestamps sort by name; a `-N` suffix sorts after the bare stamp.
         rotated.sort();
         let excess = rotated.len() - self.max_files;
         for name in &rotated[..excess] {
-            fs::remove_file(self.dir.join(name))?;
+            let path = self.dir.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("modelrouter: could not delete old log {}: {e}", path.display()),
+            }
         }
-        Ok(())
     }
 }
 
@@ -167,11 +185,19 @@ impl Write for RotatingFile {
         let now = (self.clock)();
         let over_size = self.size + buf.len() as u64 > self.max_bytes;
         let new_period = self.period != period_of(self.rotation, now);
-        if self.size > 0 && (over_size || new_period) {
+        let may_retry = self.retry_rotation_at.is_none_or(|at| now >= at);
+        if self.size > 0 && (over_size || new_period) && may_retry {
             // A failed rotation must not lose the line: keep writing to the
             // current file and say why on stderr, which is still the console.
-            if let Err(e) = self.rotate(now) {
-                eprintln!("modelrouter: could not rotate {}: {e}", self.path.display());
+            match self.rotate(now) {
+                Ok(()) => self.retry_rotation_at = None,
+                Err(e) => {
+                    eprintln!(
+                        "modelrouter: could not rotate {}: {e}; retrying in a minute",
+                        self.path.display()
+                    );
+                    self.retry_rotation_at = Some(now + chrono::Duration::seconds(60));
+                }
             }
         }
         self.file.write_all(buf)?;
@@ -389,5 +415,48 @@ mod tests {
     fn a_path_without_a_file_name_is_refused() {
         let err = RotatingFile::open(Path::new("/"), LogRotation::Daily, 1, 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rotation_keeps_writing_and_waits_before_retrying() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        let start = Utc.with_ymd_and_hms(2026, 11, 11, 12, 0, 0).unwrap();
+        let (t, clock) = manual_clock(start);
+        let mut w = RotatingFile::open_with_clock(&path, LogRotation::Size, 3, 5, clock).unwrap();
+        w.write_all(b"abc").unwrap();
+        // A read-only directory refuses the rename (unless running as root).
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let denied = fs::File::create(dir.path().join("probe")).is_err();
+        w.write_all(b"def").unwrap();
+        if denied {
+            assert!(w.retry_rotation_at.is_some(), "the failure is remembered");
+            *t.lock().unwrap() = start + chrono::Duration::seconds(30);
+            w.write_all(b"ghi").unwrap();
+            assert_eq!(w.retry_rotation_at, Some(start + chrono::Duration::seconds(60)));
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        *t.lock().unwrap() = start + chrono::Duration::seconds(61);
+        w.write_all(b"jkl").unwrap();
+        assert!(w.retry_rotation_at.is_none(), "a later rotation succeeds and clears it");
+        assert_eq!(fs::read(&path).unwrap(), b"jkl");
+        if denied {
+            let r = rotated(dir.path());
+            assert_eq!(fs::read(dir.path().join(&r[0])).unwrap(), b"abcdefghi", "no line lost");
+        }
+    }
+
+    #[test]
+    fn prune_tolerates_a_file_that_is_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = RotatingFile::open(&dir.path().join("app.log"), LogRotation::Size, 1 << 20, 1).unwrap();
+        for s in ["20260101T000000.000000Z", "20260102T000000.000000Z"] {
+            fs::write(dir.path().join(format!("app.log.{s}")), b"old").unwrap();
+        }
+        w.prune();
+        assert_eq!(rotated(dir.path()), vec!["app.log.20260102T000000.000000Z"]);
+        w.prune();
     }
 }
