@@ -15,10 +15,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::{extract::State, Extension, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 
 use crate::api::app::AppState;
+use crate::api::readiness::Readiness;
 use crate::api::routes::search::{infer_search_engine, InferredSearchEngine};
 use crate::providers::adapter::NormalizedRequest;
 use crate::providers::embedding::EmbeddingRequest;
@@ -39,6 +40,30 @@ pub async fn health_check(
         body["extensions"] = extensions.health();
     }
     Json(body)
+}
+
+/// GET /health/live — the process is up. No I/O, so a slow store or provider
+/// never makes the platform restart a replica that is merely not ready.
+pub async fn health_live() -> Json<Value> {
+    Json(json!({"status": "ok"}))
+}
+
+/// GET /health/ready — 200 only when this replica can serve a request: store
+/// reachable, schema at head, every chat provider adapter built, not
+/// draining. 503 otherwise, with each failing part named in the body.
+pub async fn health_ready(
+    State(state): State<AppState>,
+    Extension(readiness): Extension<Readiness>,
+) -> (StatusCode, Json<Value>) {
+    let failing = readiness.failing(&*state.db).await;
+    if failing.is_empty() {
+        (StatusCode::OK, Json(json!({"status": "ready"})))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "failing": failing})),
+        )
+    }
 }
 
 /// The `cache` block shared by /health and /health/deep. `None` when caching

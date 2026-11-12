@@ -331,6 +331,8 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 }
             };
 
+            let readiness = crate::api::readiness::Readiness::new();
+
             // Init DB: Postgres when database.postgres_url is set, else SQLite.
             let main_db = crate::db::open(&settings.database).await?;
             tracing::info!(
@@ -339,6 +341,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             );
             let pool = Some(main_db.reports.clone());
             let db = main_db.db.clone();
+            readiness.mark_migrated();
 
             // Sync hook permissions from config into DB
             crate::hooks::permissions::sync_hook_permissions(&db, &settings.hooks).await?;
@@ -464,6 +467,17 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 )
                 .with_subscription(settings.subscription.clone()),
             );
+            // Build every chat adapter now so a bad provider section keeps
+            // this replica out of the Service instead of failing its first
+            // request. The process still starts: an operator can read the
+            // reason from /health/ready, and older replicas keep serving.
+            let warm = provider_registry.warm_all();
+            for (provider, result) in &warm {
+                if let Err(error) = result {
+                    tracing::warn!(provider, %error, "provider adapter failed to build; /health/ready reports it");
+                }
+            }
+            readiness.record_provider_results(warm);
             let fallback = Arc::new(crate::router::fallback::FallbackChain::new(
                 settings.routing.fallback_chains.clone(),
             ));
@@ -726,7 +740,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 let names: Vec<&str> = extensions.iter().map(|e| e.name()).collect();
                 tracing::info!(extensions = ?names, "request extensions loaded");
             }
-            let app = crate::api::app::build_router_with_extensions(state, extensions);
+            let app = crate::api::app::build_router_with_extensions_and_readiness(state, extensions, readiness);
 
             // Flag > config > built-in default. The config defaults already
             // supply 127.0.0.1:8080 when the section is absent.

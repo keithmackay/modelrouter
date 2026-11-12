@@ -15,6 +15,7 @@ use crate::{
         hooks::HookRepository,
         maintenance::MaintenanceRepository,
         groups::GroupRepository,
+        health::HealthRepository,
         webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
         users::UserRepository,
@@ -45,6 +46,7 @@ pub trait DatabaseProvider:
     + McpServerRepository
     + ModelRepository
     + GroupRepository
+    + HealthRepository
     + WebhookCallbackRepository
     + Send
     + Sync
@@ -73,6 +75,7 @@ impl<T> DatabaseProvider for T where
         + McpServerRepository
         + ModelRepository
         + GroupRepository
+        + HealthRepository
         + WebhookCallbackRepository
         + Send
         + Sync
@@ -119,6 +122,9 @@ pub struct AppState {
     pub experiments: Arc<crate::router::experiments::ExperimentRegistry>,
 }
 
+/// Build the router for a process whose startup steps already ran, so
+/// `/health/ready` depends only on the store. `serve` uses
+/// [`build_router_with_readiness`] to report its own startup.
 pub fn build_router(state: AppState) -> axum::Router {
     build_router_with_extensions(state, crate::extensions::Extensions::default())
 }
@@ -135,6 +141,25 @@ pub fn build_router_with_extensions(state: AppState, extensions: crate::extensio
     build_router_with_decision_registry(state, extensions, decisions)
 }
 
+/// [`build_router`], with a readiness handle the serve path marks as startup
+/// completes (`/health/ready` answers from it); tests pin one directly.
+pub fn build_router_with_readiness(state: AppState, readiness: crate::api::readiness::Readiness) -> axum::Router {
+    build_router_with_extensions_and_readiness(state, crate::extensions::Extensions::default(), readiness)
+}
+
+/// [`build_router_with_extensions`] with a caller-supplied readiness handle.
+pub fn build_router_with_extensions_and_readiness(
+    state: AppState,
+    extensions: crate::extensions::Extensions,
+    readiness: crate::api::readiness::Readiness,
+) -> axum::Router {
+    let decisions = Arc::new(crate::providers::decision_registry::DecisionRegistry::new(
+        state.settings.providers.clone(),
+    ));
+    let reranks = Arc::new(crate::providers::rerank_registry::RerankRegistry::new(state.settings.providers.clone()));
+    build_router_with_registries(state, extensions, decisions, reranks, readiness)
+}
+
 /// [`build_router_with_extensions`] with a caller-supplied decision registry
 /// (tests pin a fake-upstream adapter; production builds it from config).
 pub fn build_router_with_decision_registry(
@@ -143,7 +168,7 @@ pub fn build_router_with_decision_registry(
     decision_registry: Arc<crate::providers::decision_registry::DecisionRegistry>,
 ) -> axum::Router {
     let reranks = Arc::new(crate::providers::rerank_registry::RerankRegistry::new(state.settings.providers.clone()));
-    build_router_with_registries(state, extensions, decision_registry, reranks)
+    build_router_with_registries(state, extensions, decision_registry, reranks, crate::api::readiness::Readiness::started())
 }
 
 /// [`build_router_with_decision_registry`] with the rerank registry supplied
@@ -155,13 +180,14 @@ pub fn build_router_with_registries(
     extensions: crate::extensions::Extensions,
     decision_registry: Arc<crate::providers::decision_registry::DecisionRegistry>,
     rerank_registry: Arc<crate::providers::rerank_registry::RerankRegistry>,
+    readiness: crate::api::readiness::Readiness,
 ) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         audio::{speech, transcriptions},
         completions::chat_completions, decisions::decisions as decisions_handler, embeddings::embeddings,
         rerank::rerank as rerank_handler,
-        health::{deep_health, health_check, DeepHealthCache},
+        health::{deep_health, health_check, health_live, health_ready, DeepHealthCache},
         images::image_generations, messages::anthropic_messages, models::list_models,
         prometheus::metrics_handler, responses::responses_handler, search::search, systemone::systemone,
         mcp::{list_mcp_servers, create_mcp_server, get_mcp_server, update_mcp_server, delete_mcp_server, discover_mcp_tools},
@@ -230,6 +256,8 @@ pub fn build_router_with_registries(
         // Health + API routes
         .route("/health", get(health_check))
         .route("/health/deep", get(deep_health))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -438,6 +466,7 @@ pub fn build_router_with_registries(
         // route-local state, and an Extension keeps every AppState literal
         // (tests included) unchanged.
         .layer(axum::Extension(DeepHealthCache::default()))
+        .layer(axum::Extension(readiness))
         // axum's built-in limit is 2 MB; `[server] request_body_limit_mb`
         // documents 10 and was never applied (#55).
         .layer(axum::extract::DefaultBodyLimit::max(

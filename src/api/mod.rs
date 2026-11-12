@@ -6,4 +6,5 @@ pub mod error;
 pub mod failure_log;
 pub mod middleware;
 pub mod request_lifecycle;
+pub mod readiness;
 pub mod routes;

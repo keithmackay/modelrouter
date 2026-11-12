@@ -148,7 +148,7 @@ async fn test_app(endpoint: &str, rerank_deployments: Vec<String>, rerank_url: O
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: Arc::new(LiveExperiments::default()),
     };
-    let app = build_router_with_registries(state, Extensions::default(), decisions, reranks);
+    let app = build_router_with_registries(state, Extensions::default(), decisions, reranks, modelrouter::api::readiness::Readiness::started());
     TestApp { server: TestServer::new(app).unwrap(), db }
 }
 

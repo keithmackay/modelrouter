@@ -3,6 +3,7 @@
 mod aliases;
 mod learned_capabilities;
 mod groups;
+mod health;
 mod users;
 mod admin_users;
 mod sessions;
