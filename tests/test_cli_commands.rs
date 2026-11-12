@@ -2491,3 +2491,27 @@ fn version_works_with_no_config_at_all() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
 }
+
+/// A PostgreSQL URL in a build without the `postgres` feature fails the
+/// check with the message `serve` gives, instead of reporting on the SQLite
+/// file the server would never open.
+#[cfg(not(feature = "postgres"))]
+#[test]
+fn check_config_with_a_postgres_url_in_a_sqlite_build_fails_like_serve() {
+    let (_dir, config) = setup_db();
+    let content = std::fs::read_to_string(&config).expect("read config");
+    assert!(content.contains("[database]\n"), "{content}");
+    let content = content.replacen(
+        "[database]\n",
+        "[database]\npostgres_url = \"postgres://u:p@localhost/never\"\n",
+        1,
+    );
+    let path = config.with_file_name("pg.toml");
+    std::fs::write(&path, content).expect("write config");
+
+    let (ok, out, _err) = run_cli(&path, &["serve", "--check-config"]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("database: FAIL"), "{out}");
+    assert!(out.contains("--features postgres"), "{out}");
+    assert!(!out.contains("migrations applied"), "must not report on SQLite: {out}");
+}

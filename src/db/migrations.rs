@@ -124,15 +124,38 @@ pub async fn migration_status(pool: &sqlx::SqlitePool) -> anyhow::Result<Migrati
     } else {
         Vec::new()
     };
-    let pending = sqlx::migrate!("./migrations")
+    Ok(status_against(&sqlx::migrate!("./migrations"), &applied))
+}
+
+/// [`migration_status`] for a PostgreSQL store, against the embedded
+/// `migrations/postgres/` set. Applies nothing.
+#[cfg(feature = "postgres")]
+pub async fn postgres_migration_status(pool: &sqlx::PgPool) -> anyhow::Result<MigrationStatus> {
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
+            .fetch_one(pool)
+            .await?;
+    let applied: Vec<i64> = if table.is_some() {
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+            .fetch_all(pool)
+            .await?
+    } else {
+        Vec::new()
+    };
+    Ok(status_against(&sqlx::migrate!("./migrations/postgres"), &applied))
+}
+
+/// The embedded versions `applied` does not contain, ascending.
+fn status_against(migrator: &sqlx::migrate::Migrator, applied: &[i64]) -> MigrationStatus {
+    let pending = migrator
         .iter()
         .filter(|m| !applied.contains(&m.version))
         .map(|m| m.version)
         .collect();
-    Ok(MigrationStatus {
+    MigrationStatus {
         applied: applied.len(),
         pending,
-    })
+    }
 }
 
 pub async fn run_dev_seed(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
