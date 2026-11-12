@@ -6,6 +6,13 @@ metadata:
     {{- include "modelrouter.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # A new pod must be Ready before an old one stops, so a build that cannot
+  # start never takes traffic away from one that can.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.rollout.maxSurge }}
+      maxUnavailable: {{ .Values.rollout.maxUnavailable }}
   selector:
     matchLabels:
       {{- include "modelrouter.selectorLabels" . | nindent 6 }}
@@ -29,6 +36,17 @@ spec:
       {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpread.topologyKeys }}
+        - maxSkew: {{ $.Values.topologySpread.maxSkew }}
+          topologyKey: {{ . }}
+          whenUnsatisfiable: {{ $.Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "modelrouter.selectorLabels" $ | nindent 14 }}
+        {{- end }}
       {{- end }}
       initContainers:
         - name: migrate
