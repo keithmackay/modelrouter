@@ -371,6 +371,47 @@ pub struct Settings {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub gateway: GatewayConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+}
+
+/// How many replicas share the configured limits.
+///
+/// Per-user concurrency, per-session rate buckets and per-IP rate limits are
+/// counted in process memory, so with N replicas each limit is effectively N
+/// times looser. Until those counters move to a shared store, each replica
+/// enforces its share of the configured value.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClusterConfig {
+    /// Replicas serving behind one address. 1 (the default) leaves every
+    /// limit as configured.
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
+}
+
+fn default_replicas() -> u32 {
+    1
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            replicas: default_replicas(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// One replica's share of a limit: `ceil(limit / replicas)`, never below
+    /// 1 for a non-zero limit so a small limit across many replicas cannot
+    /// become 0, which the limiters read as "disabled" or "deny all".
+    pub fn share(&self, limit: u32) -> u32 {
+        if limit == 0 {
+            return 0;
+        }
+        let replicas = self.replicas.max(1);
+        limit.div_ceil(replicas).max(1)
+    }
 }
 
 /// `[gateway]` — API (gateway) key management.
@@ -2367,4 +2408,39 @@ mod shutdown_grace_tests {
         assert_eq!(s.server.shutdown_grace_secs, Some(7));
         assert_eq!(s.shutdown_grace_secs(), 7);
 }
+}
+
+#[cfg(test)]
+mod cluster_tests {
+    use super::*;
+
+    #[test]
+    fn replicas_default_to_one_and_leave_limits_alone() {
+        let c = ClusterConfig::default();
+        assert_eq!(c.replicas, 1);
+        assert_eq!(c.share(7), 7);
+        assert_eq!(c.share(0), 0);
+    }
+
+    #[test]
+    fn share_rounds_up_and_never_reaches_zero_for_a_set_limit() {
+        let c = ClusterConfig { replicas: 3 };
+        assert_eq!(c.share(9), 3);
+        assert_eq!(c.share(10), 4);
+        assert_eq!(c.share(1), 1);
+        assert_eq!(c.share(0), 0, "0 means disabled and stays disabled");
+    }
+
+    #[test]
+    fn zero_replicas_is_treated_as_one() {
+        assert_eq!(ClusterConfig { replicas: 0 }.share(5), 5);
+    }
+
+    #[test]
+    fn cluster_section_parses() {
+        let s: Settings = toml::from_str("[cluster]\nreplicas = 4\n").unwrap();
+        assert_eq!(s.cluster.replicas, 4);
+        let s: Settings = toml::from_str("").unwrap();
+        assert_eq!(s.cluster.replicas, 1);
+    }
 }
