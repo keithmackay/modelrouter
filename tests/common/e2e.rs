@@ -62,6 +62,8 @@ pub struct RouterOptions {
     pub extra_toml: String,
     /// `[database] postgres_url`. `None` leaves the line out so SQLite applies.
     pub postgres_url: Option<String>,
+    /// `[server] shutdown_grace_secs`. `None` leaves the line out.
+    pub shutdown_grace_secs: Option<u64>,
 }
 
 impl RouterOptions {
@@ -73,7 +75,13 @@ impl RouterOptions {
             request_body_limit_mb: None,
             extra_toml: String::new(),
             postgres_url: None,
+            shutdown_grace_secs: None,
         }
+    }
+
+    pub fn with_shutdown_grace_secs(mut self, secs: u64) -> Self {
+        self.shutdown_grace_secs = Some(secs);
+        self
     }
 
     pub fn with_extra_toml(mut self, toml: impl Into<String>) -> Self {
@@ -118,12 +126,16 @@ pub fn render_config(dir: &Path, port: u16, opts: &RouterOptions) -> String {
         .as_deref()
         .map(|u| format!("postgres_url = \"{u}\"\n"))
         .unwrap_or_default();
+    let grace = opts
+        .shutdown_grace_secs
+        .map(|s| format!("shutdown_grace_secs = {s}\n"))
+        .unwrap_or_default();
     format!(
         r#"
 [server]
 host = "127.0.0.1"
 port = {port}
-{body_limit}
+{body_limit}{grace}
 [database]
 path = "{db}"
 {postgres_url}
@@ -153,6 +165,7 @@ store_prompts = true
         body_limit = body_limit,
         extra = opts.extra_toml,
         postgres_url = postgres_url,
+        grace = grace,
     )
 }
 
@@ -288,6 +301,11 @@ impl RouterProcess {
     }
 
     /// Process ID. Used by tests that send signals directly (e.g. SIGTERM).
+    /// Exit status if the child has exited, without blocking.
+    pub fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("try_wait")
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -343,6 +361,9 @@ impl Drop for RouterProcess {
         #[cfg(unix)]
         {
             use std::process::Command;
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
             let pid = self.child.id();
             let _ = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
