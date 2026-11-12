@@ -93,7 +93,7 @@ topologySpread:
 modelrouter serve --check-config
 ```
 
-Loads the config, checks the signing secret and OIDC role, opens the database and counts pending migrations without applying them, and builds every provider adapter without calling a provider. Exit 0 or a named failure. Run it as a pre-deploy job against the new image, or as a CI step against a candidate config.
+Loads the config, checks the signing secret and OIDC role, opens the PostgreSQL store named by `database.postgres_url` and counts pending migrations without applying them (a binary built without `--features postgres` fails here, as `serve` would), and builds every provider adapter without calling a provider. Exit 0 or a named failure. Run it as a pre-deploy job against the new image, or as a CI step against a candidate config.
 
 ## Checklist for the first replicated rollout
 

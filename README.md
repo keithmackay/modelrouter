@@ -392,7 +392,7 @@ curl http://localhost:8080/health   # → {"status":"ok"}
 modelrouter serve --check-config
 ```
 
-Runs the startup checks and exits without binding a port: config parses, every configured provider's feature is compiled in, the signing secret is set, the OIDC role is valid, the database opens (applied and pending migrations are counted, none are applied), the prompt-log database opens when configured, and every chat provider adapter builds. No provider is called. Each line prints `ok` or `FAIL` with the cause; the exit code is 1 if anything failed. Use it as a pre-start job for a new image, or in CI against a candidate config. `modelrouter --version` works with no config at all.
+Runs the startup checks and exits without binding a port: config parses, every configured provider's feature is compiled in, the signing secret is set, the OIDC role is valid, the database `serve` would use opens (PostgreSQL when `database.postgres_url` is set, else the SQLite file; applied and pending migrations are counted, none are applied), the prompt-log database opens when configured, and every chat provider adapter builds. No provider is called. Each line prints `ok` or `FAIL` with the cause; the exit code is 1 if anything failed. Use it as a pre-start job for a new image, or in CI against a candidate config. `modelrouter --version` works with no config at all.
 
 ### 3. Create the first superadmin
 
