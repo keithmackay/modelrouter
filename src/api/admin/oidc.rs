@@ -10,8 +10,14 @@ struct PendingOidcState {
     created_at: Instant,
 }
 
+/// Pending logins: the PKCE verifier for each outstanding `state`. In memory
+/// a login must finish on the replica that started it; with a cluster Redis
+/// link any replica can finish it. The Redis path has no local fallback: a
+/// verifier that only one replica knows is exactly the failure this exists to
+/// remove, so an unreachable Redis fails the login instead.
 pub struct OidcStateStore {
     map: DashMap<String, PendingOidcState>,
+    redis: Option<std::sync::Arc<crate::cluster::RedisLink>>,
 }
 
 impl Default for OidcStateStore {
@@ -20,24 +26,59 @@ impl Default for OidcStateStore {
     }
 }
 
+const PENDING_LOGIN_SECS: u64 = 300;
+
 impl OidcStateStore {
     pub fn new() -> Self {
-        Self { map: DashMap::new() }
+        Self {
+            map: DashMap::new(),
+            redis: None,
+        }
     }
 
-    pub fn insert(&self, state: String, code_verifier: String) {
+    pub fn with_redis(mut self, link: Option<std::sync::Arc<crate::cluster::RedisLink>>) -> Self {
+        self.redis = link;
+        self
+    }
+
+    pub async fn insert(&self, state: String, code_verifier: String) -> anyhow::Result<()> {
+        if let Some(link) = &self.redis {
+            let stored: Option<Option<String>> = link
+                .run(
+                    "oidc state set",
+                    redis::cmd("SET")
+                        .arg(link.key(&format!("oidc:{state}")))
+                        .arg(&code_verifier)
+                        .arg("NX")
+                        .arg("EX")
+                        .arg(PENDING_LOGIN_SECS),
+                )
+                .await;
+            return match stored {
+                Some(Some(_)) => Ok(()),
+                Some(None) => anyhow::bail!("login state collided with a pending login"),
+                None => anyhow::bail!("the shared login store is unreachable; try again shortly"),
+            };
+        }
         self.cleanup_expired();
         self.map.insert(state, PendingOidcState {
             code_verifier,
             created_at: Instant::now(),
         });
+        Ok(())
     }
 
     /// Consume the state entry, returning the code_verifier if it exists and hasn't expired.
-    pub fn take(&self, state: &str) -> Option<String> {
+    pub async fn take(&self, state: &str) -> Option<String> {
+        if let Some(link) = &self.redis {
+            let taken: Option<Option<String>> = link
+                .run("oidc state take", redis::cmd("GETDEL").arg(link.key(&format!("oidc:{state}"))))
+                .await;
+            return taken.flatten();
+        }
         // Check expiry before consuming the entry
         let expired = self.map.get(state)
-            .map(|e| e.created_at.elapsed() > Duration::from_secs(300))
+            .map(|e| e.created_at.elapsed() > Duration::from_secs(PENDING_LOGIN_SECS))
             .unwrap_or(false);
         if expired {
             self.map.remove(state);
@@ -47,7 +88,7 @@ impl OidcStateStore {
     }
 
     fn cleanup_expired(&self) {
-        self.map.retain(|_, v| v.created_at.elapsed() <= Duration::from_secs(300));
+        self.map.retain(|_, v| v.created_at.elapsed() <= Duration::from_secs(PENDING_LOGIN_SECS));
     }
 }
 
@@ -239,7 +280,10 @@ pub async fn oidc_login(State(state): State<AppState>) -> Response {
 
     let (verifier, challenge) = generate_pkce_pair();
     let state_token = generate_state();
-    state.oidc_state.insert(state_token.clone(), verifier);
+    if let Err(e) = state.oidc_state.insert(state_token.clone(), verifier).await {
+        tracing::warn!(error = %e, "could not record pending login");
+        return (StatusCode::SERVICE_UNAVAILABLE, "login store unavailable; try again shortly").into_response();
+    }
 
     let auth_url = {
         let mut url = match reqwest::Url::parse(&discovery.authorization_endpoint) {
@@ -281,7 +325,7 @@ pub async fn oidc_callback(
     }
 
     // Verify state and retrieve code_verifier
-    let code_verifier = match state.oidc_state.take(&params.state) {
+    let code_verifier = match state.oidc_state.take(&params.state).await {
         Some(v) => v,
         None => return (StatusCode::BAD_REQUEST, "Invalid or expired state").into_response(),
     };

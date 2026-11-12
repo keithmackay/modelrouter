@@ -133,7 +133,7 @@ async fn systemone_inner(
         .map_err(|_| ApiError::Internal)?
     {
         PolicyDecision::Allow { max_concurrent } => match max_concurrent {
-            Some(max) => match state.concurrency.try_acquire(user.id, max) {
+            Some(max) => match state.concurrency.try_acquire(user.id, max).await {
                 Some(permit) => Some(permit),
                 None => {
                     return Err(ApiError::PolicyDenied {

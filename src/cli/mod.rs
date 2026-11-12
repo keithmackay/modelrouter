@@ -446,6 +446,16 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 });
             }
 
+            // Shared store for the cross-replica counters and pins, when
+            // configured. One link per process; every limiter clones it.
+            let cluster_link = match settings.cluster.redis_target(&settings.cache)? {
+                Some((url, namespace)) => {
+                    tracing::info!(namespace, "cross-replica limits, pins and pending logins in redis");
+                    Some(crate::cluster::RedisLink::open(&url, &namespace)?)
+                }
+                None => None,
+            };
+
             // Build app components
             if settings.cluster.replicas > 1 {
                 tracing::info!(
@@ -525,7 +535,9 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                     .with_settings(live_settings.clone()),
             );
 
-            let oidc_state = Arc::new(crate::api::admin::oidc::OidcStateStore::new());
+            let oidc_state = Arc::new(
+                crate::api::admin::oidc::OidcStateStore::new().with_redis(cluster_link.clone()),
+            );
 
             // Load DB webhooks before moving `db` into AppState
             let db_webhooks: Vec<crate::db::repositories::webhook_callbacks::WebhookCallback> =
@@ -559,18 +571,28 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 embedding_registry,
                 search_registry,
                 load_balancer,
-                concurrency: Arc::new(crate::router::concurrency::ConcurrencyLimiter::for_cluster(
-                    settings.cluster.clone(),
-                )),
+                concurrency: Arc::new(
+                    crate::router::concurrency::ConcurrencyLimiter::for_cluster(settings.cluster.clone())
+                        .with_redis(cluster_link.clone()),
+                ),
                 circuit_breaker: Arc::new(crate::router::circuit_breaker::CircuitBreaker::default()),
-                ip_rate_limiter: Arc::new(crate::api::middleware::ip_rate_limit::IpRateLimiter::new(
-                    settings.cluster.share(settings.server.ip_rate_limit_rpm),
-                )),
-                session_limiter: Arc::new(crate::router::session_limits::SessionLimiter::new(
-                    settings.cluster.share(settings.session_limits.tpm),
-                    settings.cluster.share(settings.session_limits.rpm),
-                )),
-                session_affinity: Arc::new(crate::router::session_affinity::SessionAffinityMap::new(30 * 60)),
+                ip_rate_limiter: Arc::new(
+                    crate::api::middleware::ip_rate_limit::IpRateLimiter::new(settings.server.ip_rate_limit_rpm)
+                        .for_cluster(settings.cluster.clone())
+                        .with_redis(cluster_link.clone()),
+                ),
+                session_limiter: Arc::new(
+                    crate::router::session_limits::SessionLimiter::new(
+                        settings.session_limits.tpm,
+                        settings.session_limits.rpm,
+                    )
+                    .for_cluster(settings.cluster.clone())
+                    .with_redis(cluster_link.clone()),
+                ),
+                session_affinity: Arc::new(
+                    crate::router::session_affinity::SessionAffinityMap::new(30 * 60)
+                        .with_redis(cluster_link.clone()),
+                ),
                 callbacks: {
                     let mut backends: Vec<Box<dyn crate::callbacks::CallbackBackend>> = vec![];
                     if let Some(cfg) = settings.callbacks.langfuse.clone() {

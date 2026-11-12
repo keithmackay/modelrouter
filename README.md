@@ -359,7 +359,21 @@ Export writes every table and column the live schema has, so it needs no update 
 
 ### Running more than one replica: `[cluster] replicas`
 
-Per-user concurrency, per-session rate buckets and per-IP rate limits are counted in each process. With several replicas behind one address, set `[cluster] replicas` to the replica count and each process enforces `ceil(limit / replicas)` of every such limit, never below 1 for a limit that is set; 0 still means disabled. Per-budget-rule `rate_rpm` is counted in the database and needs no division. The Helm chart sets this from `replicaCount`. If the replica count varies under autoscaling, set it to the usual count; the shared-counter backend for the same limits is tracked separately.
+Per-user concurrency, per-session rate buckets and per-IP rate limits are counted in each process. With several replicas behind one address, set `[cluster] replicas` to the replica count and each process enforces `ceil(limit / replicas)` of every such limit, never below 1 for a limit that is set; 0 still means disabled. Per-budget-rule `rate_rpm` is counted in the database and needs no division. The Helm chart sets this from `replicaCount`.
+
+For exact limits under autoscaling, and for session pins and admin logins that survive a hop between replicas, set `[cluster] backend = "redis"`:
+
+```toml
+[cluster]
+replicas = 3
+backend = "redis"
+# redis_url and namespace default to the [cache] values
+# redis_url = "redis://redis:6379"
+# namespace = "modelrouter:cluster"
+# lease_secs = 60
+```
+
+Then every replica enforces the full configured limit against one shared counter per limit: per-user concurrency is a set of leased permits (each refreshed while held and expiring after `lease_secs` if the replica holding it dies), session buckets and IP counters are checked and reserved atomically, session affinity pins carry a sliding TTL, and a pending OIDC login started on one replica can finish on any other. If Redis becomes unreachable, the limiters fall back to this replica's share of the limit and pins to the local map, so an outage loosens limits to the `replicas`-divided level rather than failing requests; an admin login that cannot be recorded fails with a clear message. Every Redis call is bounded by a 250 ms timeout, so a slow Redis degrades the same way as a dead one. Pending logins use `GETDEL`, so the Redis server must be 6.2 or newer. The response cache is a separate setting (`[cache] backend`) and may use the same Redis.
 
 ### 2. Run migrations and start the server
 

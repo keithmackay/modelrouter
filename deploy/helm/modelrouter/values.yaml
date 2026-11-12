@@ -85,6 +85,14 @@ probes:
 # longest tier timeout, 6 hours).
 terminationGracePeriodSeconds: 21630
 
+# Cross-replica state. "memory" divides the in-memory limits by replicaCount;
+# "redis" shares them (and session pins and pending admin logins) through
+# one Redis. redisUrl may be left empty when the response cache already
+# names one under [cache] in `config`.
+cluster:
+  backend: memory
+  redisUrl: ""
+
 # Node selector, tolerations, affinity
 nodeSelector: {}
 tolerations: []
