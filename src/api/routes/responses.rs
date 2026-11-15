@@ -273,7 +273,8 @@ fn record_responses_cost(
     attr_correlation: Option<String>,
     attr_tags: String,
 ) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     tokio::spawn(async move {
         let messages_json = serde_json::to_string(&messages).unwrap_or_default();
@@ -334,7 +335,7 @@ fn record_responses_cost(
                 cache_read_tokens: cache_read_tokens as i64,
                 cache_write_tokens: cache_write_tokens as i64,
             };
-            let _ = CostRepository::create(&*state.db, ledger).await;
+            let _ = record_usage(&*state.db, &state.callbacks, ledger).await;
         }
     });
 }

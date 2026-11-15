@@ -251,7 +251,8 @@ fn record_usage(
     cost: f64,
     latency_ms: i64,
 ) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     let state = state.clone();
     let pseudo_model = pseudo_model.to_string();
@@ -316,7 +317,7 @@ fn record_usage(
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         };
-        if let Err(e) = CostRepository::create(&*state.db, ledger).await {
+        if let Err(e) = record_usage(&*state.db, &state.callbacks, ledger).await {
             tracing::error!("Failed to record System One cost: {}", e);
         }
     });

@@ -134,6 +134,21 @@ async fn test_app_full_with_config(
     Arc<LiveExperiments>,
     Arc<arc_swap::ArcSwap<modelrouter::config::schema::StorageConfig>>,
 ) {
+    let callbacks = Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![]));
+    test_app_full_with_callbacks(config, strict_model_resolution, callbacks).await
+}
+
+/// `test_app_full_with_config` delivering callback events to `callbacks`.
+async fn test_app_full_with_callbacks(
+    config: ProviderConfig,
+    strict_model_resolution: bool,
+    callbacks: Arc<modelrouter::callbacks::CallbackDispatcher>,
+) -> (
+    TestServer,
+    Arc<dyn DatabaseProvider>,
+    Arc<LiveExperiments>,
+    Arc<arc_swap::ArcSwap<modelrouter::config::schema::StorageConfig>>,
+) {
     let db = common::in_memory_db().await;
     common::create_user(&db, "test-user", "test-token").await;
 
@@ -181,7 +196,7 @@ async fn test_app_full_with_config(
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
         prompt_db: db.clone(),
         app_metrics: None,
-        callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        callbacks,
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: Arc::new(LiveExperiments::default()),
@@ -283,6 +298,24 @@ async fn a_decision_passes_through_the_body_and_the_answers_and_prices_the_call(
     assert_eq!(meta["tokens"]["completion"], 3);
     assert_eq!(meta["timing"]["attempts"], 1);
     assert_eq!(meta["settings"]["questions"], 1);
+}
+
+#[tokio::test]
+async fn a_decision_emits_one_usage_event_for_its_ledger_row() {
+    let (base, _capture) = spawn_upstream(StatusCode::OK, answer_payload()).await;
+    let usage = common::RecordedUsage::default();
+    let (server, db, _, _) =
+        test_app_full_with_callbacks(foundry_config(&base, vec![]), true, usage.dispatcher()).await;
+    let (name, value) = bearer();
+    let resp = server.post("/v1/decisions").add_header(name, value).json(&request_body()).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    let events = usage.wait_for(1).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "usage");
+    assert_eq!(events[0]["ledger_id"], ledger[0].id);
+    assert_eq!(events[0]["model"], DEPLOYMENT);
 }
 
 #[tokio::test]

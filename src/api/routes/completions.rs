@@ -1154,7 +1154,8 @@ struct CompletionLogCtx {
 /// (when `write_prompt`), the cost-ledger row, callback egress (unless
 /// `skip_log`) and `on_response_sent` lifecycle hooks.
 fn spawn_completion_logging(ctx: CompletionLogCtx) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     tokio::spawn(async move {
         let ledger_row = |prompt_id: Option<i64>| NewCostLedgerEntry {
@@ -1207,7 +1208,7 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
             match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
                 Ok(saved_prompt) => {
                     if let Err(e) =
-                        CostRepository::create(&*ctx.state.db, ledger_row(Some(saved_prompt.id))).await
+                        record_usage(&*ctx.state.db, &ctx.state.callbacks, ledger_row(Some(saved_prompt.id))).await
                     {
                         tracing::error!("Failed to record cost: {}", e);
                     }
@@ -1239,7 +1240,7 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
             }
         } else {
             // Skip logging but still record cost for budget enforcement
-            if let Err(e) = CostRepository::create(&*ctx.state.db, ledger_row(None)).await {
+            if let Err(e) = record_usage(&*ctx.state.db, &ctx.state.callbacks, ledger_row(None)).await {
                 tracing::error!("Failed to record cost: {}", e);
             }
         }
@@ -1359,7 +1360,8 @@ pub(crate) fn record_cache_hit(
     ctx: CacheHitCtx,
     result: &crate::providers::adapter::CompletionResult,
 ) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_cache_hit_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     #[cfg(feature = "otel")]
     {
@@ -1439,7 +1441,7 @@ pub(crate) fn record_cache_hit(
         };
 
         let ledger = NewCostLedgerEntry { prompt_id, ..ledger };
-        if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {
+        if let Err(e) = record_cache_hit_usage(&*state.db, &state.callbacks, ledger).await {
             tracing::error!("Failed to record cache-hit usage: {}", e);
         }
     });
@@ -1811,7 +1813,8 @@ impl Drop for StreamLogger {
 /// Persist one streamed response: prompt row (unless logging is skipped),
 /// ledger row, lifecycle hooks. Mirrors the non-streaming write.
 async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     let attr_correlation = ctx.attribution.correlation_id.clone();
     let attr_tags = ctx.attribution.tags_json();
@@ -1876,7 +1879,7 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
     };
 
     let ledger = NewCostLedgerEntry { prompt_id, ..ledger };
-    if let Err(e) = CostRepository::create(&*ctx.state.db, ledger).await {
+    if let Err(e) = record_usage(&*ctx.state.db, &ctx.state.callbacks, ledger).await {
         tracing::error!("Failed to log streaming cost: {}", e);
     }
 

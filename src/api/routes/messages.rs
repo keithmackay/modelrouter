@@ -30,7 +30,8 @@ async fn log_messages_cost(
     latency_ms: i64,
     attribution: crate::api::attribution::Attribution,
 ) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     let prompt = NewPrompt {
         user_id,
@@ -87,7 +88,7 @@ async fn log_messages_cost(
         cache_read_tokens: cache_read_tokens as i64,
         cache_write_tokens: cache_write_tokens as i64,
     };
-    if let Err(e) = CostRepository::create(&*state.db, ledger).await {
+    if let Err(e) = record_usage(&*state.db, &state.callbacks, ledger).await {
         tracing::error!("Failed to record cost: {}", e);
     }
 
@@ -540,7 +541,8 @@ async fn anthropic_messages_inner(
     let provider_c = provider_label.clone();
 
     tokio::spawn(async move {
-        use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+        use crate::api::ledger::record_usage;
+        use crate::db::repositories::prompts::PromptRepository;
 
         let prompt = NewPrompt {
             user_id,
@@ -598,7 +600,7 @@ async fn anthropic_messages_inner(
                     cache_read_tokens: cache_read_tokens as i64,
                     cache_write_tokens: cache_write_tokens as i64,
                 };
-                if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
+                if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
                 }
                 let mut event = crate::callbacks::CallbackEvent {

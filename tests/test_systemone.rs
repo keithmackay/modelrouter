@@ -82,6 +82,7 @@ struct Opts {
     pricing: Vec<PricingEntry>,
     policy_rules: Vec<PolicyRuleConfig>,
     concurrency: Arc<modelrouter::router::concurrency::ConcurrencyLimiter>,
+    usage: common::RecordedUsage,
 }
 
 async fn test_app(opts: Opts) -> (TestServer, Arc<dyn DatabaseProvider>) {
@@ -146,7 +147,7 @@ async fn test_app_with_user_id(opts: Opts) -> (TestServer, Arc<dyn DatabaseProvi
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
         prompt_db: db.clone(),
         app_metrics: None,
-        callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        callbacks: opts.usage.dispatcher(),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
     };
@@ -160,6 +161,7 @@ fn opts(api_base: Option<String>) -> Opts {
         pricing: vec![],
         policy_rules: vec![],
         concurrency: Arc::new(modelrouter::router::concurrency::ConcurrencyLimiter::new()),
+        usage: common::RecordedUsage::default(),
     }
 }
 
@@ -186,6 +188,40 @@ async fn call(server: &TestServer, body: &Value) -> axum_test::TestResponse {
         )
         .json(body)
         .await
+}
+
+/// A metered call emits one `usage` event carrying the request's attribution.
+#[tokio::test]
+async fn a_metered_call_emits_a_usage_event() {
+    let (base, _up) = start_upstream(200, choice_answer()).await;
+    let o = opts(Some(base));
+    let usage = o.usage.clone();
+    let (server, db) = test_app(o).await;
+
+    let resp = server
+        .post("/v1/systemone")
+        .add_header(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-attribution-correlation-id"),
+            axum::http::HeaderValue::from_static("task-17"),
+        )
+        .add_header(
+            axum::http::HeaderName::from_static("x-project"),
+            axum::http::HeaderValue::from_static("alpha"),
+        )
+        .json(&request_body())
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let rows = common::wait_for_ledger_rows(&*db, 1).await;
+    let events = usage.wait_for(1).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["ledger_id"], rows[0].id);
+    assert_eq!(events[0]["correlation_id"], "task-17");
+    assert_eq!(events[0]["project"], "alpha");
 }
 
 #[tokio::test]
