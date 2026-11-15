@@ -39,7 +39,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Embedding failover with width verification** — `/v1/embeddings` walks the same fallback chains as completions, and a `dimensions` request is verified against what the provider returned, so failing over between models of different widths can never corrupt a vector store
 - **Multi-scope budget enforcement** — set monthly or fixed date-range limits at the global (org-wide), project, user, or group level; any limit hit blocks the request before it reaches the upstream
 - **Admin dashboard** — web UI at `/admin` with usage stats, failures, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
-- **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion; wire Datadog, Slack, or any HTTP endpoint; takes effect on next restart
+- **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion, and a `usage` event for every metered call (streamed, cached or not, any endpoint) carrying its attribution, tokens and cost; optional HMAC-SHA256 signing, timeouts and retries; wire Datadog, Slack, a downstream coordinator or any HTTP endpoint; takes effect on next restart
 - **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
 - **Controlled experiments** — create an experiment with named variants, put `x-modelrouter-experiment: <id>[:<label>]` on each chat completion, report outcomes with `POST /v1/feedback`, and read per-variant and per-run cost, tokens, turns, latency, failures and outcomes back as JSON, from the CLI, or on `/admin/experiments`; bound requests are pinned to their variant's priced model with no downgrade, pool, cache or fallback
 - **Request cost attribution** — tag any metered call with your own correlation id and free-form tags (`attribution` in the request body, or `X-Attribution-*` headers); the router persists them on the prompt and cost-ledger rows and reports spend *and* cache savings per tag, so a consuming app can drop its own cost accounting. Attribution never affects routing or the cache key
@@ -2321,6 +2321,9 @@ and on `/admin/reports`, where picking an attribution value swaps the panels
 for an attributed-usage view (spend, savings, cache-hit rate, per-model and
 per-day breakdowns).
 
+To receive each call as it happens instead, subscribe a webhook to the
+`usage` event (see [Webhooks and usage events](#webhooks-and-usage-events)).
+
 To compare two arms of an experiment — two tag values, two correlation ids,
 two models, two providers or two variants of a controlled experiment — use
 `GET /admin/api/compare`, `modelrouter report compare`, or the
@@ -2458,6 +2461,113 @@ window (`--retain-content`), purged after close. Part 1 of
 [docs/experiments.md](docs/experiments.md) is the end-to-end guide.
 
 Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login`. The browser-based dashboard is at `/admin`.
+
+### Webhooks and usage events
+
+A webhook is a URL the router POSTs JSON to. Register one with the CLI, the
+`/admin/webhooks` page or `POST /admin/api/webhooks`. Webhooks are loaded when
+the server starts, so **restart the server** after adding, deleting, enabling
+or disabling one.
+
+```bash
+export USAGE_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+modelrouter webhook add --name coordinator \
+  --url http://127.0.0.1:9000/hooks/modelrouter \
+  --events usage --signing-secret-env USAGE_WEBHOOK_SECRET
+```
+
+`--events` takes a comma-separated list. A webhook receives the events it
+lists; an empty list or `*` receives every event.
+
+| Event | Fired for | Payload |
+|---|---|---|
+| `completion` | Non-streaming `/v1/chat/completions` and `/v1/messages` calls that wrote a prompt row | `event`, `trace_id`, `user_id`, `model`, `provider`, `prompt_tokens`, `completion_tokens`, `cost_usd`, `latency_ms` |
+| `usage` | Every cost-ledger row a request writes: chat completions and `/v1/messages` (streamed or not), response-cache hits, `/v1/responses`, embeddings, images, audio, search, `/v1/rerank`, `/v1/decisions` and `/v1/systemone` | below |
+
+Health-probe calls and rows written by CLI commands emit no event.
+
+#### The `usage` event (schema version 1)
+
+```json
+{
+  "schema_version": 1,
+  "event": "usage",
+  "delivery_id": "3f0c2a8e-9b1d-4c55-8a7e-2d6f1e0b9c41",
+  "ledger_id": 48213,
+  "occurred_at": "2026-11-14T15:02:11.482913+00:00",
+  "user_id": 7,
+  "project": "website",
+  "correlation_id": "eng-4711-run-3",
+  "tags": { "engagement": "eng-4711", "phase": "research" },
+  "model": "claude-sonnet-4-5",
+  "provider": "anthropic",
+  "tokens": { "input": 1200, "output": 340, "cache_read": 50000, "cache_write": 0, "estimated": false },
+  "cost_usd": 0.0234,
+  "cache_hit": false,
+  "saved_usd": 0.0,
+  "uncached_cost_usd": 0.0234
+}
+```
+
+- One event per cost-ledger row, built from the stored row: `ledger_id` is the
+  row's id and `occurred_at` its `created_at`. `ledger_id` is the key to
+  deduplicate on; `delivery_id` names one delivery and stays the same across
+  its retries.
+- `project` is the project the call was billed to (`X-Project` or the body's
+  attribution, else the API key's project). `correlation_id` and `project` are
+  `null`, and `tags` is `{}`, when the call carried none.
+- `tokens.input` and `tokens.output` are the counts the ledger records, as the
+  provider reported them; `cache_read` and `cache_write` are the provider's
+  prompt-cache tokens (0 where the endpoint has none). `estimated` is true
+  when the provider reported no usage and the router counted characters.
+- `cache_hit` is true when the router's response cache answered: `cost_usd`
+  is then 0 and `saved_usd` is what the call would have cost.
+  `uncached_cost_usd` is `cost_usd + saved_usd`, the cost without the response
+  cache, as in the router's reports. The provider's prompt cache is described
+  by the token counts and is not folded into it.
+- No prompt or response content is ever included.
+- Adding a field keeps `schema_version`; removing, renaming or changing the
+  meaning of one increments it. Receivers should ignore fields they do not
+  know.
+
+#### Signing
+
+A webhook with a signing secret signs every delivery and adds four headers:
+
+```text
+X-Modelrouter-Event: usage
+X-Modelrouter-Delivery: 3f0c2a8e-9b1d-4c55-8a7e-2d6f1e0b9c41
+X-Modelrouter-Timestamp: 1794668531
+X-Modelrouter-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>">
+```
+
+To verify, recompute the HMAC with the shared secret over the timestamp
+header, a `.`, and the request body exactly as received (before any JSON
+parsing), compare it to the signature in constant time, and reject a
+timestamp more than a few minutes from your clock. Each retry is signed
+again with a fresh timestamp. For example:
+
+```bash
+printf '%s.%s' "$TIMESTAMP" "$RAW_BODY" | openssl dgst -sha256 -hmac "$USAGE_WEBHOOK_SECRET"
+```
+
+The secret is stored in the router's database and never returned by the API,
+the dashboard or `webhook list`; listings report only `signed: true|false`.
+`--signing-secret-env` reads it from the named environment variable so it
+stays out of shell history. A webhook without a signing secret is sent
+unsigned, without these headers. The optional static header
+(`--secret-header-name`/`--secret-header-value`) is sent either way.
+
+#### Delivery
+
+Every POST has a 10-second timeout and does not follow redirects. A `usage`
+delivery that fails with a connection error, a timeout, `429` or a `5xx` is
+retried after 1 s, 5 s, 30 s, 2 min and 10 min, then dropped with a warning;
+any other `4xx` ends it at once. A `completion` delivery is attempted once.
+Deliveries are held in memory: a restart loses any still pending, and when a
+webhook already has 1000 in flight a new one is dropped with a warning. A
+receiver that must not miss a call should reconcile against
+`GET /admin/api/usage/attribution` or the reports.
 
 ### OTel observability stack
 
