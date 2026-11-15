@@ -10,6 +10,7 @@ struct WebhookRow {
     events: String,
     secret_header_name: Option<String>,
     secret_header_value: Option<String>,
+    signing_secret: Option<String>,
     enabled: i64,
     created_at: String,
 }
@@ -23,6 +24,7 @@ impl From<WebhookRow> for WebhookCallback {
             events: r.events,
             secret_header_name: r.secret_header_name,
             secret_header_value: r.secret_header_value,
+            signing_secret: r.signing_secret,
             enabled: r.enabled != 0,
             created_at: r.created_at,
         }
@@ -33,7 +35,7 @@ impl From<WebhookRow> for WebhookCallback {
 impl WebhookCallbackRepository for SqliteDb {
     async fn list_webhooks(&self) -> anyhow::Result<Vec<WebhookCallback>> {
         let rows = sqlx::query_as::<_, WebhookRow>(
-            "SELECT id, name, url, events, secret_header_name, secret_header_value, enabled, created_at \
+            "SELECT id, name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at \
              FROM webhook_callbacks ORDER BY id ASC"
         )
         .fetch_all(&self.pool)
@@ -43,7 +45,7 @@ impl WebhookCallbackRepository for SqliteDb {
 
     async fn list_enabled_webhooks(&self) -> anyhow::Result<Vec<WebhookCallback>> {
         let rows = sqlx::query_as::<_, WebhookRow>(
-            "SELECT id, name, url, events, secret_header_name, secret_header_value, enabled, created_at \
+            "SELECT id, name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at \
              FROM webhook_callbacks WHERE enabled = 1 ORDER BY id ASC"
         )
         .fetch_all(&self.pool)
@@ -54,21 +56,22 @@ impl WebhookCallbackRepository for SqliteDb {
     async fn create_webhook(&self, new: NewWebhookCallback) -> anyhow::Result<WebhookCallback> {
         let now = now_utc();
         let result = sqlx::query(
-            "INSERT INTO webhook_callbacks (name, url, events, secret_header_name, secret_header_value, enabled, created_at) \
-             VALUES (?, ?, ?, ?, ?, 1, ?)"
+            "INSERT INTO webhook_callbacks (name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?)"
         )
         .bind(&new.name)
         .bind(&new.url)
         .bind(&new.events)
         .bind(&new.secret_header_name)
         .bind(&new.secret_header_value)
+        .bind(&new.signing_secret)
         .bind(&now)
         .execute(&self.pool)
         .await?;
 
         let id = result.last_insert_rowid();
         let row = sqlx::query_as::<_, WebhookRow>(
-            "SELECT id, name, url, events, secret_header_name, secret_header_value, enabled, created_at \
+            "SELECT id, name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at \
              FROM webhook_callbacks WHERE id = ?"
         )
         .bind(id)
@@ -115,6 +118,7 @@ mod tests {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         }).await.unwrap();
         assert_eq!(w.name, "test");
         assert!(w.enabled);
@@ -134,6 +138,7 @@ mod tests {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         }).await.unwrap();
         db.set_webhook_enabled(w.id, false).await.unwrap();
         let enabled = db.list_enabled_webhooks().await.unwrap();
@@ -152,6 +157,7 @@ mod tests {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         }).await.unwrap();
         db.delete_webhook(w.id).await.unwrap();
         let list = db.list_webhooks().await.unwrap();

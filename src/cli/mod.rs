@@ -603,15 +603,8 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                     }
                     // Load DB-registered webhooks
                     for row in db_webhooks {
-                        let events: Vec<String> = serde_json::from_str(&row.events).unwrap_or_default();
                         backends.push(Box::new(crate::callbacks::webhook::WebhookBackend::new(
-                            crate::callbacks::webhook::WebhookBackendConfig {
-                                name: row.name,
-                                url: row.url,
-                                events,
-                                secret_header_name: row.secret_header_name,
-                                secret_header_value: row.secret_header_value,
-                            },
+                            crate::callbacks::webhook::WebhookBackendConfig::from_row(row),
                         )));
                     }
                     Arc::new(crate::callbacks::CallbackDispatcher::new(backends))
@@ -2141,7 +2134,14 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                         );
                     }
                 }
-                WebhookCommands::Add { name, url, events, secret_header_name, secret_header_value } => {
+                WebhookCommands::Add { name, url, events, secret_header_name, secret_header_value, signing_secret_env } => {
+                    let signing_secret = match signing_secret_env {
+                        Some(var) => match std::env::var(&var) {
+                            Ok(v) if !v.trim().is_empty() => Some(v),
+                            _ => anyhow::bail!("--signing-secret-env names {var}, which is unset or empty"),
+                        },
+                        None => None,
+                    };
                     let events_json = if events.starts_with('[') {
                         events
                     } else {
@@ -2156,6 +2156,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                         events: events_json,
                         secret_header_name,
                         secret_header_value,
+                        signing_secret,
                     }).await?;
                     println!("Created webhook id={} name={} url={}", w.id, w.name, w.url);
                     println!("Restart the server for this webhook to take effect.");

@@ -123,6 +123,7 @@ async fn list_webhooks_api_admin_can_read() {
         events: r#"["completion"]"#.to_string(),
         secret_header_name: None,
         secret_header_value: None,
+        signing_secret: None,
     })
     .await
     .unwrap();
@@ -204,6 +205,7 @@ async fn delete_webhook_api_success() {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         })
         .await
         .unwrap();
@@ -229,6 +231,7 @@ async fn enable_webhook_api_success() {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         })
         .await
         .unwrap();
@@ -255,6 +258,7 @@ async fn disable_webhook_api_success() {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         })
         .await
         .unwrap();
@@ -288,6 +292,7 @@ async fn get_webhooks_page_renders_list() {
         events: r#"["completion"]"#.to_string(),
         secret_header_name: Some("X-Secret".to_string()),
         secret_header_value: Some("secret".to_string()),
+        signing_secret: None,
     })
     .await
     .unwrap();
@@ -383,6 +388,7 @@ async fn post_delete_webhook_page_success() {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         })
         .await
         .unwrap();
@@ -408,6 +414,7 @@ async fn post_enable_webhook_page_success() {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         })
         .await
         .unwrap();
@@ -434,6 +441,7 @@ async fn post_disable_webhook_page_success() {
             events: r#"["completion"]"#.to_string(),
             secret_header_name: None,
             secret_header_value: None,
+            signing_secret: None,
         })
         .await
         .unwrap();
@@ -467,4 +475,92 @@ async fn create_webhook_api_hides_secret_value() {
     let webhook: Value = resp.json();
     assert_eq!(webhook["secret_header_name"], "X-Secret");
     assert!(webhook.get("secret_header_value").is_none());
+}
+
+// ── Signing secrets ───────────────────────────────────────────────────────────
+
+const SIGNING_SECRET: &str = "whsec-do-not-echo-0123456789";
+
+#[tokio::test]
+async fn create_webhook_api_stores_a_signing_secret_and_never_returns_it() {
+    let (server, settings, db) = build_server().await;
+    let (hk, hv) = cookie(&jwt(&settings, "superadmin"));
+    let resp = server
+        .post("/admin/api/webhooks")
+        .add_header(hk, hv)
+        .json(&json!({
+            "name": "signed",
+            "url": "https://example.com/signed",
+            "events": r#"["usage"]"#,
+            "signing_secret": SIGNING_SECRET,
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 201);
+    assert!(!resp.text().contains(SIGNING_SECRET));
+    assert_eq!(resp.json::<Value>()["signed"], true);
+
+    let stored = db.list_webhooks().await.unwrap();
+    assert_eq!(stored[0].signing_secret.as_deref(), Some(SIGNING_SECRET));
+
+    let (hk, hv) = cookie(&jwt(&settings, "admin"));
+    let list = server.get("/admin/api/webhooks").add_header(hk, hv).await;
+    assert_eq!(list.status_code(), 200);
+    assert!(!list.text().contains(SIGNING_SECRET));
+    assert_eq!(list.json::<Value>()[0]["signed"], true);
+}
+
+#[tokio::test]
+async fn a_webhook_without_a_signing_secret_is_listed_as_unsigned() {
+    let (server, settings, _db) = build_server().await;
+    let (hk, hv) = cookie(&jwt(&settings, "superadmin"));
+    let resp = server
+        .post("/admin/api/webhooks")
+        .add_header(hk, hv)
+        .json(&json!({"name": "plain", "url": "https://example.com/plain"}))
+        .await;
+    assert_eq!(resp.status_code(), 201);
+    assert_eq!(resp.json::<Value>()["signed"], false);
+}
+
+#[tokio::test]
+async fn dashboard_form_stores_a_signing_secret_and_the_page_never_shows_it() {
+    let (server, settings, db) = build_server().await;
+    let (hk, hv) = cookie(&jwt(&settings, "admin"));
+    let resp = server
+        .post("/admin/webhooks")
+        .add_header(hk.clone(), hv.clone())
+        .form(&[
+            ("name", "signed-form"),
+            ("url", "https://example.com/signed-form"),
+            ("events", "usage"),
+            ("signing_secret", SIGNING_SECRET),
+        ])
+        .await;
+    assert_eq!(resp.status_code(), 303);
+    let stored = db.list_webhooks().await.unwrap();
+    assert_eq!(stored[0].signing_secret.as_deref(), Some(SIGNING_SECRET));
+    assert_eq!(stored[0].events, r#"["usage"]"#);
+
+    let page = server.get("/admin/webhooks").add_header(hk, hv).await;
+    assert_eq!(page.status_code(), 200);
+    let html = page.text();
+    assert!(html.contains("signed-form"));
+    assert!(!html.contains(SIGNING_SECRET));
+    assert!(html.contains("name=\"signing_secret\""));
+}
+
+#[tokio::test]
+async fn dashboard_form_with_a_blank_signing_secret_stores_none() {
+    let (server, settings, db) = build_server().await;
+    let (hk, hv) = cookie(&jwt(&settings, "admin"));
+    server
+        .post("/admin/webhooks")
+        .add_header(hk, hv)
+        .form(&[
+            ("name", "blank"),
+            ("url", "https://example.com/blank"),
+            ("signing_secret", "  "),
+        ])
+        .await;
+    assert_eq!(db.list_webhooks().await.unwrap()[0].signing_secret, None);
 }
