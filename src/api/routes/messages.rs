@@ -526,7 +526,7 @@ async fn anthropic_messages_inner(
     let canonical_c = canonical_model.clone();
     let user_name_c = user.name.clone();
     let api_key_id_c = user.api_key_id;
-    let project = user.api_key_project.clone();
+    let project = attribution.project_or(user.api_key_project.clone());
     let messages_json = serde_json::to_string(
         &body["messages"].as_array().cloned().unwrap_or_default(),
     )

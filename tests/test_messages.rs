@@ -824,6 +824,48 @@ async fn messages_streaming_fires_lifecycle_hook() {
     assert_eq!(ledger.len(), 1);
 }
 
+/// `X-Project` names the project a call is billed to, overriding the API key's
+/// own project, on the streaming and the non-streaming path alike.
+#[tokio::test]
+async fn messages_record_the_per_request_project() {
+    for stream in [false, true] {
+        let (server, db, _mock) = test_app_with_mock_server().await;
+        let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+        ApiKeyRepository::create_api_key(
+            &*db,
+            NewApiKey {
+                user_id: user.id,
+                key_hash: hash_token("beta-token"),
+                label: Some("beta".to_string()),
+                expires_at: None,
+                project: Some("beta".to_string()),
+                session_window_secs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = server
+            .post("/v1/messages")
+            .add_header(bearer("beta-token").0, bearer("beta-token").1)
+            .add_header(
+                axum::http::HeaderName::from_static("x-project"),
+                axum::http::HeaderValue::from_static("alpha"),
+            )
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": stream
+            }))
+            .await;
+        assert_eq!(resp.status_code(), 200, "stream={stream}");
+
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        assert_eq!(ledger[0].project.as_deref(), Some("alpha"), "stream={stream}");
+    }
+}
+
 #[tokio::test]
 async fn messages_circuit_breaker_records_failure() {
     let (server, _db, mock) = test_app_with_mock_server().await;
