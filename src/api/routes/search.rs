@@ -694,6 +694,8 @@ async fn search_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Search,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record search cost: {}", e);
@@ -900,6 +902,8 @@ fn record_search_cache_hit(
         experiment_variant: None,
         call_kind: crate::db::models::CallKind::Search,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
     tokio::spawn(async move {
         if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {

@@ -67,6 +67,8 @@ fn entry(user_id: i64, model: &str, cost_usd: f64) -> NewCostLedgerEntry {
         experiment_id: None,
         experiment_variant: None,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     }
 }
 
@@ -115,6 +117,8 @@ async fn create_round_trips_every_column() {
                 experiment_id: Some(4),
                 experiment_variant: Some("control".into()),
                 tokens_estimated: true,
+                cache_read_tokens: 5000,
+                cache_write_tokens: 700,
                 ..entry(u, "m1", 0.25)
             },
         )
@@ -135,6 +139,7 @@ async fn create_round_trips_every_column() {
         assert_eq!(row.experiment_id, Some(4));
         assert_eq!(row.experiment_variant.as_deref(), Some("control"));
         assert!(row.tokens_estimated);
+        assert_eq!((row.cache_read_tokens, row.cache_write_tokens), (5000, 700));
 
         let bare = put(&db, entry(u, "m2", 0.0)).await;
         assert!(bare.id > row.id);
@@ -144,6 +149,7 @@ async fn create_round_trips_every_column() {
         assert_eq!(bare.experiment_id, None);
         assert_eq!(bare.experiment_variant, None);
         assert!(!bare.tokens_estimated);
+        assert_eq!((bare.cache_read_tokens, bare.cache_write_tokens), (0, 0));
     })
     .await;
 }
@@ -158,6 +164,8 @@ async fn create_cache_hit_records_saving_not_spend() {
                 experiment_id: Some(4),
                 experiment_variant: Some("control".into()),
                 tokens_estimated: true,
+                cache_read_tokens: 40,
+                cache_write_tokens: 3,
                 ..entry(u, "m1", 0.5)
             },
         )
@@ -168,6 +176,7 @@ async fn create_cache_hit_records_saving_not_spend() {
         assert_eq!(hit.prompt_id, 0);
         assert_eq!(hit.experiment_id, Some(4));
         assert!(hit.tokens_estimated);
+        assert_eq!((hit.cache_read_tokens, hit.cache_write_tokens), (40, 3));
         assert!(close(db.sum_global_since(EPOCH).await.unwrap(), 0.0));
     })
     .await;

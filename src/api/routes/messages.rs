@@ -84,6 +84,8 @@ async fn log_messages_cost(
         experiment_variant: None,
         call_kind: crate::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: cache_read_tokens as i64,
+        cache_write_tokens: cache_write_tokens as i64,
     };
     if let Err(e) = CostRepository::create(&*state.db, ledger).await {
         tracing::error!("Failed to record cost: {}", e);
@@ -593,6 +595,8 @@ async fn anthropic_messages_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Chat,
                     tokens_estimated: false,
+                    cache_read_tokens: cache_read_tokens as i64,
+                    cache_write_tokens: cache_write_tokens as i64,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);

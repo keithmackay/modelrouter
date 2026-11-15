@@ -1173,6 +1173,8 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
             experiment_variant: ctx.experiment_variant.clone(),
             call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: false,
+            cache_read_tokens: ctx.cache_read_tokens as i64,
+            cache_write_tokens: ctx.cache_write_tokens as i64,
         };
 
         if ctx.write_prompt {
@@ -1389,6 +1391,8 @@ pub(crate) fn record_cache_hit(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: false,
+            cache_read_tokens: result.cache_read_tokens as i64,
+            cache_write_tokens: result.cache_write_tokens as i64,
         };
 
         let prompt_id = if ctx.skip_log {
@@ -1827,6 +1831,8 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
         experiment_variant: ctx.experiment_variant.clone(),
         call_kind: crate::db::models::CallKind::Chat,
         tokens_estimated: s.tokens_estimated,
+        cache_read_tokens: s.cache_read_tokens as i64,
+        cache_write_tokens: 0,
     };
 
     let prompt_id = if !ctx.write_prompt {

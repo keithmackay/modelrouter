@@ -392,6 +392,8 @@ async fn rerank_inner(
             experiment_variant: experiment_variant_row,
             call_kind: crate::db::models::CallKind::Rerank,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         };
         if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
             tracing::error!("Failed to record rerank cost: {}", e);

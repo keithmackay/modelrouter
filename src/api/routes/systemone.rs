@@ -313,6 +313,8 @@ fn record_usage(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Judgment,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         };
         if let Err(e) = CostRepository::create(&*state.db, ledger).await {
             tracing::error!("Failed to record System One cost: {}", e);

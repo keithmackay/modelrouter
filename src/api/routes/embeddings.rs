@@ -379,6 +379,8 @@ async fn embeddings_inner(
                     experiment_variant: experiment_variant.clone(),
                     call_kind: crate::db::models::CallKind::Embedding,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record embedding cost: {}", e);

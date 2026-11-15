@@ -206,6 +206,8 @@ async fn speech_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record speech cost: {e}");
@@ -432,6 +434,8 @@ async fn transcriptions_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record transcription cost: {e}");

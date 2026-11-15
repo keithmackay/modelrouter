@@ -866,6 +866,46 @@ async fn messages_record_the_per_request_project() {
     }
 }
 
+/// The prompt-cache tokens Anthropic reports land on the ledger row, so the
+/// row alone says what share of the input was served from the prompt cache.
+#[tokio::test]
+async fn messages_record_prompt_cache_tokens_on_the_ledger() {
+    let (server, db, mock) = test_app_with_mock_server().await;
+    mock.set_response(
+        axum::http::StatusCode::OK,
+        serde_json::json!({
+            "id": "msg-mock",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "cached"}],
+            "model": "claude-mock",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 50000,
+                "cache_creation_input_tokens": 300
+            }
+        }),
+    );
+
+    let resp = server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger[0].tokens_in, 12);
+    assert_eq!(ledger[0].cache_read_tokens, 50000);
+    assert_eq!(ledger[0].cache_write_tokens, 300);
+}
+
 #[tokio::test]
 async fn messages_circuit_breaker_records_failure() {
     let (server, _db, mock) = test_app_with_mock_server().await;

@@ -187,6 +187,8 @@ async fn image_generations_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Image,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record image cost: {}", e);

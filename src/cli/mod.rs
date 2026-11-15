@@ -2598,6 +2598,8 @@ mod attribution_cli_tests {
                 experiment_variant: None,
                 call_kind: crate::db::models::CallKind::Chat,
                 tokens_estimated: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             },
         )
         .await
@@ -2739,6 +2741,8 @@ mod tests {
                 experiment_variant: None,
                 call_kind: crate::db::models::CallKind::Chat,
                 tokens_estimated: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2842,6 +2846,8 @@ mod tests {
                 experiment_variant: None,
                 call_kind: crate::db::models::CallKind::Chat,
                 tokens_estimated: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2905,6 +2911,8 @@ mod tests {
                 experiment_variant: Some(variant.into()),
                 call_kind: crate::db::models::CallKind::Chat,
                 tokens_estimated: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: "m".into(), routed_model: "m".into(),
