@@ -2519,7 +2519,9 @@ Health-probe calls and rows written by CLI commands emit no event.
 - `tokens.input` and `tokens.output` are the counts the ledger records, as the
   provider reported them; `cache_read` and `cache_write` are the provider's
   prompt-cache tokens (0 where the endpoint has none). `estimated` is true
-  when the provider reported no usage and the router counted characters.
+  when the provider reported no usage and the router counted characters, or
+  when a streamed `/v1/messages` call ended before `message_stop`, so its
+  output count is the last one the stream reported.
 - `cache_hit` is true when the router's response cache answered: `cost_usd`
   is then 0 and `saved_usd` is what the call would have cost.
   `uncached_cost_usd` is `cost_usd + saved_usd`, the cost without the response
