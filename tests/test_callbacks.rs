@@ -48,19 +48,39 @@ impl Delivery {
     }
 }
 
+/// How the receiver answers one POST.
+#[derive(Clone, Copy)]
+enum Reply {
+    Status(u16),
+    /// Record the request, then never answer.
+    Hang,
+}
+
 /// A local webhook endpoint on an ephemeral port that records every POST and
-/// answers 204.
+/// answers with the scripted replies in order, then 204.
 #[derive(Clone, Default)]
-struct Receiver(Arc<Mutex<Vec<Delivery>>>);
+struct Receiver {
+    seen: Arc<Mutex<Vec<Delivery>>>,
+    script: Arc<Mutex<std::collections::VecDeque<Reply>>>,
+}
 
 async fn record(State(r): State<Receiver>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    r.0.lock().unwrap().push(Delivery { headers, body });
-    StatusCode::NO_CONTENT
+    r.seen.lock().unwrap().push(Delivery { headers, body });
+    let reply = r.script.lock().unwrap().pop_front().unwrap_or(Reply::Status(204));
+    match reply {
+        Reply::Status(code) => StatusCode::from_u16(code).unwrap(),
+        Reply::Hang => std::future::pending().await,
+    }
 }
 
 impl Receiver {
     async fn start() -> (Self, String) {
+        Self::scripted(&[]).await
+    }
+
+    async fn scripted(replies: &[Reply]) -> (Self, String) {
         let r = Receiver::default();
+        r.script.lock().unwrap().extend(replies.iter().copied());
         let app = Router::new().route("/hook", post(record)).with_state(r.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -70,7 +90,7 @@ impl Receiver {
 
     async fn wait_for(&self, want: usize) -> Vec<Delivery> {
         for _ in 0..200 {
-            let got = self.0.lock().unwrap().clone();
+            let got = self.seen.lock().unwrap().clone();
             if got.len() >= want {
                 return got;
             }
@@ -84,7 +104,7 @@ impl Receiver {
     async fn settle(&self, want: usize) -> Vec<Delivery> {
         self.wait_for(want).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        self.0.lock().unwrap().clone()
+        self.seen.lock().unwrap().clone()
     }
 }
 
@@ -242,4 +262,172 @@ async fn a_usage_subscription_receives_no_completion_event() {
     let got = receiver.settle(1).await;
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].json()["event"], "usage");
+}
+
+// ── Timeouts, retries and the pending bound ───────────────────────────────────
+
+use modelrouter::callbacks::webhook::DeliveryPolicy;
+use std::time::Duration;
+
+fn quick_policy() -> DeliveryPolicy {
+    DeliveryPolicy {
+        timeout: Duration::from_millis(200),
+        retry_delays: vec![Duration::from_millis(10); 5],
+        max_pending: 1000,
+    }
+}
+
+fn signed_usage_backend(url: &str, policy: DeliveryPolicy) -> WebhookBackend {
+    WebhookBackend::with_policy(
+        WebhookBackendConfig {
+            name: "test".into(),
+            url: url.into(),
+            events: vec!["usage".into()],
+            secret_header_name: None,
+            secret_header_value: None,
+            signing_secret: Some(SECRET.into()),
+        },
+        policy,
+    )
+}
+
+fn usage_payload() -> Value {
+    modelrouter::callbacks::usage::from_ledger(&ledger_row())
+}
+
+#[test]
+fn the_default_policy_is_a_ten_second_timeout_and_five_backed_off_retries() {
+    let p = DeliveryPolicy::default();
+    assert_eq!(p.timeout, Duration::from_secs(10));
+    assert_eq!(
+        p.retry_delays,
+        [1, 5, 30, 120, 600].map(Duration::from_secs).to_vec()
+    );
+    assert_eq!(p.max_pending, 1000);
+}
+
+#[tokio::test]
+async fn server_errors_are_retried_under_one_delivery_id_each_attempt_signed() {
+    let (receiver, url) = Receiver::scripted(&[Reply::Status(503), Reply::Status(503)]).await;
+    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+
+    let got = receiver.settle(3).await;
+    assert_eq!(got.len(), 3, "503, 503, then 204");
+    let id = got[0].header("x-modelrouter-delivery").unwrap();
+    for d in &got {
+        assert_eq!(d.header("x-modelrouter-delivery"), Some(id));
+        assert_eq!(d.json()["delivery_id"], id);
+        let ts = d.header("x-modelrouter-timestamp").unwrap();
+        assert_eq!(d.header("x-modelrouter-signature"), Some(expected_signature(ts, &d.body).as_str()));
+    }
+}
+
+#[tokio::test]
+async fn each_attempt_carries_a_fresh_timestamp() {
+    // Timestamps have one-second resolution, so the retry waits just over it.
+    let policy = DeliveryPolicy {
+        retry_delays: vec![Duration::from_millis(1100)],
+        ..quick_policy()
+    };
+    let (receiver, url) = Receiver::scripted(&[Reply::Status(500)]).await;
+    signed_usage_backend(&url, policy).send_usage(&usage_payload());
+
+    let got = receiver.wait_for(2).await;
+    let (first, second) = (
+        got[0].header("x-modelrouter-timestamp").unwrap().parse::<i64>().unwrap(),
+        got[1].header("x-modelrouter-timestamp").unwrap().parse::<i64>().unwrap(),
+    );
+    assert!(second > first, "{first} then {second}");
+    assert_ne!(got[0].header("x-modelrouter-signature"), got[1].header("x-modelrouter-signature"));
+}
+
+#[tokio::test]
+async fn too_many_requests_is_retried() {
+    let (receiver, url) = Receiver::scripted(&[Reply::Status(429)]).await;
+    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    assert_eq!(receiver.settle(2).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_client_error_is_not_retried() {
+    let (receiver, url) = Receiver::scripted(&[Reply::Status(400)]).await;
+    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    assert_eq!(receiver.settle(1).await.len(), 1);
+}
+
+#[tokio::test]
+async fn retries_stop_when_the_schedule_runs_out() {
+    let policy = DeliveryPolicy { retry_delays: vec![Duration::from_millis(10); 2], ..quick_policy() };
+    let (receiver, url) = Receiver::scripted(&[Reply::Status(503); 5]).await;
+    signed_usage_backend(&url, policy).send_usage(&usage_payload());
+    assert_eq!(receiver.settle(3).await.len(), 3, "one attempt plus two retries");
+}
+
+#[tokio::test]
+async fn a_receiver_that_never_answers_times_out_and_is_retried() {
+    let (receiver, url) = Receiver::scripted(&[Reply::Hang]).await;
+    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    let got = receiver.wait_for(2).await;
+    assert_eq!(got[0].header("x-modelrouter-delivery"), got[1].header("x-modelrouter-delivery"));
+}
+
+#[tokio::test]
+async fn a_completion_delivery_times_out_and_is_not_retried() {
+    let (receiver, url) = Receiver::scripted(&[Reply::Hang]).await;
+    let b = WebhookBackend::with_policy(
+        WebhookBackendConfig {
+            name: "test".into(),
+            url,
+            events: vec!["completion".into()],
+            secret_header_name: None,
+            secret_header_value: None,
+            signing_secret: None,
+        },
+        quick_policy(),
+    );
+    b.send(completion());
+    // Long enough for the 200 ms timeout and any retry to have happened.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(receiver.seen.lock().unwrap().len(), 1);
+}
+
+/// Collects formatted log output so a test can assert on a warning.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn deliveries_beyond_the_pending_bound_are_dropped_with_a_warning() {
+    let logs = LogCapture::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (receiver, url) = Receiver::scripted(&[Reply::Hang]).await;
+    let policy = DeliveryPolicy {
+        timeout: Duration::from_secs(5),
+        max_pending: 1,
+        ..quick_policy()
+    };
+    let b = signed_usage_backend(&url, policy);
+    b.send_usage(&usage_payload());
+    b.send_usage(&usage_payload());
+
+    assert_eq!(receiver.settle(1).await.len(), 1, "the second delivery was dropped");
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("WARN"), "{logged}");
+    assert!(logged.contains("webhook delivery dropped"), "{logged}");
+    assert!(logged.contains("pending=1"), "{logged}");
 }

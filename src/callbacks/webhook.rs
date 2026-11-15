@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use serde_json::Value;
@@ -44,14 +46,62 @@ pub fn signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+/// How a webhook's deliveries are attempted.
+#[derive(Clone, Debug)]
+pub struct DeliveryPolicy {
+    /// Limit on one attempt, from connecting to the full response.
+    pub timeout: Duration,
+    /// Wait before each retry of a `usage` delivery; one retry per entry.
+    pub retry_delays: Vec<Duration>,
+    /// Deliveries in flight for one webhook beyond which a new one is dropped.
+    pub max_pending: usize,
+}
+
+impl Default for DeliveryPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            retry_delays: [1, 5, 30, 120, 600].map(Duration::from_secs).to_vec(),
+            max_pending: 1000,
+        }
+    }
+}
+
 pub struct WebhookBackend {
     config: Arc<WebhookBackendConfig>,
+    policy: Arc<DeliveryPolicy>,
     client: reqwest::Client,
+    pending: Arc<AtomicUsize>,
+}
+
+/// Counts one delivery as pending for as long as it lives.
+struct PendingDelivery(Arc<AtomicUsize>);
+
+impl Drop for PendingDelivery {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl WebhookBackend {
     pub fn new(config: WebhookBackendConfig) -> Self {
-        Self { config: Arc::new(config), client: reqwest::Client::new() }
+        Self::with_policy(config, DeliveryPolicy::default())
+    }
+
+    pub fn with_policy(config: WebhookBackendConfig, policy: DeliveryPolicy) -> Self {
+        // Redirects are not followed: a signed body must reach the URL the
+        // operator registered, and nowhere else.
+        let client = reqwest::Client::builder()
+            .timeout(policy.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a client with a timeout and no redirects always builds");
+        Self {
+            config: Arc::new(config),
+            policy: Arc::new(policy),
+            client,
+            pending: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// True when this webhook subscribes to `event`; an empty list or `*`
@@ -61,12 +111,37 @@ impl WebhookBackend {
             || self.config.events.iter().any(|e| e == "*" || e == event)
     }
 
+    /// Claim a pending slot, or `None` when the webhook already has
+    /// `max_pending` deliveries in flight.
+    fn claim_pending(&self) -> Option<PendingDelivery> {
+        let claimed = self
+            .pending
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.policy.max_pending).then_some(n + 1)
+            })
+            .is_ok();
+        claimed.then(|| PendingDelivery(self.pending.clone()))
+    }
+
     /// POST `body` in the background. `delivery_id` names the delivery in the
-    /// `X-Modelrouter-Delivery` header of a signed webhook.
-    fn deliver(&self, event: &'static str, delivery_id: String, body: Value) {
+    /// `X-Modelrouter-Delivery` header of a signed webhook and stays the same
+    /// across retries. With `retry`, a connection error, timeout, 429 or 5xx is
+    /// retried on the policy's schedule; any other answer ends the delivery.
+    fn deliver(&self, event: &'static str, delivery_id: String, body: Value, retry: bool) {
+        let Some(pending) = self.claim_pending() else {
+            tracing::warn!(
+                webhook = self.config.name.as_str(),
+                event,
+                pending = self.policy.max_pending,
+                "webhook delivery dropped: too many deliveries pending"
+            );
+            return;
+        };
         let config = self.config.clone();
+        let policy = self.policy.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
+            let _pending = pending;
             let body = match serde_json::to_vec(&body) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -74,11 +149,50 @@ impl WebhookBackend {
                     return;
                 }
             };
-            if let Err(e) = post(&client, &config, event, &delivery_id, body).await {
-                tracing::warn!(webhook = config.name.as_str(), "webhook POST failed: {e}");
+            let delays: &[Duration] = if retry { &policy.retry_delays } else { &[] };
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let failure = match post(&client, &config, event, &delivery_id, body.clone()).await {
+                    Ok(resp) if resp.status().is_success() => return,
+                    Ok(resp) if is_retryable(resp.status()) => format!("status {}", resp.status()),
+                    Ok(resp) => {
+                        tracing::warn!(
+                            webhook = config.name.as_str(),
+                            event,
+                            delivery_id = delivery_id.as_str(),
+                            status = resp.status().as_u16(),
+                            "webhook delivery refused; not retrying"
+                        );
+                        return;
+                    }
+                    Err(e) => e.to_string(),
+                };
+                let Some(delay) = delays.get(attempt - 1) else {
+                    tracing::warn!(
+                        webhook = config.name.as_str(),
+                        event,
+                        delivery_id = delivery_id.as_str(),
+                        attempts = attempt,
+                        "webhook POST failed: {failure}"
+                    );
+                    return;
+                };
+                tracing::debug!(
+                    webhook = config.name.as_str(),
+                    delivery_id = delivery_id.as_str(),
+                    attempt,
+                    "webhook POST failed ({failure}); retrying in {delay:?}"
+                );
+                tokio::time::sleep(*delay).await;
             }
         });
     }
+}
+
+/// An answer worth retrying: the receiver is overloaded or failed.
+fn is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// One POST of `body`, signed afresh when the webhook has a signing secret.
@@ -121,7 +235,7 @@ impl CallbackBackend for WebhookBackend {
             "cost_usd": event.cost_usd,
             "latency_ms": event.latency_ms,
         });
-        self.deliver("completion", uuid::Uuid::new_v4().to_string(), body);
+        self.deliver("completion", uuid::Uuid::new_v4().to_string(), body, false);
     }
 
     fn send_usage(&self, payload: &Value) {
@@ -130,7 +244,7 @@ impl CallbackBackend for WebhookBackend {
         let delivery_id = uuid::Uuid::new_v4().to_string();
         let mut body = payload.clone();
         body["delivery_id"] = Value::String(delivery_id.clone());
-        self.deliver(super::usage::EVENT, delivery_id, body);
+        self.deliver(super::usage::EVENT, delivery_id, body, true);
     }
 }
 
