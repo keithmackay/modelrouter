@@ -2568,8 +2568,49 @@ retried after 1 s, 5 s, 30 s, 2 min and 10 min, then dropped with a warning;
 any other `4xx` ends it at once. A `completion` delivery is attempted once.
 Deliveries are held in memory: a restart loses any still pending, and when a
 webhook already has 1000 in flight a new one is dropped with a warning. A
-receiver that must not miss a call should reconcile against
-`GET /admin/api/usage/attribution` or the reports.
+receiver that must not miss a call should also read the events back (below).
+
+#### Reading events back
+
+`GET /admin/api/usage/events` returns the `usage` events for stored ledger
+rows, so a receiver that was down, or lost deliveries to a restart, can fill
+the gaps. It takes the admin session, like the other `/admin/api` routes: a
+`Bearer` token from `POST /admin/api/login` or the dashboard cookie.
+
+```bash
+TOKEN=$(curl -s localhost:8080/admin/api/login \
+  -H 'content-type: application/json' \
+  -d '{"name":"admin","password":"…"}' | jq -r .token)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/admin/api/usage/events?since=2026-11-14T00:00:00Z&after_id=0&limit=500'
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `since` | none | RFC 3339 timestamp; only rows with `created_at` at or after it |
+| `after_id` | `0` | Only rows with a ledger id greater than this |
+| `limit` | `1000` | Page size, 1 to 1000 |
+
+An invalid value is a `400` naming the parameter.
+
+```json
+{ "events": [ { "schema_version": 1, "event": "usage", "ledger_id": 48213, "…": "…" } ],
+  "next_after_id": 48213 }
+```
+
+- Each item is exactly the `usage` payload the webhook sends for that row,
+  without `delivery_id` (a read is not a delivery). The rows are the ones that
+  emit an event: health-probe rows are left out.
+- Events are in ledger-id order. `next_after_id` is the last event's
+  `ledger_id` when the page is full, so more may follow: pass it as `after_id`
+  for the next page, with the same `since`. It is `null` when the page is not
+  full, meaning you have caught up.
+- To backfill, page from `after_id=0` with `since` set a little before the
+  oldest event you might have missed (for example the last 24 hours), and
+  deduplicate against deliveries on `ledger_id`. Overlap is harmless.
+- On PostgreSQL, ids are allocated before their transactions commit, so a row
+  can become visible after a higher id already has. Re-reading a window with
+  `since` rather than resuming only from the last id seen picks such rows up.
 
 ### OTel observability stack
 

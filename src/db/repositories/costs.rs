@@ -274,6 +274,16 @@ pub trait CostRepository: Send + Sync {
     async fn sum_tokens_for_key_since(&self, api_key_id: i64, since: &str) -> anyhow::Result<i64>;
     async fn list_cost_entries_before(&self, cutoff: &str) -> anyhow::Result<Vec<crate::db::models::CostLedgerEntry>>;
     async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()>;
+    /// Request-path usage rows with `id > after_id`, and `created_at >= since`
+    /// when given (RFC3339 UTC, as stored), in id order, at most `limit`. The
+    /// health probe's rows are left out: they are the rows that emit no
+    /// `usage` event, so this reads back exactly what the webhook sends.
+    async fn list_usage_after(
+        &self,
+        since: Option<&str>,
+        after_id: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CostLedgerEntry>>;
     /// Delete usage rows with `created_at` before `cutoff_rfc3339`, the
     /// retention tick's purge. The caller decides the cutoff; see
     /// `db::retention` for how it is held above every budget window.

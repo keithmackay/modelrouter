@@ -291,6 +291,26 @@ impl CostRepository for PostgresDb {
         Ok(rows)
     }
 
+    async fn list_usage_after(
+        &self,
+        since: Option<&str>,
+        after_id: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CostLedgerEntry>> {
+        let (since_clause, limit_param) =
+            if since.is_some() { (" AND created_at >= $2", "$3") } else { ("", "$2") };
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE id > $1 AND call_kind <> 'health'{} \
+             ORDER BY id ASC LIMIT {}",
+            LEDGER_COLUMNS, since_clause, limit_param
+        );
+        let mut q = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(sql)).bind(after_id);
+        if let Some(since) = since {
+            q = q.bind(since);
+        }
+        Ok(q.bind(limit).fetch_all(&self.pool).await?)
+    }
+
     async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());

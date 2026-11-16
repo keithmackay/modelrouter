@@ -2,7 +2,8 @@
 //! carrying the request's attribution: streaming and non-streaming chat, the
 //! Messages API, response-cache hits, /v1/responses, embeddings, search,
 //! images and audio. Rerank and decisions are covered in their own suites.
-//! The health probe's synthetic rows emit none.
+//! The health probe's synthetic rows emit none. `GET /admin/api/usage/events`
+//! reads the same events back by ledger id.
 
 mod common;
 
@@ -25,6 +26,7 @@ use std::sync::Arc;
 struct Harness {
     server: TestServer,
     db: Arc<dyn DatabaseProvider>,
+    settings: Arc<Settings>,
     usage: RecordedUsage,
     _anthropic: common::mock_anthropic::MockAnthropicServer,
     _openai: common::mock_audio::MockAudioServer,
@@ -117,6 +119,7 @@ async fn harness(cache: CacheConfig) -> Harness {
     Harness {
         server: TestServer::new(build_router(state)).unwrap(),
         db,
+        settings,
         usage,
         _anthropic: anthropic,
         _openai: openai,
@@ -338,4 +341,183 @@ async fn the_health_probe_emits_no_usage_event() {
     common::wait_for_ledger_rows(&*h.db, 1).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(h.usage.events().is_empty(), "{:?}", h.usage.events());
+}
+
+// ── Reading events back ───────────────────────────────────────────────────────
+
+const EVENTS: &str = "/admin/api/usage/events";
+
+fn admin(h: &Harness, request: axum_test::TestRequest) -> axum_test::TestRequest {
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+    let token = modelrouter::api::admin::auth::issue_jwt(
+        &modelrouter::api::admin::auth::AdminClaims {
+            sub: 1,
+            name: "viewer-user".to_string(),
+            role: "viewer".to_string(),
+            exp,
+        },
+        &h.settings.auth.jwt_secret,
+    )
+    .unwrap();
+    request.add_header(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    )
+}
+
+/// GET the events page for `params`, expecting a 200.
+async fn read_events(h: &Harness, params: &[(&str, &str)]) -> Value {
+    let mut request = h.server.get(EVENTS);
+    for (name, value) in params {
+        request = request.add_query_param(name, value);
+    }
+    let resp = admin(h, request).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    resp.json()
+}
+
+/// Write `n` request-path ledger rows straight to the store.
+async fn ledger_rows(h: &Harness, n: usize) -> Vec<modelrouter::db::models::CostLedgerEntry> {
+    use modelrouter::db::repositories::costs::CostRepository;
+    let mut rows = Vec::new();
+    for i in 0..n {
+        let entry = modelrouter::db::models::NewCostLedgerEntry {
+            call_kind: modelrouter::db::models::CallKind::Chat,
+            user_id: 1,
+            prompt_id: None,
+            model: format!("m{i}"),
+            provider: "p".into(),
+            project: None,
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 0.01,
+            api_key_id: None,
+            attribution_correlation_id: None,
+            attribution_tags: "{}".into(),
+            experiment_id: None,
+            experiment_variant: None,
+            tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        rows.push(CostRepository::create(&*h.db, entry).await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    rows
+}
+
+fn ledger_ids(page: &Value) -> Vec<i64> {
+    page["events"].as_array().unwrap().iter().map(|e| e["ledger_id"].as_i64().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn reading_events_needs_an_admin_session() {
+    let h = harness(CacheConfig::default()).await;
+    assert_eq!(h.server.get(EVENTS).await.status_code(), 401);
+    let forged = h.server.get(EVENTS).add_header(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer not-a-real-jwt"),
+    );
+    assert_eq!(forged.await.status_code(), 401);
+}
+
+#[tokio::test]
+async fn an_event_read_back_is_the_emitted_payload() {
+    let h = harness(CacheConfig::default()).await;
+    assert_eq!(tagged_post(&h, "/v1/chat/completions", chat(false)).await.status_code(), 200);
+    let emitted = assert_one_tagged_event(&h).await;
+
+    // Both sides cross the wire as JSON text; parsing that text is not exact
+    // for every float, so compare the emitted payload as a receiver parses it.
+    let delivered: Value = serde_json::from_str(&emitted.to_string()).unwrap();
+    let page = read_events(&h, &[]).await;
+    assert_eq!(page["events"], json!([delivered]));
+    assert!(page["events"][0].get("delivery_id").is_none());
+    assert_eq!(page["next_after_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn pages_cover_every_row_once_in_id_order() {
+    let h = harness(CacheConfig::default()).await;
+    let rows = ledger_rows(&h, 5).await;
+    let all: Vec<i64> = rows.iter().map(|r| r.id).collect();
+
+    let mut seen = Vec::new();
+    let mut after = "0".to_string();
+    let mut cursors = Vec::new();
+    loop {
+        let page = read_events(&h, &[("after_id", &after), ("limit", "2")]).await;
+        seen.extend(ledger_ids(&page));
+        cursors.push(page["next_after_id"].clone());
+        match page["next_after_id"].as_i64() {
+            Some(next) => after = next.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, all);
+    assert_eq!(cursors, [json!(all[1]), json!(all[3]), Value::Null]);
+
+    // A full last page points past itself; the page after it is empty and caught up.
+    let full = read_events(&h, &[("limit", "5")]).await;
+    assert_eq!(ledger_ids(&full), all);
+    assert_eq!(full["next_after_id"], all[4]);
+    let empty = read_events(&h, &[("after_id", &all[4].to_string()), ("limit", "5")]).await;
+    assert_eq!(empty, json!({"events": [], "next_after_id": null}));
+
+    // Without a limit, a page holds up to 1000 events.
+    let default = read_events(&h, &[]).await;
+    assert_eq!(ledger_ids(&default), all);
+    assert_eq!(default["next_after_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn since_keeps_rows_from_that_instant_on_in_any_offset() {
+    let h = harness(CacheConfig::default()).await;
+    let rows = ledger_rows(&h, 4).await;
+
+    let page = read_events(&h, &[("since", &rows[2].created_at)]).await;
+    assert_eq!(ledger_ids(&page), [rows[2].id, rows[3].id]);
+
+    let elsewhere = chrono::DateTime::parse_from_rfc3339(&rows[2].created_at)
+        .unwrap()
+        .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+        .to_rfc3339();
+    let page = read_events(&h, &[("since", &elsewhere)]).await;
+    assert_eq!(ledger_ids(&page), [rows[2].id, rows[3].id]);
+
+    let page = read_events(&h, &[("since", &rows[2].created_at), ("after_id", &rows[2].id.to_string())]).await;
+    assert_eq!(ledger_ids(&page), [rows[3].id]);
+}
+
+#[tokio::test]
+async fn bad_parameters_are_refused_naming_the_field() {
+    let h = harness(CacheConfig::default()).await;
+    for (name, value) in [
+        ("limit", "0"),
+        ("limit", "1001"),
+        ("limit", "ten"),
+        ("after_id", "x"),
+        ("since", "yesterday"),
+        ("since", "2026-11-14"),
+    ] {
+        let resp = admin(&h, h.server.get(EVENTS).add_query_param(name, value)).await;
+        assert_eq!(resp.status_code(), 400, "{name}={value}");
+        let body: Value = resp.json();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(name), "{name}={value}: {message}");
+    }
+    for limit in ["1", "1000"] {
+        read_events(&h, &[("limit", limit)]).await;
+    }
+}
+
+#[tokio::test]
+async fn health_probe_rows_are_not_read_back() {
+    let h = harness(CacheConfig::default()).await;
+    assert_eq!(h.server.get("/health/deep").await.status_code(), 200);
+    common::wait_for_ledger_rows(&*h.db, 1).await;
+    let rows = ledger_rows(&h, 1).await;
+
+    let page = read_events(&h, &[]).await;
+    assert_eq!(ledger_ids(&page), [rows[0].id]);
 }
