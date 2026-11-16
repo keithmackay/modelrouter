@@ -285,6 +285,25 @@ impl CostRepository for SqliteDb {
         Ok(rows)
     }
 
+    async fn list_usage_after(
+        &self,
+        since: Option<&str>,
+        after_id: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CostLedgerEntry>> {
+        let since_clause = if since.is_some() { " AND created_at >= ?" } else { "" };
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE id > ? AND call_kind <> 'health'{} \
+             ORDER BY id ASC LIMIT ?",
+            LEDGER_COLUMNS, since_clause
+        );
+        let mut q = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(sql)).bind(after_id);
+        if let Some(since) = since {
+            q = q.bind(since);
+        }
+        Ok(q.bind(limit).fetch_all(&self.pool).await?)
+    }
+
     async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()> {
         for chunk in ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");

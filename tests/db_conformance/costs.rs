@@ -673,6 +673,50 @@ async fn list_before_and_delete_by_ids() {
     .await;
 }
 
+// ── Usage events read ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_usage_after_pages_by_id_without_health_rows() {
+    each_backend(|db| async move {
+        let u = user(&db, "alice").await;
+        let a = put(&db, entry(u, "m1", 1.0)).await;
+        put(
+            &db,
+            NewCostLedgerEntry {
+                call_kind: modelrouter::db::models::CallKind::Health,
+                ..entry(u, "probe", 0.1)
+            },
+        )
+        .await;
+        let b = put_hit(&db, entry(u, "m2", 2.0)).await;
+        let c = put(&db, entry(u, "m3", 4.0)).await;
+
+        let ids = |rows: Vec<CostLedgerEntry>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(db.list_usage_after(None, 0, 10).await.unwrap()),
+            [a.id, b.id, c.id],
+            "id order, health rows left out"
+        );
+        assert_eq!(ids(db.list_usage_after(None, 0, 2).await.unwrap()), [a.id, b.id]);
+        assert_eq!(ids(db.list_usage_after(None, b.id, 2).await.unwrap()), [c.id]);
+        assert!(db.list_usage_after(None, c.id, 2).await.unwrap().is_empty());
+
+        assert_eq!(
+            ids(db.list_usage_after(Some(&b.created_at), 0, 10).await.unwrap()),
+            [b.id, c.id],
+            "since is inclusive"
+        );
+        assert_eq!(ids(db.list_usage_after(Some(&b.created_at), b.id, 10).await.unwrap()), [c.id]);
+        assert!(db.list_usage_after(Some(FUTURE), 0, 10).await.unwrap().is_empty());
+
+        let hit = &db.list_usage_after(None, a.id, 1).await.unwrap()[0];
+        assert!(hit.cache_hit);
+        assert!(close(hit.saved_usd, 2.0));
+        assert_eq!(hit.model, "m2");
+    })
+    .await;
+}
+
 // ── Pickers ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]

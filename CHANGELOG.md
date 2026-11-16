@@ -4,6 +4,9 @@
 
 ### Week of 2026-11-09
 
+**Features**
+- `GET /admin/api/usage/events?since=&after_id=&limit=` reads `usage` events back by ledger id, so a receiver can backfill deliveries it missed. Each item is the webhook payload for that row without `delivery_id`; health-probe rows are left out. Pages are in id order, at most 1000 events; `next_after_id` is the cursor for the next page and `null` once caught up. Admin session required.
+
 **Fixes**
 - On PostgreSQL, prompts read back by id or in a listing reported an empty `call_kind`: those reads did not select the column. SQLite was unaffected.
 

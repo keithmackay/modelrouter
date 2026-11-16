@@ -66,6 +66,7 @@ modelrouter install-service  (macOS/Linux)
 | `GET /admin/stats` | Usage stats (admin JWT required) |
 | `GET /admin/budgets` | List budget rules (admin JWT required) |
 | `GET /admin/audit` | Audit log (admin JWT required) |
+| `GET /admin/api/usage/events` | `usage` webhook payloads read back by ledger id, `?since=&after_id=&limit=` (≤ 1000), health-probe rows excluded; `next_after_id` null when caught up (admin JWT required) |
 | `GET /admin/api/compare` | Two-arm comparison by model, provider, tag, run or experiment variant (admin JWT required; see `docs/experiments.md`) |
 | `GET /admin/compare` | Comparison page (admin dashboard) |
 | `GET /admin/api/experiments` | List experiments, `?status=active\|closed\|all` (admin JWT required) |
