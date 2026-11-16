@@ -45,6 +45,8 @@ fn ledger(user_id: i64, model: &str, project: Option<&str>, cost_usd: f64) -> Ne
         experiment_id: None,
         experiment_variant: None,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     }
 }
 

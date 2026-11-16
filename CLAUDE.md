@@ -37,7 +37,7 @@ modelrouter experiment results --id <id> [--limit <1-1000>] [--offset <n>] [--fo
 modelrouter db export --out <file.json>
 modelrouter db import --in <file.json> [--merge]
 modelrouter webhook list
-modelrouter webhook add --name <name> --url <url> [--events completion] [--secret-header-name <h>] [--secret-header-value <v>]
+modelrouter webhook add --name <name> --url <url> [--events completion|usage|*] [--secret-header-name <h>] [--secret-header-value <v>] [--signing-secret-env <VAR>]
 modelrouter webhook delete --id <id>
 modelrouter webhook enable --id <id>
 modelrouter webhook disable --id <id>

@@ -812,6 +812,10 @@ pub enum WebhookCommands {
         secret_header_name: Option<String>,
         #[arg(long)]
         secret_header_value: Option<String>,
+        /// Name of the environment variable holding the secret deliveries are
+        /// signed with (HMAC-SHA256); the secret never goes on the command line
+        #[arg(long)]
+        signing_secret_env: Option<String>,
     },
     /// Delete a webhook by ID
     Delete {

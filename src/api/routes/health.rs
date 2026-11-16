@@ -556,6 +556,8 @@ fn record_probe_usage(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Health,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         };
         if let Err(e) = CostRepository::create(&*state.db, entry).await {
             tracing::error!(error = %e, "failed to record health-probe usage");

@@ -89,6 +89,7 @@ fn foundry_config(endpoint: &str, rerank_deployments: Vec<String>, rerank_url: O
 struct TestApp {
     server: TestServer,
     db: Arc<dyn DatabaseProvider>,
+    usage: common::RecordedUsage,
 }
 
 /// The app with `rerank` aliased to `foundry/rerank-a`, strict resolution on,
@@ -120,6 +121,7 @@ async fn test_app(endpoint: &str, rerank_deployments: Vec<String>, rerank_url: O
         vec![]
     };
     let db: Arc<dyn DatabaseProvider> = Arc::new(db);
+    let usage = common::RecordedUsage::default();
     let state = AppState {
         settings: settings.clone(),
         db: db.clone(),
@@ -143,13 +145,13 @@ async fn test_app(endpoint: &str, rerank_deployments: Vec<String>, rerank_url: O
         storage: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
         prompt_db: db.clone(),
         app_metrics: None,
-        callbacks: Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![])),
+        callbacks: usage.dispatcher(),
         guardrails: Arc::new(modelrouter::guardrails::GuardrailChain::new(vec![])),
         oidc_state: Arc::new(modelrouter::api::admin::oidc::OidcStateStore::new()),
         experiments: Arc::new(LiveExperiments::default()),
     };
     let app = build_router_with_registries(state, Extensions::default(), decisions, reranks, modelrouter::api::readiness::Readiness::started());
-    TestApp { server: TestServer::new(app).unwrap(), db }
+    TestApp { server: TestServer::new(app).unwrap(), db, usage }
 }
 
 fn bearer() -> (axum::http::HeaderName, axum::http::HeaderValue) {
@@ -217,6 +219,22 @@ async fn a_rerank_passes_through_the_body_and_the_results_and_prices_the_search_
     assert_eq!(meta["settings"]["top_n"], 2);
     assert_eq!(meta["settings"]["search_units"], 2);
     assert_eq!(meta["timing"]["attempts"], 1);
+}
+
+#[tokio::test]
+async fn a_rerank_emits_one_usage_event_for_its_ledger_row() {
+    let (base, _capture) = spawn_upstream(StatusCode::OK, results_payload()).await;
+    let app = test_app(&base, vec![], None, true).await;
+    let (name, value) = bearer();
+    let resp = app.server.post("/v1/rerank").add_header(name, value).json(&request_body()).await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+
+    let ledger = common::wait_for_ledger_rows(&*app.db, 1).await;
+    let events = app.usage.wait_for(1).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "usage");
+    assert_eq!(events[0]["ledger_id"], ledger[0].id);
+    assert_eq!(events[0]["model"], DEPLOYMENT);
 }
 
 #[tokio::test]

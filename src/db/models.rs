@@ -446,6 +446,14 @@ pub struct CostLedgerEntry {
     #[sqlx(default)]
     #[serde(default = "unknown_call_kind")]
     pub call_kind: String,
+    /// Input tokens the provider served from its prompt cache.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub cache_read_tokens: i64,
+    /// Input tokens the provider wrote to its prompt cache.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub cache_write_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -466,6 +474,8 @@ pub struct NewCostLedgerEntry {
     pub tokens_estimated: bool,
     /// What kind of call this row records; every route sets it.
     pub call_kind: CallKind,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

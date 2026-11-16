@@ -13,7 +13,8 @@ const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, 
                               tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
                               cache_hit, saved_usd, attribution_correlation_id, \
                               attribution_tags, experiment_id, experiment_variant, \
-                              tokens_estimated, call_kind";
+                              tokens_estimated, call_kind, \
+                              cache_read_tokens, cache_write_tokens";
 
 #[async_trait]
 impl CostRepository for SqliteDb {
@@ -30,8 +31,8 @@ impl CostRepository for SqliteDb {
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        call_kind, cache_read_tokens, cache_write_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -49,6 +50,8 @@ impl CostRepository for SqliteDb {
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
         .bind(entry.call_kind.as_str())
+        .bind(entry.cache_read_tokens)
+        .bind(entry.cache_write_tokens)
         .execute(&self.pool)
         .await?;
 
@@ -73,8 +76,8 @@ impl CostRepository for SqliteDb {
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        call_kind, cache_read_tokens, cache_write_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -92,6 +95,8 @@ impl CostRepository for SqliteDb {
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
         .bind(entry.call_kind.as_str())
+        .bind(entry.cache_read_tokens)
+        .bind(entry.cache_write_tokens)
         .execute(&self.pool)
         .await?;
 
@@ -1357,6 +1362,8 @@ mod tests {
                 experiment_variant: None,
                 tokens_estimated: false,
                 call_kind: kind,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             },
         )
         .await
@@ -1522,6 +1529,8 @@ mod tests {
             experiment_variant: Some("control".into()),
             call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: true,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         };
         let row = db.create(entry.clone()).await.unwrap();
         assert_eq!(row.experiment_id, Some(4));

@@ -364,7 +364,8 @@ async fn search_inner(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     // Request receipt: `x_router.timing.total_ms` is measured from here.
     let received = Instant::now();
@@ -694,8 +695,10 @@ async fn search_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Search,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                 };
-                if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
+                if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record search cost: {}", e);
                 }
         }
@@ -878,7 +881,7 @@ fn record_search_cache_hit(
     avoided_cost: f64,
     attribution: &crate::api::attribution::Attribution,
 ) {
-    use crate::db::repositories::costs::CostRepository;
+    use crate::api::ledger::record_cache_hit_usage;
 
     let state = state.clone();
     let ledger = NewCostLedgerEntry {
@@ -900,9 +903,11 @@ fn record_search_cache_hit(
         experiment_variant: None,
         call_kind: crate::db::models::CallKind::Search,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
     tokio::spawn(async move {
-        if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {
+        if let Err(e) = record_cache_hit_usage(&*state.db, &state.callbacks, ledger).await {
             tracing::error!("Failed to record search cache-hit usage: {}", e);
         }
     });
