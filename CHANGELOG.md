@@ -4,6 +4,9 @@
 
 ### Week of 2026-11-09
 
+**Features**
+- `GET /admin/api/usage/events?since=&after_id=&limit=` reads `usage` events back by ledger id, so a receiver can backfill deliveries it missed. Each item is the webhook payload for that row without `delivery_id`; health-probe rows are left out. Pages are in id order, at most 1000 events; `next_after_id` is the cursor for the next page and `null` once caught up. Admin session required.
+
 **Fixes**
 - On PostgreSQL, prompts read back by id or in a listing reported an empty `call_kind`: those reads did not select the column. SQLite was unaffected.
 
@@ -16,7 +19,6 @@ commit; `git log v0.1.1..v0.2.0` has the detail.
 
 **Features**
 - `usage` webhook event. Every cost-ledger row a request writes (chat completions and `/v1/messages` streamed or not, response-cache hits, `/v1/responses`, embeddings, images, audio, search, `/v1/rerank`, `/v1/decisions`, `/v1/systemone`) emits one event carrying the row's id and time, the caller's correlation id, tags and resolved project, model, provider, token counts including prompt-cache reads and writes, `cost_usd`, `cache_hit`, `saved_usd` and `uncached_cost_usd`, and no content (`schema_version: 1`). Subscribe with `--events usage`. A webhook registered with `*` or no events now receives `usage` events as well as `completion`.
-- `GET /admin/api/usage/events?since=&after_id=&limit=` reads `usage` events back by ledger id, so a receiver can backfill deliveries it missed. Each item is the webhook payload for that row without `delivery_id`; health-probe rows are left out. Pages are in id order, at most 1000 events; `next_after_id` is the cursor for the next page and `null` once caught up. Admin session required.
 - Signed webhooks. A webhook with a signing secret (`webhook add --signing-secret-env <VAR>`, `signing_secret` on `POST /admin/api/webhooks`, or the dashboard form) sends `X-Modelrouter-Signature: sha256=<HMAC-SHA256 of "<timestamp>.<body>">` with `X-Modelrouter-Timestamp`, `X-Modelrouter-Delivery` and `X-Modelrouter-Event`. Listings show only whether a webhook is signed.
 - Webhook deliveries time out after 10 s and follow no redirects. `usage` deliveries are retried on a connection error, timeout, 429 or 5xx after 1 s, 5 s, 30 s, 2 min and 10 min; at most 1000 deliveries per webhook are held in flight.
 - The cost ledger records prompt-cache read and write tokens (`cache_read_tokens`, `cache_write_tokens`).
