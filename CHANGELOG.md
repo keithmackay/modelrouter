@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Week of 2026-11-09
+
+**Fixes**
+- On PostgreSQL, prompts read back by id or in a listing reported an empty `call_kind`: those reads did not select the column. SQLite was unaffected.
+
 ## 0.2.0 — 2026-11-15
 
 Everything since 0.1.1, by week. Entries are the merged result, not every
