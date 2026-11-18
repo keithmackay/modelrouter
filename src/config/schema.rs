@@ -58,6 +58,13 @@ pub struct ModelCapabilityEntry {
     /// bounds how much it reasons. Omitted leaves the built-in default.
     #[serde(default)]
     pub supports_effort: Option<bool>,
+    /// `true` when a request carrying function tools must reach the model
+    /// over the OpenAI Responses API rather than chat completions, on the
+    /// providers that serve both (Azure AI Foundry). The newest OpenAI
+    /// reasoning generations refuse function tools on `/chat/completions`
+    /// unless reasoning is turned off. Omitted leaves the built-in default.
+    #[serde(default)]
+    pub tools_via_responses_api: Option<bool>,
 }
 
 /// Response cache configuration.

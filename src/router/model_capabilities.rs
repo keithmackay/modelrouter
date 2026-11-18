@@ -361,6 +361,28 @@ pub fn openai_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
         .map(|(_, levels)| *levels)
 }
 
+/// Families that refuse function tools on `/chat/completions` while they
+/// reason (the service answers *"Function tools with reasoning_effort are
+/// not supported ... use /v1/responses or set reasoning_effort to 'none'"*),
+/// and take them on the Responses API. A provider that serves both surfaces
+/// sends a tool-carrying request for one of these over the Responses API;
+/// a request without tools stays on chat completions. Turning reasoning off
+/// instead would silently downgrade the model, so it is never the fallback.
+const TOOLS_VIA_RESPONSES_API: &[&str] = &["gpt-6", "gpt-6.1"];
+
+/// Whether a request for `model` that carries function tools must go over
+/// the OpenAI Responses API: a config entry (`tools_via_responses_api`),
+/// else membership of the built-in family table. A dated snapshot or a
+/// deployment named after its model (`gpt-6-foo`) is a release of its family.
+pub fn tools_via_responses_api(model: &str, overrides: &[ModelCapabilityEntry]) -> bool {
+    lookup_flag(
+        model,
+        overrides,
+        |e| e.tools_via_responses_api,
+        |c| TOOLS_VIA_RESPONSES_API.iter().any(|family| family_matches(c, family)),
+    )
+}
+
 /// Every reasoning level a caller may name, lowest first.
 const REASONING_SCALE: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -847,5 +869,38 @@ mod tests {
             }
         );
         assert_eq!(resolve_reasoning("gpt-4o", Some("low"), &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod tools_via_responses_api_tests {
+    use super::*;
+
+    /// The families that refuse function tools on chat completions while
+    /// reasoning, by family and by deployment name; their predecessors and
+    /// the non-OpenAI deployments stay on chat completions.
+    #[test]
+    fn the_built_in_table_covers_the_family_and_its_deployments_only() {
+        for model in ["gpt-6", "gpt-6-foo", "GPT-6-Bar", "foundry/gpt-6-foo", "gpt-6.1", "gpt-6.1-baz", "gpt-6@20260101"] {
+            assert!(tools_via_responses_api(model, &[]), "{model}");
+        }
+        for model in ["gpt-5.6", "gpt-5.6-foo", "gpt-60", "gpt-6x", "o3", "Llama-3.3-70B-Instruct", "claude-opus-5"] {
+            assert!(!tools_via_responses_api(model, &[]), "{model}");
+        }
+    }
+
+    /// `[[model_capabilities]]` puts a deployment in or out of the rule
+    /// without a release, by its pinned name or its family.
+    #[test]
+    fn config_entries_override_the_table_either_way() {
+        let overrides = vec![
+            ModelCapabilityEntry { model: "my-deployment".into(), tools_via_responses_api: Some(true), ..Default::default() },
+            ModelCapabilityEntry { model: "gpt-6-legacy".into(), tools_via_responses_api: Some(false), ..Default::default() },
+            ModelCapabilityEntry { model: "gpt-6-foo".into(), supports_temperature: Some(false), ..Default::default() },
+        ];
+        assert!(tools_via_responses_api("foundry/my-deployment", &overrides));
+        assert!(!tools_via_responses_api("gpt-6-legacy", &overrides));
+        assert!(tools_via_responses_api("gpt-6-foo", &overrides), "an entry that says nothing leaves the table in force");
+        assert!(tools_via_responses_api("gpt-6-other", &overrides));
     }
 }

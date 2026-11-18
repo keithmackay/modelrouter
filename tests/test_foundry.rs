@@ -1274,3 +1274,267 @@ fn config_toml_parses_the_account_resource_id() {
     let settings = modelrouter::config::load(Some(path)).unwrap();
     assert_eq!(settings.providers["foundry"].account_resource_id.as_deref(), Some(ACCOUNT_ID));
 }
+
+// ── the Responses API for tool-carrying requests ───────────────────────────
+//
+// The newest OpenAI reasoning generations refuse function tools on
+// `/chat/completions` ("use /v1/responses or set reasoning_effort to
+// 'none'"). A request that carries tools, for a deployment in that family,
+// goes over `POST {endpoint}/openai/v1/responses` and is translated both
+// ways; everything else keeps the chat-completions path above.
+
+const RESPONSES_DEPLOYMENT: &str = "gpt-6-example";
+
+fn responses_tool_call_payload() -> serde_json::Value {
+    json!({
+        "id": "resp_1", "object": "response", "status": "completed", "model": RESPONSES_DEPLOYMENT,
+        "output": [
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup",
+             "arguments": "{\"q\":\"revenue\"}", "status": "completed"}
+        ],
+        "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27,
+                  "input_tokens_details": {"cached_tokens": 4},
+                  "output_tokens_details": {"reasoning_tokens": 5}}
+    })
+}
+
+const RESPONSES_TOOL_CALL_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+    "event: response.output_item.added\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+    "event: response.output_item.added\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"q\\\":\"}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"revenue\\\"}\"}\n\n",
+    "event: response.function_call_arguments.done\n",
+    "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"arguments\":\"{\\\"q\\\":\\\"revenue\\\"}\"}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n",
+);
+
+/// A mock resource serving BOTH the chat-completions and the Responses
+/// routes of the OpenAI v1 surface, recording which one each call took.
+async fn spawn_foundry_with_responses(
+    status: StatusCode,
+    responses: serde_json::Value,
+    sse: Option<&'static str>,
+) -> (String, Arc<Mutex<Capture>>) {
+    let capture = Arc::new(Mutex::new(Capture::default()));
+    fn record(capture: &Arc<Mutex<Capture>>, uri: &Uri, headers: &HeaderMap, body: &str) {
+        let mut c = capture.lock().unwrap();
+        c.paths.push(uri.path().to_string());
+        c.queries.push(uri.query().unwrap_or("").to_string());
+        c.bodies.push(serde_json::from_str(body).unwrap_or(serde_json::Value::Null));
+        c.authorization.push(header(headers, "authorization"));
+        c.api_key.push(header(headers, "api-key"));
+    }
+    let responses_handler = {
+        let capture = capture.clone();
+        move |uri: Uri, headers: HeaderMap, body: String| {
+            let capture = capture.clone();
+            let responses = responses.clone();
+            async move {
+                record(&capture, &uri, &headers, &body);
+                let streaming = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["stream"].as_bool())
+                    .unwrap_or(false);
+                match (streaming, sse) {
+                    (true, Some(events)) => {
+                        (status, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], events).into_response()
+                    }
+                    _ => (status, Json(responses)).into_response(),
+                }
+            }
+        }
+    };
+    let chat_handler = {
+        let capture = capture.clone();
+        move |uri: Uri, headers: HeaderMap, body: String| {
+            let capture = capture.clone();
+            async move {
+                record(&capture, &uri, &headers, &body);
+                (StatusCode::OK, Json(chat_payload())).into_response()
+            }
+        }
+    };
+    let app = Router::new()
+        .route("/openai/v1/responses", post(responses_handler))
+        .route("/openai/v1/chat/completions", post(chat_handler.clone()))
+        .route("/models/chat/completions", post(chat_handler));
+    (spawn(app).await, capture)
+}
+
+/// A tool-carrying request for a deployment in the family posts to the
+/// Responses route, in the Responses shape, and the call parses back as a
+/// chat tool call with the usage the service counted.
+#[tokio::test]
+async fn a_responses_family_deployment_with_tools_posts_to_the_responses_surface() {
+    let (base, capture) = spawn_foundry_with_responses(StatusCode::OK, responses_tool_call_payload(), None).await;
+    let adapter = static_adapter(&config(&base));
+    let mut r = tool_req(RESPONSES_DEPLOYMENT);
+    r.reasoning = Some(modelrouter::providers::adapter::ReasoningControl { disable_thinking: false, effort: Some("high") });
+    assert!(adapter.uses_responses_api(&r));
+
+    let result = adapter.complete(&r).await.unwrap();
+    assert_eq!(result.finish_reason, "tool_calls");
+    let calls = result.tool_calls.expect("the call parsed back");
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"q\":\"revenue\"}");
+    assert_eq!(result.prompt_tokens, 20);
+    assert_eq!(result.completion_tokens, 7);
+    assert_eq!(result.cache_read_tokens, 4);
+    assert_eq!(result.reasoning_tokens, Some(5));
+    assert!(result.ttft_ms.is_some());
+
+    let c = capture.lock().unwrap();
+    assert_eq!(c.paths, vec!["/openai/v1/responses"], "chat completions was never called");
+    assert_eq!(c.authorization[0].as_deref(), Some("Bearer static-token"));
+    let body = &c.bodies[0];
+    assert_eq!(body["model"], RESPONSES_DEPLOYMENT);
+    assert_eq!(body["input"][0]["role"], "user");
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["tools"][0]["name"], "lookup");
+    assert!(body["tools"][0].get("function").is_none());
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["max_output_tokens"], 8);
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["store"], false);
+}
+
+/// Without tools the same deployment answers on chat completions, so that
+/// is where a plain request still goes; a deployment outside the family
+/// keeps its tools on chat completions as before.
+#[tokio::test]
+async fn requests_outside_the_rule_stay_on_chat_completions() {
+    let (base, capture) = spawn_foundry_with_responses(StatusCode::OK, responses_tool_call_payload(), None).await;
+    let adapter = static_adapter(&config(&base));
+
+    assert!(!adapter.uses_responses_api(&req(RESPONSES_DEPLOYMENT)));
+    adapter.complete(&req(RESPONSES_DEPLOYMENT)).await.unwrap();
+    assert!(!adapter.uses_responses_api(&tool_req("gpt-5.6-example")));
+    adapter.complete(&tool_req("gpt-5.6-example")).await.unwrap();
+    adapter.complete(&tool_req(DEPLOYMENT)).await.unwrap();
+
+    let c = capture.lock().unwrap();
+    assert_eq!(c.paths, vec!["/openai/v1/chat/completions"; 3]);
+    assert_eq!(c.bodies[1]["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(c.bodies[1]["max_completion_tokens"], 8, "the chat path is unchanged for the earlier reasoning families");
+}
+
+/// `[[model_capabilities]]` moves a deployment in or out of the rule, and
+/// the registry hands those entries to the adapter it builds.
+#[tokio::test]
+async fn model_capabilities_overrides_reach_the_adapter_through_the_registry() {
+    use modelrouter::config::schema::ModelCapabilityEntry;
+    let (base, capture) = spawn_foundry_with_responses(StatusCode::OK, responses_tool_call_payload(), None).await;
+    let overrides = vec![
+        ModelCapabilityEntry { model: DEPLOYMENT.into(), tools_via_responses_api: Some(true), ..Default::default() },
+        ModelCapabilityEntry { model: RESPONSES_DEPLOYMENT.into(), tools_via_responses_api: Some(false), ..Default::default() },
+    ];
+
+    let adapter = static_adapter(&config(&base)).with_model_capabilities(overrides.clone());
+    assert!(adapter.uses_responses_api(&tool_req(DEPLOYMENT)));
+    assert!(!adapter.uses_responses_api(&tool_req(RESPONSES_DEPLOYMENT)));
+
+    // Key auth, so this asserts registry plumbing without the credential chain.
+    let mut cfg = config(&base);
+    cfg.api_key = "k".into();
+    let mut configs = HashMap::new();
+    configs.insert("foundry".to_string(), cfg);
+    let registry = ProviderRegistry::new(configs).with_model_capabilities(overrides);
+    registry.get("foundry").unwrap().complete(&tool_req(DEPLOYMENT)).await.unwrap();
+    registry.get("foundry").unwrap().complete(&tool_req(RESPONSES_DEPLOYMENT)).await.unwrap();
+
+    let c = capture.lock().unwrap();
+    assert_eq!(c.paths, vec!["/openai/v1/responses", "/openai/v1/chat/completions"]);
+    assert_eq!(c.api_key[0].as_deref(), Some("k"));
+}
+
+/// A streamed Responses call comes back as OpenAI `chat.completion.chunk`
+/// frames: the same contract the chat path's pass-through meets, so the
+/// router's stream capture folds it into the call the model made, usage
+/// included.
+#[tokio::test]
+async fn a_streamed_responses_call_is_translated_to_openai_chunks() {
+    use modelrouter::router::cache::stream::ChatStreamCapture;
+    let (base, capture) =
+        spawn_foundry_with_responses(StatusCode::OK, responses_tool_call_payload(), Some(RESPONSES_TOOL_CALL_SSE)).await;
+    let adapter = static_adapter(&config(&base));
+    let mut r = tool_req(RESPONSES_DEPLOYMENT);
+    r.stream = true;
+
+    let mut stream = adapter.stream(&r).await.unwrap();
+    let mut body = Vec::new();
+    let mut folded = ChatStreamCapture::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        folded.feed(&chunk);
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    assert!(!body.contains("response.output_item"), "no Responses event reaches the client: {body}");
+    let frames: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    assert!(frames.iter().all(|f| f["object"] == "chat.completion.chunk"), "{frames:?}");
+    assert_eq!(frames[0]["choices"][0]["delta"]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(frames.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+
+    let result = folded.finish().expect("a usable, complete stream");
+    assert_eq!(result.finish_reason, "tool_calls");
+    let calls = result.tool_calls.expect("the call reassembled");
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"q\":\"revenue\"}");
+    assert_eq!(result.prompt_tokens, 20);
+    assert_eq!(result.completion_tokens, 7);
+    assert_eq!(result.cache_read_tokens, 4);
+
+    let c = capture.lock().unwrap();
+    assert_eq!(c.paths, vec!["/openai/v1/responses"]);
+    assert_eq!(c.bodies[0]["stream"], true);
+    assert!(c.bodies[0].get("stream_options").is_none(), "a chat-completions field, not a Responses one");
+}
+
+/// Only the OpenAI v1 surface carries the Responses API: an endpoint
+/// configured for the Model Inference surface crosses to it on the same
+/// host, as discovery does, while its plain chat stays on `/models`.
+#[tokio::test]
+async fn the_model_inference_surface_crosses_to_the_openai_v1_responses_route() {
+    let (base, capture) = spawn_foundry_with_responses(StatusCode::OK, responses_tool_call_payload(), None).await;
+    let adapter = static_adapter(&config(&format!("{base}/models")));
+    adapter.complete(&tool_req(RESPONSES_DEPLOYMENT)).await.unwrap();
+    adapter.complete(&req(RESPONSES_DEPLOYMENT)).await.unwrap();
+    let c = capture.lock().unwrap();
+    assert_eq!(c.paths, vec!["/openai/v1/responses", "/models/chat/completions"]);
+    assert_eq!(c.queries[0], "", "the Model Inference api-version is not sent to the OpenAI v1 surface");
+    assert!(c.queries[1].starts_with("api-version="));
+}
+
+/// A refusal on the Responses route is the adapter's own error, with the
+/// same deployment-and-surface hint as chat completions.
+#[tokio::test]
+async fn a_responses_failure_names_the_deployment() {
+    let (base, _capture) = spawn_foundry_with_responses(
+        StatusCode::NOT_FOUND,
+        json!({"error": {"code": "DeploymentNotFound", "message": "no such deployment"}}),
+        None,
+    )
+    .await;
+    let adapter = static_adapter(&config(&base));
+    let err = adapter.complete(&tool_req(RESPONSES_DEPLOYMENT)).await.unwrap_err().to_string();
+    assert!(err.contains("404"), "{err}");
+    assert!(err.contains("no such deployment"), "{err}");
+    assert!(err.contains(RESPONSES_DEPLOYMENT), "{err}");
+}

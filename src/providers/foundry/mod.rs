@@ -14,6 +14,8 @@
 //! - `endpoint` — endpoint/surface/api-version/scope resolution
 //! - `auth` — Entra by default, `api-key` header on explicit opt-in
 //! - `adapter` — chat completions and streaming
+//! - `responses` — tool-carrying chat over the Responses API, for the
+//!   families that refuse function tools on chat completions
 //! - `embed` — embeddings
 //! - `decide` — the Decisions API (typed questions over a document)
 //! - `catalog` — deployed-model discovery
@@ -29,6 +31,7 @@ pub mod decide;
 pub mod embed;
 pub mod endpoint;
 pub mod rerank;
+pub mod responses;
 pub mod retail_pricing;
 
 pub use adapter::FoundryAdapter;

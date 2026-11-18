@@ -515,6 +515,16 @@ rotation_overlap_mins = 15
 # thinks_by_default = true
 # can_disable_thinking = true
 # supports_effort = true
+#
+# Function tools over the Responses API. On Azure AI Foundry the `gpt-6` and
+# `gpt-6.1` families refuse function tools on chat completions while they
+# reason, so a tool-carrying request for them is posted to the Responses API
+# and translated both ways (a request without tools stays on chat
+# completions). Put another deployment in, or one of those out, here:
+#
+# [[model_capabilities]]
+# model = "my-gpt-6-deployment"
+# tools_via_responses_api = true
 
 # ---------------------------------------------------------------------------
 # Declarative Policy Rules

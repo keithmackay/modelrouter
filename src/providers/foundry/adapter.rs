@@ -34,6 +34,15 @@
 //! surface-aware catalog discovery — would have to be bolted on from outside.
 //! Standalone, like `azure_openai.rs`.
 //!
+//! ## Two doors for the OpenAI-shaped deployments
+//!
+//! A deployment in the Responses-only family table
+//! (`model_capabilities::tools_via_responses_api`, overridable per model in
+//! `[[model_capabilities]]`) refuses function tools on `/chat/completions`
+//! while it reasons. A request for one of those that carries tools goes over
+//! the Responses API instead (`foundry::responses`), translated both ways;
+//! every other request, that deployment's plain chat included, stays here.
+//!
 //! ## No network in this environment
 //!
 //! Written against the published REST specs; the development host has no route
@@ -47,7 +56,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures::TryStreamExt;
 
-use crate::config::schema::{ProviderConfig, TierTimeoutsConfig};
+use crate::config::schema::{ModelCapabilityEntry, ProviderConfig, TierTimeoutsConfig};
 use crate::providers::adapter::{
     CompletionResult, EffectiveSettings, NormalizedRequest, ProviderAdapter, SseStream,
 };
@@ -84,6 +93,10 @@ pub struct FoundryAdapter {
     /// `discover_deployments`: the listing's other Succeeded deployments join
     /// the catalog, classified, as `source: discovered`.
     discover_deployments: bool,
+    /// `[[model_capabilities]]`: the per-model overrides of the Responses API
+    /// rule (`tools_via_responses_api`). The serving path hands them in;
+    /// without them the built-in family table alone applies.
+    model_capabilities: Vec<ModelCapabilityEntry>,
 }
 
 /// Where and how the catalog reads the account's live deployments.
@@ -189,6 +202,7 @@ impl FoundryAdapter {
             rerank_catalog: kind_catalog(config, &config.rerank_deployments),
             deployment_listing,
             discover_deployments: config.discover_deployments,
+            model_capabilities: Vec::new(),
         })
     }
 
@@ -200,9 +214,27 @@ impl FoundryAdapter {
         self
     }
 
+    /// Apply the `[[model_capabilities]]` overrides, which can put a model
+    /// in or out of the Responses API rule without a release.
+    pub fn with_model_capabilities(mut self, entries: Vec<ModelCapabilityEntry>) -> Self {
+        self.model_capabilities = entries;
+        self
+    }
+
+    /// Whether `req` goes over the Responses API: an OpenAI-shaped
+    /// deployment in the family that refuses function tools on chat
+    /// completions, and a request that carries tools. A request without
+    /// tools stays on chat completions, where the same deployment answers,
+    /// and a Claude deployment has its own surface.
+    pub fn uses_responses_api(&self, req: &NormalizedRequest) -> bool {
+        self.claude_for(&req.model).is_none()
+            && req.tools.as_ref().is_some_and(|t| !t.is_empty())
+            && crate::router::model_capabilities::tools_via_responses_api(&req.model, &self.model_capabilities)
+    }
+
     /// Per-request ceiling: the addressed tier's value, or this provider's
     /// flat `timeout_secs` for anything else.
-    fn request_timeout(&self, req: &NormalizedRequest) -> std::time::Duration {
+    pub(crate) fn request_timeout(&self, req: &NormalizedRequest) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.tier_timeouts.resolve(&req.request_model, self.default_timeout_secs),
         )
@@ -300,7 +332,7 @@ impl FoundryAdapter {
     /// deployment, and — for the two statuses an operator actually hits — what
     /// to check. Azure's own body is always included: it carries the AADSTS or
     /// `code` value that names the real fault.
-    fn http_error(&self, model: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    pub(crate) fn http_error(&self, model: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
         let hint = match status.as_u16() {
             401 | 403 => format!(
                 " — check the identity has the \"Azure AI User\" (or equivalent) role on this \
@@ -324,7 +356,7 @@ impl FoundryAdapter {
 /// The `reasoning_effort` an OpenAI-dialect reasoning deployment is sent:
 /// the resolved level, only for the families that take the field (see
 /// `model_capabilities::openai_reasoning_levels`).
-fn openai_reasoning_effort(req: &NormalizedRequest) -> Option<&'static str> {
+pub(crate) fn openai_reasoning_effort(req: &NormalizedRequest) -> Option<&'static str> {
     crate::router::model_capabilities::openai_reasoning_levels(&req.model)?;
     req.reasoning?.effort
 }
@@ -433,7 +465,8 @@ impl ProviderAdapter for FoundryAdapter {
 
     /// Every deployment takes tools: Claude deployments translated like the
     /// direct `anthropic` provider, OpenAI-shaped ones passed through verbatim
-    /// on the v1 surface (`build_body`, `parse_response`).
+    /// on the v1 surface (`build_body`, `parse_response`), and the families
+    /// that refuse them there over the Responses API (`foundry::responses`).
     fn supports_tools(&self, _model: &str) -> bool {
         true
     }
@@ -468,6 +501,9 @@ impl ProviderAdapter for FoundryAdapter {
     async fn complete(&self, req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
         if let Some(claude) = self.claude_for(&req.model) {
             return claude.complete(&self.client, req, self.request_timeout(req)).await;
+        }
+        if self.uses_responses_api(req) {
+            return crate::providers::foundry::responses::complete(self, req).await;
         }
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, false);
@@ -526,6 +562,9 @@ impl ProviderAdapter for FoundryAdapter {
     async fn stream(&self, req: &NormalizedRequest) -> anyhow::Result<SseStream> {
         if let Some(claude) = self.claude_for(&req.model) {
             return claude.stream(&self.client, req, self.request_timeout(req)).await;
+        }
+        if self.uses_responses_api(req) {
+            return crate::providers::foundry::responses::stream(self, req).await;
         }
         let url = self.endpoint.chat_url();
         let body = Self::build_body(req, true);
