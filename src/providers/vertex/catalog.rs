@@ -111,7 +111,7 @@ impl ProviderCatalog for VertexAdapter {
                         provider: "vertex".to_string(),
                         name: format!("{publisher}/{id}"),
                         display_name: m["displayName"].as_str().map(str::to_string),
-                        kind: crate::providers::catalog::CatalogKind::Chat,
+                        kind: crate::providers::catalog::CatalogKind::from_name(id),
                         source: None,
                     });
                 }
