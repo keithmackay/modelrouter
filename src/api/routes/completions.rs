@@ -255,9 +255,10 @@ async fn chat_completions_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan
-        .store()
-        .then(|| crate::router::cache::completion_cache_key(&canonical_model, &body));
+    // Every call is fingerprinted, cached or not: the ledger row carries it so
+    // repeated requests can be reported. When the plan stores, it is the key.
+    let request_fingerprint = crate::router::cache::completion_cache_key(&canonical_model, &body);
+    let cache_key = cache_plan.store().then(|| request_fingerprint.clone());
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(response) = try_serve_cached_completion(
@@ -378,6 +379,7 @@ async fn chat_completions_inner(
                 experiment_variant,
                 cache_key,
                 cache_directives: cache_directives.clone(),
+                request_fingerprint: request_fingerprint.clone(),
             },
         );
 
@@ -474,6 +476,7 @@ async fn chat_completions_inner(
         attribution_tags: attribution.tags_json(),
         experiment_id,
         experiment_variant: experiment_variant.clone(),
+        request_fingerprint: request_fingerprint.clone(),
     });
 
     // Store result in cache for future requests. `cost` rides along so a later
@@ -802,6 +805,7 @@ async fn try_serve_cached_completion(
             avoided_cost,
             skip_log,
             attribution: attribution.clone(),
+            request_fingerprint: Some(key.to_string()),
         },
         &cached,
     );
@@ -1148,6 +1152,7 @@ struct CompletionLogCtx {
     attribution_tags: String,
     experiment_id: Option<i64>,
     experiment_variant: Option<String>,
+    request_fingerprint: String,
 }
 
 /// Fire-and-forget logging for a non-streaming completion: the prompt row
@@ -1173,6 +1178,7 @@ fn spawn_completion_logging(ctx: CompletionLogCtx) {
             experiment_variant: ctx.experiment_variant.clone(),
             call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: Some(ctx.request_fingerprint.clone()),
         };
 
         if ctx.write_prompt {
@@ -1271,6 +1277,8 @@ pub(crate) struct CacheHitCtx {
     pub(crate) avoided_cost: f64,
     pub(crate) skip_log: bool,
     pub(crate) attribution: crate::api::attribution::Attribution,
+    /// The served entry's cache key, which is the request's fingerprint.
+    pub(crate) request_fingerprint: Option<String>,
 }
 
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
@@ -1389,6 +1397,7 @@ pub(crate) fn record_cache_hit(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: ctx.request_fingerprint.clone(),
         };
 
         let prompt_id = if ctx.skip_log {
@@ -1475,6 +1484,8 @@ struct StreamLogCtx {
     cache_key: Option<String>,
     /// The caller's cache directives; they set the stored entry's TTL.
     cache_directives: crate::router::cache::CacheDirectives,
+    /// Fingerprint of the request, cached or not; the ledger row carries it.
+    request_fingerprint: String,
 }
 
 /// Usage as the provider reported it inside a streamed chunk (OpenAI shape:
@@ -1827,6 +1838,7 @@ async fn write_stream_ledger(ctx: StreamLogCtx, s: StreamSettlement) {
         experiment_variant: ctx.experiment_variant.clone(),
         call_kind: crate::db::models::CallKind::Chat,
         tokens_estimated: s.tokens_estimated,
+        request_fingerprint: Some(ctx.request_fingerprint.clone()),
     };
 
     let prompt_id = if !ctx.write_prompt {

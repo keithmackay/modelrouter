@@ -241,6 +241,7 @@ async fn budget_exceeded_returns_deny() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await
@@ -345,6 +346,7 @@ async fn test_policy_token_limit_under_budget() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await
@@ -449,6 +451,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await

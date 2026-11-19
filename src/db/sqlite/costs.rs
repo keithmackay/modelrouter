@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
-    CacheUsageSummary, CostRepository, ExperimentRunRow, ExperimentRunKey,
+    correlation_ids_from_json, like_prefix_pattern, CacheUsageSummary, CostRepository,
+    DuplicateFilter, DuplicateGroup, ExperimentRunRow, ExperimentRunKey,
     ExperimentUnboundRow, ExperimentVariantModelRow, ExperimentVariantTotals,
 };
 use super::{SqliteDb, now_utc};
@@ -13,7 +14,7 @@ const LEDGER_COLUMNS: &str = "id, user_id, prompt_id, model, provider, project, 
                               tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
                               cache_hit, saved_usd, attribution_correlation_id, \
                               attribution_tags, experiment_id, experiment_variant, \
-                              tokens_estimated, call_kind";
+                              tokens_estimated, call_kind, request_fingerprint";
 
 #[async_trait]
 impl CostRepository for SqliteDb {
@@ -30,8 +31,8 @@ impl CostRepository for SqliteDb {
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        call_kind, request_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -49,6 +50,7 @@ impl CostRepository for SqliteDb {
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
         .bind(entry.call_kind.as_str())
+        .bind(&entry.request_fingerprint)
         .execute(&self.pool)
         .await?;
 
@@ -73,8 +75,8 @@ impl CostRepository for SqliteDb {
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)"#,
+                                        call_kind, request_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(entry.user_id)
         .bind(entry.prompt_id)
@@ -92,6 +94,7 @@ impl CostRepository for SqliteDb {
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
         .bind(entry.call_kind.as_str())
+        .bind(&entry.request_fingerprint)
         .execute(&self.pool)
         .await?;
 
@@ -748,6 +751,39 @@ impl CostRepository for SqliteDb {
         self.by_day_where(&predicate, binds, start, end).await
     }
 
+    // ── Repeated requests ────────────────────────────────────────────────────
+
+    async fn duplicate_requests(
+        &self,
+        filter: &DuplicateFilter,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DuplicateGroup>> {
+        let (predicates, binds) = duplicate_predicates(filter);
+        // `json_group_array(DISTINCT ...)` keeps an unstamped row's NULL as a
+        // JSON null; `correlation_ids_from_json` drops it.
+        let sql = format!(
+            "SELECT request_fingerprint, MIN(model), MIN(call_kind), COUNT(*), \
+                    COALESCE(SUM(cache_hit), 0), COALESCE(SUM(cost_usd), 0.0), \
+                    COALESCE(SUM(saved_usd), 0.0), MIN(created_at), MAX(created_at), \
+                    json_group_array(DISTINCT attribution_correlation_id) \
+             FROM cost_ledger \
+             WHERE request_fingerprint IS NOT NULL AND created_at >= ? AND created_at < ?{} \
+             GROUP BY request_fingerprint HAVING COUNT(*) > 1 \
+             ORDER BY COUNT(*) DESC, SUM(cost_usd) DESC, request_fingerprint ASC LIMIT ?",
+            predicates
+        );
+        let mut query = sqlx::query_as::<_, DuplicateRow>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(start)
+            .bind(end);
+        for b in binds {
+            query = query.bind(b);
+        }
+        let rows = query.bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(duplicate_group_from_row).collect())
+    }
+
     // ── Experiment results ───────────────────────────────────────────────────
 
     async fn experiment_variant_totals(
@@ -1037,6 +1073,51 @@ fn breakdown_from_row(row: BreakdownRow) -> AttributionBreakdownRow {
             cache_hits,
         },
     }
+}
+
+type DuplicateRow = (String, String, String, i64, i64, f64, f64, String, String, String);
+
+fn duplicate_group_from_row(row: DuplicateRow) -> DuplicateGroup {
+    let (request_fingerprint, model, call_kind, requests, cache_hits, cost_usd, saved_usd, first_at, last_at, ids) =
+        row;
+    DuplicateGroup {
+        request_fingerprint,
+        model,
+        call_kind,
+        requests,
+        cache_hits,
+        cost_usd,
+        saved_usd,
+        first_at,
+        last_at,
+        correlation_ids: correlation_ids_from_json(&ids),
+    }
+}
+
+/// The extra `AND ...` predicates of a duplicates filter (empty when the filter
+/// is), plus their bound values in `?` order. Every caller value is bound; the
+/// tag key travels as a JSON path like `attribution_predicate`'s.
+fn duplicate_predicates(filter: &DuplicateFilter) -> (String, Vec<String>) {
+    let mut predicates = String::new();
+    let mut binds = Vec::new();
+    if let Some(prefix) = &filter.correlation_id_prefix {
+        predicates.push_str(" AND attribution_correlation_id LIKE ? ESCAPE '\\'");
+        binds.push(like_prefix_pattern(prefix));
+    }
+    if let Some((key, value)) = &filter.tag {
+        predicates.push_str(" AND json_extract(attribution_tags, ?) = ?");
+        binds.push(AttributionFilter::tag_json_path(key));
+        binds.push(value.clone());
+    }
+    if let Some(project) = &filter.project {
+        predicates.push_str(" AND project = ?");
+        binds.push(project.clone());
+    }
+    if let Some(user_id) = filter.user_id {
+        predicates.push_str(" AND user_id = CAST(? AS INTEGER)");
+        binds.push(user_id.to_string());
+    }
+    (predicates, binds)
 }
 
 /// SQL predicate plus its bound values, in `?` order, for an attribution filter.
@@ -1356,6 +1437,7 @@ mod tests {
                 experiment_id: None,
                 experiment_variant: None,
                 tokens_estimated: false,
+                request_fingerprint: None,
                 call_kind: kind,
             },
         )
@@ -1522,6 +1604,7 @@ mod tests {
             experiment_variant: Some("control".into()),
             call_kind: crate::db::models::CallKind::Chat,
             tokens_estimated: true,
+            request_fingerprint: None,
         };
         let row = db.create(entry.clone()).await.unwrap();
         assert_eq!(row.experiment_id, Some(4));

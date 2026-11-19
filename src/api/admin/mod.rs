@@ -13,6 +13,7 @@ pub mod groups;
 pub mod budgets;
 pub mod cache;
 pub mod compare;
+pub mod duplicates;
 pub mod experiments;
 pub mod reports;
 pub mod models;

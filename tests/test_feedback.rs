@@ -153,6 +153,7 @@ async fn seed_ledger(
             experiment_variant: stamp.map(|(_, v)| v.to_string()),
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await

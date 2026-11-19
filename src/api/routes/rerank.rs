@@ -329,6 +329,11 @@ async fn rerank_inner(
     let user_project = attribution.project_or(user.api_key_project.clone());
     let input_tokens = i64::from(result.input_tokens);
     let request_content = rerank_request_content(&body);
+    let request_fingerprint = crate::router::cache::request_fingerprint(
+        crate::db::models::CallKind::Rerank.as_str(),
+        &canonical_model,
+        &body,
+    );
     let results_content = rerank_results_content(&result.body);
     let experiment_id_row = experiment_id;
     let experiment_variant_row = experiment_variant.clone();
@@ -392,6 +397,7 @@ async fn rerank_inner(
             experiment_variant: experiment_variant_row,
             call_kind: crate::db::models::CallKind::Rerank,
             tokens_estimated: false,
+            request_fingerprint: Some(request_fingerprint),
         };
         if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
             tracing::error!("Failed to record rerank cost: {}", e);

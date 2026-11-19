@@ -741,8 +741,9 @@ config or redeploying. Fallback chains (`[routing.fallback_chains]`) accept any 
 (AI Services) resource fronts every model deployed on it — Llama, Mistral, Phi, DeepSeek,
 Cohere, Grok and the OpenAI models — behind one endpoint, with the deployment named in the
 request body, so `foundry/<deployment>` is all a route needs. Chat, streaming, embeddings,
-decisions (`POST /v1/decisions`), reranking (`POST /v1/rerank`) and `GET /admin/api/models/available` discovery all go
-through it.
+decisions (`POST /v1/decisions`), reranking (`POST /v1/rerank`), streaming transcription
+(`GET /v1/audio/transcriptions/stream`, see [Streaming transcription](#streaming-transcription))
+and `GET /admin/api/models/available` discovery all go through it.
 
 Distinct from `[providers.azure]`, which speaks the older Azure OpenAI surface
 (`/openai/deployments/<deployment>/…?api-version=`) with an `api-key` header and needs one
@@ -783,6 +784,30 @@ for a resource endpoint (what the published OpenAPI documents declare),
 shows `ai.azure.com` for resource endpoints too, so where spec and prose disagree
 `entra_scope` is the override. The resolved value is logged at startup and named in any
 401/403 response, so the fix is visible without a doc hunt.
+
+**Function tools on the newest reasoning generations go over the Responses API.** The
+`gpt-6` and `gpt-6.1` families refuse a chat completion that carries function tools while
+they reason (*"Function tools with reasoning_effort are not supported ... use /v1/responses
+or set reasoning_effort to 'none'"*). Turning reasoning off would silently downgrade the
+model, so a request for one of those deployments that carries `tools` is posted to
+`POST {endpoint}/openai/v1/responses` instead, with the same credential: chat `messages`
+become `input` items (an assistant `tool_calls` turn as `function_call` items, a `tool`
+result as `function_call_output`), tools and `tool_choice` flatten to the Responses shape
+(`strict` defaults to the chat default, `false`, unless the caller set it), `max_tokens` is
+`max_output_tokens`, `reasoning_effort` is `reasoning.effort`, `response_format` is
+`text.format`, and `store` is `false`. The answer is translated back: `output_text` is the
+content, `function_call` items are `tool_calls` keyed by `call_id`, usage carries the cached
+and reasoning token counts, and an output cut at `max_output_tokens` is `finish_reason:
+"length"`. Streams come back as `chat.completion.chunk` frames, tool-call deltas and the final
+`usage` chunk included, so a streaming agentic caller sees the same stream as from any other
+backend. A request without tools stays on chat completions, where the same deployment
+answers. The rule is a capability by model family, overridable per deployment:
+
+```toml
+[[model_capabilities]]
+model = "my-gpt-6-deployment"      # a name the family table cannot read
+tools_via_responses_api = true     # or false, to keep one on chat completions
+```
 
 ### Azure credentials
 
@@ -2321,6 +2346,27 @@ and on `/admin/reports`, where picking an attribution value swaps the panels
 for an attributed-usage view (spend, savings, cache-hit rate, per-model and
 per-day breakdowns).
 
+**Repeated requests.** Every ledger row also carries a *request fingerprint*:
+the hash of the normalised request body that the response cache keys on,
+computed for every call whether or not the cache applied to it (a hash only,
+so nothing is kept where prompt storage is off). Rows that share a fingerprint
+are one request made more than once. `modelrouter report duplicates` and
+`GET /admin/api/usage/duplicates` group a window's rows by fingerprint and list
+each one seen more than once with its count, how many repeats the cache
+answered, spend and savings, first and last time, and the correlation ids that
+made it; filter by a correlation-id prefix, a tag, a project or a user. Rows
+older than the column have no fingerprint and are left out.
+
+```bash
+modelrouter report duplicates --window weekly
+modelrouter report duplicates --correlation-id-prefix eng-4711 --window alltime --format json
+modelrouter report duplicates --tag engagement=eng-4711 --limit 20
+```
+
+```text
+GET /admin/api/usage/duplicates?window=weekly&correlation_id_prefix=eng-4711
+```
+
 To compare two arms of an experiment — two tag values, two correlation ids,
 two models, two providers or two variants of a controlled experiment — use
 `GET /admin/api/compare`, `modelrouter report compare`, or the
@@ -2378,6 +2424,79 @@ curl -N http://localhost:8080/v1/chat/completions \
 # data: [DONE]
 ```
 
+### Streaming transcription
+
+`GET /v1/audio/transcriptions/stream` is a WebSocket: audio frames go in as
+they are captured, transcript segments come out as they are recognised, for as
+long as the conversation lasts. It is the live counterpart of the batch
+`POST /v1/audio/transcriptions`, and like every other route the router holds the
+provider credential; the caller holds only its router key.
+
+One provider serves the route, named in config, so a speech service or a
+self-hosted model plugs in behind the same protocol later:
+
+```toml
+[transcription]
+provider = "foundry"           # the [providers.<name>] that serves it
+model = "<deployment>"         # default model; a session may name its own
+# url = "wss://..."            # override the derived realtime URL
+# session_shape = "ga"         # or "beta": which session message the deployment accepts
+# session_idle_timeout_secs = 7200
+# finish_drain_secs = 120
+# start_timeout_secs = 300
+# heartbeat_secs = 20
+# max_sessions = 0             # per replica; 0 = unlimited
+# usd_per_audio_minute = 0.006 # for the cost ledger; unset = recorded at 0, flagged estimated
+```
+
+The caller authenticates on the upgrade request (`Authorization: Bearer
+<router key>`; the attribution headers are honoured as on the multipart
+route). A refusal before the socket opens is a plain HTTP status: `401`,
+`400` for the experiment header, `429` past `max_sessions`, `503` when no
+provider is configured. Then, caller to router:
+
+```json
+{"type":"session.start","session_id":"<id>","model":"<deployment>",
+ "audio":{"encoding":"pcm16","sample_rate_hz":16000,"channels":1},"language":"en"}
+```
+
+followed by binary frames of raw audio in that format (or
+`{"type":"audio.append","audio":"<base64>"}` from a text-only client) and
+`{"type":"session.end"}` when the conversation is over. `model` is optional
+when `[transcription] model` is set; `provider/model` is accepted for the
+configured provider and refused for any other. Router to caller:
+
+```json
+{"type":"session.started","session_id":"<id>","provider":"foundry","model":"<deployment>"}
+{"type":"transcript.segment","session_id":"<id>","segment_id":"item_1","text":"Good","is_final":false,
+ "start_ms":100,"end_ms":null,"confidence":null,"speaker":null}
+{"type":"transcript.segment","session_id":"<id>","segment_id":"item_1","text":"Good morning.","is_final":true,
+ "start_ms":100,"end_ms":900,"confidence":0.92,"speaker":null}
+{"type":"session.ended","session_id":"<id>","audio_ms":1000,"segments":2}
+```
+
+A partial segment carries the utterance's text so far; the final one for the
+same `segment_id` replaces it. `confidence` is 0..1 when the provider reports
+one (derived from token log-probabilities where that is what it gives);
+`speaker` is the provider's label when it diarises, else `null`. An error ends
+the session: `{"type":"error","code":"...","message":"...","retryable":true|false}`
+then a close, with `protocol_error`, `model_required`, `model_not_served`,
+`policy_denied`, `provider_error`, `idle_timeout` or the provider's own code.
+The router pings every `heartbeat_secs`; a session with no audio and no
+transcript for `session_idle_timeout_secs` ends with `idle_timeout`. That bound
+is for a dead caller, not a long conversation, which is why its default is
+hours. One usage row and one cost row are written per session, metered in
+audio seconds (`call_kind: audio`); the router keeps no transcript text.
+
+**Foundry.** The adapter connects to the deployment's realtime surface
+(`wss://<host>/openai/v1/realtime?intent=transcription`, derived from
+`foundry_endpoint`; the model-inference surface has no realtime route and is
+refused by name) with the same credential chain as every other Foundry call,
+sends 16-bit PCM at 24 kHz mono (resampling and down-mixing what the caller
+declared), and maps the realtime events: speech boundaries to `start_ms` /
+`end_ms`, transcription deltas to partials, the completed utterance with its
+log-probabilities to the final segment. No speaker labels on this surface.
+
 ### Tool calling (function tools)
 
 `POST /v1/chat/completions` forwards OpenAI-shaped `tools` and `tool_choice`
@@ -2386,7 +2505,10 @@ speaks a different dialect:
 
 - **OpenAI-compatible upstreams** (OpenAI, Azure OpenAI, Groq/Ollama-style
   bases, Vertex MaaS): tools, tool-call responses and streamed tool-call
-  deltas pass through verbatim.
+  deltas pass through verbatim. On Azure AI Foundry, the reasoning families
+  that refuse function tools on chat completions (`gpt-6`, `gpt-6.1`;
+  `tools_via_responses_api` in `[[model_capabilities]]`) are called over the
+  Responses API instead and translated both ways, streaming included.
 - **Anthropic-shaped upstreams** (direct Anthropic, Claude on Vertex): tools
   translate to native `tools`/`input_schema`, assistant `tool_calls` turns
   and `tool`-role results translate to `tool_use`/`tool_result` blocks, and

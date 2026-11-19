@@ -142,6 +142,11 @@ async fn speech_inner(
 
     // Cost logging
     let char_count = body["input"].as_str().map(|s| s.len()).unwrap_or(0);
+    let request_fingerprint = crate::router::cache::request_fingerprint(
+        crate::db::models::CallKind::Audio.as_str(),
+        &model,
+        &body,
+    );
     let cost = (char_count as f64 / 1000.0) * 0.015;
     let db = state.db.clone();
     let prompt_db = state.prompt_db.clone();
@@ -206,6 +211,7 @@ async fn speech_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record speech cost: {e}");
@@ -303,8 +309,11 @@ async fn transcriptions_inner(
         )));
     }
 
-    // Reassemble multipart form
+    // Reassemble multipart form. Every part is hashed in order (field name,
+    // then content) so the request can be fingerprinted like a JSON body:
+    // the same audio with the same parameters is one request made twice.
     let mut form = reqwest::multipart::Form::new();
+    let mut request_hasher = <sha2::Sha256 as sha2::Digest>::new();
     while let Some(field) = multipart
         .next_field()
         .await
@@ -318,6 +327,8 @@ async fn transcriptions_inner(
             .await
             .map_err(|_| ApiError::InvalidRequest("read error".to_string()))?;
         let raw = bytes.to_vec();
+        sha2::Digest::update(&mut request_hasher, name.as_bytes());
+        sha2::Digest::update(&mut request_hasher, &raw);
         let mut part = reqwest::multipart::Part::bytes(raw.clone());
         if let Some(f) = filename {
             part = part.file_name(f);
@@ -330,6 +341,11 @@ async fn transcriptions_inner(
         }
         form = form.part(name, part);
     }
+    let request_fingerprint = crate::router::cache::request_fingerprint(
+        crate::db::models::CallKind::Audio.as_str(),
+        &model,
+        &serde_json::json!({ "multipart_sha256": hex::encode(sha2::Digest::finalize(request_hasher)) }),
+    );
 
     // Build OpenAI URL
     let base = provider_config
@@ -432,6 +448,7 @@ async fn transcriptions_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = CostRepository::create(&*db, ledger).await {
                     tracing::error!("Failed to record transcription cost: {e}");

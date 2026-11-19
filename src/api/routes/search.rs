@@ -490,9 +490,13 @@ async fn search_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan
-        .store()
-        .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results, &research.cache_fields(include_answer, freshness.as_deref(), &engine)));
+    let request_fingerprint = crate::router::cache::search_cache_key(
+        &engine,
+        &query,
+        max_results,
+        &research.cache_fields(include_answer, freshness.as_deref(), &engine),
+    );
+    let cache_key = cache_plan.store().then(|| request_fingerprint.clone());
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(payload) = state
@@ -519,6 +523,7 @@ async fn search_inner(
                 results_returned,
                 cost,
                 &attribution,
+                &request_fingerprint,
             );
             let mut body = payload;
             // The ledger's model for this row: the serving engine's pseudo-model.
@@ -694,6 +699,7 @@ async fn search_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Search,
                     tokens_estimated: false,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
                     tracing::error!("Failed to record search cost: {}", e);
@@ -877,6 +883,7 @@ fn record_search_cache_hit(
     results_returned: i64,
     avoided_cost: f64,
     attribution: &crate::api::attribution::Attribution,
+    request_fingerprint: &str,
 ) {
     use crate::db::repositories::costs::CostRepository;
 
@@ -900,6 +907,7 @@ fn record_search_cache_hit(
         experiment_variant: None,
         call_kind: crate::db::models::CallKind::Search,
         tokens_estimated: false,
+        request_fingerprint: Some(request_fingerprint.to_string()),
     };
     tokio::spawn(async move {
         if let Err(e) = CostRepository::create_cache_hit(&*state.db, ledger).await {

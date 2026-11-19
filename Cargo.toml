@@ -41,7 +41,13 @@ otel = [
 ]
 
 [dependencies]
-axum = { version = "0.7", features = ["macros", "multipart"] }
+# `ws`: the streaming transcription route is a WebSocket (audio frames in,
+# transcript segments out); axum's ws support rides on tokio-tungstenite, the
+# same crate the provider-side WebSocket client below uses.
+axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
+# WebSocket client for providers whose streaming transcription is a socket
+# (Azure AI Foundry's realtime surface). native-tls, as reqwest already uses.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 # Named directly so the drain gate can wrap response bodies; already in the
 # tree through axum.
 http-body = "1"

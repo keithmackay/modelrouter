@@ -218,6 +218,11 @@ async fn systemone_inner(
         output_tokens,
         cost,
         latency_ms,
+        crate::router::cache::request_fingerprint(
+            crate::db::models::CallKind::Judgment.as_str(),
+            &pseudo_model,
+            &body,
+        ),
     );
 
     Ok(passthrough(status, content_type, bytes))
@@ -250,6 +255,7 @@ fn record_usage(
     output_tokens: i64,
     cost: f64,
     latency_ms: i64,
+    request_fingerprint: String,
 ) {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
@@ -313,6 +319,7 @@ fn record_usage(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Judgment,
             tokens_estimated: false,
+            request_fingerprint: Some(request_fingerprint),
         };
         if let Err(e) = CostRepository::create(&*state.db, ledger).await {
             tracing::error!("Failed to record System One cost: {}", e);

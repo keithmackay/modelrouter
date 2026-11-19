@@ -604,6 +604,31 @@ pub enum ReportCommands {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+    /// Repeated requests: ledger rows that share one request fingerprint
+    /// (the same normalised request made more than once), with how many the
+    /// response cache absorbed. Same query as `GET /admin/api/usage/duplicates`.
+    Duplicates {
+        /// Only rows whose attribution correlation id starts with this
+        #[arg(long, value_name = "PREFIX")]
+        correlation_id_prefix: Option<String>,
+        /// Only rows carrying one attribution tag, as `key=value`
+        #[arg(long, value_name = "KEY=VALUE")]
+        tag: Option<String>,
+        /// Only rows in this project
+        #[arg(long)]
+        project: Option<String>,
+        /// Only one user's rows, by name
+        #[arg(long)]
+        user: Option<String>,
+        /// Most groups to show, 1 to 1000  [default: 50]
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Time window: daily | weekly | monthly | alltime  [default: monthly]
+        #[arg(long, default_value = "monthly")]
+        window: String,
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Usage report with flexible scope/window/granularity
     Usage {
         // Granularity (exactly one required)

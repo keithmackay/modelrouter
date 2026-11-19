@@ -240,6 +240,7 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
             experiment_variant: s.experiment_variant(),
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await
@@ -271,6 +272,7 @@ async fn seed_cache_hit(
             experiment_variant: s.experiment_variant(),
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await

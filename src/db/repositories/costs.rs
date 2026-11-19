@@ -141,6 +141,66 @@ pub struct AttributionBreakdownRow {
     pub totals: AttributionTotals,
 }
 
+/// Narrows the duplicates report ([`CostRepository::duplicate_requests`]).
+/// Every part is optional; the parts set compose with AND.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct DuplicateFilter {
+    /// Rows whose `attribution_correlation_id` starts with this prefix, so one
+    /// run or one family of runs can be inspected on its own.
+    pub correlation_id_prefix: Option<String>,
+    /// Rows whose `attribution_tags` object has `key` equal to `value`.
+    pub tag: Option<(String, String)>,
+    pub project: Option<String>,
+    pub user_id: Option<i64>,
+}
+
+/// One request fingerprint seen more than once in a window: the same
+/// normalised request, made `requests` times.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DuplicateGroup {
+    pub request_fingerprint: String,
+    /// The rows' model; the first by name when a fallback served some of them.
+    pub model: String,
+    pub call_kind: String,
+    pub requests: i64,
+    /// How many of the repeats the response cache answered (at no cost).
+    pub cache_hits: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub first_at: String,
+    pub last_at: String,
+    /// Distinct correlation ids of the rows, sorted; unstamped rows add none.
+    pub correlation_ids: Vec<String>,
+}
+
+/// A `LIKE` pattern matching strings that start with `prefix`, with the
+/// pattern's own metacharacters escaped (`ESCAPE '\\'` in the query).
+pub fn like_prefix_pattern(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + 1);
+    for c in prefix.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// The correlation ids a backend aggregated as a JSON array (a `null` for an
+/// unstamped row, duplicates possible), as the sorted distinct list.
+pub fn correlation_ids_from_json(json: &str) -> Vec<String> {
+    let mut ids: Vec<String> = serde_json::from_str::<Vec<Option<String>>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 // ── Experiment results (spec §7a) ─────────────────────────────────────────────
 //
 // A run is every ledger row sharing `(user_id, attribution_correlation_id)`.
@@ -471,4 +531,18 @@ pub trait CostRepository: Send + Sync {
         &self,
         experiment_id: i64,
     ) -> anyhow::Result<Vec<ExperimentUnboundRow>>;
+
+    // ── Repeated requests ────────────────────────────────────────────────────
+
+    /// Request fingerprints seen more than once between `start` (inclusive)
+    /// and `end` (exclusive), most repeated first (ties: highest spend, then
+    /// fingerprint), at most `limit` groups. Rows with no fingerprint (older
+    /// than the column, or a call with nothing to hash) are left out.
+    async fn duplicate_requests(
+        &self,
+        filter: &DuplicateFilter,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DuplicateGroup>>;
 }

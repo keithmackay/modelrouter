@@ -230,6 +230,9 @@ async fn responses_inner(
         latency_ms,
         attr_correlation,
         attr_tags,
+        // The Responses body is its own shape, so its fingerprints never meet
+        // a chat completion's.
+        crate::router::cache::request_fingerprint("responses", &canonical_model, &body),
     );
 
     let response_body = serde_json::json!({
@@ -272,6 +275,7 @@ fn record_responses_cost(
     latency_ms: i64,
     attr_correlation: Option<String>,
     attr_tags: String,
+    request_fingerprint: String,
 ) {
     use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
 
@@ -331,6 +335,7 @@ fn record_responses_cost(
                 experiment_variant: None,
                 call_kind: crate::db::models::CallKind::Chat,
                 tokens_estimated: false,
+                request_fingerprint: Some(request_fingerprint),
             };
             let _ = CostRepository::create(&*state.db, ledger).await;
         }

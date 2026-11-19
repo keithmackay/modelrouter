@@ -387,6 +387,7 @@ async fn get_stats_admin_can_read() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            request_fingerprint: None,
         },
     )
     .await

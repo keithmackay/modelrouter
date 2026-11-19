@@ -371,6 +371,11 @@ async fn decisions_inner(
     let prompt_tokens = result.prompt_tokens;
     let completion_tokens = result.completion_tokens;
     let request_content = decision_request_content(&body);
+    let request_fingerprint = crate::router::cache::request_fingerprint(
+        crate::db::models::CallKind::Decision.as_str(),
+        &canonical_model,
+        &body,
+    );
     let answers_content = decision_answers_content(&result.body);
     let experiment_id_row = experiment_id;
     let experiment_variant_row = experiment_variant.clone();
@@ -442,6 +447,7 @@ async fn decisions_inner(
             experiment_variant: experiment_variant_row,
             call_kind: crate::db::models::CallKind::Decision,
             tokens_estimated: false,
+            request_fingerprint: Some(request_fingerprint),
         };
         if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
             tracing::error!("Failed to record decision cost: {}", e);

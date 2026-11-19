@@ -667,6 +667,7 @@ mod seed {
                 experiment_variant: row.variant.map(str::to_string),
                 call_kind: modelrouter::db::models::CallKind::Chat,
                 tokens_estimated: row.estimated,
+                request_fingerprint: None,
             },
         )
         .await

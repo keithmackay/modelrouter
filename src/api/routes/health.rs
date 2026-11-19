@@ -556,6 +556,9 @@ fn record_probe_usage(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Health,
             tokens_estimated: false,
+            // The router's own probe, never a caller's request: nothing to
+            // report as repeated work.
+            request_fingerprint: None,
         };
         if let Err(e) = CostRepository::create(&*state.db, entry).await {
             tracing::error!(error = %e, "failed to record health-probe usage");
