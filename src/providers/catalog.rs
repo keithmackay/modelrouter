@@ -31,6 +31,44 @@ pub enum CatalogKind {
     Other,
 }
 
+/// Name fragments that mark a model as something other than chat, checked in
+/// this order against a lower-cased id. One list for every provider, so a
+/// configured deployment, a discovered one and a plain `/models` listing all
+/// read the same name the same way.
+const NAME_KINDS: &[(&[&str], CatalogKind)] = &[
+    (&["embed"], CatalogKind::Embedding),
+    (&["rerank"], CatalogKind::Rerank),
+    (&["whisper", "tts", "transcribe", "realtime", "speech"], CatalogKind::Audio),
+    (&["dall-e", "dalle", "image", "flux", "sora", "stable-diffusion"], CatalogKind::Image),
+];
+
+impl CatalogKind {
+    /// What a model can answer, judged from its id alone: the only evidence a
+    /// `/models` listing or a configured deployment name carries. A name that
+    /// says nothing is chat: that is what a model is for unless something marks
+    /// it otherwise, and a wrong guess costs one refused call, not a missing
+    /// model. An embedding, reranking, image or audio model offered for chat
+    /// fails on its first call, so those names are never read as chat.
+    pub fn from_name(name: &str) -> CatalogKind {
+        let lower = name.to_ascii_lowercase();
+        NAME_KINDS
+            .iter()
+            .find(|(needles, _)| needles.iter().any(|n| lower.contains(n)))
+            .map(|(_, kind)| *kind)
+            .unwrap_or(CatalogKind::Chat)
+    }
+
+    /// [`Self::from_name`] over several names for one model (a deployment and
+    /// the base model behind it): the first that says more than chat wins.
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> CatalogKind {
+        names
+            .into_iter()
+            .map(CatalogKind::from_name)
+            .find(|k| *k != CatalogKind::Chat)
+            .unwrap_or(CatalogKind::Chat)
+    }
+}
+
 /// Where a catalog entry came from, when the provider can tell: named in its
 /// configuration, or found on the account beyond the configured list
 /// (`discover_deployments`). Absent for providers whose listing is the catalog.
@@ -65,4 +103,32 @@ pub struct CatalogModel {
 #[async_trait]
 pub trait ProviderCatalog: Send + Sync {
     async fn list_models(&self) -> anyhow::Result<Vec<CatalogModel>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CatalogKind;
+
+    #[test]
+    fn a_name_that_says_what_it_serves_is_never_read_as_chat() {
+        assert_eq!(CatalogKind::from_name("text-embedding-3-large"), CatalogKind::Embedding);
+        assert_eq!(CatalogKind::from_name("Cohere-embed-v4"), CatalogKind::Embedding);
+        assert_eq!(CatalogKind::from_name("Cohere-rerank-v4.0-pro"), CatalogKind::Rerank);
+        assert_eq!(CatalogKind::from_name("whisper-1"), CatalogKind::Audio);
+        assert_eq!(CatalogKind::from_name("gpt-4o-mini-tts"), CatalogKind::Audio);
+        assert_eq!(CatalogKind::from_name("gpt-4o-realtime-preview"), CatalogKind::Audio);
+        assert_eq!(CatalogKind::from_name("dall-e-3"), CatalogKind::Image);
+        assert_eq!(CatalogKind::from_name("gpt-image-1"), CatalogKind::Image);
+        assert_eq!(CatalogKind::from_name("gpt-4.1"), CatalogKind::Chat);
+        assert_eq!(CatalogKind::from_name("claude-sonnet-4-5"), CatalogKind::Chat);
+        assert_eq!(CatalogKind::from_name("DeepSeek-V4-Pro"), CatalogKind::Chat);
+    }
+
+    #[test]
+    fn several_names_for_one_model_take_the_first_that_says_more_than_chat() {
+        assert_eq!(CatalogKind::from_names(["my-eu-vectors", "text-embedding-3-large"]), CatalogKind::Embedding);
+        assert_eq!(CatalogKind::from_names(["ranker", "Cohere-rerank-v4.0-pro"]), CatalogKind::Rerank);
+        assert_eq!(CatalogKind::from_names(["my-chat", "gpt-5"]), CatalogKind::Chat);
+        assert_eq!(CatalogKind::from_names(std::iter::empty()), CatalogKind::Chat);
+    }
 }

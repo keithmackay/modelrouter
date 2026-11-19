@@ -42,7 +42,7 @@ pub fn parse_models(v: &serde_json::Value) -> Vec<CatalogModel> {
             // The listing carries no human label — `id` IS the deployment name
             // the operator chose. Inventing one from `owned_by` would be noise.
             display_name: None,
-            kind: CatalogKind::Chat,
+            kind: CatalogKind::from_name(id),
             source: None,
         });
     }
@@ -109,71 +109,65 @@ fn capability_on(d: &LiveDeployment, key: &str) -> bool {
         .any(|(k, v)| k.eq_ignore_ascii_case(key) && v.eq_ignore_ascii_case("true"))
 }
 
-fn name_has(d: &LiveDeployment, needles: &[&str]) -> bool {
-    let name = d.name.to_ascii_lowercase();
-    let model = d.model_name.as_deref().unwrap_or("").to_ascii_lowercase();
-    needles.iter().any(|n| name.contains(n) || model.contains(n))
-}
+/// Azure's capability keys and the kind each one decides, checked in this
+/// order: a deployment with `embeddings: true` is an embedding model whatever
+/// its name says, and one with `chatCompletion: true` is chat even when its
+/// name would read otherwise.
+const CAPABILITY_KINDS: &[(&[&str], CatalogKind)] = &[
+    (&["embeddings"], CatalogKind::Embedding),
+    (&["imageGenerations"], CatalogKind::Image),
+    (&["audio", "realtime", "speech", "transcription", "textToSpeech"], CatalogKind::Audio),
+    (&["rerank"], CatalogKind::Rerank),
+    (&["chatCompletion", "completion", "assistants", "responses", "agents"], CatalogKind::Chat),
+];
 
-/// What a discovered deployment can answer, from its capability map first
-/// (Azure's own word) and the model's name when the map is empty, as it is
-/// for most serverless (Models-as-a-Service) deployments. A deployment that
-/// says nothing either way is chat: that is what a deployment is for unless
-/// something marks it otherwise, and a wrong guess costs one refused call,
-/// not a missing model.
+/// What a live deployment can answer, from its capability map first (Azure's
+/// own word) and from its name and its base model's name when the map is
+/// empty, as it is for most serverless (Models-as-a-Service) deployments
+/// ([`CatalogKind::from_names`]). The same rule serves a configured deployment
+/// and a discovered one: a name the operator listed is no more chat-capable
+/// for being listed.
 pub fn classify_deployment(d: &LiveDeployment) -> CatalogKind {
-    if capability_on(d, "embeddings") {
-        return CatalogKind::Embedding;
-    }
-    if capability_on(d, "imageGenerations") {
-        return CatalogKind::Image;
-    }
-    if ["audio", "realtime", "speech", "transcription", "textToSpeech"].iter().any(|k| capability_on(d, k)) {
-        return CatalogKind::Audio;
-    }
-    if capability_on(d, "rerank") {
-        return CatalogKind::Rerank;
-    }
-    if ["chatCompletion", "completion", "assistants", "responses", "agents"].iter().any(|k| capability_on(d, k)) {
-        return CatalogKind::Chat;
-    }
-    if name_has(d, &["embed"]) {
-        return CatalogKind::Embedding;
-    }
-    if name_has(d, &["rerank"]) {
-        return CatalogKind::Rerank;
-    }
-    if name_has(d, &["whisper", "tts", "transcribe", "realtime", "speech"]) {
-        return CatalogKind::Audio;
-    }
-    if name_has(d, &["dall-e", "dalle", "image", "flux", "sora", "stable-diffusion"]) {
-        return CatalogKind::Image;
-    }
-    CatalogKind::Chat
+    CAPABILITY_KINDS
+        .iter()
+        .find(|(keys, _)| keys.iter().any(|k| capability_on(d, k)))
+        .map(|(_, kind)| *kind)
+        .unwrap_or_else(|| CatalogKind::from_names([d.name.as_str()].into_iter().chain(d.model_name.as_deref())))
 }
 
 /// Page bound for the deployment listing: an account holds far fewer
 /// deployments than this many pages, so reaching it means a looping nextLink.
 const MAX_DEPLOYMENT_PAGES: usize = 50;
 
+/// A deployment known by name alone (no live record): its kind is what the
+/// name says.
 fn foundry_model(name: &str) -> CatalogModel {
     CatalogModel {
         provider: "foundry".to_string(),
         name: name.to_string(),
         display_name: None,
-        kind: CatalogKind::Chat,
+        kind: CatalogKind::from_name(name),
         source: None,
     }
 }
 
-fn configured_model(name: &str) -> CatalogModel {
-    CatalogModel { source: Some(CatalogSource::Configured), ..foundry_model(name) }
+/// A deployment the account reports, classified from its live record.
+fn live_model(d: &LiveDeployment, source: Option<CatalogSource>) -> CatalogModel {
+    CatalogModel {
+        provider: "foundry".to_string(),
+        name: d.name.clone(),
+        display_name: None,
+        kind: classify_deployment(d),
+        source,
+    }
+}
+
+fn configured_model(d: &LiveDeployment) -> CatalogModel {
+    live_model(d, Some(CatalogSource::Configured))
 }
 
 fn discovered_model(d: &LiveDeployment) -> CatalogModel {
     CatalogModel {
-        provider: "foundry".to_string(),
-        name: d.name.clone(),
         // The base model, when the deployment is not simply named after it,
         // so a picker can say what "my-chat-eu" is.
         display_name: d
@@ -181,16 +175,17 @@ fn discovered_model(d: &LiveDeployment) -> CatalogModel {
             .as_ref()
             .filter(|m| !m.eq_ignore_ascii_case(&d.name))
             .map(|m| format!("{} ({m})", d.name)),
-        kind: classify_deployment(d),
-        source: Some(CatalogSource::Discovered),
+        ..live_model(d, Some(CatalogSource::Discovered))
     }
 }
 
 /// The configured catalog narrowed to the account's live deployments, and,
-/// with `discover`, every other live deployment after it (sorted, classified,
+/// with `discover`, every other live deployment after it (sorted,
 /// `source: discovered`; `decision` names are never discovered as chat). An
-/// empty configured list is every live deployment: as chat with no source
-/// unless `discover`, when each is classified and discovered.
+/// empty configured list is every live deployment: with no source unless
+/// `discover`, when each is discovered. Every entry is classified from its
+/// live record, configured or not, so a chat picker never offers a name
+/// that only serves embeddings because an operator listed it.
 pub fn merge_live_catalog(
     configured: &[String],
     decision: &[String],
@@ -201,12 +196,12 @@ pub fn merge_live_catalog(
     if configured.is_empty() {
         let models = by_name
             .values()
-            .map(|d| if discover { discovered_model(d) } else { foundry_model(&d.name) })
+            .map(|d| if discover { discovered_model(d) } else { live_model(d, None) })
             .collect();
         return (models, Vec::new());
     }
     let (kept, missing): (Vec<&String>, Vec<&String>) = configured.iter().partition(|n| by_name.contains_key(n.as_str()));
-    let mut models: Vec<CatalogModel> = kept.iter().map(|n| configured_model(n)).collect();
+    let mut models: Vec<CatalogModel> = kept.iter().filter_map(|n| by_name.get(n.as_str()).map(|d| configured_model(d))).collect();
     if discover {
         models.extend(
             by_name
@@ -464,6 +459,42 @@ mod tests {
         assert_eq!(classify_deployment(&live("whisper", None, &[])), CatalogKind::Audio);
         assert_eq!(classify_deployment(&live("dall-e-3", None, &[])), CatalogKind::Image);
         assert_eq!(classify_deployment(&live("DeepSeek-V4-Pro", Some("DeepSeek-V4-Pro"), &[])), CatalogKind::Chat);
+        // Azure's word wins over a name that reads otherwise, either way round.
+        assert_eq!(classify_deployment(&live("vectors", Some("gpt-4.1"), &[("embeddings", "true")])), CatalogKind::Embedding);
+        assert_eq!(classify_deployment(&live("embed-chat", None, &[("chatCompletion", "true")])), CatalogKind::Chat);
+    }
+
+    // Break proof: with `configured_model` and `foundry_model` back on a fixed `CatalogKind::Chat`,
+    // every assertion on an embedding kind below fails: a configured embedding deployment was
+    // offered as chat, whether the account listed it or not.
+    #[test]
+    fn a_configured_deployment_is_classified_like_a_discovered_one() {
+        let live = vec![
+            live("gpt-4.1", Some("gpt-4.1"), &[("chatCompletion", "true")]),
+            live("text-embedding-3-large", Some("text-embedding-3-large"), &[("embeddings", "true")]),
+            live("vectors-eu", Some("text-embedding-3-small"), &[]),
+        ];
+        let configured = vec!["gpt-4.1".to_string(), "text-embedding-3-large".to_string(), "vectors-eu".to_string()];
+        for discover in [false, true] {
+            let (models, missing) = merge_live_catalog(&configured, &[], &live, discover);
+            assert!(missing.is_empty());
+            assert_eq!(
+                models.iter().map(|m| (m.name.as_str(), m.kind, m.source)).collect::<Vec<_>>(),
+                vec![
+                    ("gpt-4.1", CatalogKind::Chat, Some(CatalogSource::Configured)),
+                    ("text-embedding-3-large", CatalogKind::Embedding, Some(CatalogSource::Configured)),
+                    ("vectors-eu", CatalogKind::Embedding, Some(CatalogSource::Configured)),
+                ],
+                "discover = {discover}: the capability map, then the base model's name, decide a configured entry's kind"
+            );
+        }
+        // No live record at all (no account to list): the name decides.
+        assert_eq!(foundry_model("text-embedding-3-large").kind, CatalogKind::Embedding);
+        assert_eq!(foundry_model("gpt-4.1").kind, CatalogKind::Chat);
+        assert_eq!(serde_json::to_value(&foundry_model("text-embedding-3-large")).unwrap()["kind"], "embedding");
+        // The plain `/models` listing too.
+        let listed = parse_models(&serde_json::json!({"data": [{"id": "gpt-4.1"}, {"id": "text-embedding-3-large"}]}));
+        assert_eq!(listed.iter().map(|m| m.kind).collect::<Vec<_>>(), vec![CatalogKind::Chat, CatalogKind::Embedding]);
     }
 
     // Break proof: with the `if discover` extension in merge_live_catalog disabled, this
@@ -509,7 +540,8 @@ mod tests {
     fn with_no_configured_list_every_live_deployment_is_the_catalog() {
         let live = vec![live("b", None, &[("embeddings", "true")]), live("a", None, &[])];
         let (off, _) = merge_live_catalog(&[], &[], &live, false);
-        assert_eq!(off.iter().map(|m| (m.name.as_str(), m.kind, m.source)).collect::<Vec<_>>(), vec![("a", CatalogKind::Chat, None), ("b", CatalogKind::Chat, None)]);
+        // Classified from the live record even with discovery off: `b` only serves embeddings.
+        assert_eq!(off.iter().map(|m| (m.name.as_str(), m.kind, m.source)).collect::<Vec<_>>(), vec![("a", CatalogKind::Chat, None), ("b", CatalogKind::Embedding, None)]);
         let (on, _) = merge_live_catalog(&[], &[], &live, true);
         assert_eq!(on.iter().map(|m| (m.name.as_str(), m.kind)).collect::<Vec<_>>(), vec![("a", CatalogKind::Chat), ("b", CatalogKind::Embedding)]);
         assert!(on.iter().all(|m| m.source == Some(CatalogSource::Discovered)));

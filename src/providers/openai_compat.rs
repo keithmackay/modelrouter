@@ -250,7 +250,8 @@ impl crate::providers::catalog::ProviderCatalog for OpenAICompatAdapter {
                 provider: String::new(),
                 name: id.to_string(),
                 display_name: None,
-                kind: crate::providers::catalog::CatalogKind::Chat,
+                // The listing says nothing about what a model serves: its name does.
+                kind: crate::providers::catalog::CatalogKind::from_name(id),
                 source: None,
             })
             .collect())

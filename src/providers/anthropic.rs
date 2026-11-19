@@ -74,7 +74,7 @@ impl crate::providers::catalog::ProviderCatalog for AnthropicAdapter {
                     provider: "anthropic".to_string(),
                     name: id.to_string(),
                     display_name: m["display_name"].as_str().map(str::to_string),
-                    kind: crate::providers::catalog::CatalogKind::Chat,
+                    kind: crate::providers::catalog::CatalogKind::from_name(id),
                     source: None,
                 })
             })

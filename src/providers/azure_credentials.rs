@@ -1047,6 +1047,16 @@ impl AzureAuth {
             Self::ApiKey(_) => None,
         }
     }
+
+    /// The credential as a header `(name, value)`, for a request that is not
+    /// built through reqwest (a WebSocket handshake). Same two modes as
+    /// [`Self::apply`].
+    pub async fn header(&self) -> anyhow::Result<(&'static str, String)> {
+        Ok(match self {
+            Self::Entra(provider) => ("authorization", format!("Bearer {}", provider.token().await?)),
+            Self::ApiKey(key) => ("api-key", key.clone()),
+        })
+    }
 }
 
 #[cfg(test)]
