@@ -14,6 +14,7 @@ fn webhook(name: &str) -> NewWebhookCallback {
         events: r#"["completion"]"#.to_string(),
         secret_header_name: None,
         secret_header_value: None,
+        signing_secret: None,
     }
 }
 
@@ -44,6 +45,7 @@ async fn webhook_create_returns_the_stored_row() {
             .create_webhook(NewWebhookCallback {
                 secret_header_name: Some("X-Secret".into()),
                 secret_header_value: Some("s3cret".into()),
+                signing_secret: Some("whsec".into()),
                 ..webhook("first")
             })
             .await
@@ -54,6 +56,7 @@ async fn webhook_create_returns_the_stored_row() {
         assert_eq!(w.events, r#"["completion"]"#);
         assert_eq!(w.secret_header_name.as_deref(), Some("X-Secret"));
         assert_eq!(w.secret_header_value.as_deref(), Some("s3cret"));
+        assert_eq!(w.signing_secret.as_deref(), Some("whsec"));
         assert!(w.enabled);
         // Stored as the RFC 3339 string it was written with.
         assert!(chrono::DateTime::parse_from_rfc3339(&w.created_at).is_ok(), "{}", w.created_at);
@@ -63,6 +66,9 @@ async fn webhook_create_returns_the_stored_row() {
         assert_eq!(listed[0].id, w.id);
         assert_eq!(listed[0].created_at, w.created_at);
         assert_eq!(listed[0].secret_header_value.as_deref(), Some("s3cret"));
+        assert_eq!(listed[0].signing_secret.as_deref(), Some("whsec"));
+        let enabled = db.list_enabled_webhooks().await.unwrap();
+        assert_eq!(enabled[0].signing_secret.as_deref(), Some("whsec"));
     })
     .await;
 }

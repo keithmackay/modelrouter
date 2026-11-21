@@ -67,6 +67,8 @@ fn entry(user_id: i64, model: &str, cost_usd: f64) -> NewCostLedgerEntry {
         experiment_id: None,
         experiment_variant: None,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     }
 }
 
@@ -115,6 +117,8 @@ async fn create_round_trips_every_column() {
                 experiment_id: Some(4),
                 experiment_variant: Some("control".into()),
                 tokens_estimated: true,
+                cache_read_tokens: 5000,
+                cache_write_tokens: 700,
                 ..entry(u, "m1", 0.25)
             },
         )
@@ -135,6 +139,7 @@ async fn create_round_trips_every_column() {
         assert_eq!(row.experiment_id, Some(4));
         assert_eq!(row.experiment_variant.as_deref(), Some("control"));
         assert!(row.tokens_estimated);
+        assert_eq!((row.cache_read_tokens, row.cache_write_tokens), (5000, 700));
 
         let bare = put(&db, entry(u, "m2", 0.0)).await;
         assert!(bare.id > row.id);
@@ -144,6 +149,7 @@ async fn create_round_trips_every_column() {
         assert_eq!(bare.experiment_id, None);
         assert_eq!(bare.experiment_variant, None);
         assert!(!bare.tokens_estimated);
+        assert_eq!((bare.cache_read_tokens, bare.cache_write_tokens), (0, 0));
     })
     .await;
 }
@@ -158,6 +164,8 @@ async fn create_cache_hit_records_saving_not_spend() {
                 experiment_id: Some(4),
                 experiment_variant: Some("control".into()),
                 tokens_estimated: true,
+                cache_read_tokens: 40,
+                cache_write_tokens: 3,
                 ..entry(u, "m1", 0.5)
             },
         )
@@ -168,6 +176,7 @@ async fn create_cache_hit_records_saving_not_spend() {
         assert_eq!(hit.prompt_id, 0);
         assert_eq!(hit.experiment_id, Some(4));
         assert!(hit.tokens_estimated);
+        assert_eq!((hit.cache_read_tokens, hit.cache_write_tokens), (40, 3));
         assert!(close(db.sum_global_since(EPOCH).await.unwrap(), 0.0));
     })
     .await;
@@ -590,6 +599,50 @@ async fn summarize_by_model_highest_spend_first() {
     .await;
 }
 
+/// Grouped by call kind, then model. PostgreSQL returns `SUM(BIGINT)` as
+/// `NUMERIC`, so the token sums must be cast for the row to decode (#154).
+#[tokio::test]
+async fn summarize_by_kind_groups_by_kind_then_model() {
+    use modelrouter::db::models::CallKind;
+    each_backend(|db| async move {
+        let alice = user(&db, "alice").await;
+        let bob = user(&db, "bob").await;
+        put(&db, NewCostLedgerEntry { project: Some("proj".into()), ..entry(alice, "m1", 1.0) }).await;
+        put(&db, entry(bob, "m2", 4.0)).await;
+        let late = put(&db, NewCostLedgerEntry { call_kind: CallKind::Decision, ..entry(alice, "m1", 2.0) }).await;
+        put_hit(&db, NewCostLedgerEntry { call_kind: CallKind::Decision, ..entry(alice, "m1", 8.0) }).await;
+
+        let rows = db.summarize_by_kind(None, None, None, EPOCH).await.unwrap();
+        let keys: Vec<(&str, &str, i64, i64, i64)> = rows
+            .iter()
+            .map(|r| (r.call_kind.as_str(), r.model.as_str(), r.tokens_in, r.tokens_out, r.request_count))
+            .collect();
+        // Kind ascending, then highest spend first within a kind.
+        assert_eq!(
+            keys,
+            [("chat", "m2", 10, 5, 1), ("chat", "m1", 10, 5, 1), ("decision", "m1", 20, 10, 2)]
+        );
+        assert!(close(rows[0].total_cost_usd, 4.0));
+        assert!(close(rows[2].total_cost_usd, 2.0));
+        assert!(close(rows[2].uncached_cost_usd, 10.0));
+
+        let proj = db.summarize_by_kind(None, Some("proj"), None, EPOCH).await.unwrap();
+        assert_eq!(proj.len(), 1);
+        assert_eq!((proj[0].call_kind.as_str(), proj[0].model.as_str()), ("chat", "m1"));
+        let m2 = db.summarize_by_kind(None, None, Some("m2"), EPOCH).await.unwrap();
+        assert_eq!(m2.len(), 1);
+        let alice_only = db.summarize_by_kind(Some(&[alice]), None, None, EPOCH).await.unwrap();
+        assert_eq!(alice_only.len(), 2);
+        let since = db.summarize_by_kind(None, None, None, &late.created_at).await.unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].call_kind, "decision");
+
+        assert!(db.summarize_by_kind(Some(&[]), None, None, EPOCH).await.unwrap().is_empty());
+        assert!(db.summarize_by_kind(None, None, None, FUTURE).await.unwrap().is_empty());
+    })
+    .await;
+}
+
 // ── Retention ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -616,6 +669,50 @@ async fn list_before_and_delete_by_ids() {
             db.list_cost_entries_before(FUTURE).await.unwrap().iter().map(|r| r.id).collect();
         assert_eq!(left, [b.id]);
         assert!(close(db.sum_global_since(EPOCH).await.unwrap(), 0.0));
+    })
+    .await;
+}
+
+// ── Usage events read ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_usage_after_pages_by_id_without_health_rows() {
+    each_backend(|db| async move {
+        let u = user(&db, "alice").await;
+        let a = put(&db, entry(u, "m1", 1.0)).await;
+        put(
+            &db,
+            NewCostLedgerEntry {
+                call_kind: modelrouter::db::models::CallKind::Health,
+                ..entry(u, "probe", 0.1)
+            },
+        )
+        .await;
+        let b = put_hit(&db, entry(u, "m2", 2.0)).await;
+        let c = put(&db, entry(u, "m3", 4.0)).await;
+
+        let ids = |rows: Vec<CostLedgerEntry>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(db.list_usage_after(None, 0, 10).await.unwrap()),
+            [a.id, b.id, c.id],
+            "id order, health rows left out"
+        );
+        assert_eq!(ids(db.list_usage_after(None, 0, 2).await.unwrap()), [a.id, b.id]);
+        assert_eq!(ids(db.list_usage_after(None, b.id, 2).await.unwrap()), [c.id]);
+        assert!(db.list_usage_after(None, c.id, 2).await.unwrap().is_empty());
+
+        assert_eq!(
+            ids(db.list_usage_after(Some(&b.created_at), 0, 10).await.unwrap()),
+            [b.id, c.id],
+            "since is inclusive"
+        );
+        assert_eq!(ids(db.list_usage_after(Some(&b.created_at), b.id, 10).await.unwrap()), [c.id]);
+        assert!(db.list_usage_after(Some(FUTURE), 0, 10).await.unwrap().is_empty());
+
+        let hit = &db.list_usage_after(None, a.id, 1).await.unwrap()[0];
+        assert!(hit.cache_hit);
+        assert!(close(hit.saved_usd, 2.0));
+        assert_eq!(hit.model, "m2");
     })
     .await;
 }

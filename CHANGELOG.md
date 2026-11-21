@@ -2,12 +2,26 @@
 
 ## Unreleased
 
-Everything since 0.1.0, by week. Entries are the merged result, not every
-commit; `git log v0.1.0..` has the detail.
+### Week of 2026-11-09
+
+**Features**
+- `GET /admin/api/usage/events?since=&after_id=&limit=` reads `usage` events back by ledger id, so a receiver can backfill deliveries it missed. Each item is the webhook payload for that row without `delivery_id`; health-probe rows are left out. Pages are in id order, at most 1000 events; `next_after_id` is the cursor for the next page and `null` once caught up. Admin session required.
+
+**Fixes**
+- On PostgreSQL, prompts read back by id or in a listing reported an empty `call_kind`: those reads did not select the column. SQLite was unaffected.
+
+## 0.2.0 — 2026-11-15
+
+Everything since 0.1.1, by week. Entries are the merged result, not every
+commit; `git log v0.1.1..v0.2.0` has the detail.
 
 ### Week of 2026-11-09
 
 **Features**
+- `usage` webhook event. Every cost-ledger row a request writes (chat completions and `/v1/messages` streamed or not, response-cache hits, `/v1/responses`, embeddings, images, audio, search, `/v1/rerank`, `/v1/decisions`, `/v1/systemone`) emits one event carrying the row's id and time, the caller's correlation id, tags and resolved project, model, provider, token counts including prompt-cache reads and writes, `cost_usd`, `cache_hit`, `saved_usd` and `uncached_cost_usd`, and no content (`schema_version: 1`). Subscribe with `--events usage`. A webhook registered with `*` or no events now receives `usage` events as well as `completion`.
+- Signed webhooks. A webhook with a signing secret (`webhook add --signing-secret-env <VAR>`, `signing_secret` on `POST /admin/api/webhooks`, or the dashboard form) sends `X-Modelrouter-Signature: sha256=<HMAC-SHA256 of "<timestamp>.<body>">` with `X-Modelrouter-Timestamp`, `X-Modelrouter-Delivery` and `X-Modelrouter-Event`. Listings show only whether a webhook is signed.
+- Webhook deliveries time out after 10 s and follow no redirects. `usage` deliveries are retried on a connection error, timeout, 429 or 5xx after 1 s, 5 s, 30 s, 2 min and 10 min; at most 1000 deliveries per webhook are held in flight.
+- The cost ledger records prompt-cache read and write tokens (`cache_read_tokens`, `cache_write_tokens`).
 - Subscription mode. With `[subscription] enabled = true`, chat traffic for Anthropic, OpenAI and Gemini models goes through `claude -p`, `codex exec` and `gemini` on their subscription logins, on `/v1/chat/completions`, `/v1/responses` and `/v1/messages`. A request that continues a conversation resumes the same CLI session and sends only the new turn; sessions are kept per user, project, CLI and model. Calls are metered as `claude-cli`, `codex-cli` and `gemini-cli`, priced at the API rate. Text only: tool, image and document requests get a 400.
 - The SQL reports (`report cost`, `report usage`, `report prompts`, `report audit`, `report hooks`, `audit`) and the dashboard's hook latency panel now work on Postgres.
 - PostgreSQL backend. With `--features postgres` and `database.postgres_url` set (or `MODELROUTER_DATABASE__POSTGRES_URL`), `serve`, `migrate` and the `user`, `admin`, `key`, `budget`, `group`, `model`, `alias`, `provider`, `webhook` and `experiment` commands run on Postgres and apply `migrations/postgres/` first. Previously the setting was ignored and everything used SQLite. A binary built without the feature refuses to start with `postgres_url` set. 
@@ -23,7 +37,10 @@ commit; `git log v0.1.0..` has the detail.
 **Fixes**
 - A fresh PostgreSQL database could not be migrated: `migrations/postgres/` held three files numbered 035 and two numbered 037, and sqlx keys its history by version, so the first start failed inserting the second 035 (`_sqlx_migrations_pkey`) and a database that had recorded one of them failed every later start on the checksum. Each version now has one file; the files that lost their number were replayed as guarded `042`-`044`, and a store that recorded a retired file under its old version has that version released before migrating. (#153)
 - The model catalog reported every configured Foundry deployment, and every id a provider's `/models` listing returned, as a chat model, so a tier picker built on it offered embedding, reranking, image and audio models that fail on their first chat call. A configured deployment is now classified like a discovered one, from the account's capability map and then its name and base model; a listing with no capability data is classified from the name (`embed`, `rerank`, `whisper`, `tts`, `dall-e`, ...). A name that says nothing is still chat.
+- The config hot-reload re-read the file every 30 s and logged `config hot-reloaded` at `info` each time, changed or not (about 2,900 lines a day), and repeated a parse error's warning every tick. It now swaps the settings and logs only when the file's contents change, and warns once per distinct error until it clears. An unreadable or deleted config file keeps the running settings instead of reloading defaults.
 - Retention purges on SQLite ran as one `DELETE` per table, holding the single write lock for the whole run, so request and cost logging failed with "database is locked" on a large store. Each purge now deletes in short batches, each in its own transaction, yielding between them; the usage rows that point at purged prompts are detached per batch. New indexes cover the age and link lookups the purges make (`038_purge_indexes`, `041` on Postgres), and the first tick waits five minutes after start so it does not compete with migrations and the first requests.
+- Streamed `/v1/messages` calls were metered with a guess: input as characters divided by four, output and prompt-cache tokens as 0, and the row not flagged as estimated. They are now metered from the usage the stream reports, prompt-cache tokens included, with latency measured to the end of the stream. A stream that ends before `message_stop`, including when the client disconnects, is still recorded, from the counts that arrived, and flagged estimated.
+- Non-streaming `/v1/messages` billed every call to the API key's project and ignored `X-Project` and the body's attribution project. It now resolves the project per request like every other route.
 - Phoenix in `docker-compose.otel.yml` rejected every trace as unauthenticated: current Phoenix requires auth whenever it binds a non-loopback address, as it always does in a container. Auth is now off and the UI is published on `127.0.0.1:6006` only.
 - `install-service` on macOS wrote a plist launchd could not use: `${HOME}` is not expanded by launchd, the binary was assumed to be at `/usr/local/bin`, and launchd's default `PATH` hides Homebrew-installed CLIs. It now writes absolute paths for the running binary, the selected config and the log, plus the installing shell's `PATH`, and refuses to install without a config.
 - `init` writes to `--config` (or `MODELROUTER_CONFIG`) when given, instead of always `~/.modelrouter/config.toml`.

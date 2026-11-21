@@ -17,7 +17,8 @@ const LEDGER_COLUMNS: &str = "id, user_id, COALESCE(prompt_id, 0) AS prompt_id, 
                               project, tokens_in, tokens_out, cost_usd, created_at, api_key_id, \
                               cache_hit, saved_usd, attribution_correlation_id, \
                               attribution_tags, experiment_id, experiment_variant, \
-                              tokens_estimated, call_kind";
+                              tokens_estimated, call_kind, \
+                              cache_read_tokens, cache_write_tokens";
 
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
 const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)::BIGINT";
@@ -41,8 +42,8 @@ impl CostRepository for PostgresDb {
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                        call_kind, cache_read_tokens, cache_write_tokens)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                RETURNING {LEDGER_COLUMNS}"#
         )))
         .bind(entry.user_id)
@@ -61,6 +62,8 @@ impl CostRepository for PostgresDb {
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
         .bind(entry.call_kind.as_str())
+        .bind(entry.cache_read_tokens)
+        .bind(entry.cache_write_tokens)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -75,8 +78,8 @@ impl CostRepository for PostgresDb {
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16)
+                                        call_kind, cache_read_tokens, cache_write_tokens)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                RETURNING {LEDGER_COLUMNS}"#
         )))
         .bind(entry.user_id)
@@ -95,6 +98,8 @@ impl CostRepository for PostgresDb {
         .bind(&entry.experiment_variant)
         .bind(entry.tokens_estimated)
         .bind(entry.call_kind.as_str())
+        .bind(entry.cache_read_tokens)
+        .bind(entry.cache_write_tokens)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -286,6 +291,26 @@ impl CostRepository for PostgresDb {
         Ok(rows)
     }
 
+    async fn list_usage_after(
+        &self,
+        since: Option<&str>,
+        after_id: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CostLedgerEntry>> {
+        let (since_clause, limit_param) =
+            if since.is_some() { (" AND created_at >= $2", "$3") } else { ("", "$2") };
+        let sql = format!(
+            "SELECT {} FROM cost_ledger WHERE id > $1 AND call_kind <> 'health'{} \
+             ORDER BY id ASC LIMIT {}",
+            LEDGER_COLUMNS, since_clause, limit_param
+        );
+        let mut q = sqlx::query_as::<_, CostLedgerEntry>(sqlx::AssertSqlSafe(sql)).bind(after_id);
+        if let Some(since) = since {
+            q = q.bind(since);
+        }
+        Ok(q.bind(limit).fetch_all(&self.pool).await?)
+    }
+
     async fn delete_cost_entries_by_ids(&self, ids: &[i64]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -444,8 +469,8 @@ impl CostRepository for PostgresDb {
         }
         let mut sql = "SELECT call_kind, model, \
                               COALESCE(SUM(cost_usd), 0.0), \
-                              COALESCE(SUM(tokens_in), 0), \
-                              COALESCE(SUM(tokens_out), 0), \
+                              COALESCE(SUM(tokens_in), 0)::BIGINT, \
+                              COALESCE(SUM(tokens_out), 0)::BIGINT, \
                               COUNT(*), \
                               COALESCE(SUM(saved_usd), 0.0) \
                        FROM cost_ledger \

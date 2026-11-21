@@ -116,7 +116,7 @@ impl PromptRepository for PostgresDb {
                       cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                       attribution_correlation_id, attribution_tags,
-                      experiment_id, experiment_variant, created_at
+                      experiment_id, experiment_variant, call_kind, created_at
                FROM prompts WHERE id = $1"#,
         )
         .bind(id)
@@ -132,7 +132,7 @@ impl PromptRepository for PostgresDb {
                       cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                       attribution_correlation_id, attribution_tags,
-                      experiment_id, experiment_variant, created_at
+                      experiment_id, experiment_variant, call_kind, created_at
                FROM prompts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2"#,
         )
         .bind(user_id)
@@ -149,7 +149,7 @@ impl PromptRepository for PostgresDb {
                       cache_read_tokens, cache_write_tokens,
                       cost_usd, latency_ms, ttft_ms, attempts, tags, project,
                       attribution_correlation_id, attribution_tags,
-                      experiment_id, experiment_variant, created_at
+                      experiment_id, experiment_variant, call_kind, created_at
                FROM prompts ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
         )
         .bind(limit)

@@ -704,6 +704,62 @@ fn webhook_enable_disable_delete() {
     assert!(out.contains("Deleted") || out.contains("deleted"));
 }
 
+/// `--signing-secret-env` names the variable holding the secret, so the secret
+/// itself never appears on the command line or in shell history.
+#[test]
+fn webhook_add_reads_the_signing_secret_from_the_named_variable() {
+    let (dir, config) = setup_db();
+    let secret = "whsec-from-the-environment-42";
+    let out = std::process::Command::new(BIN)
+        .args([
+            "webhook", "add", "--name", "signed", "--url", "http://127.0.0.1:9/hook",
+            "--events", "usage", "--signing-secret-env", "TEST_WEBHOOK_SIGNING_SECRET",
+        ])
+        .env("MODELROUTER_CONFIG", &config)
+        .env("TEST_WEBHOOK_SIGNING_SECRET", secret)
+        .output()
+        .expect("run webhook add");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "webhook add failed: {stderr}");
+    assert!(!stdout.contains(secret) && !stderr.contains(secret), "the secret was echoed");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (events, stored): (String, Option<String>) = rt.block_on(async {
+        let url = format!("sqlite://{}", dir.path().join("router.db").display());
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query_as("SELECT events, signing_secret FROM webhook_callbacks")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    });
+    assert_eq!(events, r#"["usage"]"#);
+    assert_eq!(stored.as_deref(), Some(secret));
+}
+
+#[test]
+fn webhook_add_refuses_an_unset_signing_secret_variable() {
+    let (_dir, config) = setup_db();
+    let out = std::process::Command::new(BIN)
+        .args([
+            "webhook", "add", "--name", "signed", "--url", "http://127.0.0.1:9/hook",
+            "--signing-secret-env", "TEST_WEBHOOK_SIGNING_SECRET_UNSET",
+        ])
+        .env("MODELROUTER_CONFIG", &config)
+        .env_remove("TEST_WEBHOOK_SIGNING_SECRET_UNSET")
+        .output()
+        .expect("run webhook add");
+    assert!(!out.status.success(), "an unset variable must not create an unsigned webhook");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("TEST_WEBHOOK_SIGNING_SECRET_UNSET"),
+        "the error names the variable: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (ok, list, _) = run_cli(&config, &["webhook", "list"]);
+    assert!(ok);
+    assert!(!list.contains("signed"), "nothing was created: {list}");
+}
+
 // ── Experiment commands ───────────────────────────────────────────────────────
 
 #[test]
@@ -2490,4 +2546,28 @@ fn version_works_with_no_config_at_all() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
+}
+
+/// A PostgreSQL URL in a build without the `postgres` feature fails the
+/// check with the message `serve` gives, instead of reporting on the SQLite
+/// file the server would never open.
+#[cfg(not(feature = "postgres"))]
+#[test]
+fn check_config_with_a_postgres_url_in_a_sqlite_build_fails_like_serve() {
+    let (_dir, config) = setup_db();
+    let content = std::fs::read_to_string(&config).expect("read config");
+    assert!(content.contains("[database]\n"), "{content}");
+    let content = content.replacen(
+        "[database]\n",
+        "[database]\npostgres_url = \"postgres://u:p@localhost/never\"\n",
+        1,
+    );
+    let path = config.with_file_name("pg.toml");
+    std::fs::write(&path, content).expect("write config");
+
+    let (ok, out, _err) = run_cli(&path, &["serve", "--check-config"]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("database: FAIL"), "{out}");
+    assert!(out.contains("--features postgres"), "{out}");
+    assert!(!out.contains("migrations applied"), "must not report on SQLite: {out}");
 }

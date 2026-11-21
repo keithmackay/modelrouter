@@ -75,6 +75,7 @@ pub async fn wait_for_ledger_rows(db: &dyn DatabaseProvider, want: usize) -> Vec
     panic!("timed out waiting for {want} cost-ledger rows");
 }
 
+#[allow(dead_code)]
 pub struct MockAdapter {
     pub response: String,
 }
@@ -103,6 +104,7 @@ impl ProviderAdapter for MockAdapter {
     }
 }
 
+#[allow(dead_code)]
 pub struct MockEmbeddingAdapter {
     pub embedding: Vec<f32>,
 }
@@ -120,6 +122,7 @@ impl modelrouter::providers::embedding::EmbeddingAdapter for MockEmbeddingAdapte
     }
 }
 
+#[allow(dead_code)]
 pub struct MockSearchAdapter {
     pub results: Vec<modelrouter::providers::search::SearchResultItem>,
 }
@@ -142,6 +145,7 @@ impl modelrouter::providers::search::SearchAdapter for MockSearchAdapter {
 
 /// Mock search adapter that always fails with a provider error.
 /// Used to test search engine fallback chains.
+#[allow(dead_code)]
 pub struct FailingSearchAdapter {
     pub error_message: String,
 }
@@ -157,6 +161,7 @@ impl modelrouter::providers::search::SearchAdapter for FailingSearchAdapter {
 }
 
 /// Mock search adapter that returns results with a custom engine name.
+#[allow(dead_code)]
 pub struct NamedMockSearchAdapter {
     pub results: Vec<modelrouter::providers::search::SearchResultItem>,
     pub engine_name: String,
@@ -180,6 +185,7 @@ impl modelrouter::providers::search::SearchAdapter for NamedMockSearchAdapter {
 
 /// Mock search adapter that tracks whether it was called.
 /// Used to verify an engine in a fallback chain was NOT consulted.
+#[allow(dead_code)]
 pub struct CallTrackingSearchAdapter {
     pub results: Vec<modelrouter::providers::search::SearchResultItem>,
     pub engine_name: String,
@@ -200,5 +206,45 @@ impl modelrouter::providers::search::SearchAdapter for CallTrackingSearchAdapter
             usage: None,
             grounding_miss: None,
         })
+    }
+}
+
+/// Usage events a test's callback dispatcher received, in order. Hand
+/// `dispatcher()` to the app state and read the events back.
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+pub struct RecordedUsage(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+#[allow(dead_code)]
+impl RecordedUsage {
+    pub fn dispatcher(&self) -> std::sync::Arc<modelrouter::callbacks::CallbackDispatcher> {
+        std::sync::Arc::new(modelrouter::callbacks::CallbackDispatcher::new(vec![Box::new(
+            self.clone(),
+        )]))
+    }
+
+    pub fn events(&self) -> Vec<serde_json::Value> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Emission follows a fire-and-forget ledger write, so poll until at
+    /// least `want` events arrived rather than sleeping for a guessed interval.
+    pub async fn wait_for(&self, want: usize) -> Vec<serde_json::Value> {
+        for _ in 0..200 {
+            let events = self.events();
+            if events.len() >= want {
+                return events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {want} usage events, got {:?}", self.events());
+    }
+}
+
+impl modelrouter::callbacks::CallbackBackend for RecordedUsage {
+    fn send(&self, _event: modelrouter::callbacks::CallbackEvent) {}
+
+    fn send_usage(&self, payload: &serde_json::Value) {
+        self.0.lock().unwrap().push(payload.clone());
     }
 }

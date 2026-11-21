@@ -347,6 +347,10 @@ pub fn build_router_with_registries(
             get(crate::api::admin::attribution::get_attribution_facets),
         )
         .route(
+            "/admin/api/usage/events",
+            get(crate::api::admin::usage_events::get_usage_events),
+        )
+        .route(
             "/admin/api/compare",
             get(crate::api::admin::compare::get_compare),
         )

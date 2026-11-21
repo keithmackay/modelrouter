@@ -1,6 +1,6 @@
 [package]
 name = "modelrouter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.94.1"
@@ -75,6 +75,7 @@ comfy-table = "7"
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 time = { version = "0.3", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -19,6 +19,7 @@ pub struct CreateWebhookJson {
     pub events: Option<String>,
     pub secret_header_name: Option<String>,
     pub secret_header_value: Option<String>,
+    pub signing_secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -28,6 +29,8 @@ pub struct WebhookResponse {
     pub url: String,
     pub events: String,
     pub secret_header_name: Option<String>,
+    /// Whether deliveries are signed. The secret itself is never returned.
+    pub signed: bool,
     pub enabled: bool,
     pub created_at: String,
 }
@@ -40,6 +43,7 @@ impl From<WebhookCallback> for WebhookResponse {
             url: w.url,
             events: w.events,
             secret_header_name: w.secret_header_name,
+            signed: w.signing_secret.is_some(),
             enabled: w.enabled,
             created_at: w.created_at,
         }
@@ -72,6 +76,7 @@ pub async fn create_webhook_api(
         events: body.events.unwrap_or_else(|| r#"["completion"]"#.to_string()),
         secret_header_name: body.secret_header_name,
         secret_header_value: body.secret_header_value,
+        signing_secret: body.signing_secret.filter(|s| !s.trim().is_empty()),
     };
     match state.db.create_webhook(new).await {
         Ok(w) => (StatusCode::CREATED, Json(WebhookResponse::from(w))).into_response(),
@@ -121,6 +126,7 @@ pub struct CreateWebhookForm {
     pub events: Option<String>,
     pub secret_header_name: Option<String>,
     pub secret_header_value: Option<String>,
+    pub signing_secret: Option<String>,
 }
 
 // ── Dashboard page handlers ────────────────────────────────────────────────────
@@ -137,6 +143,7 @@ pub async fn get_webhooks_page(
             "url": w.url,
             "events": w.events,
             "secret_header_name": w.secret_header_name,
+            "signed": w.signing_secret.is_some(),
             "enabled": w.enabled,
             "created_at": w.created_at,
         })
@@ -182,6 +189,7 @@ pub async fn post_create_webhook_page(
         events,
         secret_header_name: form.secret_header_name.filter(|s| !s.trim().is_empty()),
         secret_header_value: form.secret_header_value.filter(|s| !s.trim().is_empty()),
+        signing_secret: form.signing_secret.filter(|s| !s.trim().is_empty()),
     }).await;
 
     Ok(Redirect::to("/admin/webhooks").into_response())

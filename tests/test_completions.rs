@@ -281,6 +281,8 @@ mod accounting {
     pub(crate) struct ScriptedAdapter {
         fail_first: AtomicUsize,
         chunks: Vec<Chunk>,
+        /// Prompt-cache (read, write) tokens the non-streaming answer reports.
+        cache_tokens: (u32, u32),
     }
 
     impl ScriptedAdapter {
@@ -288,6 +290,7 @@ mod accounting {
             Self {
                 fail_first: AtomicUsize::new(0),
                 chunks,
+                cache_tokens: (0, 0),
             }
         }
 
@@ -295,6 +298,15 @@ mod accounting {
             Self {
                 fail_first: AtomicUsize::new(n),
                 chunks: vec![],
+                cache_tokens: (0, 0),
+            }
+        }
+
+        pub(crate) fn answering_with_cache_tokens(read: u32, write: u32) -> Self {
+            Self {
+                fail_first: AtomicUsize::new(0),
+                chunks: vec![],
+                cache_tokens: (read, write),
             }
         }
     }
@@ -318,6 +330,8 @@ mod accounting {
                 // the adapter's measurement into the prompt row.
                 ttft_ms: Some(42),
                 tool_calls: None,
+                cache_read_tokens: self.cache_tokens.0,
+                cache_write_tokens: self.cache_tokens.1,
                 ..Default::default()
             })
         }
@@ -570,6 +584,47 @@ mod accounting {
         // dispatch as one attempt (the streaming path has no retry loop).
         assert!(prompts[0].ttft_ms.is_some(), "streamed row should carry a TTFT");
         assert_eq!(prompts[0].attempts, Some(1));
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_tokens_are_recorded_on_the_ledger() {
+        let (server, db) = build_app(
+            ScriptedAdapter::answering_with_cache_tokens(70, 9),
+            HashMap::new(),
+            false,
+        )
+        .await;
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&request_body(false))
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        assert_eq!((ledger[0].cache_read_tokens, ledger[0].cache_write_tokens), (70, 9));
+    }
+
+    #[tokio::test]
+    async fn streamed_prompt_cache_reads_are_recorded_on_the_ledger() {
+        let chunks = vec![
+            Chunk::Data(delta("Hello")),
+            Chunk::Data(format!(
+                "{}data: [DONE]\n\n",
+                sse(json!({"choices":[],"usage":{
+                    "prompt_tokens":40,"completion_tokens":6,"total_tokens":46,
+                    "prompt_tokens_details":{"cached_tokens":32}
+                }}))
+            )),
+        ];
+        let (server, db) = build_app(ScriptedAdapter::streaming(chunks), HashMap::new(), false).await;
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&request_body(true))
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        assert_eq!((ledger[0].cache_read_tokens, ledger[0].cache_write_tokens), (32, 0));
     }
 
     #[tokio::test]
