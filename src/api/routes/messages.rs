@@ -31,6 +31,7 @@ async fn log_messages_cost(
     cost: f64,
     latency_ms: i64,
     attribution: crate::api::attribution::Attribution,
+    request_fingerprint: Option<String>,
 ) {
     use crate::api::ledger::record_usage;
     use crate::db::repositories::prompts::PromptRepository;
@@ -87,6 +88,7 @@ async fn log_messages_cost(
         experiment_variant: None,
         call_kind: crate::db::models::CallKind::Chat,
         tokens_estimated,
+        request_fingerprint,
         cache_read_tokens: cache_read_tokens as i64,
         cache_write_tokens: cache_write_tokens as i64,
     };
@@ -255,9 +257,8 @@ async fn anthropic_messages_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan
-        .store()
-        .then(|| crate::router::cache::messages_cache_key(&canonical_model, &body));
+    let request_fingerprint = crate::router::cache::messages_cache_key(&canonical_model, &body);
+    let cache_key = cache_plan.store().then(|| request_fingerprint.clone());
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(message) = state
             .response_cache
@@ -377,6 +378,7 @@ async fn anthropic_messages_inner(
         let stream_directives = cache_directives.clone();
         let mut usage = StreamUsageRecorder::new(streamed_cost_logger(
             &state, &user, &attribution, &model, &canonical_model, &body, start,
+            request_fingerprint.clone(),
         ));
         let byte_stream = upstream_resp.bytes_stream().map(move |chunk| {
             match &chunk {
@@ -581,6 +583,7 @@ async fn anthropic_messages_inner(
                     tokens_estimated: false,
                     cache_read_tokens: cache_read_tokens as i64,
                     cache_write_tokens: cache_write_tokens as i64,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
@@ -681,6 +684,7 @@ fn streamed_cost_logger(
     canonical_model: &str,
     body: &Value,
     start: std::time::Instant,
+    request_fingerprint: String,
 ) -> Box<dyn FnOnce(MessagesStreamUsage) + Send> {
     let state = state.clone();
     let user_id = user.id;
@@ -730,6 +734,7 @@ fn streamed_cost_logger(
                 cost,
                 latency_ms,
                 attribution,
+                Some(request_fingerprint),
             )
             .await;
         });
@@ -799,6 +804,7 @@ fn serve_cached_message(
             avoided_cost,
             skip_log: false,
             attribution: attribution.clone(),
+            request_fingerprint: Some(key.to_string()),
         },
         &usage,
     );

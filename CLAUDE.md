@@ -30,6 +30,7 @@ modelrouter user list
 modelrouter budget set --user alice --limit 10.0 --window monthly
 modelrouter report cost [--user] [--window] [--format table|csv|json]
 modelrouter report compare --dimension model|provider|tag|run|variant [--key <tag-key|experiment-id>] --a <arm> --b <arm> [--window] [--format table|csv|json]
+modelrouter report duplicates [--correlation-id-prefix <p>] [--tag key=value] [--project <p>] [--user <name>] [--limit <1-1000>] [--window] [--format table|csv|json]
 modelrouter experiment add --name <n> --variant <label>=<key>:<target>[,...] ... --expires-at <RFC3339|never> --content-retention-days <n> [--retain-content] [--feed-learning] [--allow-user <name>]...
 modelrouter experiment list [--status active|closed|all] [--format table|csv|json]
 modelrouter experiment close --id <id>
@@ -60,6 +61,7 @@ modelrouter install-service  (macOS/Linux)
 | `GET /v1/models` | List available models |
 | `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); forwards `tools`/`tool_choice` to tool-capable backends (translated for Anthropic-shaped upstreams); forwards `response_format` to OpenAI-shaped backends and as Gemini's JSON mime type, reporting a drop elsewhere; `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
 | `POST /v1/systemone` | TypeSafe System One passthrough (typed Choice/Score/Noul judgments); router adds the `[providers.typesafe]` key; policy/pricing key `systemone/{model}`; upstream 429/529/422 pass through, upstream 401/403 → 502 |
+| `GET /v1/audio/transcriptions/stream` | Streaming transcription over a WebSocket: `session.start`, binary audio frames, `session.end` in; `transcript.segment` (partial and final, with timestamps and confidence), `session.ended` or `error` out; one provider from `[transcription]` (Foundry's realtime surface first) |
 | `POST /v1/feedback` | Report a run's outcome by attribution correlation id (API key) |
 | `GET /admin/users` | List users (admin JWT required) |
 | `POST /admin/users` | Create user (superadmin JWT required) |
@@ -68,6 +70,7 @@ modelrouter install-service  (macOS/Linux)
 | `GET /admin/audit` | Audit log (admin JWT required) |
 | `GET /admin/api/usage/events` | `usage` webhook payloads read back by ledger id, `?since=&after_id=&limit=` (≤ 1000), health-probe rows excluded; `next_after_id` null when caught up (admin JWT required) |
 | `GET /admin/api/compare` | Two-arm comparison by model, provider, tag, run or experiment variant (admin JWT required; see `docs/experiments.md`) |
+| `GET /admin/api/usage/duplicates` | Repeated requests: ledger rows sharing one request fingerprint in a window, `?window=&correlation_id_prefix=&tag_key=&tag_value=&project=&user=&limit=` (admin JWT required) |
 | `GET /admin/compare` | Comparison page (admin dashboard) |
 | `GET /admin/api/experiments` | List experiments, `?status=active\|closed\|all` (admin JWT required) |
 | `POST /admin/api/experiments` | Create an experiment; expiry and retention required, every target must be priced (superadmin JWT required) |

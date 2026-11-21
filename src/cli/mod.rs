@@ -1335,6 +1335,30 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                     };
                     report_compare(db, &settings, &query, format).await?;
                 }
+                ReportCommands::Duplicates {
+                    correlation_id_prefix, tag, project, user, limit, window, format,
+                } => {
+                    let (tag_key, tag_value) = match tag {
+                        None => (None, None),
+                        Some(raw) => {
+                            let (k, v) = raw.split_once('=').ok_or_else(|| {
+                                anyhow::anyhow!("--tag must be in KEY=VALUE form, got '{}'", raw)
+                            })?;
+                            (Some(k.to_string()), Some(v.to_string()))
+                        }
+                    };
+                    let query = crate::api::admin::duplicates::DuplicatesQuery {
+                        // `alltime` is the CLI's spelling of the API's `all`.
+                        window: if window == "alltime" { "all".to_string() } else { window },
+                        correlation_id_prefix,
+                        tag_key,
+                        tag_value,
+                        project,
+                        user,
+                        limit,
+                    };
+                    report_duplicates(&*db, &query, format).await?;
+                }
                 ReportCommands::Usage {
                     total, subtotal, detail,
                     alltime, annual, monthly,
@@ -2304,6 +2328,79 @@ async fn report_compare(
     }
 }
 
+async fn report_duplicates(
+    db: &dyn crate::api::app::DatabaseProvider,
+    query: &crate::api::admin::duplicates::DuplicatesQuery,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let report = crate::api::admin::duplicates::build_report(db, query)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Like `print_rows`: a closed pipe (`| head`) is not an error.
+    match write_duplicates(&report, format, &mut std::io::stdout()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Render the duplicates report: the full JSON document (identical to the
+/// endpoint's) or a group-per-row table/CSV, the totals as a trailing line in
+/// table form. The fingerprint is printed whole in every form, since it is
+/// what an operator searches the ledger by.
+fn write_duplicates(
+    report: &crate::api::admin::duplicates::DuplicatesReport,
+    format: OutputFormat,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    use crate::report::formatter::write_rows;
+
+    if matches!(format, OutputFormat::Json) {
+        return writeln!(out, "{}", serde_json::to_string_pretty(report)?);
+    }
+    let table = matches!(format, OutputFormat::Table);
+    write_rows(
+        &report.groups,
+        &[
+            "Fingerprint", "Model", "Kind", "Requests", "Cache Hits", "Cost (USD)",
+            "Saved (USD)", "First", "Last", "Correlation Ids",
+        ],
+        |g| {
+            vec![
+                g.request_fingerprint.clone(),
+                g.model.clone(),
+                crate::db::models::CallKind::label(&g.call_kind).to_string(),
+                g.requests.to_string(),
+                g.cache_hits.to_string(),
+                format!("{:.4}", g.cost_usd),
+                format!("{:.4}", g.saved_usd),
+                g.first_at.clone(),
+                g.last_at.clone(),
+                g.correlation_ids.join(" "),
+            ]
+        },
+        format,
+        out,
+    )?;
+    if table {
+        let t = &report.totals;
+        writeln!(
+            out,
+            "{} repeated request{} in {} group{} (window: {}; {} repeat{}, {} from cache, {:.4} USD spent, {:.4} USD saved)",
+            t.requests,
+            if t.requests == 1 { "" } else { "s" },
+            t.groups,
+            if t.groups == 1 { "" } else { "s" },
+            report.window,
+            t.repeats,
+            if t.repeats == 1 { "" } else { "s" },
+            t.cache_hits,
+            t.cost_usd,
+            t.saved_usd,
+        )?;
+    }
+    Ok(())
+}
+
 /// Render a comparison: the full JSON document (identical to the endpoint's)
 /// or a metric-per-row table/CSV. The honesty data — latency sample counts
 /// and unpriced models — are rows in both, so a CSV consumer sees them too;
@@ -2610,6 +2707,7 @@ mod attribution_cli_tests {
                 tokens_estimated: false,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                request_fingerprint: None,
             },
         )
         .await
@@ -2753,6 +2851,7 @@ mod tests {
                 tokens_estimated: false,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                request_fingerprint: None,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2858,6 +2957,7 @@ mod tests {
                 tokens_estimated: false,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                request_fingerprint: None,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: model.into(), routed_model: model.into(),
@@ -2923,6 +3023,7 @@ mod tests {
                 tokens_estimated: false,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                request_fingerprint: None,
             }).await.unwrap();
             PromptRepository::create(&db, NewPrompt {
                 user_id: 1, session_id: None, request_model: "m".into(), routed_model: "m".into(),
@@ -4021,5 +4122,91 @@ mod experiment_cli_tests {
             RunPage::parse(Some("0"), None).unwrap_err(),
             "limit must be an integer between 1 and 1000"
         );
+    }
+}
+
+#[cfg(test)]
+mod duplicates_report_tests {
+    use super::*;
+    use crate::api::admin::duplicates::{build_report, DuplicatesQuery};
+    use crate::db::models::NewCostLedgerEntry;
+    use crate::db::repositories::costs::CostRepository;
+
+    async fn seeded_db() -> crate::db::sqlite::SqliteDb {
+        let db = crate::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        crate::db::repositories::users::UserRepository::create(
+            &db,
+            crate::db::models::NewUser { name: "u".into(), email: None },
+        )
+        .await
+        .unwrap();
+        for (fp, run) in [("fp-1", "run-a"), ("fp-1", "run-b"), ("fp-2", "run-a")] {
+            CostRepository::create(&db, NewCostLedgerEntry {
+                user_id: 1, prompt_id: None, model: "m".into(), provider: "p".into(),
+                project: None, tokens_in: 10, tokens_out: 20, cost_usd: 0.5, api_key_id: None,
+                attribution_correlation_id: Some(run.into()), attribution_tags: "{}".into(),
+                experiment_id: None,
+                experiment_variant: None,
+                call_kind: crate::db::models::CallKind::Chat,
+                tokens_estimated: false,
+                request_fingerprint: Some(fp.into()),
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }).await.unwrap();
+        }
+        db
+    }
+
+    fn query() -> DuplicatesQuery {
+        DuplicatesQuery { window: "all".into(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn json_output_is_the_endpoint_document() {
+        let db = seeded_db().await;
+        let report = build_report(&db, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_duplicates(&report, OutputFormat::Json, &mut out).unwrap();
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, serde_json::to_value(&report).unwrap());
+        assert_eq!(printed["groups"][0]["request_fingerprint"], "fp-1");
+        assert_eq!(printed["groups"][0]["requests"], 2);
+        assert_eq!(printed["totals"]["repeats"], 1);
+    }
+
+    #[tokio::test]
+    async fn table_lists_the_group_whole_and_ends_with_the_totals() {
+        let db = seeded_db().await;
+        let report = build_report(&db, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_duplicates(&report, OutputFormat::Table, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("fp-1"), "{text}");
+        assert!(!text.contains("fp-2"), "a fingerprint seen once is not listed: {text}");
+        assert!(text.contains("run-a run-b"), "{text}");
+        assert!(text.contains("2 repeated requests in 1 group (window: all; 1 repeat, 0 from cache, 1.0000 USD spent, 0.0000 USD saved)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn csv_carries_the_header_and_one_row_per_group() {
+        let db = seeded_db().await;
+        let report = build_report(&db, &query()).await.unwrap();
+        let mut out = Vec::new();
+        write_duplicates(&report, OutputFormat::Csv, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Fingerprint,Model,Kind,Requests,Cache Hits,Cost (USD),Saved (USD),First,Last,Correlation Ids");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("fp-1,m,chat,2,0,1.0000,0.0000,"), "{}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_query_is_the_validation_message() {
+        let db = seeded_db().await;
+        let err = report_duplicates(&db, &DuplicatesQuery { window: "yearly".into(), ..Default::default() }, OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("window must be one of"), "{err}");
     }
 }

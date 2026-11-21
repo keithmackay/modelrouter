@@ -491,9 +491,13 @@ async fn search_inner(
     } else {
         crate::router::cache::CachePlan::Skip
     };
-    let cache_key = cache_plan
-        .store()
-        .then(|| crate::router::cache::search_cache_key(&engine, &query, max_results, &research.cache_fields(include_answer, freshness.as_deref(), &engine)));
+    let request_fingerprint = crate::router::cache::search_cache_key(
+        &engine,
+        &query,
+        max_results,
+        &research.cache_fields(include_answer, freshness.as_deref(), &engine),
+    );
+    let cache_key = cache_plan.store().then(|| request_fingerprint.clone());
 
     if let (true, Some(key)) = (cache_plan.lookup(), cache_key.as_ref()) {
         if let Some(payload) = state
@@ -520,6 +524,7 @@ async fn search_inner(
                 results_returned,
                 cost,
                 &attribution,
+                &request_fingerprint,
             );
             let mut body = payload;
             // The ledger's model for this row: the serving engine's pseudo-model.
@@ -697,6 +702,7 @@ async fn search_inner(
                     tokens_estimated: false,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record search cost: {}", e);
@@ -880,6 +886,7 @@ fn record_search_cache_hit(
     results_returned: i64,
     avoided_cost: f64,
     attribution: &crate::api::attribution::Attribution,
+    request_fingerprint: &str,
 ) {
     use crate::api::ledger::record_cache_hit_usage;
 
@@ -905,6 +912,7 @@ fn record_search_cache_hit(
         tokens_estimated: false,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        request_fingerprint: Some(request_fingerprint.to_string()),
     };
     tokio::spawn(async move {
         if let Err(e) = record_cache_hit_usage(&*state.db, &state.callbacks, ledger).await {

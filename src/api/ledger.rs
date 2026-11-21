@@ -80,6 +80,7 @@ mod tests {
             call_kind: crate::db::models::CallKind::Chat,
             cache_read_tokens: 3,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         }
     }
 

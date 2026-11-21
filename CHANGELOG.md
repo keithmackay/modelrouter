@@ -15,7 +15,12 @@
 Everything since 0.1.1, by week. Entries are the merged result, not every
 commit; `git log v0.1.1..v0.2.0` has the detail.
 
-### Week of 2026-11-09
+### Week of 2026-11-16
+
+**Features**
+- Request fingerprints and a duplicates report. Every cost-ledger row now carries `request_fingerprint`, the hash of the normalised request body the response cache keys on, computed for every call (chat completions, messages, responses, embeddings, decisions, reranks, images, speech, transcription uploads, judgments and searches) whether or not the cache applied, so repeated work can be found without keeping any request content. `modelrouter report duplicates` and `GET /admin/api/usage/duplicates` group a window's rows by fingerprint and list each one seen more than once with its count, the repeats the cache answered, spend, savings, first and last time and the correlation ids; filters are a correlation-id prefix, a tag, a project and a user. Migration 041 (047 on Postgres) adds the column and a partial index; older rows stay NULL and are left out of the report.
+- Streaming transcription. `GET /v1/audio/transcriptions/stream` is a WebSocket that takes `session.start` (session id, model, audio format, language), binary 16-bit PCM frames and `session.end`, and answers with `transcript.segment` frames as speech is recognised (partials carrying the utterance's text so far, then a final with `start_ms`/`end_ms`, `confidence` and `speaker` where the provider gives them), `session.ended` with the audio duration, or `error` with a code. One provider serves it, named in the new `[transcription]` table with a default model, idle/drain/start bounds (hours-scale idle by default), a heartbeat, a per-replica session cap and a per-minute price for the ledger. The first provider is Azure AI Foundry over its realtime surface, with the usual credential chain, resampling to the 24 kHz mono it takes and the GA or beta session message by config; a provider that cannot stream is refused by name. Sessions are metered in audio seconds as `call_kind: audio`, attribution headers apply, and no transcript text is kept.
+
 
 **Features**
 - `usage` webhook event. Every cost-ledger row a request writes (chat completions and `/v1/messages` streamed or not, response-cache hits, `/v1/responses`, embeddings, images, audio, search, `/v1/rerank`, `/v1/decisions`, `/v1/systemone`) emits one event carrying the row's id and time, the caller's correlation id, tags and resolved project, model, provider, token counts including prompt-cache reads and writes, `cost_usd`, `cache_hit`, `saved_usd` and `uncached_cost_usd`, and no content (`schema_version: 1`). Subscribe with `--events usage`. A webhook registered with `*` or no events now receives `usage` events as well as `completion`.

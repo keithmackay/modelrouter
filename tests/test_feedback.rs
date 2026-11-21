@@ -155,6 +155,7 @@ async fn seed_ledger(
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         },
     )
     .await

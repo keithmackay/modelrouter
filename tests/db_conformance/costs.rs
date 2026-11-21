@@ -69,6 +69,7 @@ fn entry(user_id: i64, model: &str, cost_usd: f64) -> NewCostLedgerEntry {
         tokens_estimated: false,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        request_fingerprint: None,
     }
 }
 
@@ -119,6 +120,7 @@ async fn create_round_trips_every_column() {
                 tokens_estimated: true,
                 cache_read_tokens: 5000,
                 cache_write_tokens: 700,
+                request_fingerprint: Some("completion:ab12:fp-1".into()),
                 ..entry(u, "m1", 0.25)
             },
         )
@@ -140,6 +142,7 @@ async fn create_round_trips_every_column() {
         assert_eq!(row.experiment_variant.as_deref(), Some("control"));
         assert!(row.tokens_estimated);
         assert_eq!((row.cache_read_tokens, row.cache_write_tokens), (5000, 700));
+        assert_eq!(row.request_fingerprint.as_deref(), Some("completion:ab12:fp-1"));
 
         let bare = put(&db, entry(u, "m2", 0.0)).await;
         assert!(bare.id > row.id);
@@ -150,6 +153,7 @@ async fn create_round_trips_every_column() {
         assert_eq!(bare.experiment_variant, None);
         assert!(!bare.tokens_estimated);
         assert_eq!((bare.cache_read_tokens, bare.cache_write_tokens), (0, 0));
+        assert_eq!(bare.request_fingerprint, None);
     })
     .await;
 }
@@ -166,6 +170,7 @@ async fn create_cache_hit_records_saving_not_spend() {
                 tokens_estimated: true,
                 cache_read_tokens: 40,
                 cache_write_tokens: 3,
+                request_fingerprint: None,
                 ..entry(u, "m1", 0.5)
             },
         )
@@ -1012,6 +1017,7 @@ async fn seed_experiment(db: &Db) -> (i64, i64, Vec<CostLedgerEntry>) {
                     experiment_id: exp.map(|(id, _)| id),
                     experiment_variant: exp.map(|(_, v)| v.to_string()),
                     tokens_estimated: estimated,
+                    request_fingerprint: None,
                     ..entry(uid, model, cost)
                 },
             )
@@ -1141,6 +1147,122 @@ async fn experiment_unbound_requests_share_a_bound_runs_key() {
             unbound.iter().map(|u| (u.user_id, u.correlation_id.as_str(), u.requests)).collect();
         assert_eq!(rows, [(alice, "b", 1)], "run `none` has no bound row and is not counted");
         assert!(db.experiment_unbound_requests(8).await.unwrap().is_empty());
+    })
+    .await;
+}
+
+// ── Repeated requests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn duplicate_requests_groups_repeats_filters_and_skips_unfingerprinted_rows() {
+    use modelrouter::db::repositories::costs::DuplicateFilter;
+
+    each_backend(|db| async move {
+        let alice = user(&db, "alice").await;
+        let bob = user(&db, "bob").await;
+        let fp = |uid: i64, fp: &str, run: Option<&str>, tags: &str, project: Option<&str>, cost: f64| {
+            NewCostLedgerEntry {
+                request_fingerprint: Some(fp.into()),
+                attribution_correlation_id: run.map(str::to_string),
+                attribution_tags: tags.into(),
+                project: project.map(str::to_string),
+                ..entry(uid, "m", cost)
+            }
+        };
+        // fp-a: three alice rows across two runs (one a cache hit) and a bob row.
+        let first = put(&db, fp(alice, "fp-a", Some("run-1"), r#"{"team":"blue"}"#, Some("p1"), 1.0)).await;
+        put(&db, fp(alice, "fp-a", Some("run-1"), r#"{"team":"blue"}"#, Some("p1"), 2.0)).await;
+        put_hit(&db, fp(alice, "fp-a", Some("run-2"), r#"{"team":"blue"}"#, Some("p1"), 4.0)).await;
+        let last = put(&db, fp(bob, "fp-a", None, "{}", Some("p2"), 8.0)).await;
+        // fp-b: twice, bob, unstamped.
+        put(&db, fp(bob, "fp-b", None, "{}", None, 0.5)).await;
+        put(&db, fp(bob, "fp-b", None, "{}", None, 0.5)).await;
+        // fp-c: once; never a duplicate.
+        put(&db, fp(alice, "fp-c", Some("run-1"), "{}", None, 16.0)).await;
+        // Legacy rows with no fingerprint: three of them, never grouped.
+        for _ in 0..3 {
+            put(&db, entry(alice, "m", 32.0)).await;
+        }
+
+        let all = CostRepository::duplicate_requests(&*db, &DuplicateFilter::default(), EPOCH, FUTURE, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|g| (g.request_fingerprint.as_str(), g.requests)).collect::<Vec<_>>(),
+            vec![("fp-a", 4), ("fp-b", 2)],
+            "most repeated first; singletons and unfingerprinted rows absent"
+        );
+        let a = &all[0];
+        assert_eq!((a.model.as_str(), a.call_kind.as_str()), ("m", "chat"));
+        assert_eq!(a.cache_hits, 1);
+        assert!(close(a.cost_usd, 11.0), "the hit's would-be cost is a saving, not spend: {}", a.cost_usd);
+        assert!(close(a.saved_usd, 4.0));
+        assert_eq!((a.first_at.as_str(), a.last_at.as_str()), (first.created_at.as_str(), last.created_at.as_str()));
+        assert_eq!(a.correlation_ids, vec!["run-1".to_string(), "run-2".to_string()]);
+        assert!(all[1].correlation_ids.is_empty(), "unstamped rows add no correlation id");
+
+        // The limit caps the groups.
+        let one = CostRepository::duplicate_requests(&*db, &DuplicateFilter::default(), EPOCH, FUTURE, 1)
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+
+        // Filters: each narrows the rows BEFORE grouping, so a fingerprint
+        // repeated only across the filter's boundary is not a duplicate.
+        let by = |filter: DuplicateFilter| {
+            let db = db.clone();
+            async move {
+                CostRepository::duplicate_requests(&*db, &filter, EPOCH, FUTURE, 50)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|g| (g.request_fingerprint, g.requests))
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            by(DuplicateFilter { correlation_id_prefix: Some("run-".into()), ..Default::default() }).await,
+            vec![("fp-a".to_string(), 3)]
+        );
+        assert_eq!(
+            by(DuplicateFilter { correlation_id_prefix: Some("run-2".into()), ..Default::default() }).await,
+            Vec::<(String, i64)>::new(),
+            "one row under the prefix is not a repeat"
+        );
+        assert_eq!(
+            by(DuplicateFilter { correlation_id_prefix: Some("run_".into()), ..Default::default() }).await,
+            Vec::<(String, i64)>::new(),
+            "a LIKE metacharacter in the prefix is literal"
+        );
+        assert_eq!(
+            by(DuplicateFilter { tag: Some(("team".into(), "blue".into())), ..Default::default() }).await,
+            vec![("fp-a".to_string(), 3)]
+        );
+        assert_eq!(
+            by(DuplicateFilter { project: Some("p1".into()), ..Default::default() }).await,
+            vec![("fp-a".to_string(), 3)]
+        );
+        assert_eq!(
+            by(DuplicateFilter { user_id: Some(bob), ..Default::default() }).await,
+            vec![("fp-b".to_string(), 2)]
+        );
+        assert_eq!(
+            by(DuplicateFilter {
+                user_id: Some(alice),
+                project: Some("p1".into()),
+                tag: Some(("team".into(), "blue".into())),
+                correlation_id_prefix: Some("run".into()),
+            })
+            .await,
+            vec![("fp-a".to_string(), 3)],
+            "filters compose with AND"
+        );
+
+        // The window is half-open on created_at.
+        let after_last = CostRepository::duplicate_requests(&*db, &DuplicateFilter::default(), &last.created_at, FUTURE, 50)
+            .await
+            .unwrap();
+        assert!(after_last.iter().all(|g| g.request_fingerprint != "fp-a"));
     })
     .await;
 }

@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry, RunStamp};
 use crate::db::repositories::costs::{
     ArmFilter, AttributionBreakdownRow, AttributionFilter, AttributionTotals,
-    CacheUsageSummary, CostRepository, ExperimentRunRow, ExperimentRunKey,
+    correlation_ids_from_json, like_prefix_pattern, CacheUsageSummary, CostRepository,
+    DuplicateFilter, DuplicateGroup, ExperimentRunRow, ExperimentRunKey,
     ExperimentUnboundRow, ExperimentVariantModelRow, ExperimentVariantTotals,
 };
 use super::{PostgresDb, now_utc};
@@ -18,7 +19,7 @@ const LEDGER_COLUMNS: &str = "id, user_id, COALESCE(prompt_id, 0) AS prompt_id, 
                               cache_hit, saved_usd, attribution_correlation_id, \
                               attribution_tags, experiment_id, experiment_variant, \
                               tokens_estimated, call_kind, \
-                              cache_read_tokens, cache_write_tokens";
+                              cache_read_tokens, cache_write_tokens, request_fingerprint";
 
 /// Postgres stores `cache_hit` as BOOLEAN, so it must be cast before SUM.
 const CACHE_HIT_SUM: &str = "COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)::BIGINT";
@@ -42,8 +43,8 @@ impl CostRepository for PostgresDb {
                                         tokens_in, tokens_out, cost_usd, api_key_id, created_at,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind, cache_read_tokens, cache_write_tokens)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                                        call_kind, cache_read_tokens, cache_write_tokens, request_fingerprint)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                RETURNING {LEDGER_COLUMNS}"#
         )))
         .bind(entry.user_id)
@@ -64,6 +65,7 @@ impl CostRepository for PostgresDb {
         .bind(entry.call_kind.as_str())
         .bind(entry.cache_read_tokens)
         .bind(entry.cache_write_tokens)
+        .bind(&entry.request_fingerprint)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -78,8 +80,8 @@ impl CostRepository for PostgresDb {
                                         cache_hit, saved_usd,
                                         attribution_correlation_id, attribution_tags,
                                         experiment_id, experiment_variant, tokens_estimated,
-                                        call_kind, cache_read_tokens, cache_write_tokens)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                                        call_kind, cache_read_tokens, cache_write_tokens, request_fingerprint)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 0.0, $8, $9, TRUE, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                RETURNING {LEDGER_COLUMNS}"#
         )))
         .bind(entry.user_id)
@@ -100,6 +102,7 @@ impl CostRepository for PostgresDb {
         .bind(entry.call_kind.as_str())
         .bind(entry.cache_read_tokens)
         .bind(entry.cache_write_tokens)
+        .bind(&entry.request_fingerprint)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -803,6 +806,40 @@ impl CostRepository for PostgresDb {
         self.by_day_where(&predicate, binds, start, end).await
     }
 
+    // ── Repeated requests ────────────────────────────────────────────────────
+
+    async fn duplicate_requests(
+        &self,
+        filter: &DuplicateFilter,
+        start: &str,
+        end: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DuplicateGroup>> {
+        // $1 and $2 are the window; the filter's binds follow; the limit is last.
+        let (predicates, binds) = duplicate_predicates(filter, 3);
+        let limit_param = 3 + binds.len();
+        let sql = format!(
+            "SELECT request_fingerprint, MIN(model), MIN(call_kind), COUNT(*), {}, \
+                    COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(saved_usd), 0.0), \
+                    MIN(created_at), MAX(created_at), \
+                    COALESCE(jsonb_agg(DISTINCT attribution_correlation_id) \
+                             FILTER (WHERE attribution_correlation_id IS NOT NULL)::text, '[]') \
+             FROM cost_ledger \
+             WHERE request_fingerprint IS NOT NULL AND created_at >= $1 AND created_at < $2{} \
+             GROUP BY request_fingerprint HAVING COUNT(*) > 1 \
+             ORDER BY COUNT(*) DESC, SUM(cost_usd) DESC, request_fingerprint ASC LIMIT ${}",
+            CACHE_HIT_SUM, predicates, limit_param
+        );
+        let mut query = sqlx::query_as::<_, DuplicateRow>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(start)
+            .bind(end);
+        for b in binds {
+            query = query.bind(b);
+        }
+        let rows = query.bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(duplicate_group_from_row).collect())
+    }
+
     // ── Experiment results ───────────────────────────────────────────────────
 
     async fn experiment_variant_totals(
@@ -1129,6 +1166,55 @@ pub(crate) fn attribution_predicate(filter: &AttributionFilter) -> (String, Vec<
             vec![key.clone(), value.clone()],
         ),
     }
+}
+
+type DuplicateRow = (String, String, String, i64, i64, f64, f64, String, String, String);
+
+fn duplicate_group_from_row(row: DuplicateRow) -> DuplicateGroup {
+    let (request_fingerprint, model, call_kind, requests, cache_hits, cost_usd, saved_usd, first_at, last_at, ids) =
+        row;
+    DuplicateGroup {
+        request_fingerprint,
+        model,
+        call_kind,
+        requests,
+        cache_hits,
+        cost_usd,
+        saved_usd,
+        first_at,
+        last_at,
+        correlation_ids: correlation_ids_from_json(&ids),
+    }
+}
+
+/// The extra `AND ...` predicates of a duplicates filter (empty when the filter
+/// is), numbered from `first_param`, plus their bound values in that order.
+/// Every caller value is bound; nothing reaches the SQL text.
+fn duplicate_predicates(filter: &DuplicateFilter, first_param: usize) -> (String, Vec<String>) {
+    let mut predicates = String::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(prefix) = &filter.correlation_id_prefix {
+        predicates.push_str(&format!(
+            " AND attribution_correlation_id LIKE ${} ESCAPE '\\'",
+            first_param + binds.len()
+        ));
+        binds.push(like_prefix_pattern(prefix));
+    }
+    if let Some((key, value)) = &filter.tag {
+        let k = first_param + binds.len();
+        predicates.push_str(&format!(" AND (attribution_tags::jsonb ->> ${}) = ${}", k, k + 1));
+        binds.push(key.clone());
+        binds.push(value.clone());
+    }
+    if let Some(project) = &filter.project {
+        predicates.push_str(&format!(" AND project = ${}", first_param + binds.len()));
+        binds.push(project.clone());
+    }
+    if let Some(user_id) = filter.user_id {
+        predicates.push_str(&format!(" AND user_id = CAST(${} AS BIGINT)", first_param + binds.len()));
+        binds.push(user_id.to_string());
+    }
+    (predicates, binds)
 }
 
 /// SQL predicate plus its bound values for one experiment variant. Shared by

@@ -558,6 +558,9 @@ fn record_probe_usage(
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            // The router's own probe, never a caller's request: nothing to
+            // report as repeated work.
+            request_fingerprint: None,
         };
         if let Err(e) = CostRepository::create(&*state.db, entry).await {
             tracing::error!(error = %e, "failed to record health-probe usage");

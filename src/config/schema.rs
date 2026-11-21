@@ -380,6 +380,8 @@ pub struct Settings {
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub transcription: TranscriptionConfig,
 }
 
 /// How many replicas share the configured limits.
@@ -1248,6 +1250,105 @@ impl RetentionConfig {
             || self.request_failures_days > 0
             || self.hook_metrics_days > 0
             || self.audit_log_days > 0
+    }
+}
+
+/// `[transcription]`: the streaming transcription route
+/// (`GET /v1/audio/transcriptions/stream`, a WebSocket). Audio frames go in,
+/// transcript segments come out, and ONE configured provider does the work.
+/// The route is absent from the configuration until `provider` is set: a
+/// caller that opens it then gets a clear `transcription_not_configured`.
+///
+/// The provider is named here rather than resolved per request because a
+/// streaming transcription session is a long-lived socket to one backend, not
+/// a request that can fail over mid-utterance; which providers can serve it is
+/// decided in `providers::transcription_registry`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct TranscriptionConfig {
+    /// The `[providers.<name>]` entry that serves streaming transcription
+    /// (`foundry` today). Unset = the route refuses every session.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The deployment (model) name sent to the provider when a session names
+    /// none. A session's own `model` wins; `provider/model` prefixes are
+    /// stripped to the model for the provider named above.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Full WebSocket URL of the provider's streaming endpoint, overriding the
+    /// one derived from the provider's configured endpoint. For a deployment
+    /// whose realtime surface lives at an address the derivation cannot guess.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Shape of the session configuration message sent to a realtime-style
+    /// provider: `ga` (`session.update` with `session.type = transcription`)
+    /// or `beta` (`transcription_session.update`). Both are documented
+    /// upstream; which one a deployment accepts depends on its api surface.
+    #[serde(default = "default_transcription_session_shape")]
+    pub session_shape: String,
+    /// A session with no audio frame and no transcript event for this long is
+    /// ended with an `idle_timeout` error. A safety bound for a dead caller,
+    /// never a limit on a long conversation: hours, not minutes.
+    #[serde(default = "default_transcription_idle_timeout_secs")]
+    pub session_idle_timeout_secs: u64,
+    /// How long after the caller's `session.end` the provider is given to
+    /// deliver the segments for audio already sent before the session is
+    /// closed as ended anyway.
+    #[serde(default = "default_transcription_finish_drain_secs")]
+    pub finish_drain_secs: u64,
+    /// How long a caller has to send `session.start` after the socket opens.
+    #[serde(default = "default_transcription_start_timeout_secs")]
+    pub start_timeout_secs: u64,
+    /// WebSocket ping cadence towards the caller, so an idle socket crossing a
+    /// proxy stays open and a dead caller is noticed.
+    #[serde(default = "default_transcription_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+    /// Concurrent sessions this replica accepts; 0 = unlimited. A session
+    /// over the limit is refused with 429 before any provider socket opens.
+    #[serde(default)]
+    pub max_sessions: usize,
+    /// Price per minute of audio, for the cost ledger. Unset = the session is
+    /// recorded at zero cost and flagged as estimated.
+    #[serde(default)]
+    pub usd_per_audio_minute: Option<f64>,
+}
+
+fn default_transcription_session_shape() -> String {
+    "ga".to_string()
+}
+fn default_transcription_idle_timeout_secs() -> u64 {
+    2 * 60 * 60
+}
+fn default_transcription_finish_drain_secs() -> u64 {
+    120
+}
+fn default_transcription_start_timeout_secs() -> u64 {
+    300
+}
+fn default_transcription_heartbeat_secs() -> u64 {
+    20
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            url: None,
+            session_shape: default_transcription_session_shape(),
+            session_idle_timeout_secs: default_transcription_idle_timeout_secs(),
+            finish_drain_secs: default_transcription_finish_drain_secs(),
+            start_timeout_secs: default_transcription_start_timeout_secs(),
+            heartbeat_secs: default_transcription_heartbeat_secs(),
+            max_sessions: 0,
+            usd_per_audio_minute: None,
+        }
+    }
+}
+
+impl TranscriptionConfig {
+    /// The configured provider name, trimmed; `None` when the route is off.
+    pub fn provider_name(&self) -> Option<&str> {
+        self.provider.as_deref().map(str::trim).filter(|p| !p.is_empty())
     }
 }
 

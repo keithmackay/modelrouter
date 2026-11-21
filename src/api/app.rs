@@ -182,6 +182,43 @@ pub fn build_router_with_registries(
     rerank_registry: Arc<crate::providers::rerank_registry::RerankRegistry>,
     readiness: crate::api::readiness::Readiness,
 ) -> axum::Router {
+    let transcription = Arc::new(crate::providers::transcription_registry::TranscriptionRegistry::new(
+        state.settings.transcription.clone(),
+        state.settings.providers.clone(),
+    ));
+    build_router_with_all_registries(state, extensions, decision_registry, rerank_registry, transcription, readiness)
+}
+
+/// [`build_router`] with the streaming transcription registry supplied
+/// (tests pin a fake provider session; production builds it from
+/// `[transcription]`). The other registries come from config.
+pub fn build_router_with_transcription_registry(
+    state: AppState,
+    extensions: crate::extensions::Extensions,
+    transcription_registry: Arc<crate::providers::transcription_registry::TranscriptionRegistry>,
+) -> axum::Router {
+    let decisions = Arc::new(crate::providers::decision_registry::DecisionRegistry::new(
+        state.settings.providers.clone(),
+    ));
+    let reranks = Arc::new(crate::providers::rerank_registry::RerankRegistry::new(state.settings.providers.clone()));
+    build_router_with_all_registries(
+        state,
+        extensions,
+        decisions,
+        reranks,
+        transcription_registry,
+        crate::api::readiness::Readiness::started(),
+    )
+}
+
+fn build_router_with_all_registries(
+    state: AppState,
+    extensions: crate::extensions::Extensions,
+    decision_registry: Arc<crate::providers::decision_registry::DecisionRegistry>,
+    rerank_registry: Arc<crate::providers::rerank_registry::RerankRegistry>,
+    transcription_registry: Arc<crate::providers::transcription_registry::TranscriptionRegistry>,
+    readiness: crate::api::readiness::Readiness,
+) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     use crate::api::routes::{
         audio::{speech, transcriptions},
@@ -269,6 +306,10 @@ pub fn build_router_with_registries(
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/audio/speech", post(speech))
         .route("/v1/audio/transcriptions", post(transcriptions))
+        .route(
+            crate::api::routes::transcription_stream::ROUTE,
+            get(crate::api::routes::transcription_stream::transcription_stream),
+        )
         .route("/v1/search", post(search))
         .route("/v1/systemone", post(systemone))
         .route("/v1/feedback", post(feedback::post_feedback))
@@ -353,6 +394,10 @@ pub fn build_router_with_registries(
         .route(
             "/admin/api/compare",
             get(crate::api::admin::compare::get_compare),
+        )
+        .route(
+            "/admin/api/usage/duplicates",
+            get(crate::api::admin::duplicates::get_duplicates),
         )
         .route("/admin/api/models/available", get(crate::api::admin::models::get_available_models))
         .route("/admin/api/pricing", get(crate::api::admin::models::get_pricing))
@@ -466,6 +511,7 @@ pub fn build_router_with_registries(
         .layer(axum::Extension(extensions))
         .layer(axum::Extension(decision_registry))
         .layer(axum::Extension(rerank_registry))
+        .layer(axum::Extension(transcription_registry))
         // Deep-health result cache lives in a layer, not AppState: it is
         // route-local state, and an Extension keeps every AppState literal
         // (tests included) unchanged.

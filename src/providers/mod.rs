@@ -33,6 +33,9 @@ pub mod search_registry;
 pub mod sse_lines;
 pub mod stream_fallback;
 pub mod tavily;
+/// Streaming transcription: the provider-neutral session seam and its registry.
+pub mod transcription;
+pub mod transcription_registry;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 

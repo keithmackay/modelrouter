@@ -689,28 +689,29 @@ pub fn make_cache_key(body: &Value) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Fingerprint of one request: `{kind}:{model_fp}:{body_hash}`, where the body
+/// hash is [`make_cache_key`] over the normalised request. The cache classes
+/// below are the same shape, so a completion or messages fingerprint IS its
+/// cache key; the other kinds (embeddings, decisions, reranks, images, speech,
+/// judgments) are fingerprinted the same way though nothing caches them. Two
+/// ledger rows with one fingerprint are one request made twice. It is a hash,
+/// so no request content is kept.
+pub fn request_fingerprint(kind: &str, resolved_model: &str, body: &Value) -> String {
+    format!("{}:{}:{}", kind, model_fingerprint(resolved_model), make_cache_key(body))
+}
+
 /// Full store key for a completion: `completion:{model_fp}:{body_hash}`.
 ///
 /// The resolved (post-alias, post-load-balancer) model is used, so two aliases
 /// pointing at the same model share entries and a re-pointed alias naturally
 /// misses instead of replaying another model's answer.
 pub fn completion_cache_key(resolved_model: &str, body: &Value) -> String {
-    format!(
-        "{}:{}:{}",
-        CLASS_COMPLETION,
-        model_fingerprint(resolved_model),
-        make_cache_key(body)
-    )
+    request_fingerprint(CLASS_COMPLETION, resolved_model, body)
 }
 
 /// Full store key for a `/v1/messages` call: `messages:{model_fp}:{body_hash}`.
 pub fn messages_cache_key(resolved_model: &str, body: &Value) -> String {
-    format!(
-        "{}:{}:{}",
-        CLASS_MESSAGES,
-        model_fingerprint(resolved_model),
-        make_cache_key(body)
-    )
+    request_fingerprint(CLASS_MESSAGES, resolved_model, body)
 }
 
 /// Full store key for a search: `search:{engine_fp}:{hash(engine, query, options)}`.
@@ -760,4 +761,35 @@ pub fn search_cache_key(
         model_fingerprint(&format!("search/{}", engine)),
         make_cache_key(&canonical)
     )
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_completion_fingerprint_is_its_cache_key_and_ignores_volatile_fields() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0.2});
+        let fp = request_fingerprint(CLASS_COMPLETION, "provider/m", &body);
+        assert_eq!(fp, completion_cache_key("provider/m", &body));
+        assert!(fp.starts_with("completion:"));
+
+        let mut noisy = body.clone();
+        noisy["stream"] = json!(true);
+        noisy["user"] = json!("someone");
+        noisy["attribution"] = json!({"correlation_id": "run-1"});
+        noisy["_mr_note"] = json!("internal");
+        assert_eq!(request_fingerprint(CLASS_COMPLETION, "provider/m", &noisy), fp, "transport fields never change it");
+    }
+
+    #[test]
+    fn fingerprints_differ_by_body_kind_and_model() {
+        let body = json!({"input": "hello"});
+        let base = request_fingerprint("embedding", "provider/e", &body);
+        assert_ne!(base, request_fingerprint("embedding", "provider/e", &json!({"input": "hello!"})));
+        assert_ne!(base, request_fingerprint("rerank", "provider/e", &body));
+        assert_ne!(base, request_fingerprint("embedding", "provider/f", &body));
+        assert_eq!(base, request_fingerprint("embedding", "provider/e", &json!({"input": "hello"})));
+    }
 }

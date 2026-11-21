@@ -142,6 +142,7 @@ fn ledger_row() -> CostLedgerEntry {
         call_kind: "chat".into(),
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        request_fingerprint: None,
     }
 }
 
