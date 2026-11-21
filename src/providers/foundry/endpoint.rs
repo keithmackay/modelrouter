@@ -217,6 +217,22 @@ impl FoundryEndpoint {
         self.with_api_version(format!("{}/embeddings", self.base))
     }
 
+    /// The Responses API: `POST {endpoint}/openai/v1/responses`. Only the
+    /// OpenAI-compatible surface carries it, so an endpoint configured for
+    /// the Model Inference surface crosses to the OpenAI v1 base of the same
+    /// resource, as `models_url` does for discovery; its api-version rule is
+    /// the surface's own (optional, defaulting to `v1`), so the pinned
+    /// Model Inference version is not sent there.
+    pub fn responses_url(&self) -> String {
+        match self.surface {
+            FoundrySurface::OpenAIV1 => self.with_api_version(format!("{}/responses", self.base)),
+            FoundrySurface::ModelInference => format!(
+                "{}{OPENAI_V1_PATH}/responses",
+                self.base.trim_end_matches(MODEL_INFERENCE_PATH).trim_end_matches('/')
+            ),
+        }
+    }
+
     /// The Decisions API: `POST {base}/decisions`, on whichever surface the
     /// endpoint resolved to, with the same api-version rule as chat.
     pub fn decisions_url(&self) -> String {
@@ -480,5 +496,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("foundry_endpoint"), "{err}");
+    }
+
+    /// The Responses API lives on the OpenAI v1 surface only: a bare host
+    /// gets `{host}/openai/v1/responses` with the surface's api-version rule,
+    /// and a Model Inference endpoint crosses to the same resource's OpenAI
+    /// v1 base without its pinned version, as discovery does.
+    #[test]
+    fn responses_url_is_on_the_openai_v1_surface_for_every_endpoint_shape() {
+        let bare = FoundryEndpoint::from_config(&ProviderConfig {
+            foundry_endpoint: Some("https://res.services.ai.azure.com".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(bare.responses_url(), "https://res.services.ai.azure.com/openai/v1/responses");
+
+        let pinned = FoundryEndpoint::from_config(&ProviderConfig {
+            foundry_endpoint: Some("https://res.services.ai.azure.com/openai/v1".into()),
+            api_version: Some("preview".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(pinned.responses_url(), "https://res.services.ai.azure.com/openai/v1/responses?api-version=preview");
+
+        let inference = FoundryEndpoint::from_config(&ProviderConfig {
+            foundry_endpoint: Some("https://res.services.ai.azure.com/models".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(inference.chat_url().contains("/models/chat/completions?api-version="));
+        assert_eq!(inference.responses_url(), "https://res.services.ai.azure.com/openai/v1/responses");
     }
 }

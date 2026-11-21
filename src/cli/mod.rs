@@ -491,6 +491,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                     settings.providers.clone(),
                     settings.tier_timeouts.clone(),
                 )
+                .with_model_capabilities(settings.model_capabilities.clone())
                 .with_subscription(settings.subscription.clone()),
             );
             // Build every chat adapter now so a bad provider section keeps

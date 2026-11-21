@@ -66,7 +66,8 @@ pub async fn run(settings: Arc<Settings>, config_path: Option<&str>) -> anyhow::
     let registry = crate::providers::registry::ProviderRegistry::new_with_tier_timeouts(
         settings.providers.clone(),
         settings.tier_timeouts.clone(),
-    );
+    )
+    .with_model_capabilities(settings.model_capabilities.clone());
     let mut names: Vec<&String> = settings
         .providers
         .iter()

@@ -784,6 +784,30 @@ shows `ai.azure.com` for resource endpoints too, so where spec and prose disagre
 `entra_scope` is the override. The resolved value is logged at startup and named in any
 401/403 response, so the fix is visible without a doc hunt.
 
+**Function tools on the newest reasoning generations go over the Responses API.** The
+`gpt-6` and `gpt-6.1` families refuse a chat completion that carries function tools while
+they reason (*"Function tools with reasoning_effort are not supported ... use /v1/responses
+or set reasoning_effort to 'none'"*). Turning reasoning off would silently downgrade the
+model, so a request for one of those deployments that carries `tools` is posted to
+`POST {endpoint}/openai/v1/responses` instead, with the same credential: chat `messages`
+become `input` items (an assistant `tool_calls` turn as `function_call` items, a `tool`
+result as `function_call_output`), tools and `tool_choice` flatten to the Responses shape
+(`strict` defaults to the chat default, `false`, unless the caller set it), `max_tokens` is
+`max_output_tokens`, `reasoning_effort` is `reasoning.effort`, `response_format` is
+`text.format`, and `store` is `false`. The answer is translated back: `output_text` is the
+content, `function_call` items are `tool_calls` keyed by `call_id`, usage carries the cached
+and reasoning token counts, and an output cut at `max_output_tokens` is `finish_reason:
+"length"`. Streams come back as `chat.completion.chunk` frames, tool-call deltas and the final
+`usage` chunk included, so a streaming agentic caller sees the same stream as from any other
+backend. A request without tools stays on chat completions, where the same deployment
+answers. The rule is a capability by model family, overridable per deployment:
+
+```toml
+[[model_capabilities]]
+model = "my-gpt-6-deployment"      # a name the family table cannot read
+tools_via_responses_api = true     # or false, to keep one on chat completions
+```
+
 ### Azure credentials
 
 > **Status: implemented from Microsoft's documentation; not yet exercised against a live
@@ -2389,7 +2413,10 @@ speaks a different dialect:
 
 - **OpenAI-compatible upstreams** (OpenAI, Azure OpenAI, Groq/Ollama-style
   bases, Vertex MaaS): tools, tool-call responses and streamed tool-call
-  deltas pass through verbatim.
+  deltas pass through verbatim. On Azure AI Foundry, the reasoning families
+  that refuse function tools on chat completions (`gpt-6`, `gpt-6.1`;
+  `tools_via_responses_api` in `[[model_capabilities]]`) are called over the
+  Responses API instead and translated both ways, streaming included.
 - **Anthropic-shaped upstreams** (direct Anthropic, Claude on Vertex): tools
   translate to native `tools`/`input_schema`, assistant `tool_calls` turns
   and `tool`-role results translate to `tool_use`/`tool_result` blocks, and

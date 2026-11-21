@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::schema::{ProviderConfig, SubscriptionConfig, TierTimeoutsConfig};
+use crate::config::schema::{ModelCapabilityEntry, ProviderConfig, SubscriptionConfig, TierTimeoutsConfig};
 use crate::providers::adapter::ProviderAdapter;
 
 pub struct ProviderRegistry {
@@ -13,6 +13,9 @@ pub struct ProviderRegistry {
     /// exist only then, so a caller cannot make the router run a local CLI
     /// unless the operator turned the mode on.
     subscription: Option<SubscriptionConfig>,
+    /// `[[model_capabilities]]`: the per-model overrides an adapter consults
+    /// when it picks a wire surface by model (Foundry's Responses API rule).
+    model_capabilities: Vec<ModelCapabilityEntry>,
 }
 
 impl ProviderRegistry {
@@ -29,7 +32,15 @@ impl ProviderRegistry {
             configs,
             tier_timeouts,
             subscription: None,
+            model_capabilities: Vec::new(),
         }
+    }
+
+    /// Hand the `[[model_capabilities]]` overrides to the adapters that read
+    /// them. Without this the built-in family tables alone apply.
+    pub fn with_model_capabilities(mut self, entries: Vec<ModelCapabilityEntry>) -> Self {
+        self.model_capabilities = entries;
+        self
     }
 
     /// Serve the CLI providers named by `[subscription]` when it is enabled.
@@ -123,7 +134,8 @@ impl ProviderRegistry {
             #[cfg(feature = "foundry")]
             if provider_name == "foundry" {
                 let adapter = crate::providers::foundry::FoundryAdapter::new(config)?
-                    .with_tier_timeouts(self.tier_timeouts.clone());
+                    .with_tier_timeouts(self.tier_timeouts.clone())
+                    .with_model_capabilities(self.model_capabilities.clone());
                 let entry = self
                     .adapters
                     .entry(provider_name.to_string())
@@ -199,6 +211,7 @@ impl ProviderRegistry {
             configs: HashMap::new(),
             tier_timeouts: TierTimeoutsConfig::default(),
             subscription: None,
+            model_capabilities: Vec::new(),
         };
         let mock_arc: Arc<dyn ProviderAdapter> = Arc::new(mock);
         registry.adapters.insert("__mock__".to_string(), mock_arc);
