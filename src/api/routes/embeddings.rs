@@ -310,6 +310,11 @@ async fn embeddings_inner(
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
     let prompt_tokens = result.prompt_tokens;
+    let request_fingerprint = crate::router::cache::request_fingerprint(
+        crate::db::models::CallKind::Embedding.as_str(),
+        &canonical_model,
+        &body,
+    );
 
     tokio::spawn(async move {
         let prompt = NewPrompt {
@@ -382,6 +387,7 @@ async fn embeddings_inner(
                     tokens_estimated: false,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record embedding cost: {}", e);

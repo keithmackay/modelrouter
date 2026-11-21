@@ -741,8 +741,9 @@ config or redeploying. Fallback chains (`[routing.fallback_chains]`) accept any 
 (AI Services) resource fronts every model deployed on it — Llama, Mistral, Phi, DeepSeek,
 Cohere, Grok and the OpenAI models — behind one endpoint, with the deployment named in the
 request body, so `foundry/<deployment>` is all a route needs. Chat, streaming, embeddings,
-decisions (`POST /v1/decisions`), reranking (`POST /v1/rerank`) and `GET /admin/api/models/available` discovery all go
-through it.
+decisions (`POST /v1/decisions`), reranking (`POST /v1/rerank`), streaming transcription
+(`GET /v1/audio/transcriptions/stream`, see [Streaming transcription](#streaming-transcription))
+and `GET /admin/api/models/available` discovery all go through it.
 
 Distinct from `[providers.azure]`, which speaks the older Azure OpenAI surface
 (`/openai/deployments/<deployment>/…?api-version=`) with an `api-key` header and needs one
@@ -2348,6 +2349,27 @@ per-day breakdowns).
 To receive each call as it happens instead, subscribe a webhook to the
 `usage` event (see [Webhooks and usage events](#webhooks-and-usage-events)).
 
+**Repeated requests.** Every ledger row also carries a *request fingerprint*:
+the hash of the normalised request body that the response cache keys on,
+computed for every call whether or not the cache applied to it (a hash only,
+so nothing is kept where prompt storage is off). Rows that share a fingerprint
+are one request made more than once. `modelrouter report duplicates` and
+`GET /admin/api/usage/duplicates` group a window's rows by fingerprint and list
+each one seen more than once with its count, how many repeats the cache
+answered, spend and savings, first and last time, and the correlation ids that
+made it; filter by a correlation-id prefix, a tag, a project or a user. Rows
+older than the column have no fingerprint and are left out.
+
+```bash
+modelrouter report duplicates --window weekly
+modelrouter report duplicates --correlation-id-prefix eng-4711 --window alltime --format json
+modelrouter report duplicates --tag engagement=eng-4711 --limit 20
+```
+
+```text
+GET /admin/api/usage/duplicates?window=weekly&correlation_id_prefix=eng-4711
+```
+
 To compare two arms of an experiment — two tag values, two correlation ids,
 two models, two providers or two variants of a controlled experiment — use
 `GET /admin/api/compare`, `modelrouter report compare`, or the
@@ -2404,6 +2426,79 @@ curl -N http://localhost:8080/v1/chat/completions \
 #        "usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12,...}}
 # data: [DONE]
 ```
+
+### Streaming transcription
+
+`GET /v1/audio/transcriptions/stream` is a WebSocket: audio frames go in as
+they are captured, transcript segments come out as they are recognised, for as
+long as the conversation lasts. It is the live counterpart of the batch
+`POST /v1/audio/transcriptions`, and like every other route the router holds the
+provider credential; the caller holds only its router key.
+
+One provider serves the route, named in config, so a speech service or a
+self-hosted model plugs in behind the same protocol later:
+
+```toml
+[transcription]
+provider = "foundry"           # the [providers.<name>] that serves it
+model = "<deployment>"         # default model; a session may name its own
+# url = "wss://..."            # override the derived realtime URL
+# session_shape = "ga"         # or "beta": which session message the deployment accepts
+# session_idle_timeout_secs = 7200
+# finish_drain_secs = 120
+# start_timeout_secs = 300
+# heartbeat_secs = 20
+# max_sessions = 0             # per replica; 0 = unlimited
+# usd_per_audio_minute = 0.006 # for the cost ledger; unset = recorded at 0, flagged estimated
+```
+
+The caller authenticates on the upgrade request (`Authorization: Bearer
+<router key>`; the attribution headers are honoured as on the multipart
+route). A refusal before the socket opens is a plain HTTP status: `401`,
+`400` for the experiment header, `429` past `max_sessions`, `503` when no
+provider is configured. Then, caller to router:
+
+```json
+{"type":"session.start","session_id":"<id>","model":"<deployment>",
+ "audio":{"encoding":"pcm16","sample_rate_hz":16000,"channels":1},"language":"en"}
+```
+
+followed by binary frames of raw audio in that format (or
+`{"type":"audio.append","audio":"<base64>"}` from a text-only client) and
+`{"type":"session.end"}` when the conversation is over. `model` is optional
+when `[transcription] model` is set; `provider/model` is accepted for the
+configured provider and refused for any other. Router to caller:
+
+```json
+{"type":"session.started","session_id":"<id>","provider":"foundry","model":"<deployment>"}
+{"type":"transcript.segment","session_id":"<id>","segment_id":"item_1","text":"Good","is_final":false,
+ "start_ms":100,"end_ms":null,"confidence":null,"speaker":null}
+{"type":"transcript.segment","session_id":"<id>","segment_id":"item_1","text":"Good morning.","is_final":true,
+ "start_ms":100,"end_ms":900,"confidence":0.92,"speaker":null}
+{"type":"session.ended","session_id":"<id>","audio_ms":1000,"segments":2}
+```
+
+A partial segment carries the utterance's text so far; the final one for the
+same `segment_id` replaces it. `confidence` is 0..1 when the provider reports
+one (derived from token log-probabilities where that is what it gives);
+`speaker` is the provider's label when it diarises, else `null`. An error ends
+the session: `{"type":"error","code":"...","message":"...","retryable":true|false}`
+then a close, with `protocol_error`, `model_required`, `model_not_served`,
+`policy_denied`, `provider_error`, `idle_timeout` or the provider's own code.
+The router pings every `heartbeat_secs`; a session with no audio and no
+transcript for `session_idle_timeout_secs` ends with `idle_timeout`. That bound
+is for a dead caller, not a long conversation, which is why its default is
+hours. One usage row and one cost row are written per session, metered in
+audio seconds (`call_kind: audio`); the router keeps no transcript text.
+
+**Foundry.** The adapter connects to the deployment's realtime surface
+(`wss://<host>/openai/v1/realtime?intent=transcription`, derived from
+`foundry_endpoint`; the model-inference surface has no realtime route and is
+refused by name) with the same credential chain as every other Foundry call,
+sends 16-bit PCM at 24 kHz mono (resampling and down-mixing what the caller
+declared), and maps the realtime events: speech boundaries to `start_ms` /
+`end_ms`, transcription deltas to partials, the completed utterance with its
+log-probabilities to the final segment. No speaker labels on this surface.
 
 ### Tool calling (function tools)
 

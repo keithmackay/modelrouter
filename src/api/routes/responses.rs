@@ -230,6 +230,9 @@ async fn responses_inner(
         latency_ms,
         attr_correlation,
         attr_tags,
+        // The Responses body is its own shape, so its fingerprints never meet
+        // a chat completion's.
+        crate::router::cache::request_fingerprint("responses", &canonical_model, &body),
     );
 
     let response_body = serde_json::json!({
@@ -272,6 +275,7 @@ fn record_responses_cost(
     latency_ms: i64,
     attr_correlation: Option<String>,
     attr_tags: String,
+    request_fingerprint: String,
 ) {
     use crate::api::ledger::record_usage;
     use crate::db::repositories::prompts::PromptRepository;
@@ -334,6 +338,7 @@ fn record_responses_cost(
                 tokens_estimated: false,
                 cache_read_tokens: cache_read_tokens as i64,
                 cache_write_tokens: cache_write_tokens as i64,
+                request_fingerprint: Some(request_fingerprint),
             };
             let _ = record_usage(&*state.db, &state.callbacks, ledger).await;
         }

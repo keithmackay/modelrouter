@@ -82,6 +82,7 @@ mod tests {
             call_kind: "chat".into(),
             cache_read_tokens: 50000,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         }
     }
 

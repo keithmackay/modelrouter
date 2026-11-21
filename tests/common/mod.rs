@@ -4,6 +4,7 @@ pub mod mock_audio;
 pub mod mock_anthropic;
 pub mod mock_oidc;
 pub mod search_app;
+pub mod transcription_app;
 
 use modelrouter::api::app::DatabaseProvider;
 use modelrouter::api::auth::hash_token;

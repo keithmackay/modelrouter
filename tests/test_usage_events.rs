@@ -399,6 +399,7 @@ async fn ledger_rows(h: &Harness, n: usize) -> Vec<modelrouter::db::models::Cost
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         };
         rows.push(CostRepository::create(&*h.db, entry).await.unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(3)).await;

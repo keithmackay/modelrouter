@@ -669,6 +669,7 @@ mod seed {
                 tokens_estimated: row.estimated,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                request_fingerprint: None,
             },
         )
         .await

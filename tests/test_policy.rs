@@ -243,6 +243,7 @@ async fn budget_exceeded_returns_deny() {
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         },
     )
     .await
@@ -349,6 +350,7 @@ async fn test_policy_token_limit_under_budget() {
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         },
     )
     .await
@@ -455,6 +457,7 @@ async fn test_policy_token_limit_blocks_when_exceeded() {
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         },
     )
     .await

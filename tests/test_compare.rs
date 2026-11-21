@@ -242,6 +242,7 @@ async fn seed_ledger(db: &Arc<dyn DatabaseProvider>, s: &Seed<'_>, tokens: (i64,
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         },
     )
     .await
@@ -275,6 +276,7 @@ async fn seed_cache_hit(
             tokens_estimated: false,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            request_fingerprint: None,
         },
     )
     .await

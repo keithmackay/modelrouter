@@ -19,6 +19,7 @@
 //! - `embed` — embeddings
 //! - `decide` — the Decisions API (typed questions over a document)
 //! - `catalog` — deployed-model discovery
+//! - `transcribe` — streaming transcription over the realtime WebSocket
 //!
 //! The Entra token source is shared with `bing_grounding` and lives in
 //! `crate::providers::azure_entra`; the audience is passed per caller.
@@ -33,6 +34,7 @@ pub mod endpoint;
 pub mod rerank;
 pub mod responses;
 pub mod retail_pricing;
+pub mod transcribe;
 
 pub use adapter::FoundryAdapter;
 pub use decide::FoundryDecisionAdapter;

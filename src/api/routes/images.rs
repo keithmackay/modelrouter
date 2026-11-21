@@ -130,6 +130,11 @@ async fn image_generations_inner(
     let state_clone = state.clone();
     let model_clone = model.clone();
     let provider_clone = provider_name.clone();
+    let request_fingerprint = crate::router::cache::request_fingerprint(
+        crate::db::models::CallKind::Image.as_str(),
+        &model,
+        &body,
+    );
     let user_id = user.id;
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
@@ -190,6 +195,7 @@ async fn image_generations_inner(
                     tokens_estimated: false,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    request_fingerprint: Some(request_fingerprint),
                 };
                 if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record image cost: {}", e);

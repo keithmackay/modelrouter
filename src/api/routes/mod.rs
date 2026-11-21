@@ -15,6 +15,7 @@ pub mod rerank;
 pub mod search;
 pub mod systemone;
 pub mod tools;
+pub mod transcription_stream;
 
 use crate::{
     api::{app::AppState, error::ApiError},

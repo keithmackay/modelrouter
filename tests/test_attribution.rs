@@ -787,6 +787,7 @@ async fn health_probe_writes_empty_object_not_array() {
         tokens_estimated: false,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        request_fingerprint: None,
     };
     CostRepository::create(&db, entry).await.unwrap();
 
@@ -799,4 +800,204 @@ async fn health_probe_writes_empty_object_not_array() {
         ledger[0].attribution_tags, "{}",
         "health probe must write '{{}}', not '[]' (issue #50)"
     );
+}
+
+// ── Request fingerprints and the duplicates report ───────────────────────────
+
+fn admin_header(settings: &Settings) -> (axum::http::HeaderName, axum::http::HeaderValue) {
+    (
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {}", admin_jwt(settings, "viewer"))).unwrap(),
+    )
+}
+
+/// Ledger rows oldest first, so the n-th call is the n-th row.
+async fn ledger_rows(db: &Arc<dyn DatabaseProvider>) -> Vec<modelrouter::db::models::CostLedgerEntry> {
+    let mut rows = CostRepository::list_cost_entries_before(&**db, FOREVER).await.unwrap();
+    rows.sort_by_key(|r| r.id);
+    rows
+}
+
+#[tokio::test]
+async fn identical_uncached_requests_share_a_fingerprint_and_different_ones_do_not() {
+    // The cache is off, so every call is a real (mock) provider call.
+    let (server, db, _settings) = build_app(CacheConfig::default()).await;
+    let post = |content: &'static str, correlation: &'static str| {
+        let server = &server;
+        async move {
+            let resp = server
+                .post("/v1/chat/completions")
+                .add_header(bearer().0, bearer().1)
+                .json(&json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": content}],
+                    "temperature": 0.7,
+                    "attribution": {"correlation_id": correlation},
+                }))
+                .await;
+            assert_eq!(resp.status_code(), 200);
+        }
+    };
+    post("hi", "run-1").await;
+    post("hi", "run-2").await;
+    post("hello", "run-1").await;
+    wait_for_ledger_rows(&db, 3).await;
+
+    let rows = ledger_rows(&db).await;
+    assert!(rows.iter().all(|r| !r.cache_hit), "the cache is off in this test");
+    let fps: Vec<&str> = rows.iter().map(|r| r.request_fingerprint.as_deref().unwrap()).collect();
+    assert_eq!(fps[0], fps[1], "the same request under a different correlation id is one fingerprint");
+    assert_ne!(fps[0], fps[2], "a different prompt is a different fingerprint");
+    assert!(fps[0].starts_with("completion:"), "the fingerprint is the completion cache key: {}", fps[0]);
+
+    let groups = CostRepository::duplicate_requests(
+        &*db,
+        &modelrouter::db::repositories::costs::DuplicateFilter::default(),
+        EPOCH,
+        FOREVER,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].request_fingerprint, fps[0]);
+    assert_eq!((groups[0].requests, groups[0].cache_hits), (2, 0));
+    assert_eq!(groups[0].correlation_ids, vec!["run-1".to_string(), "run-2".to_string()]);
+}
+
+#[tokio::test]
+async fn a_cache_hit_row_carries_the_fingerprint_of_the_entry_it_served() {
+    let cache = CacheConfig { enabled: true, max_entries: 32, ttl_seconds: 300, ..Default::default() };
+    let (server, db, _settings) = build_app(cache).await;
+    for _ in 0..2 {
+        let resp = server
+            .post("/v1/chat/completions")
+            .add_header(bearer().0, bearer().1)
+            .json(&json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.0,
+            }))
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        wait_for_ledger_rows(&db, 1).await;
+    }
+    wait_for_ledger_rows(&db, 2).await;
+
+    let rows = ledger_rows(&db).await;
+    assert_eq!(rows.iter().filter(|r| r.cache_hit).count(), 1, "the second call hit the cache");
+    assert_eq!(rows[0].request_fingerprint, rows[1].request_fingerprint);
+    assert!(rows[0].request_fingerprint.is_some());
+}
+
+#[tokio::test]
+async fn search_rows_carry_the_search_fingerprint() {
+    let (server, db, _settings) = build_app(CacheConfig::default()).await;
+    for query in ["rust programming language", "rust programming language", "go programming language"] {
+        let resp = server
+            .post("/v1/search")
+            .add_header(bearer().0, bearer().1)
+            .json(&json!({ "query": query }))
+            .await;
+        assert_eq!(resp.status_code(), 200);
+    }
+    wait_for_ledger_rows(&db, 3).await;
+
+    let rows = ledger_rows(&db).await;
+    let fps: Vec<&str> = rows.iter().map(|r| r.request_fingerprint.as_deref().unwrap()).collect();
+    assert!(fps[0].starts_with("search:"), "{}", fps[0]);
+    assert_eq!(fps[0], fps[1]);
+    assert_ne!(fps[0], fps[2]);
+}
+
+#[tokio::test]
+async fn admin_duplicates_endpoint_groups_filters_and_validates() {
+    let (server, db, settings) = build_app(CacheConfig::default()).await;
+    let post = |content: &'static str, correlation: &'static str| {
+        let server = &server;
+        async move {
+            let resp = server
+                .post("/v1/chat/completions")
+                .add_header(bearer().0, bearer().1)
+                .json(&json!({
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": content}],
+                    "temperature": 0.7,
+                    "attribution": {"correlation_id": correlation, "tags": {"team": "blue"}},
+                }))
+                .await;
+            assert_eq!(resp.status_code(), 200);
+        }
+    };
+    post("hi", "eng-1-run-a").await;
+    post("hi", "eng-1-run-b").await;
+    post("hi", "eng-2-run-a").await;
+    post("other", "eng-1-run-a").await;
+    wait_for_ledger_rows(&db, 4).await;
+
+    // Unauthenticated: refused.
+    let resp = server.get("/admin/api/usage/duplicates").await;
+    assert_eq!(resp.status_code(), 401);
+
+    let get = |params: Vec<(&'static str, &'static str)>| {
+        let server = &server;
+        let settings = settings.clone();
+        async move {
+            let mut req = server
+                .get("/admin/api/usage/duplicates")
+                .add_header(admin_header(&settings).0, admin_header(&settings).1);
+            for (k, v) in params {
+                req = req.add_query_param(k, v);
+            }
+            req.await
+        }
+    };
+
+    let resp = get(vec![("window", "all")]).await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["window"], "all");
+    assert_eq!(body["totals"]["groups"], 1);
+    assert_eq!(body["totals"]["requests"], 3);
+    assert_eq!(body["totals"]["repeats"], 2);
+    assert_eq!(body["groups"][0]["requests"], 3);
+    // The routed (canonical) model, as the ledger records it.
+    assert_eq!(body["groups"][0]["model"], ledger_rows(&db).await[0].model);
+    assert_eq!(body["groups"][0]["call_kind"], "chat");
+    assert_eq!(
+        body["groups"][0]["correlation_ids"],
+        json!(["eng-1-run-a", "eng-1-run-b", "eng-2-run-a"])
+    );
+    assert!(body["groups"][0]["cost_usd"].as_f64().unwrap() > 0.0);
+
+    // A prefix narrows the rows before grouping.
+    let resp = get(vec![("window", "all"), ("correlation_id_prefix", "eng-1")]).await;
+    assert_eq!(resp.status_code(), 200);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["filter"]["correlation_id_prefix"], "eng-1");
+    assert_eq!(body["groups"][0]["requests"], 2);
+    assert_eq!(body["groups"][0]["correlation_ids"], json!(["eng-1-run-a", "eng-1-run-b"]));
+
+    let resp = get(vec![("window", "all"), ("correlation_id_prefix", "eng-2")]).await;
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["groups"], json!([]), "one row under the prefix is not a repeat");
+
+    // Tag, project and user filters are accepted; a tag that matches nothing empties the report.
+    let resp = get(vec![("window", "all"), ("tag_key", "team"), ("tag_value", "blue"), ("user", "test-user")]).await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(resp.json::<serde_json::Value>()["totals"]["groups"], 1);
+    let resp = get(vec![("window", "all"), ("tag_key", "team"), ("tag_value", "red")]).await;
+    assert_eq!(resp.json::<serde_json::Value>()["totals"]["groups"], 0);
+
+    // Invalid queries are 400s that say why.
+    for (params, needle) in [
+        (vec![("window", "yearly")], "window"),
+        (vec![("window", "all"), ("limit", "0")], "limit"),
+        (vec![("window", "all"), ("tag_key", "team")], "together"),
+        (vec![("window", "all"), ("user", "nobody")], "unknown user"),
+    ] {
+        let resp = get(params).await;
+        assert_eq!(resp.status_code(), 400);
+        assert!(resp.text().contains(needle), "{needle}: {}", resp.text());
+    }
 }

@@ -132,6 +132,20 @@ timeout_secs = 120
 # timeout_secs = 30
 # generic_chat = false
 
+# Streaming transcription (GET /v1/audio/transcriptions/stream, a WebSocket:
+# audio frames in, transcript segments out). One provider serves it; `foundry`
+# today (its realtime surface). Unset = the route refuses with 503.
+# [transcription]
+# provider = "foundry"
+# model = "<transcription deployment>"   # default; a session may name its own
+# session_shape = "ga"                   # or "beta" (which session message the deployment accepts)
+# session_idle_timeout_secs = 7200       # no audio and no transcript for this long ends the session
+# finish_drain_secs = 120                # after session.end, how long the provider may take to finish
+# start_timeout_secs = 300               # how long a caller has to send session.start
+# heartbeat_secs = 20                    # WebSocket ping cadence towards the caller
+# max_sessions = 0                       # per replica; 0 = unlimited
+# usd_per_audio_minute = 0.006           # for the cost ledger; unset = recorded at 0, flagged estimated
+
 # TypeSafe System One typed judgments (POST /v1/systemone). JSON passthrough:
 # callers send the TypeSafe request body; the router adds this key, so callers
 # never hold it. Gated by policy as the pseudo-model "systemone/{model}".
