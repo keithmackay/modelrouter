@@ -745,15 +745,23 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             if let Some(ref cfg_path) = config_path {
                 let loader = crate::config::loader::SettingsLoader::new(cfg_path.clone());
                 let live = live_settings.clone();
+                let mut watcher = crate::config::loader::ReloadWatcher::seeded(
+                    std::fs::read(loader.path()).ok(),
+                );
                 tokio::spawn(async move {
+                    use crate::config::loader::ReloadOutcome;
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                        match loader.load() {
-                            Ok(new_settings) => {
-                                live.store(Arc::new(new_settings));
+                        match watcher.tick(std::fs::read(loader.path()), || loader.load()) {
+                            ReloadOutcome::Unchanged => {}
+                            ReloadOutcome::Reloaded(new_settings) => {
+                                live.store(Arc::new(*new_settings));
                                 tracing::info!("config hot-reloaded");
                             }
-                            Err(e) => tracing::warn!("config reload failed: {e}"),
+                            ReloadOutcome::Failed { error, report: true } => {
+                                tracing::warn!("config reload failed: {error}")
+                            }
+                            ReloadOutcome::Failed { report: false, .. } => {}
                         }
                     }
                 });
