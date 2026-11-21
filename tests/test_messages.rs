@@ -824,6 +824,169 @@ async fn messages_streaming_fires_lifecycle_hook() {
     assert_eq!(ledger.len(), 1);
 }
 
+/// `X-Project` names the project a call is billed to, overriding the API key's
+/// own project, on the streaming and the non-streaming path alike.
+#[tokio::test]
+async fn messages_record_the_per_request_project() {
+    for stream in [false, true] {
+        let (server, db, _mock) = test_app_with_mock_server().await;
+        let user = UserRepository::find_by_name(&*db, "test-user").await.unwrap().unwrap();
+        ApiKeyRepository::create_api_key(
+            &*db,
+            NewApiKey {
+                user_id: user.id,
+                key_hash: hash_token("beta-token"),
+                label: Some("beta".to_string()),
+                expires_at: None,
+                project: Some("beta".to_string()),
+                session_window_secs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = server
+            .post("/v1/messages")
+            .add_header(bearer("beta-token").0, bearer("beta-token").1)
+            .add_header(
+                axum::http::HeaderName::from_static("x-project"),
+                axum::http::HeaderValue::from_static("alpha"),
+            )
+            .json(&serde_json::json!({
+                "model": "claude-opus-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": stream
+            }))
+            .await;
+        assert_eq!(resp.status_code(), 200, "stream={stream}");
+
+        let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+        assert_eq!(ledger[0].project.as_deref(), Some("alpha"), "stream={stream}");
+    }
+}
+
+/// The prompt-cache tokens Anthropic reports land on the ledger row, so the
+/// row alone says what share of the input was served from the prompt cache.
+#[tokio::test]
+async fn messages_record_prompt_cache_tokens_on_the_ledger() {
+    let (server, db, mock) = test_app_with_mock_server().await;
+    mock.set_response(
+        axum::http::StatusCode::OK,
+        serde_json::json!({
+            "id": "msg-mock",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "cached"}],
+            "model": "claude-mock",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 50000,
+                "cache_creation_input_tokens": 300
+            }
+        }),
+    );
+
+    let resp = server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger[0].tokens_in, 12);
+    assert_eq!(ledger[0].cache_read_tokens, 50000);
+    assert_eq!(ledger[0].cache_write_tokens, 300);
+}
+
+/// An Anthropic event stream whose usage is split the way Anthropic splits it:
+/// input and prompt-cache counts on `message_start`, output on `message_delta`.
+/// `finished` false cuts the stream off before either the output count or
+/// `message_stop` arrives.
+fn usage_reporting_stream(finished: bool) -> String {
+    let mut events = vec![
+        serde_json::json!({"type": "message_start", "message": {"id": "msg_u", "type": "message", "role": "assistant",
+            "model": "claude-opus-4-5", "content": [], "stop_reason": null, "stop_sequence": null,
+            "usage": {"input_tokens": 12, "cache_read_input_tokens": 50000, "cache_creation_input_tokens": 300, "output_tokens": 1}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}),
+    ];
+    if finished {
+        events.extend([
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 40}}),
+            serde_json::json!({"type": "message_stop"}),
+        ]);
+    }
+    events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect()
+}
+
+/// A streamed call is recorded with the token counts the stream itself
+/// reports, prompt-cache tokens included, as measured rather than estimated.
+#[tokio::test]
+async fn messages_streaming_records_the_usage_the_stream_reports() {
+    let (server, db, mock) = test_app_with_mock_server().await;
+    mock.set_streaming_response(axum::http::StatusCode::OK, usage_reporting_stream(true));
+
+    let resp = server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].tokens_in, 12);
+    assert_eq!(ledger[0].tokens_out, 40);
+    assert_eq!(ledger[0].cache_read_tokens, 50000);
+    assert_eq!(ledger[0].cache_write_tokens, 300);
+    assert!(!ledger[0].tokens_estimated);
+    assert!(ledger[0].cost_usd > 0.0);
+}
+
+/// A stream that ends before `message_stop` never reported its final output
+/// count, so its row is recorded from what did arrive and flagged estimated.
+#[tokio::test]
+async fn messages_streaming_cut_short_is_recorded_as_estimated() {
+    let (server, db, mock) = test_app_with_mock_server().await;
+    mock.set_streaming_response(axum::http::StatusCode::OK, usage_reporting_stream(false));
+
+    let resp = server
+        .post("/v1/messages")
+        .add_header(bearer("test-token").0, bearer("test-token").1)
+        .json(&serde_json::json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let ledger = common::wait_for_ledger_rows(&*db, 1).await;
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].tokens_in, 12);
+    assert_eq!(ledger[0].tokens_out, 1);
+    assert_eq!(ledger[0].cache_read_tokens, 50000);
+    assert!(ledger[0].tokens_estimated);
+}
+
 #[tokio::test]
 async fn messages_circuit_breaker_records_failure() {
     let (server, _db, mock) = test_app_with_mock_server().await;

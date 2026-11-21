@@ -35,7 +35,8 @@ async fn speech_inner(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     crate::api::routes::reject_experiment_header("/v1/audio/speech", &headers)?;
     let user = user.0;
@@ -149,6 +150,7 @@ async fn speech_inner(
     );
     let cost = (char_count as f64 / 1000.0) * 0.015;
     let db = state.db.clone();
+    let callbacks = state.callbacks.clone();
     let prompt_db = state.prompt_db.clone();
     let storage = state.storage.clone();
     let user_id = user.id;
@@ -211,9 +213,11 @@ async fn speech_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                     request_fingerprint: Some(request_fingerprint),
                 };
-                if let Err(e) = CostRepository::create(&*db, ledger).await {
+                if let Err(e) = record_usage(&*db, &callbacks, ledger).await {
                     tracing::error!("Failed to record speech cost: {e}");
                 }
         }
@@ -244,7 +248,8 @@ async fn transcriptions_inner(
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     crate::api::routes::reject_experiment_header(
         "/v1/audio/transcriptions",
@@ -386,6 +391,7 @@ async fn transcriptions_inner(
     // Cost logging
     let cost = 0.006_f64;
     let db = state.db.clone();
+    let callbacks = state.callbacks.clone();
     let prompt_db = state.prompt_db.clone();
     let storage = state.storage.clone();
     let user_id = user.id;
@@ -448,9 +454,11 @@ async fn transcriptions_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Audio,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                     request_fingerprint: Some(request_fingerprint),
                 };
-                if let Err(e) = CostRepository::create(&*db, ledger).await {
+                if let Err(e) = record_usage(&*db, &callbacks, ledger).await {
                     tracing::error!("Failed to record transcription cost: {e}");
                 }
         }

@@ -4,6 +4,7 @@ pub mod learned_capabilities;
 pub mod pricing;
 pub mod auth;
 pub mod attribution;
+pub mod usage_events;
 pub mod audit;
 pub mod oidc;
 pub mod routes;

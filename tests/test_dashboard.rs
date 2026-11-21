@@ -382,6 +382,8 @@ async fn seed_compare_ledger(
                 experiment_variant: None,
                 call_kind: modelrouter::db::models::CallKind::Chat,
                 tokens_estimated: false,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 request_fingerprint: None,
             },
         )
@@ -741,6 +743,8 @@ async fn seed_experiment_ledger(
             experiment_variant: Some(variant.to_string()),
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             request_fingerprint: None,
         },
     )
@@ -1585,6 +1589,8 @@ async fn overview_page_renders_spend_totals() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     }).await.unwrap();
 
@@ -2186,6 +2192,8 @@ async fn cost_page_with_project_filter() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     }).await.unwrap();
     // A rerun of the same call served from the response cache.
@@ -2207,6 +2215,8 @@ async fn cost_page_with_project_filter() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             request_fingerprint: None,
         },
     )
@@ -2267,6 +2277,8 @@ async fn reports_panels_list_uncached_spend_by_user_model_and_project() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     };
     CostRepository::create(&raw_db, entry()).await.unwrap();
@@ -2357,6 +2369,8 @@ async fn cost_page_headline_and_token_columns_follow_the_filters() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     };
     CostRepository::create(&raw_db, entry(ann.id, "proj-a", 0.25))
@@ -2994,6 +3008,8 @@ async fn cost_page_intersects_the_user_and_group_filters() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             request_fingerprint: None,
         })
         .await
@@ -3069,6 +3085,8 @@ async fn cost_page_with_an_unknown_group_yields_no_rows() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     })
     .await
@@ -3129,6 +3147,8 @@ async fn cost_page_accepts_the_project_model_and_key_filters() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     })
     .await
@@ -3189,6 +3209,8 @@ async fn overview_warns_about_a_user_near_their_budget_limit() {
             experiment_variant: None,
             call_kind: modelrouter::db::models::CallKind::Chat,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             request_fingerprint: None,
         })
         .await

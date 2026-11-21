@@ -37,6 +37,12 @@
       <input type="password" name="secret_header_value" id="webhook-secret-header-value" placeholder=""
              style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:180px;">
     </div>
+    <div>
+      <label for="webhook-signing-secret" style="display:block;font-size:0.85rem;margin-bottom:0.25rem;">Signing Secret</label>
+      <input type="password" name="signing_secret" id="webhook-signing-secret" placeholder=""
+             style="padding:0.4rem 0.6rem;border:1px solid #ccc;border-radius:4px;width:180px;">
+      <div style="font-size:0.75rem;color:#777;margin-top:0.2rem;">HMAC-SHA256 signs every delivery</div>
+    </div>
     <button type="submit" class="btn btn-success">Add Webhook</button>
   </div>
 </form>
@@ -49,6 +55,7 @@
       <th>URL</th>
       <th>Events</th>
       <th>Secret Header</th>
+      <th>Signed</th>
       <th>Status</th>
       <th>Created</th>
       <th>Actions</th>
@@ -64,6 +71,7 @@
       </td>
       <td><code>{{ w.events }}</code></td>
       <td>{{ w.secret_header_name | default(value="—") }}</td>
+      <td>{% if w.signed %}Yes{% else %}No{% endif %}</td>
       <td>
         {% if w.enabled %}
           <span class="tag tag-enabled">Enabled</span>
@@ -89,7 +97,7 @@
       </td>
     </tr>
     {% else %}
-    <tr><td colspan="8" style="color:#999;font-style:italic;">No webhooks registered yet.</td></tr>
+    <tr><td colspan="9" style="color:#999;font-style:italic;">No webhooks registered yet.</td></tr>
     {% endfor %}
   </tbody>
 </table>

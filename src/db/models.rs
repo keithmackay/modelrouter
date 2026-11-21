@@ -446,6 +446,14 @@ pub struct CostLedgerEntry {
     #[sqlx(default)]
     #[serde(default = "unknown_call_kind")]
     pub call_kind: String,
+    /// Input tokens the provider served from its prompt cache.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub cache_read_tokens: i64,
+    /// Input tokens the provider wrote to its prompt cache.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub cache_write_tokens: i64,
     /// Fingerprint of the request this row records: the normalised-request
     /// hash the response cache keys on, computed for every call. Rows with one
     /// fingerprint are one request made more than once. NULL on rows older
@@ -473,6 +481,8 @@ pub struct NewCostLedgerEntry {
     pub tokens_estimated: bool,
     /// What kind of call this row records; every route sets it.
     pub call_kind: CallKind,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     /// See [`CostLedgerEntry::request_fingerprint`]; `None` only where there
     /// is no request body to fingerprint.
     pub request_fingerprint: Option<String>,

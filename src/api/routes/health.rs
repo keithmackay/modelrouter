@@ -556,6 +556,8 @@ fn record_probe_usage(
             experiment_variant: None,
             call_kind: crate::db::models::CallKind::Health,
             tokens_estimated: false,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             // The router's own probe, never a caller's request: nothing to
             // report as repeated work.
             request_fingerprint: None,

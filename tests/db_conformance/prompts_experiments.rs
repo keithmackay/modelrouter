@@ -214,6 +214,12 @@ async fn prompt_create_round_trips_every_column() {
         let got = PromptRepository::find_by_id(&*db, saved.id).await.unwrap().expect("row exists");
         assert_eq!(serde_json::to_value(&got).unwrap(), serde_json::to_value(&saved).unwrap());
         assert!(PromptRepository::find_by_id(&*db, saved.id + 100).await.unwrap().is_none());
+        for listed in [
+            PromptRepository::list(&*db, 10, 0).await.unwrap(),
+            PromptRepository::list_by_user(&*db, uid, 10).await.unwrap(),
+        ] {
+            assert_eq!(serde_json::to_value(&listed[0]).unwrap(), serde_json::to_value(&saved).unwrap());
+        }
 
         // Defaults: nothing optional set reads back as None / zero.
         let bare = PromptRepository::create(&*db, prompt(uid)).await.unwrap();

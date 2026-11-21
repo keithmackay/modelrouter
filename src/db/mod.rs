@@ -38,7 +38,7 @@ pub async fn open(config: &DatabaseConfig) -> anyhow::Result<MainDb> {
 
 /// The Postgres URL, when one is configured. An empty string counts as unset,
 /// so `MODELROUTER_DATABASE__POSTGRES_URL=` can switch an override off.
-fn postgres_url(config: &DatabaseConfig) -> Option<&str> {
+pub(crate) fn postgres_url(config: &DatabaseConfig) -> Option<&str> {
     config.postgres_url.as_deref().map(str::trim).filter(|u| !u.is_empty())
 }
 
@@ -55,11 +55,15 @@ async fn open_postgres(url: &str) -> anyhow::Result<MainDb> {
 /// databases.
 #[cfg(not(feature = "postgres"))]
 async fn open_postgres(_url: &str) -> anyhow::Result<MainDb> {
-    anyhow::bail!(
-        "database.postgres_url is set, but this binary was built without the \
-         `postgres` feature; rebuild with `--features postgres` or unset it"
-    )
+    anyhow::bail!(POSTGRES_FEATURE_MISSING)
 }
+
+/// What `serve` and `serve --check-config` say when `database.postgres_url`
+/// is set in a binary built without the `postgres` feature.
+#[cfg_attr(feature = "postgres", allow(dead_code))]
+pub(crate) const POSTGRES_FEATURE_MISSING: &str =
+    "database.postgres_url is set, but this binary was built without the \
+     `postgres` feature; rebuild with `--features postgres` or unset it";
 
 #[cfg(test)]
 mod tests {

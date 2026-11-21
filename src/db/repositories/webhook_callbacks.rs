@@ -10,6 +10,10 @@ pub struct WebhookCallback {
     pub events: String,
     pub secret_header_name: Option<String>,
     pub secret_header_value: Option<String>,
+    /// Secret deliveries are signed with; `None` sends them unsigned. Never
+    /// serialized, so no listing can echo it.
+    #[serde(skip_serializing, default)]
+    pub signing_secret: Option<String>,
     pub enabled: bool,
     pub created_at: String,
 }
@@ -21,6 +25,7 @@ pub struct NewWebhookCallback {
     pub events: String,
     pub secret_header_name: Option<String>,
     pub secret_header_value: Option<String>,
+    pub signing_secret: Option<String>,
 }
 
 #[async_trait]

@@ -574,6 +574,8 @@ impl Session {
                 // A live session has no request body to fingerprint: the audio
                 // arrives as frames over its lifetime.
                 request_fingerprint: None,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             };
             if let Err(e) = CostRepository::create(&*db, ledger).await {
                 tracing::error!("Failed to record transcription session cost: {e}");

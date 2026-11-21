@@ -27,7 +27,8 @@ async fn image_generations_inner(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     crate::api::routes::reject_experiment_header(
         "/v1/images/generations",
@@ -192,9 +193,11 @@ async fn image_generations_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Image,
                     tokens_estimated: false,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                     request_fingerprint: Some(request_fingerprint),
                 };
-                if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
+                if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record image cost: {}", e);
                 }
         }

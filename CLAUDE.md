@@ -38,7 +38,7 @@ modelrouter experiment results --id <id> [--limit <1-1000>] [--offset <n>] [--fo
 modelrouter db export --out <file.json>
 modelrouter db import --in <file.json> [--merge]
 modelrouter webhook list
-modelrouter webhook add --name <name> --url <url> [--events completion] [--secret-header-name <h>] [--secret-header-value <v>]
+modelrouter webhook add --name <name> --url <url> [--events completion|usage|*] [--secret-header-name <h>] [--secret-header-value <v>] [--signing-secret-env <VAR>]
 modelrouter webhook delete --id <id>
 modelrouter webhook enable --id <id>
 modelrouter webhook disable --id <id>
@@ -68,6 +68,7 @@ modelrouter install-service  (macOS/Linux)
 | `GET /admin/stats` | Usage stats (admin JWT required) |
 | `GET /admin/budgets` | List budget rules (admin JWT required) |
 | `GET /admin/audit` | Audit log (admin JWT required) |
+| `GET /admin/api/usage/events` | `usage` webhook payloads read back by ledger id, `?since=&after_id=&limit=` (≤ 1000), health-probe rows excluded; `next_after_id` null when caught up (admin JWT required) |
 | `GET /admin/api/compare` | Two-arm comparison by model, provider, tag, run or experiment variant (admin JWT required; see `docs/experiments.md`) |
 | `GET /admin/api/usage/duplicates` | Repeated requests: ledger rows sharing one request fingerprint in a window, `?window=&correlation_id_prefix=&tag_key=&tag_value=&project=&user=&limit=` (admin JWT required) |
 | `GET /admin/compare` | Comparison page (admin dashboard) |

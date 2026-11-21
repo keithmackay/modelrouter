@@ -12,6 +12,7 @@ struct WebhookRow {
     events: String,
     secret_header_name: Option<String>,
     secret_header_value: Option<String>,
+    signing_secret: Option<String>,
     enabled: bool,
     created_at: String,
 }
@@ -25,6 +26,7 @@ impl From<WebhookRow> for WebhookCallback {
             events: r.events,
             secret_header_name: r.secret_header_name,
             secret_header_value: r.secret_header_value,
+            signing_secret: r.signing_secret,
             enabled: r.enabled,
             created_at: r.created_at,
         }
@@ -35,7 +37,7 @@ impl From<WebhookRow> for WebhookCallback {
 impl WebhookCallbackRepository for PostgresDb {
     async fn list_webhooks(&self) -> anyhow::Result<Vec<WebhookCallback>> {
         let rows = sqlx::query_as::<_, WebhookRow>(
-            "SELECT id, name, url, events, secret_header_name, secret_header_value, enabled, created_at \
+            "SELECT id, name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at \
              FROM webhook_callbacks ORDER BY id ASC"
         )
         .fetch_all(&self.pool)
@@ -45,7 +47,7 @@ impl WebhookCallbackRepository for PostgresDb {
 
     async fn list_enabled_webhooks(&self) -> anyhow::Result<Vec<WebhookCallback>> {
         let rows = sqlx::query_as::<_, WebhookRow>(
-            "SELECT id, name, url, events, secret_header_name, secret_header_value, enabled, created_at \
+            "SELECT id, name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at \
              FROM webhook_callbacks WHERE enabled = true ORDER BY id ASC"
         )
         .fetch_all(&self.pool)
@@ -56,15 +58,16 @@ impl WebhookCallbackRepository for PostgresDb {
     async fn create_webhook(&self, new: NewWebhookCallback) -> anyhow::Result<WebhookCallback> {
         let now = now_utc();
         let row = sqlx::query_as::<_, WebhookRow>(
-            r#"INSERT INTO webhook_callbacks (name, url, events, secret_header_name, secret_header_value, enabled, created_at)
-               VALUES ($1, $2, $3, $4, $5, true, $6)
-               RETURNING id, name, url, events, secret_header_name, secret_header_value, enabled, created_at"#
+            r#"INSERT INTO webhook_callbacks (name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, true, $7)
+               RETURNING id, name, url, events, secret_header_name, secret_header_value, signing_secret, enabled, created_at"#
         )
         .bind(&new.name)
         .bind(&new.url)
         .bind(&new.events)
         .bind(&new.secret_header_name)
         .bind(&new.secret_header_value)
+        .bind(&new.signing_secret)
         .bind(&now)
         .fetch_one(&self.pool)
         .await?;

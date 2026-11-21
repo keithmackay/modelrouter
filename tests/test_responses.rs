@@ -794,3 +794,44 @@ async fn responses_grounded_search_tool_choice_returns_400() {
     assert!(resp.text().contains("/v1/search"), "{}", resp.text());
     assert!(seen.lock().unwrap().is_none());
 }
+
+/// Answers with prompt-cache usage, as an Anthropic-shaped backend reports it.
+struct PromptCacheAdapter;
+
+#[async_trait::async_trait]
+impl ProviderAdapter for PromptCacheAdapter {
+    async fn complete(&self, _req: &NormalizedRequest) -> anyhow::Result<CompletionResult> {
+        Ok(CompletionResult {
+            content: "cached".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cache_read_tokens: 400,
+            cache_write_tokens: 60,
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        })
+    }
+    async fn stream(&self, _req: &NormalizedRequest) -> anyhow::Result<SseStream> {
+        anyhow::bail!("not used")
+    }
+}
+
+#[tokio::test]
+async fn responses_record_prompt_cache_tokens_on_the_ledger() {
+    let h = build_harness(
+        PromptCacheAdapter,
+        Arc::new(modelrouter::router::circuit_breaker::CircuitBreaker::default()),
+    )
+    .await;
+    let (hk, hv) = auth();
+    let resp = h
+        .server
+        .post("/v1/responses")
+        .add_header(hk, hv)
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "Hello"}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let rows = common::wait_for_ledger_rows(&*h.db, 1).await;
+    assert_eq!((rows[0].cache_read_tokens, rows[0].cache_write_tokens), (400, 60));
+}

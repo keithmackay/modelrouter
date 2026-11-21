@@ -8,6 +8,7 @@ use crate::{
     api::routes::completions::{record_cache_hit, CacheHitCtx, CACHE_HEADER},
     api::{app::AppState, auth::AuthenticatedUser, error::ApiError},
     db::models::{NewCostLedgerEntry, NewPrompt},
+    providers::messages_usage::MessagesStreamUsage,
     router::cache::stream::{message_as_completion, messages_replay_sse},
     router::policy::PolicyDecision,
 };
@@ -26,12 +27,14 @@ async fn log_messages_cost(
     completion_tokens: u32,
     cache_read_tokens: u32,
     cache_write_tokens: u32,
+    tokens_estimated: bool,
     cost: f64,
     latency_ms: i64,
     attribution: crate::api::attribution::Attribution,
     request_fingerprint: Option<String>,
 ) {
-    use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+    use crate::api::ledger::record_usage;
+    use crate::db::repositories::prompts::PromptRepository;
 
     let prompt = NewPrompt {
         user_id,
@@ -84,10 +87,12 @@ async fn log_messages_cost(
         experiment_id: None,
         experiment_variant: None,
         call_kind: crate::db::models::CallKind::Chat,
-        tokens_estimated: false,
+        tokens_estimated,
         request_fingerprint,
+        cache_read_tokens: cache_read_tokens as i64,
+        cache_write_tokens: cache_write_tokens as i64,
     };
-    if let Err(e) = CostRepository::create(&*state.db, ledger).await {
+    if let Err(e) = record_usage(&*state.db, &state.callbacks, ledger).await {
         tracing::error!("Failed to record cost: {}", e);
     }
 
@@ -371,9 +376,14 @@ async fn anthropic_messages_inner(
         let cache_state = state.clone();
         let cache_model = canonical_model.clone();
         let stream_directives = cache_directives.clone();
+        let mut usage = StreamUsageRecorder::new(streamed_cost_logger(
+            &state, &user, &attribution, &model, &canonical_model, &body, start,
+            request_fingerprint.clone(),
+        ));
         let byte_stream = upstream_resp.bytes_stream().map(move |chunk| {
             match &chunk {
                 Ok(bytes) => {
+                    usage.feed(bytes);
                     if let Some((_, cap)) = capture.as_mut() {
                         cap.feed(bytes);
                         if cap.is_done() {
@@ -393,31 +403,6 @@ async fn anthropic_messages_inner(
                 Err(_) => capture = None,
             }
             chunk.map_err(|e| std::io::Error::other(e.to_string()))
-        });
-
-        // Fix 3: Fire-and-forget approximate cost for streaming
-        let state_c = state.clone();
-        let user_id = user.id;
-        let api_key_id_s = user.api_key_id;
-        let user_project_s = attribution.project_or(user.api_key_project.clone());
-        let user_name_s = user.name.clone();
-        let model_s = model.clone();
-        let canonical_s = canonical_model.clone();
-        let provider_s = "anthropic".to_string();
-        let messages_json_s = serde_json::to_string(
-            &body["messages"].as_array().cloned().unwrap_or_default()
-        ).unwrap_or_default();
-        let start_s = start;
-        let attribution_s = attribution.clone();
-        let request_fingerprint_s = request_fingerprint.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let stream initiate
-            let prompt_tokens = (messages_json_s.chars().count() / 4) as u32;
-            let cost = state_c.cost_calc.calculate(&canonical_s, prompt_tokens, 0);
-            let latency_ms = start_s.elapsed().as_millis() as i64;
-            log_messages_cost(&state_c, user_id, api_key_id_s, user_project_s, &user_name_s, &model_s, &canonical_s, &provider_s,
-                               &messages_json_s, prompt_tokens, 0, 0, 0, cost, latency_ms,
-                               attribution_s, Some(request_fingerprint_s)).await;
         });
 
         let mut response = Response::builder()
@@ -528,7 +513,7 @@ async fn anthropic_messages_inner(
     let canonical_c = canonical_model.clone();
     let user_name_c = user.name.clone();
     let api_key_id_c = user.api_key_id;
-    let project = user.api_key_project.clone();
+    let project = attribution.project_or(user.api_key_project.clone());
     let messages_json = serde_json::to_string(
         &body["messages"].as_array().cloned().unwrap_or_default(),
     )
@@ -540,7 +525,8 @@ async fn anthropic_messages_inner(
     let provider_c = provider_label.clone();
 
     tokio::spawn(async move {
-        use crate::db::repositories::{costs::CostRepository, prompts::PromptRepository};
+        use crate::api::ledger::record_usage;
+        use crate::db::repositories::prompts::PromptRepository;
 
         let prompt = NewPrompt {
             user_id,
@@ -595,9 +581,11 @@ async fn anthropic_messages_inner(
                     experiment_variant: None,
                     call_kind: crate::db::models::CallKind::Chat,
                     tokens_estimated: false,
+                    cache_read_tokens: cache_read_tokens as i64,
+                    cache_write_tokens: cache_write_tokens as i64,
                     request_fingerprint: Some(request_fingerprint),
                 };
-                if let Err(e) = CostRepository::create(&*state_clone.db, ledger).await {
+                if let Err(e) = record_usage(&*state_clone.db, &state_clone.callbacks, ledger).await {
                     tracing::error!("Failed to record cost: {}", e);
                 }
                 let mut event = crate::callbacks::CallbackEvent {
@@ -653,6 +641,104 @@ async fn anthropic_messages_inner(
             .insert(CACHE_HEADER, HeaderValue::from_static(outcome));
     }
     Ok(response)
+}
+
+/// Reads a passed-through stream's usage and hands it to `on_end` when the
+/// stream is dropped: after its last chunk, or when the client goes away
+/// mid-stream. Either way the provider has billed the call, so it is recorded.
+struct StreamUsageRecorder {
+    usage: MessagesStreamUsage,
+    on_end: Option<Box<dyn FnOnce(MessagesStreamUsage) + Send>>,
+}
+
+impl StreamUsageRecorder {
+    fn new(on_end: Box<dyn FnOnce(MessagesStreamUsage) + Send>) -> Self {
+        Self {
+            usage: MessagesStreamUsage::new(),
+            on_end: Some(on_end),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.usage.feed(chunk);
+    }
+}
+
+impl Drop for StreamUsageRecorder {
+    fn drop(&mut self) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(std::mem::take(&mut self.usage));
+        }
+    }
+}
+
+/// Records a streamed call's cost from the usage its stream reported. A stream
+/// that did not reach `message_stop` is recorded from what arrived and flagged
+/// estimated; one that reported no usage at all falls back to a
+/// characters-per-token estimate of the input.
+fn streamed_cost_logger(
+    state: &AppState,
+    user: &crate::db::models::User,
+    attribution: &crate::api::attribution::Attribution,
+    model: &str,
+    canonical_model: &str,
+    body: &Value,
+    start: std::time::Instant,
+    request_fingerprint: String,
+) -> Box<dyn FnOnce(MessagesStreamUsage) + Send> {
+    let state = state.clone();
+    let user_id = user.id;
+    let api_key_id = user.api_key_id;
+    let project = attribution.project_or(user.api_key_project.clone());
+    let user_name = user.name.clone();
+    let model = model.to_string();
+    let canonical_model = canonical_model.to_string();
+    let attribution = attribution.clone();
+    let messages_json =
+        serde_json::to_string(&body["messages"].as_array().cloned().unwrap_or_default())
+            .unwrap_or_default();
+    Box::new(move |usage: MessagesStreamUsage| {
+        let latency_ms = start.elapsed().as_millis() as i64;
+        let prompt_tokens = if usage.saw_usage() {
+            usage.input_tokens
+        } else {
+            (messages_json.chars().count() / 4) as u32
+        };
+        let cost = state.cost_calc.calculate_with_cache(
+            &canonical_model,
+            prompt_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        );
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!("no runtime to record a streamed call's cost");
+            return;
+        };
+        runtime.spawn(async move {
+            log_messages_cost(
+                &state,
+                user_id,
+                api_key_id,
+                project,
+                &user_name,
+                &model,
+                &canonical_model,
+                "anthropic",
+                &messages_json,
+                prompt_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                !usage.is_complete(),
+                cost,
+                latency_ms,
+                attribution,
+                Some(request_fingerprint),
+            )
+            .await;
+        });
+    })
 }
 
 /// Store a stream's assembled `message`, priced from its own usage, once the

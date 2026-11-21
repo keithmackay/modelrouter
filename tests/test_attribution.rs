@@ -785,6 +785,8 @@ async fn health_probe_writes_empty_object_not_array() {
         experiment_variant: None,
         call_kind: modelrouter::db::models::CallKind::Chat,
         tokens_estimated: false,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         request_fingerprint: None,
     };
     CostRepository::create(&db, entry).await.unwrap();
