@@ -160,6 +160,8 @@ Callers: the OpenAI and Anthropic SDKs already retry connection errors and `503`
 
 `deploy/crash-test/` measures all of this locally: with a balancer that retries the first row, a replica killed under load cost only the streams that were mid-flight on it; without retries every request routed to it until its endpoint was dropped failed too.
 
+Background jobs. Per-replica housekeeping (session-affinity sweep, config reload, alias and experiment registry refresh) runs on every replica. The cluster-wide ones, the hourly retention purge and S3 archival, take a PostgreSQL advisory lock for the run, so one replica does each pass and the others skip it; a replica that dies mid-pass releases the lock with its connection.
+
 ## 10. Prove a build before it takes traffic
 
 ```bash
