@@ -59,6 +59,7 @@ modelrouter install-service  (macOS/Linux)
 |---|---|
 | `GET /health` | Liveness check |
 | `GET /v1/models` | List available models |
+| `GET /metrics` | Prometheus text: `modelrouter_requests_in_flight` and `modelrouter_draining` always (the autoscaling signal); request, token, cost and policy counters with `--features prometheus` |
 | `POST /v1/chat/completions` | Proxy chat completions (OpenAI-compatible); forwards `tools`/`tool_choice` to tool-capable backends (translated for Anthropic-shaped upstreams); forwards `response_format` to OpenAI-shaped backends and as Gemini's JSON mime type, reporting a drop elsewhere; `x-modelrouter-experiment: <id>[:<label>]` binds the request to an experiment variant |
 | `POST /v1/systemone` | TypeSafe System One passthrough (typed Choice/Score/Noul judgments); router adds the `[providers.typesafe]` key; policy/pricing key `systemone/{model}`; upstream 429/529/422 pass through, upstream 401/403 → 502 |
 | `GET /v1/audio/transcriptions/stream` | Streaming transcription over a WebSocket: `session.start`, binary audio frames, `session.end` in; `transcript.segment` (partial and final, with timestamps and confidence), `session.ended` or `error` out; one provider from `[transcription]` (Foundry's realtime surface first) |

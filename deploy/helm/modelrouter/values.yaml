@@ -27,13 +27,57 @@ persistence:
   size: 1Gi
   accessMode: ReadWriteOnce
 
-# Horizontal Pod Autoscaler — disable when using SQLite (single-writer)
+# Horizontal Pod Autoscaler. Needs the replicated setup: PostgreSQL
+# (`database.postgresUrl` or `database.existingSecret`, with
+# `persistence.enabled: false`) and `cluster.backend: redis`. The chart
+# refuses to render autoscaling without them, because SQLite is single-writer
+# and the in-memory limits are split by a replica count the HPA keeps changing.
+# With autoscaling on, the Deployment leaves `replicas` to the HPA and the
+# router sizes its Redis-down fallback share by `maxReplicas`.
 autoscaling:
   enabled: false
-  minReplicas: 1
-  maxReplicas: 3
+  minReplicas: 2
+  maxReplicas: 6
+  # Requests in flight per pod (streams count until their last byte), read
+  # from the modelrouter_requests_in_flight gauge on /metrics. The best
+  # signal for an I/O-bound proxy, but it needs a custom-metrics adapter
+  # (prometheus-adapter, KEDA, a cloud adapter) serving that metric for pods.
+  # Empty leaves it out.
+  targetInFlightPerPod: ""
+  # CPU is a fallback signal; a pod busy with long streams can sit at low CPU.
   targetCPUUtilizationPercentage: 70
-  targetMemoryUtilizationPercentage: 80
+  # Memory tracks load poorly for a proxy and is off by default.
+  targetMemoryUtilizationPercentage: ""
+  # Scale up fast, scale down slowly: a removed pod drains its streams, so
+  # flapping costs capacity for the length of the longest stream.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# PostgreSQL store for two or more replicas. Set postgresUrl (kept in the
+# chart Secret) or name an existingSecret holding it; either is injected as
+# MODELROUTER_DATABASE__POSTGRES_URL into the migrate init container and the
+# router. Use an image built with the postgres feature (tag suffix -postgres).
+database:
+  postgresUrl: ""
+  existingSecret: ""
+  existingSecretKey: postgres-url
+
+# Scrape annotations on the pods (prometheus.io/scrape, port, path) so a
+# Prometheus that honours them picks up /metrics, including the in-flight
+# gauge the autoscaler can use.
+metrics:
+  podAnnotations: true
 
 # config.toml content rendered into a ConfigMap.
 # Sensitive values (api_key, jwt_secret) should be provided via `secrets` below

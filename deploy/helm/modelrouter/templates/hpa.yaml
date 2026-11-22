@@ -13,6 +13,17 @@ spec:
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:
+    {{- if .Values.autoscaling.targetInFlightPerPod }}
+    # Requests in flight per pod, from the router's /metrics gauge, served
+    # to the HPA by a custom-metrics adapter.
+    - type: Pods
+      pods:
+        metric:
+          name: modelrouter_requests_in_flight
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.targetInFlightPerPod | quote }}
+    {{- end }}
     {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
       resource:
@@ -29,4 +40,8 @@ spec:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
     {{- end }}
+  {{- with .Values.autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end }}

@@ -65,3 +65,11 @@ jobs:
         # live_retail_prices_api calls a public Azure API; keep CI hermetic.
         run: cargo test --locked --features postgres -- --include-ignored --skip live_retail_prices_api
 
+  helm:
+    name: helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint and render the chart's value combinations
+        run: deploy/helm/test-chart.sh
