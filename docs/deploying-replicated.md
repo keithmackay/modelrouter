@@ -122,7 +122,45 @@ rules:
 
 The pods carry `prometheus.io/scrape` annotations (`metrics.podAnnotations`). The default `behavior` scales up by two pods every 30 s and down by one every two minutes after ten stable minutes: a pod picked for removal stops getting new requests at once but finishes its streams first, so flapping costs capacity.
 
-## 9. Prove a build before it takes traffic
+## 9. Retry connection failures at the edge
+
+A Kubernetes Service does not retry. When a pod dies (OOM kill, node loss), requests already on it fail, and for the few seconds until its endpoint is removed new connections to it are refused or reset. A retry at the ingress, or in the caller, hides the second kind completely; the first kind is limited to what was in flight on that pod.
+
+What is safe to retry:
+
+| Failure | Retry? | Why |
+|---|---|---|
+| Connection refused, reset or timed out before the request was sent | Yes | The router never saw it. |
+| `503` with `"type": "shutting_down"` and `Connection: close` | Yes | The drain refused it before doing anything. Rare with `drain_delay_secs` set. |
+| Connection reset after the request was sent, before any response byte | Only if a duplicate call is acceptable | The router may already have called the provider; a replay can bill twice. |
+| A stream cut after some bytes arrived | No, not silently | The caller has partial output and the provider billed it; replaying duplicates both. Surface it to the caller. |
+
+ingress-nginx, which the chart's optional Ingress targets (`ingress.enabled`, `ingress.nginxRetry`):
+
+```yaml
+nginx.ingress.kubernetes.io/proxy-next-upstream: "error timeout"
+nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
+nginx.ingress.kubernetes.io/proxy-read-timeout: "21600"   # long streams
+nginx.ingress.kubernetes.io/proxy-buffering: "off"        # SSE
+```
+
+nginx never re-sends a POST that already reached an upstream unless `non_idempotent` is added, so this retries exactly the first row of the table. Leave `non_idempotent` out.
+
+Envoy or Istio:
+
+```yaml
+retries:
+  attempts: 2
+  retryOn: connect-failure,refused-stream,reset-before-request
+```
+
+(`reset-before-request` needs a recent Envoy; on older ones use `connect-failure,refused-stream`.) Traefik's retry middleware re-sends on any network error before a response, including one after the request reached the pod, so it can replay a POST (the third row); use it only where a duplicate call is acceptable.
+
+Callers: the OpenAI and Anthropic SDKs already retry connection errors and `503` twice by default; keep that on. A caller that handles streams should treat a stream that ends without its final event (`[DONE]` or `message_stop`) as failed and decide for itself whether to ask again.
+
+`deploy/crash-test/` measures all of this locally: with a balancer that retries the first row, a replica killed under load cost only the streams that were mid-flight on it; without retries every request routed to it until its endpoint was dropped failed too.
+
+## 10. Prove a build before it takes traffic
 
 ```bash
 modelrouter serve --check-config

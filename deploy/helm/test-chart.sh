@@ -89,6 +89,20 @@ else
   fail "postgres_url in config not recognised"
 fi
 
+# --- Ingress: off by default; ingress-nginx retries connection failures only.
+lacks "ingress: off by default" 'kind: Ingress' "$(render)"
+ing=$(render --set ingress.enabled=true --set ingress.host=mr.example.com | doc Ingress)
+has   "ingress: nginx retries connection failures" 'proxy-next-upstream: "error timeout"' "$ing"
+lacks "ingress: never retries POST after it reached a pod" 'non_idempotent' "$ing"
+has   "ingress: stream timeouts" 'proxy-read-timeout: "21600"' "$ing"
+has   "ingress: SSE unbuffered" 'proxy-buffering: "off"' "$ing"
+has   "ingress: host" 'host: "mr.example.com"' "$ing"
+ing=$(render --set ingress.enabled=true --set ingress.className=traefik | doc Ingress)
+lacks "ingress: nginx annotations only for nginx" 'nginx.ingress' "$ing"
+has   "ingress: class passed through" 'ingressClassName: traefik' "$ing"
+ing=$(render --set ingress.enabled=true --set ingress.nginxRetry=false | doc Ingress)
+lacks "ingress: retry can be turned off" 'proxy-next-upstream' "$ing"
+
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails check(s) failed"; exit 1; fi
 echo "all chart checks passed"
