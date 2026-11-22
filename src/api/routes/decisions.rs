@@ -380,7 +380,7 @@ async fn decisions_inner(
     let answers_content = decision_answers_content(&result.body);
     let experiment_id_row = experiment_id;
     let experiment_variant_row = experiment_variant.clone();
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,

@@ -853,7 +853,9 @@ fn store_streamed_message(
     let cost = state.cost_calc.calculate_result(canonical_model, &usage);
     let state = state.clone();
     let model = canonical_model.to_string();
-    tokio::spawn(async move {
+    // The stream has already finished. Track the cache write so a scale-down
+    // does not drop it when the runtime shuts down.
+    crate::api::background::spawn(async move {
         state
             .response_cache
             .put_message(&key, &model, message, cost, &directives)

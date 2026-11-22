@@ -268,7 +268,7 @@ fn record_usage(
     let correlation_id = attribution.correlation_id.clone();
     let tags = attribution.tags_json();
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,

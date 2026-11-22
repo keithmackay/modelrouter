@@ -64,6 +64,8 @@ pub struct RouterOptions {
     pub postgres_url: Option<String>,
     /// `[server] shutdown_grace_secs`. `None` leaves the line out.
     pub shutdown_grace_secs: Option<u64>,
+    /// `[server] drain_delay_secs`. `None` leaves the line out.
+    pub drain_delay_secs: Option<u64>,
 }
 
 impl RouterOptions {
@@ -76,7 +78,14 @@ impl RouterOptions {
             extra_toml: String::new(),
             postgres_url: None,
             shutdown_grace_secs: None,
+            drain_delay_secs: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_drain_delay_secs(mut self, secs: u64) -> Self {
+        self.drain_delay_secs = Some(secs);
+        self
     }
 
     pub fn with_shutdown_grace_secs(mut self, secs: u64) -> Self {
@@ -130,6 +139,11 @@ pub fn render_config(dir: &Path, port: u16, opts: &RouterOptions) -> String {
         .shutdown_grace_secs
         .map(|s| format!("shutdown_grace_secs = {s}\n"))
         .unwrap_or_default();
+    let grace = grace
+        + &opts
+            .drain_delay_secs
+            .map(|s| format!("drain_delay_secs = {s}\n"))
+            .unwrap_or_default();
     format!(
         r#"
 [server]

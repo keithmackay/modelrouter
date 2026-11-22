@@ -430,3 +430,66 @@ async fn shutdown_grace_secs_bounds_the_drain() {
     let outcome = tokio::time::timeout(Duration::from_secs(5), in_flight).await.expect("task returned").unwrap();
     assert!(outcome.is_err(), "a request slower than the grace must not succeed: {outcome:?}");
 }
+
+/// `[server] drain_delay_secs`: after SIGTERM readiness answers 503 at once,
+/// so load balancers drop the replica, but requests that still arrive during
+/// the delay are served rather than refused. Only after it do late arrivals
+/// get the drain's 503, and an idle replica then exits.
+#[tokio::test]
+async fn drain_delay_keeps_serving_while_not_ready() {
+    let mock = MockLlm::start().await;
+    let mut router =
+        RouterProcess::start(RouterOptions::new(mock.base_url()).with_drain_delay_secs(3)).await;
+    let api_key = router.create_user_and_key("delayuser");
+    let base_url = router.base_url();
+    let ask = |content: &'static str| {
+        let base_url = base_url.clone();
+        let api_key = api_key.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&serde_json::json!({
+                    "model": "mock/test",
+                    "messages": [{"role": "user", "content": content}],
+                }))
+                .send()
+                .await
+                .expect("answered")
+        }
+    };
+
+    let signalled = std::time::Instant::now();
+    sigterm(router.pid());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let ready = reqwest::get(format!("{base_url}/health/ready")).await.expect("ready");
+    assert_eq!(ready.status(), 503, "not ready from the signal on");
+    let ready_body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["failing"][0]["part"], "draining");
+
+    let during = ask("still routed here").await;
+    assert!(during.status().is_success(), "served during the delay: {}", during.status());
+
+    let metrics = reqwest::get(format!("{base_url}/metrics")).await.unwrap().text().await.unwrap();
+    assert!(metrics.lines().any(|l| l == "modelrouter_draining 1"), "{metrics}");
+
+    // Past the delay the drain refuses newcomers, then exits when idle.
+    let wait = Duration::from_millis(3500).saturating_sub(signalled.elapsed());
+    tokio::time::sleep(wait).await;
+    match reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({"model": "mock/test", "messages": [{"role": "user", "content": "late"}]}))
+        .send()
+        .await
+    {
+        Ok(late) => assert_eq!(late.status(), 503, "refused after the delay"),
+        Err(_) => {} // already exited: also not served
+    }
+    let status = wait_for_exit(&mut router, Duration::from_secs(10));
+    assert!(status.success(), "exit status {status}");
+    assert!(signalled.elapsed() >= Duration::from_secs(3), "exited before the delay");
+    let logs = without_ansi(&router.logs());
+    assert!(logs.contains("still admitting requests"), "{logs}");
+}

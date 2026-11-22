@@ -40,11 +40,11 @@ pub fn replica_gauges(readiness: &Readiness) -> String {
         "# HELP modelrouter_requests_in_flight Requests this replica is serving now; a stream counts until its last byte.\n\
          # TYPE modelrouter_requests_in_flight gauge\n\
          modelrouter_requests_in_flight {}\n\
-         # HELP modelrouter_draining 1 while this replica drains after SIGTERM, else 0.\n\
+         # HELP modelrouter_draining 1 once this replica has started shutdown and is not ready, else 0.\n\
          # TYPE modelrouter_draining gauge\n\
          modelrouter_draining {}\n",
         readiness.in_flight(),
-        u8::from(readiness.is_draining()),
+        u8::from(readiness.is_stopping()),
     )
 }
 

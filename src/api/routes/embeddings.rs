@@ -316,7 +316,7 @@ async fn embeddings_inner(
         &body,
     );
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,

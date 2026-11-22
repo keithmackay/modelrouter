@@ -280,7 +280,7 @@ fn record_responses_cost(
     use crate::api::ledger::record_usage;
     use crate::db::repositories::prompts::PromptRepository;
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let messages_json = serde_json::to_string(&messages).unwrap_or_default();
         let prompt = NewPrompt {
             user_id,

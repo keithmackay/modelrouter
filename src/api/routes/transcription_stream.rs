@@ -519,7 +519,7 @@ impl Session {
         let correlation = self.attribution.correlation_id.clone();
         let tags = self.attribution.tags_json();
         let provider = self.provider.clone();
-        tokio::spawn(async move {
+        crate::api::background::spawn(async move {
             let prompt = NewPrompt {
                 user_id,
                 session_id: None,

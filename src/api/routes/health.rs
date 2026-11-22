@@ -518,7 +518,7 @@ fn record_probe_usage(
 
     const PROBE_USER: &str = "health-probe";
     let state = state.clone();
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let user = match UserRepository::find_by_name(&*state.db, PROBE_USER).await {
             Ok(Some(u)) => u,
             Ok(None) => {

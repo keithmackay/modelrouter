@@ -43,6 +43,7 @@ has   "default: SQLite path on the volume" 'MODELROUTER_DATABASE__PATH' "$dep"
 lacks "default: no HPA" 'kind: HorizontalPodAutoscaler' "$out"
 lacks "default: no postgres env" 'POSTGRES_URL' "$dep"
 has   "default: scrape annotation" 'prometheus.io/scrape: "true"' "$dep"
+has   "default: drain delay" 'MODELROUTER_SERVER__DRAIN_DELAY_SECS[[:space:]]+value: "10"' "$(tr '\n' ' ' <<<"$dep")"
 
 # --- Autoscaling refusals.
 AS=(--set autoscaling.enabled=true)

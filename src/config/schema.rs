@@ -857,6 +857,13 @@ pub struct ServerConfig {
     /// replica never waits this long.
     #[serde(default)]
     pub shutdown_grace_secs: Option<u64>,
+    /// How long, after SIGTERM, to keep admitting new requests while
+    /// `/health/ready` already answers 503. Load balancers drop an endpoint
+    /// asynchronously (Kubernetes takes a few seconds to propagate a
+    /// terminating pod's removal), so refusing at once turns that window
+    /// into 503s for callers. 0 (the default) refuses at once.
+    #[serde(default)]
+    pub drain_delay_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -867,6 +874,7 @@ impl Default for ServerConfig {
             request_body_limit_mb: default_request_body_limit_mb(),
             ip_rate_limit_rpm: 0,
             shutdown_grace_secs: None,
+            drain_delay_secs: 0,
         }
     }
 }
