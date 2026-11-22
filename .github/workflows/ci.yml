@@ -20,3 +20,48 @@ jobs:
         run: cargo test --locked
       - name: Build with the postgres feature
         run: cargo build --locked --features postgres
+
+  live-stores:
+    # The #[ignore]d tests that need a real PostgreSQL and Redis, plus the
+    # e2e tests that spawn the binary. The default job never runs them, which
+    # is how several PostgreSQL-only bugs reached main.
+    name: cargo test (PostgreSQL + Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: modelrouter
+          POSTGRES_PASSWORD: modelrouter
+          POSTGRES_DB: modelrouter_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U modelrouter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        # GETEX and GETDEL (session pins, pending logins) need Redis >= 6.2.
+        image: redis:7
+        ports:
+          # The cache store's live test dials 127.0.0.1:6379 directly.
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MODELROUTER_TEST_POSTGRES_URL: postgres://modelrouter:modelrouter@127.0.0.1:5432/modelrouter_test
+      MODELROUTER_TEST_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres
+      - name: Test with the postgres feature, ignored tests included
+        # live_retail_prices_api calls a public Azure API; keep CI hermetic.
+        run: cargo test --locked --features postgres -- --include-ignored --skip live_retail_prices_api
+
