@@ -1,0 +1,9 @@
+alertmanager: {enabled: false}
+prometheus-pushgateway: {enabled: false}
+kube-state-metrics: {enabled: false}
+prometheus-node-exporter: {enabled: false}
+server:
+  persistentVolume: {enabled: false}
+  global:
+    scrape_interval: 10s
+    evaluation_interval: 10s

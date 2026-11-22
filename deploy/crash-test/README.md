@@ -43,3 +43,8 @@ provided the ingress retries connection failures (#172); without that, every
 request routed to the dead pod until its endpoint is removed fails. A crash
 can also lose the cost rows of requests that had already been answered
 (#173).
+
+## On Kubernetes
+
+`k8s/` runs the same test on a cluster with the Helm chart and the HPA scaling
+on the in-flight gauge; its README has the steps and the results.
