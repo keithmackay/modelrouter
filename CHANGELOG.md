@@ -9,6 +9,7 @@
 - `GET /admin/api/usage/events?since=&after_id=&limit=` reads `usage` events back by ledger id, so a receiver can backfill deliveries it missed. Each item is the webhook payload for that row without `delivery_id`; health-probe rows are left out. Pages are in id order, at most 1000 events; `next_after_id` is the cursor for the next page and `null` once caught up. Admin session required.
 
 **Fixes**
+- CI runs the ignored tests that need a live PostgreSQL and Redis, and the e2e tests that spawn the binary, in a job with `postgres:16` and `redis:7` (`cargo test --locked --features postgres -- --include-ignored`). The public retail-price probe stays skipped. (#170)
 - The README's store section said `report`, `audit`, and the dashboard hook statistics were still SQLite-only. They read whichever store `serve` uses, including PostgreSQL. (#177)
 - A chat completion's cost-ledger row is written before the caller can see the finished response. A non-streaming `/v1/chat/completions` or `/v1/messages` response waits for the insert; a stream waits before it forwards `[DONE]` or `message_stop`, including a response served from the cache. A body dropped early still records the row, and that write keeps the process in flight so a drain waits for it. (#173)
 - On PostgreSQL, prompts read back by id or in a listing reported an empty `call_kind`: those reads did not select the column. SQLite was unaffected.
