@@ -1,0 +1,14 @@
+prometheus:
+  url: http://prom-prometheus-server.monitoring.svc
+  port: 80
+rules:
+  default: false
+  custom:
+    - seriesQuery: 'modelrouter_requests_in_flight{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+          pod: {resource: pod}
+      name:
+        as: modelrouter_requests_in_flight
+      metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[1m])'

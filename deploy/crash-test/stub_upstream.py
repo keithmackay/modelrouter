@@ -85,4 +85,4 @@ class Server(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
-    Server(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+    Server((os.environ.get("STUB_HOST", "127.0.0.1"), int(sys.argv[1])), Handler).serve_forever()

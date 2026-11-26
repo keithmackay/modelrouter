@@ -1,0 +1,59 @@
+image:
+  repository: localhost:5000/modelrouter
+  tag: crash
+  pullPolicy: Always
+persistence:
+  enabled: false
+database:
+  postgresUrl: postgres://modelrouter:modelrouter@postgres:5432/modelrouter
+cluster:
+  backend: redis
+  redisUrl: redis://redis:6379
+secrets:
+  jwtSecret: "crash-test-jwt-secret-crash-test-jwt-secret-0123456789"
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetInFlightPerPod: "6"
+  targetCPUUtilizationPercentage: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{type: Pods, value: 2, periodSeconds: 15}]
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies: [{type: Pods, value: 1, periodSeconds: 30}]
+podDisruptionBudget:
+  enabled: true
+topologySpread:
+  enabled: true
+drainDelaySeconds: 10
+terminationGracePeriodSeconds: 120
+resources:
+  requests: {cpu: 100m, memory: 64Mi}
+  limits: {cpu: "1", memory: 512Mi}
+config: |
+  [server]
+  host = "0.0.0.0"
+  port = 8080
+  shutdown_grace_secs = 90
+
+  [routing]
+  default_provider = "mock"
+  default_model = "mock-model"
+
+  [providers.mock]
+  api_base = "http://stub:8000/v1"
+  api_key = "stub-key-not-a-secret"
+
+  [auth]
+  jwt_secret = ""
+
+  [cache]
+  enabled = false
+
+  [[pricing]]
+  model = "mock-model"
+  input_per_million = 1.0
+  output_per_million = 2.0

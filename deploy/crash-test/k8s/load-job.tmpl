@@ -1,0 +1,15 @@
+apiVersion: batch/v1
+kind: Job
+metadata: {name: NAME, namespace: mr-crash}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: python:3.12-slim
+          command: ["python3", "/app/load.py", "--url", "TARGET", "--key", "KEY", "--secs", "SECS",
+                    "--workers", "WORKERS", "--stream-share", "0.3", "--run", "NAME", "--ok-ids", "/tmp/ok.txt"]
+          volumeMounts: [{name: app, mountPath: /app}]
+      volumes: [{name: app, configMap: {name: crash-scripts}}]

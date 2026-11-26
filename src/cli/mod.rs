@@ -430,20 +430,26 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                     // bootstrap, the first requests) instead of competing with it.
                     tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
                     loop {
+                        // One replica per tick: the purges are idempotent, but
+                        // N replicas deleting the same rows every hour is N
+                        // times the load for nothing.
                         let retention_days = tick_storage.load().prompt_retention_days;
-                        crate::db::retention::run_retention_tick(
-                            &*tick_db,
-                            &*tick_db,
-                            &*tick_prompt_db,
-                            retention_days,
-                            chrono::Utc::now(),
-                        )
-                        .await;
-                        crate::db::retention::run_table_retention_tick(
-                            &*tick_db,
-                            &tick_retention,
-                            chrono::Utc::now(),
-                        )
+                        crate::db::repositories::maintenance::with_job_lock(&*tick_db, "retention", async {
+                            crate::db::retention::run_retention_tick(
+                                &*tick_db,
+                                &*tick_db,
+                                &*tick_prompt_db,
+                                retention_days,
+                                chrono::Utc::now(),
+                            )
+                            .await;
+                            crate::db::retention::run_table_retention_tick(
+                                &*tick_db,
+                                &tick_retention,
+                                chrono::Utc::now(),
+                            )
+                            .await;
+                        })
                         .await;
                         tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
                     }
