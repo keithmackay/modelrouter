@@ -85,13 +85,11 @@ async fn serve_and_cli_run_against_postgres() {
     assert!(ok, "budget list on postgres: {err}");
     assert!(out.contains(&user), "{out}");
 
-    // Reports still query SQLite directly and must say so instead of failing oddly.
-    let (ok, _out, err) = run_cli(router.config_path(), &["report", "cost"]);
-    assert!(!ok);
-    assert!(
-        err.contains("not available on the postgres backend"),
-        "{err}"
-    );
+    // `report cost` reads the same PostgreSQL store the server writes to.
+    let (ok, out, err) = run_cli(router.config_path(), &["report", "cost", "--format", "json"]);
+    assert!(ok, "report cost on postgres: {err}");
+    serde_json::from_str::<serde_json::Value>(&out)
+        .unwrap_or_else(|e| panic!("report cost --format json is JSON: {e}: {out}"));
 
     // The request's cost row reached PostgreSQL.
     let pool = sqlx::PgPool::connect(&pg_url()).await.expect("connect");

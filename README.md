@@ -335,7 +335,7 @@ SQLite is the default and right for one replica. Set `database.postgres_url` to 
 postgres_url = "postgres://modelrouter:secret@db.internal:5432/modelrouter"
 ```
 
-Still SQLite-only in this release: the `report` and `audit` CLI subcommands and the dashboard's hook statistics. On PostgreSQL they print `not available on the postgres backend yet` instead of a database error. To prove the backend against a real server locally:
+`report`, `audit`, and the dashboard's hook statistics read the same store as `serve`. On PostgreSQL that is the PostgreSQL database; they no longer stop with `not available on the postgres backend yet`. To prove the backend against a real server locally:
 
 ```bash
 MODELROUTER_TEST_POSTGRES_URL=postgres://user:pass@localhost/modelrouter_test \
