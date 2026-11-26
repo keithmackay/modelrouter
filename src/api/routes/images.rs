@@ -139,7 +139,7 @@ async fn image_generations_inner(
     let api_key_id = user.api_key_id;
     let user_project = attribution.project_or(user.api_key_project.clone());
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,

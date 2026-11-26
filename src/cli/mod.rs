@@ -14,6 +14,10 @@ use crate::report::formatter::{print_rows, OutputFormat};
 /// until this deadline, then forces exit.
 /// After the drain grace has elapsed (or in-flight work reached zero), how
 /// long to give hyper to close connections before exiting regardless.
+/// Ceiling on waiting for post-response writes (ledger and prompt rows)
+/// after the drain. Each is one or two store round trips; this only bites
+/// when the store is unreachable.
+const BACKGROUND_FLUSH_SECS: u64 = 30;
 const FORCE_EXIT_AFTER_DRAIN_SECS: u64 = 5;
 
 // ── Service install/uninstall ─────────────────────────────────────────────────
@@ -829,6 +833,7 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             // the grace elapses; every clock here starts at the SIGNAL, never
             // at startup.
             let grace_secs = settings.shutdown_grace_secs();
+            let drain_delay_secs = settings.server.drain_delay_secs;
             let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<usize>();
             let drain = readiness.clone();
             let serve_future = axum::serve(
@@ -837,6 +842,13 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
             )
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
+                if drain_delay_secs > 0 {
+                    // Readiness goes 503 now; keep serving while the load
+                    // balancers notice and stop sending traffic here.
+                    drain.begin_stopping();
+                    tracing::info!(drain_delay_secs, "stopping: not ready, still admitting requests");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(drain_delay_secs)).await;
+                }
                 drain.begin_drain();
                 let waiting_for = drain.in_flight();
                 tracing::info!(in_flight = waiting_for, grace_secs, "draining");
@@ -876,6 +888,23 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                         FORCE_EXIT_AFTER_DRAIN_SECS
                     );
                 }
+            }
+            // Ledger, prompt and cache writes spawned after each response:
+            // the runtime drops them on return, losing rows of spend.
+            let pending = crate::api::background::pending();
+            if pending > 0 {
+                tracing::info!(pending, "waiting for post-response writes");
+            }
+            let left = crate::api::background::wait_idle(std::time::Duration::from_secs(
+                BACKGROUND_FLUSH_SECS,
+            ))
+            .await;
+            if left > 0 {
+                tracing::warn!(
+                    left,
+                    "post-response writes still pending {}s after the drain; exiting without them",
+                    BACKGROUND_FLUSH_SECS
+                );
             }
         }
         Commands::Cache(cache_args) => {

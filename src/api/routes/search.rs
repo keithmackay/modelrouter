@@ -646,7 +646,7 @@ async fn search_inner(
     let attr_correlation = attribution.correlation_id.clone();
     let attr_tags = attribution.tags_json();
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,
@@ -914,7 +914,7 @@ fn record_search_cache_hit(
         cache_write_tokens: 0,
         request_fingerprint: Some(request_fingerprint.to_string()),
     };
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         if let Err(e) = record_cache_hit_usage(&*state.db, &state.callbacks, ledger).await {
             tracing::error!("Failed to record search cache-hit usage: {}", e);
         }

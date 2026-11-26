@@ -69,7 +69,7 @@ Never point liveness at `/health/ready`: a store outage would then restart every
 
 ## 6. Let the drain finish long streams
 
-On SIGTERM the router flips readiness to 503, keeps the listener open, answers new requests with 503 and `Connection: close`, lets in-flight requests finish to their last byte, and exits as soon as nothing is in flight or `[server] shutdown_grace_secs` elapses. The grace defaults to the longest configured tier timeout. The pod's `terminationGracePeriodSeconds` must be at least as large or the kubelet kills the process first; the chart sets both. An idle replica exits in milliseconds, so a long ceiling costs nothing in the common case.
+On SIGTERM the router flips readiness to 503, keeps the listener open, answers new requests with 503 and `Connection: close`, lets in-flight requests finish to their last byte, and exits as soon as nothing is in flight or `[server] shutdown_grace_secs` elapses. The grace defaults to the longest configured tier timeout. The pod's `terminationGracePeriodSeconds` must be at least as large or the kubelet kills the process first; the chart sets both. An idle replica exits in milliseconds, so a long ceiling costs nothing in the common case. With `[server] drain_delay_secs` set (the Helm chart sets 10), readiness goes to 503 at the signal but new requests are still served for that many seconds, while the Service and ingress stop routing to the pod; only then does the refusal start. After the drain the process also waits (up to 30 s) for the cost-ledger, prompt and cache writes spawned after each response, so a rollout or scale-down does not lose rows of spend.
 
 ## 7. Rollout settings
 

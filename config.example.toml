@@ -15,6 +15,10 @@ request_body_limit_mb = 10
 # nothing is in flight, so an idle replica never waits this long. Set the
 # pod's terminationGracePeriodSeconds at least this high.
 # shutdown_grace_secs = 21600
+# After SIGTERM, keep admitting requests this many seconds while /health/ready
+# already answers 503, so load balancers drop this replica before it refuses
+# (Kubernetes propagates endpoint removal asynchronously). Default 0.
+# drain_delay_secs = 10
 
 # [cluster]
 # # Replicas serving behind one address. Per-user concurrency, per-session

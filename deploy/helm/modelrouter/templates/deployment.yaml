@@ -90,6 +90,8 @@ spec:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
             {{- include "modelrouter.storeEnv" . | nindent 12 }}
+            - name: MODELROUTER_SERVER__DRAIN_DELAY_SECS
+              value: {{ .Values.drainDelaySeconds | quote }}
             - name: MODELROUTER_CLUSTER__BACKEND
               value: {{ .Values.cluster.backend | quote }}
             {{- if .Values.cluster.redisUrl }}

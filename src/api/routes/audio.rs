@@ -159,7 +159,7 @@ async fn speech_inner(
     let model_clone = model.clone();
     let provider_clone = provider_name.clone();
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,
@@ -400,7 +400,7 @@ async fn transcriptions_inner(
     let model_clone = model.clone();
     let provider_clone = provider_name.clone();
 
-    tokio::spawn(async move {
+    crate::api::background::spawn(async move {
         let prompt = NewPrompt {
             user_id,
             session_id: None,

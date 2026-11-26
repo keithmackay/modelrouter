@@ -26,6 +26,7 @@ pub struct Readiness(Arc<Inner>);
 
 struct Inner {
     migrated: AtomicBool,
+    stopping: AtomicBool,
     draining: AtomicBool,
     in_flight: AtomicUsize,
     refused: AtomicUsize,
@@ -57,6 +58,7 @@ impl Readiness {
     pub fn new() -> Self {
         Self(Arc::new(Inner {
             migrated: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
             refused: AtomicUsize::new(0),
@@ -78,8 +80,22 @@ impl Readiness {
         self.0.migrated.store(true, Ordering::Release);
     }
 
+    /// Report not-ready (so load balancers drop this replica) while still
+    /// admitting requests. The first step of shutdown when a drain delay is
+    /// configured; [`begin_drain`](Self::begin_drain) follows.
+    pub fn begin_stopping(&self) {
+        self.0.stopping.store(true, Ordering::Release);
+    }
+
+    /// Not ready, and refuse new requests from now on.
     pub fn begin_drain(&self) {
+        self.0.stopping.store(true, Ordering::Release);
         self.0.draining.store(true, Ordering::Release);
+    }
+
+    /// True from the first shutdown step: readiness answers 503.
+    pub fn is_stopping(&self) -> bool {
+        self.0.stopping.load(Ordering::Acquire)
     }
 
     pub fn is_draining(&self) -> bool {
@@ -156,7 +172,7 @@ impl Readiness {
     /// The store probe is the only I/O and is cached for [`DB_PROBE_TTL`].
     pub async fn failing<D: HealthRepository + ?Sized>(&self, db: &D) -> Vec<NotReady> {
         let mut failing = Vec::new();
-        if self.is_draining() {
+        if self.is_stopping() {
             failing.push(NotReady::Draining);
         }
         if !self.0.migrated.load(Ordering::Acquire) {
@@ -379,5 +395,30 @@ mod tests {
             serde_json::to_value(NotReady::Draining).unwrap(),
             serde_json::json!({"part": "draining"})
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_reports_not_ready_but_still_admits() {
+        let r = Readiness::started();
+        r.begin_stopping();
+        assert!(r.is_stopping());
+        assert!(!r.is_draining());
+        assert_eq!(r.failing(&db(false)).await, vec![NotReady::Draining]);
+        let guard = r.track();
+        assert!(guard.is_some(), "a stopping replica still admits requests");
+        assert_eq!(r.refused(), 0);
+        drop(guard);
+
+        r.begin_drain();
+        assert!(r.is_draining());
+        assert!(r.track().is_none());
+        assert_eq!(r.refused(), 1);
+    }
+
+    #[test]
+    fn begin_drain_alone_also_stops() {
+        let r = Readiness::started();
+        r.begin_drain();
+        assert!(r.is_stopping());
     }
 }

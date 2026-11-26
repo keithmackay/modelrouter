@@ -2,6 +2,7 @@ pub mod admin;
 pub mod app;
 pub mod attribution;
 pub mod auth;
+pub mod background;
 pub mod error;
 pub mod ledger;
 pub mod failure_log;
