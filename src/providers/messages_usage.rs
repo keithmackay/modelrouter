@@ -73,6 +73,12 @@ impl MessagesStreamUsage {
     pub fn is_complete(&self) -> bool {
         self.saw_usage && self.done
     }
+
+    /// True once `message_stop` has been read, whether or not usage arrived.
+    /// The router waits for the ledger insert before forwarding that event.
+    pub fn stopped(&self) -> bool {
+        self.done
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +134,7 @@ mod tests {
         usage.feed(stream(&[json!({"type": "message_stop"})]).as_bytes());
         assert!(!usage.saw_usage());
         assert!(!usage.is_complete());
+        assert!(usage.stopped());
     }
 
     #[test]

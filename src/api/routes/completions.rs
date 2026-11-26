@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use axum::{extract::State, response::{IntoResponse, Response}, Json};
+use axum::{extract::{Extension, State}, response::{IntoResponse, Response}, Json};
 use serde_json::Value;
 use tracing::Instrument;
 
@@ -25,6 +25,7 @@ use crate::{
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    Extension(readiness): Extension<crate::api::readiness::Readiness>,
     user: AuthenticatedUser,
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
@@ -50,7 +51,7 @@ pub async fn chat_completions(
     );
     let started = Instant::now();
 
-    let result = chat_completions_inner(State(state.clone()), user, headers, Json(body))
+    let result = chat_completions_inner(State(state.clone()), readiness, user, headers, Json(body))
         .instrument(span)
         .await;
 
@@ -66,6 +67,7 @@ pub async fn chat_completions(
 
 async fn chat_completions_inner(
     State(state): State<AppState>,
+    readiness: crate::api::readiness::Readiness,
     user: AuthenticatedUser,
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
@@ -380,6 +382,7 @@ async fn chat_completions_inner(
                 cache_key,
                 cache_directives: cache_directives.clone(),
                 request_fingerprint: request_fingerprint.clone(),
+                readiness: readiness.clone(),
             },
         );
 
@@ -445,8 +448,38 @@ async fn chat_completions_inner(
 
     record_success_metrics(&state, &current_model, &current_provider, user.id, &result, cost, latency_ms);
 
-    // Fire-and-forget: log prompt + cost
-    spawn_completion_logging(CompletionLogCtx {
+    // Store result in cache for future requests. `cost` rides along so a later
+    // hit can report what it saved.
+    if let Some(key) = cache_key {
+        state
+            .response_cache
+            .put_completion(&key, &canonical_model, &result, cost, &cache_directives)
+            .await;
+    }
+
+    // The ledger insert finishes before this response is returned, so a crash
+    // after the client has the body cannot lose the row. `meta` carries the
+    // same figures the ledger write records.
+    let meta = RouterMeta {
+        requested_model,
+        model: current_model.clone(),
+        provider: current_provider.clone(),
+        settings,
+        tokens: Some(completion_tokens(&result)),
+        results: None,
+        cost: CallCost::spent(cost)
+            .with_no_cache_cost(no_cache_cost)
+            .priced_if(priced),
+        timing: TimingMeta {
+            total_ms: received.elapsed().as_millis() as i64,
+            latency_ms,
+            provider_ms: Some(provider_ms),
+            ttft_ms: result.ttft_ms,
+            attempts: attempts.max(1),
+            fallbacks,
+        },
+    };
+    write_completion_logging(CompletionLogCtx {
         state: state.clone(),
         user_id: user.id,
         api_key_id: user.api_key_id,
@@ -477,36 +510,9 @@ async fn chat_completions_inner(
         experiment_id,
         experiment_variant: experiment_variant.clone(),
         request_fingerprint: request_fingerprint.clone(),
-    });
+    })
+    .await;
 
-    // Store result in cache for future requests. `cost` rides along so a later
-    // hit can report what it saved.
-    if let Some(key) = cache_key {
-        state
-            .response_cache
-            .put_completion(&key, &canonical_model, &result, cost, &cache_directives)
-            .await;
-    }
-
-    // Every figure below is the one handed to `spawn_completion_logging`
-    // above, so what the caller reads is what the ledger holds.
-    let meta = RouterMeta {
-        requested_model,
-        model: current_model,
-        provider: current_provider,
-        settings,
-        tokens: Some(completion_tokens(&result)),
-        results: None,
-        cost: CallCost::spent(cost).with_no_cache_cost(no_cache_cost).priced_if(priced),
-        timing: TimingMeta {
-            total_ms: received.elapsed().as_millis() as i64,
-            latency_ms,
-            provider_ms: Some(provider_ms),
-            ttft_ms: result.ttft_ms,
-            attempts: attempts.max(1),
-            fallbacks,
-        },
-    };
     let mut response = Json(build_openai_response(request_id, &result, &meta)).into_response();
     // No header when the cache was not involved: that is a plain response,
     // not a miss.
@@ -808,7 +814,8 @@ async fn try_serve_cached_completion(
             request_fingerprint: Some(key.to_string()),
         },
         &cached,
-    );
+    )
+    .await;
     let request_id = format!("chatcmpl-mr-{}", uuid::Uuid::new_v4());
     // No provider was called; the settings are those the cached answer's
     // request resolved to (the cache key covers the request parameters).
@@ -1118,8 +1125,8 @@ fn record_success_metrics(
     }
 }
 
-/// Everything the fire-and-forget logging task needs, owned, so the spawned
-/// task borrows nothing from the handler.
+/// Everything the completion ledger write needs, owned. The handler awaits
+/// the write before it returns the response.
 struct CompletionLogCtx {
     state: AppState,
     user_id: i64,
@@ -1155,116 +1162,118 @@ struct CompletionLogCtx {
     request_fingerprint: String,
 }
 
-/// Fire-and-forget logging for a non-streaming completion: the prompt row
-/// (when `write_prompt`), the cost-ledger row, callback egress (unless
-/// `skip_log`) and `on_response_sent` lifecycle hooks.
-fn spawn_completion_logging(ctx: CompletionLogCtx) {
+/// Write the prompt row and the cost-ledger row before the response is
+/// returned. The prompt row is written when `write_prompt` is set; the
+/// ledger row is always written. Callback egress is skipped when `skip_log`.
+async fn write_completion_logging(ctx: CompletionLogCtx) {
     use crate::api::ledger::record_usage;
     use crate::db::repositories::prompts::PromptRepository;
 
-    tokio::spawn(async move {
-        let ledger_row = |prompt_id: Option<i64>| NewCostLedgerEntry {
+    let ledger_row = |prompt_id: Option<i64>| NewCostLedgerEntry {
+        user_id: ctx.user_id,
+        prompt_id,
+        model: ctx.canonical_model.clone(),
+        provider: ctx.provider.clone(),
+        project: ctx.user_project.clone(),
+        tokens_in: ctx.prompt_tokens as i64,
+        tokens_out: ctx.completion_tokens as i64,
+        cost_usd: ctx.cost,
+        api_key_id: ctx.api_key_id,
+        attribution_correlation_id: ctx.attribution_correlation_id.clone(),
+        attribution_tags: ctx.attribution_tags.clone(),
+        experiment_id: ctx.experiment_id,
+        experiment_variant: ctx.experiment_variant.clone(),
+        call_kind: crate::db::models::CallKind::Chat,
+        tokens_estimated: false,
+        cache_read_tokens: ctx.cache_read_tokens as i64,
+        cache_write_tokens: ctx.cache_write_tokens as i64,
+        request_fingerprint: Some(ctx.request_fingerprint.clone()),
+    };
+
+    if ctx.write_prompt {
+        let mut prompt = NewPrompt {
             user_id: ctx.user_id,
-            prompt_id,
-            model: ctx.canonical_model.clone(),
+            session_id: None,
+            request_model: ctx.model.clone(),
+            routed_model: ctx.canonical_model.clone(),
             provider: ctx.provider.clone(),
-            project: ctx.user_project.clone(),
-            tokens_in: ctx.prompt_tokens as i64,
-            tokens_out: ctx.completion_tokens as i64,
+            messages: ctx.messages_json.clone(),
+            response: Some(ctx.response.clone()),
+            finish_reason: Some(ctx.finish_reason.clone()),
+            prompt_tokens: ctx.prompt_tokens as i64,
+            completion_tokens: ctx.completion_tokens as i64,
+            cache_read_tokens: ctx.cache_read_tokens as i64,
+            cache_write_tokens: ctx.cache_write_tokens as i64,
             cost_usd: ctx.cost,
-            api_key_id: ctx.api_key_id,
+            latency_ms: Some(ctx.latency_ms),
+            ttft_ms: ctx.ttft_ms,
+            attempts: Some(ctx.attempts),
+            tags: "[]".to_string(),
+            project: ctx.user_project.clone(),
             attribution_correlation_id: ctx.attribution_correlation_id.clone(),
             attribution_tags: ctx.attribution_tags.clone(),
             experiment_id: ctx.experiment_id,
             experiment_variant: ctx.experiment_variant.clone(),
             call_kind: crate::db::models::CallKind::Chat,
-            tokens_estimated: false,
-            cache_read_tokens: ctx.cache_read_tokens as i64,
-            cache_write_tokens: ctx.cache_write_tokens as i64,
-            request_fingerprint: Some(ctx.request_fingerprint.clone()),
         };
-
-        if ctx.write_prompt {
-            let mut prompt = NewPrompt {
-                user_id: ctx.user_id,
-                session_id: None,
-                request_model: ctx.model.clone(),
-                routed_model: ctx.canonical_model.clone(),
-                provider: ctx.provider.clone(),
-                messages: ctx.messages_json.clone(),
-                response: Some(ctx.response.clone()),
-                finish_reason: Some(ctx.finish_reason.clone()),
-                prompt_tokens: ctx.prompt_tokens as i64,
-                completion_tokens: ctx.completion_tokens as i64,
-                cache_read_tokens: ctx.cache_read_tokens as i64,
-                cache_write_tokens: ctx.cache_write_tokens as i64,
-                cost_usd: ctx.cost,
-                latency_ms: Some(ctx.latency_ms),
-                ttft_ms: ctx.ttft_ms,
-                attempts: Some(ctx.attempts),
-                tags: "[]".to_string(),
-                project: ctx.user_project.clone(),
-                attribution_correlation_id: ctx.attribution_correlation_id.clone(),
-                attribution_tags: ctx.attribution_tags.clone(),
-                experiment_id: ctx.experiment_id,
-                experiment_variant: ctx.experiment_variant.clone(),
-                call_kind: crate::db::models::CallKind::Chat,
-            };
-            crate::db::prompt_store::redact_prompt_content(&ctx.effective_storage, &mut prompt);
-            match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
-                Ok(saved_prompt) => {
-                    if let Err(e) =
-                        record_usage(&*ctx.state.db, &ctx.state.callbacks, ledger_row(Some(saved_prompt.id))).await
-                    {
-                        tracing::error!("Failed to record cost: {}", e);
-                    }
-                    // A row written only because a retaining experiment asked
-                    // for it does not open the operator's egress gate.
-                    if !ctx.skip_log {
-                        let mut event = crate::callbacks::CallbackEvent {
-                            trace_id: format!("{}", saved_prompt.id),
-                            user_id: ctx.user_id,
-                            model: ctx.canonical_model.clone(),
-                            provider: ctx.provider.clone(),
-                            input: serde_json::from_str(&ctx.messages_json)
-                                .unwrap_or(serde_json::Value::Null),
-                            output: ctx.response.clone(),
-                            prompt_tokens: ctx.prompt_tokens,
-                            completion_tokens: ctx.completion_tokens,
-                            cost_usd: ctx.cost,
-                            latency_ms: ctx.latency_ms,
-                        };
-                        // The row above was redacted; the egress must be too (issue #53).
-                        crate::db::prompt_store::redact_callback_content(
-                            &ctx.state.storage.load(),
-                            &mut event,
-                        );
-                        ctx.state.callbacks.dispatch(event);
-                    }
+        crate::db::prompt_store::redact_prompt_content(&ctx.effective_storage, &mut prompt);
+        match PromptRepository::create(&*ctx.state.prompt_db, prompt).await {
+            Ok(saved_prompt) => {
+                if let Err(e) = record_usage(
+                    &*ctx.state.db,
+                    &ctx.state.callbacks,
+                    ledger_row(Some(saved_prompt.id)),
+                )
+                .await
+                {
+                    tracing::error!("Failed to record cost: {}", e);
                 }
-                Err(e) => tracing::error!("Failed to record prompt: {}", e),
+                // A row written only because a retaining experiment asked
+                // for it does not open the operator's egress gate.
+                if !ctx.skip_log {
+                    let mut event = crate::callbacks::CallbackEvent {
+                        trace_id: format!("{}", saved_prompt.id),
+                        user_id: ctx.user_id,
+                        model: ctx.canonical_model.clone(),
+                        provider: ctx.provider.clone(),
+                        input: serde_json::from_str(&ctx.messages_json)
+                            .unwrap_or(serde_json::Value::Null),
+                        output: ctx.response.clone(),
+                        prompt_tokens: ctx.prompt_tokens,
+                        completion_tokens: ctx.completion_tokens,
+                        cost_usd: ctx.cost,
+                        latency_ms: ctx.latency_ms,
+                    };
+                    // The row above was redacted; the egress must be too (issue #53).
+                    crate::db::prompt_store::redact_callback_content(
+                        &ctx.state.storage.load(),
+                        &mut event,
+                    );
+                    ctx.state.callbacks.dispatch(event);
+                }
             }
-        } else {
-            // Skip logging but still record cost for budget enforcement
-            if let Err(e) = record_usage(&*ctx.state.db, &ctx.state.callbacks, ledger_row(None)).await {
-                tracing::error!("Failed to record cost: {}", e);
-            }
+            Err(e) => tracing::error!("Failed to record prompt: {}", e),
         }
+    } else {
+        // Skip logging but still record cost for budget enforcement
+        if let Err(e) = record_usage(&*ctx.state.db, &ctx.state.callbacks, ledger_row(None)).await {
+            tracing::error!("Failed to record cost: {}", e);
+        }
+    }
 
-        // Fire on_response_sent lifecycle hooks
-        for hook in &ctx.state.settings.hooks.lifecycle {
-            if hook.event == "on_response_sent" {
-                let payload = crate::hooks::lifecycle::response_sent_payload(
-                    &ctx.user_name,
-                    &ctx.model,
-                    &ctx.canonical_model,
-                    ctx.cost,
-                    ctx.latency_ms,
-                );
-                crate::hooks::lifecycle::fire(hook, payload);
-            }
+    // Fire on_response_sent lifecycle hooks
+    for hook in &ctx.state.settings.hooks.lifecycle {
+        if hook.event == "on_response_sent" {
+            let payload = crate::hooks::lifecycle::response_sent_payload(
+                &ctx.user_name,
+                &ctx.model,
+                &ctx.canonical_model,
+                ctx.cost,
+                ctx.latency_ms,
+            );
+            crate::hooks::lifecycle::fire(hook, payload);
         }
-    });
+    }
 }
 
 /// Everything needed to meter a cache hit, gathered at the call site so the
@@ -1286,7 +1295,7 @@ pub(crate) struct CacheHitCtx {
 
 /// Record a cache hit as usage: a prompt row (unless logging is skipped) and a
 /// cost-ledger row with `cache_hit = true`, `cost_usd = 0`, and the avoided cost
-/// in `saved_usd`. Fire-and-forget, matching the live-call logging path.
+/// in `saved_usd`. The caller awaits it before the cached response is returned.
 /// Next fallback candidate after `current_model` that passes policy model-permission
 /// checks and is not operator-disabled. A candidate denied by policy or disabled by
 /// an administrator is skipped, not fatal — the chain exists to find a working
@@ -1363,7 +1372,7 @@ async fn next_available_fallback_with_policy(
     None
 }
 
-pub(crate) fn record_cache_hit(
+pub(crate) async fn record_cache_hit(
     state: &AppState,
     ctx: CacheHitCtx,
     result: &crate::providers::adapter::CompletionResult,
@@ -1380,9 +1389,7 @@ pub(crate) fn record_cache_hit(
         metrics.record_request(&ctx.canonical_model, &ctx.provider, "cache_hit");
     }
 
-    let state = state.clone();
-    let result = result.clone();
-    tokio::spawn(async move {
+    {
         // `cost_usd` here is the *avoided* cost; `create_cache_hit` writes it to
         // saved_usd and forces cost_usd to zero, so it can never inflate spend.
         let ledger = NewCostLedgerEntry {
@@ -1453,7 +1460,7 @@ pub(crate) fn record_cache_hit(
         if let Err(e) = record_cache_hit_usage(&*state.db, &state.callbacks, ledger).await {
             tracing::error!("Failed to record cache-hit usage: {}", e);
         }
-    });
+    }
 }
 
 #[derive(Clone)]
@@ -1492,6 +1499,8 @@ struct StreamLogCtx {
     cache_directives: crate::router::cache::CacheDirectives,
     /// Fingerprint of the request, cached or not; the ledger row carries it.
     request_fingerprint: String,
+    /// Drain accounting for a ledger write that outlives the response body.
+    readiness: crate::api::readiness::Readiness,
 }
 
 /// Usage as the provider reported it inside a streamed chunk (OpenAI shape:
@@ -1621,13 +1630,26 @@ struct StreamLogger {
 }
 
 impl StreamLogger {
-    fn observe(&mut self, chunk_result: anyhow::Result<bytes::Bytes>) -> anyhow::Result<bytes::Bytes> {
+    fn observe(&mut self, chunk_result: anyhow::Result<bytes::Bytes>) -> Observed {
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(e) => {
                 self.capture = None;
-                self.record(Some(e.to_string()));
-                return Err(e);
+                let message = e.to_string();
+                let ledger = if self.acc.recorded {
+                    None
+                } else {
+                    self.acc.recorded = true;
+                    Some(PendingLedger {
+                        ctx: self.ctx.clone(),
+                        settlement: self.settle(self.finish_reason(Some(&message))),
+                        provider_error: Some(message),
+                    })
+                };
+                return Observed {
+                    result: Err(e),
+                    ledger,
+                };
             }
         };
         if let Some(capture) = self.capture.as_mut() {
@@ -1648,17 +1670,26 @@ impl StreamLogger {
             self.acc.finish_reason = info.finish_reason;
         }
         if !info.done || self.acc.recorded {
-            return Ok(chunk);
+            return Observed {
+                result: Ok(chunk),
+                ledger: None,
+            };
         }
         // Terminal chunk: settle once, tell the caller what it cost in a final
-        // usage chunk ahead of `[DONE]`, and write that same settlement to the
-        // ledger — one value, so the two can never disagree.
+        // usage chunk ahead of `[DONE]`, and hand the same settlement back so
+        // the stream awaits the ledger write before `[DONE]` is forwarded.
         self.acc.recorded = true;
         let settlement = self.settle(self.finish_reason(None));
         let event = cost_chunk_event(&self.ctx.request_id, &stream_meta(&self.ctx, &settlement));
         let chunk = insert_before_done(&chunk, &event);
-        self.spawn_ledger_write(settlement, None);
-        Ok(chunk)
+        Observed {
+            result: Ok(chunk),
+            ledger: Some(PendingLedger {
+                ctx: self.ctx.clone(),
+                settlement,
+                provider_error: None,
+            }),
+        }
     }
 
     /// Store the captured response, priced as the ledger prices it, after the
@@ -1788,28 +1819,69 @@ impl StreamLogger {
             tracing::warn!("streaming ledger write skipped: no tokio runtime");
             return;
         };
+        // The body's own in-flight guard drops with the body. This one keeps
+        // the drain waiting until the insert returns.
+        let guard = ctx.readiness.hold_work();
         handle.spawn(async move {
-            if let Some(message) = provider_error {
-                let failure_ctx = crate::api::failure_log::FailureContext {
-                    endpoint: "/v1/chat/completions",
-                    request_model: ctx.model.clone(),
-                    routed_model: Some(ctx.canonical_model.clone()),
-                    provider: Some(ctx.provider.clone()),
-                    user_id: Some(ctx.user_id),
-                    api_key_id: ctx.api_key_id,
-                    project: ctx.user_project.clone(),
-                    attribution_correlation_id: ctx.attribution.correlation_id.clone(),
-                    attribution_tags: ctx.attribution.tags_json(),
-                    latency_ms: Some(settlement.latency_ms),
-                    experiment_id: ctx.experiment_id,
-                    experiment_variant: ctx.experiment_variant.clone(),
-                };
-                let err = ApiError::ProviderError(anyhow::anyhow!("{message}"));
-                crate::api::failure_log::record_failure(&ctx.state, failure_ctx, &err).await;
-            }
-            write_stream_ledger(ctx, settlement).await;
+            let _guard = guard;
+            await_stream_ledger(PendingLedger {
+                ctx,
+                settlement,
+                provider_error,
+            })
+            .await;
         });
     }
+}
+
+struct PendingLedger {
+    ctx: StreamLogCtx,
+    settlement: StreamSettlement,
+    provider_error: Option<String>,
+}
+
+struct Observed {
+    result: anyhow::Result<bytes::Bytes>,
+    ledger: Option<PendingLedger>,
+}
+
+/// The ledger write for one streamed response. Awaited before the terminal
+/// chunk is forwarded, and spawned from `Drop` when the body is abandoned.
+async fn await_stream_ledger(pending: PendingLedger) {
+    let PendingLedger {
+        ctx,
+        settlement,
+        provider_error,
+    } = pending;
+    if let Some(message) = provider_error {
+        let failure_ctx = crate::api::failure_log::FailureContext {
+            endpoint: "/v1/chat/completions",
+            request_model: ctx.model.clone(),
+            routed_model: Some(ctx.canonical_model.clone()),
+            provider: Some(ctx.provider.clone()),
+            user_id: Some(ctx.user_id),
+            api_key_id: ctx.api_key_id,
+            project: ctx.user_project.clone(),
+            attribution_correlation_id: ctx.attribution.correlation_id.clone(),
+            attribution_tags: ctx.attribution.tags_json(),
+            latency_ms: Some(settlement.latency_ms),
+            experiment_id: ctx.experiment_id,
+            experiment_variant: ctx.experiment_variant.clone(),
+        };
+        let err = ApiError::ProviderError(anyhow::anyhow!("{message}"));
+        crate::api::failure_log::record_failure(&ctx.state, failure_ctx, &err).await;
+    }
+    write_stream_ledger(ctx, settlement).await;
+}
+
+/// Resolves to `value` only after `ledger` finishes. The chat response uses
+/// this so the caller cannot observe the body before the cost row is written.
+pub(crate) async fn release_after_ledger<T>(
+    ledger: impl std::future::Future<Output = ()> + Send,
+    value: T,
+) -> T {
+    ledger.await;
+    value
 }
 
 impl Drop for StreamLogger {
@@ -1929,8 +2001,36 @@ fn log_streaming_request(
         capture,
     };
     // The closure owns the logger, so dropping the mapped stream drops the
-    // logger and its guard fires.
-    stream.map(move |chunk_result| logger.observe(chunk_result))
+    // logger and its guard fires. The terminal chunk is not yielded until
+    // the ledger insert has finished. The insert is spawned, not only awaited,
+    // so a client that disconnects during it does not cancel the write; the
+    // spawned task holds its own in-flight guard until the insert returns.
+    stream.then(move |chunk_result| {
+        let observed = logger.observe(chunk_result);
+        let task = observed.ledger.and_then(|pending| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                tracing::warn!("streaming ledger write skipped: no tokio runtime");
+                return None;
+            };
+            let guard = pending.ctx.readiness.hold_work();
+            Some(handle.spawn(async move {
+                let _guard = guard;
+                await_stream_ledger(pending).await;
+            }))
+        });
+        async move {
+            if let Some(task) = task {
+                release_after_ledger(
+                    async move {
+                        let _ = task.await;
+                    },
+                    (),
+                )
+                .await;
+            }
+            observed.result
+        }
+    })
 }
 
 /// `x_router` for a settled stream — the settlement's figures, which are the
@@ -2827,5 +2927,34 @@ mod response_format_request_tests {
         let plain = completion_settings(EffectiveSettings::default(), &normalized(&json!({})), &json!({}));
         assert!(plain["response_format"].is_null());
         assert_eq!(plain["dropped"], json!([]));
+    }
+}
+
+#[cfg(test)]
+mod ledger_before_response_tests {
+    use super::release_after_ledger;
+
+    /// The issue's contract: the response value is not observable until the
+    /// ledger future has finished.
+    #[tokio::test]
+    async fn the_response_is_not_ready_until_the_ledger_insert_finishes() {
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let ledger = async move {
+            let _ = started_tx.send(());
+            let _ = gate_rx.await;
+        };
+        let response = tokio::spawn(release_after_ledger(ledger, "body"));
+        started_rx.await.expect("ledger future started");
+        assert!(
+            !response.is_finished(),
+            "response resolved before the ledger insert"
+        );
+        gate_tx.send(()).expect("ledger gate still open");
+        let body = tokio::time::timeout(std::time::Duration::from_secs(1), response)
+            .await
+            .expect("ledger insert finished")
+            .expect("task");
+        assert_eq!(body, "body");
     }
 }
