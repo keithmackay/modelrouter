@@ -39,7 +39,7 @@ Point your existing OpenAI SDK at modelrouter instead of `api.openai.com`. It au
 - **Embedding failover with width verification** — `/v1/embeddings` walks the same fallback chains as completions, and a `dimensions` request is verified against what the provider returned, so failing over between models of different widths can never corrupt a vector store
 - **Multi-scope budget enforcement** — set monthly or fixed date-range limits at the global (org-wide), project, user, or group level; any limit hit blocks the request before it reaches the upstream
 - **Admin dashboard** — web UI at `/admin` with usage stats, failures, audit log, and full management pages for users, API keys, groups, budgets, and webhooks
-- **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion, and a `usage` event for every metered call (streamed, cached or not, any endpoint) carrying its attribution, tokens and cost; optional HMAC-SHA256 signing, timeouts and retries; wire Datadog, Slack, a downstream coordinator or any HTTP endpoint; takes effect on next restart
+- **Webhook callbacks** — register outbound webhooks via admin UI or CLI (`modelrouter webhook add`) that fire JSON POSTs after each completion, and a `usage` event for every metered call (streamed, cached or not, any endpoint) carrying its attribution, tokens and cost; optional HMAC-SHA256 signing, timeouts and retries; a `usage` delivery is stored before it is sent, so a restart keeps it; wire Datadog, Slack, a downstream coordinator or any HTTP endpoint
 - **Response cache** — identical eligible requests (deterministic completions and search queries) are served from an in-memory or Redis store at zero provider cost; hits are metered with `cache_hit` and zero spend, and cache-hit % is a first-class metric on `/admin/cache` and the cost page
 - **Controlled experiments** — create an experiment with named variants, put `x-modelrouter-experiment: <id>[:<label>]` on each chat completion, report outcomes with `POST /v1/feedback`, and read per-variant and per-run cost, tokens, turns, latency, failures and outcomes back as JSON, from the CLI, or on `/admin/experiments`; bound requests are pinned to their variant's priced model with no downgrade, pool, cache or fallback
 - **Request cost attribution** — tag any metered call with your own correlation id and free-form tags (`attribution` in the request body, or `X-Attribution-*` headers); the router persists them on the prompt and cost-ledger rows and reports spend *and* cache savings per tag, so a consuming app can drop its own cost accounting. Attribution never affects routing or the cache key
@@ -2587,9 +2587,11 @@ Admin REST endpoints at `/admin/api/*` require a JWT from `POST /admin/api/login
 ### Webhooks and usage events
 
 A webhook is a URL the router POSTs JSON to. Register one with the CLI, the
-`/admin/webhooks` page or `POST /admin/api/webhooks`. Webhooks are loaded when
-the server starts, so **restart the server** after adding, deleting, enabling
-or disabling one.
+`/admin/webhooks` page or `POST /admin/api/webhooks`. `completion` deliveries
+use the webhooks loaded when the server starts, so restart after changing one
+for that event. A `usage` delivery is written when the ledger row is, and the
+sender reads the webhook's URL, secret and enabled flag at send time, so a
+change applies on the next attempt without a restart.
 
 ```bash
 export USAGE_WEBHOOK_SECRET="$(openssl rand -hex 32)"
@@ -2685,18 +2687,26 @@ unsigned, without these headers. The optional static header
 #### Delivery
 
 Every POST has a 10-second timeout and does not follow redirects. A `usage`
-delivery that fails with a connection error, a timeout, `429` or a `5xx` is
-retried after 1 s, 5 s, 30 s, 2 min and 10 min, then dropped with a warning;
-any other `4xx` ends it at once. A `completion` delivery is attempted once.
-Deliveries are held in memory: a restart loses any still pending, and when a
-webhook already has 1000 in flight a new one is dropped with a warning. A
-receiver that must not miss a call should also read the events back (below).
+delivery is inserted into `webhook_deliveries` immediately after the ledger
+row. Every replica claims due rows under a short lease — PostgreSQL with
+`FOR UPDATE SKIP LOCKED`, SQLite with a single-writer `UPDATE ... RETURNING` —
+so a replica that dies mid-send releases the row when the lease expires and
+another replica retries it. A connection error, a timeout, `429` or a `5xx`
+is retried after 1 s, 5 s, 30 s, 2 min and 10 min, then left in the table with
+`next_attempt_at` empty and `last_error` set. Any other `4xx` ends the same
+way, at once. Delivered rows are deleted after 7 days. A row that was given
+up is kept. Treat `usage` as at least once and deduplicate on `ledger_id`.
+
+A `completion` delivery is attempted once, in memory. A restart drops it, and
+when a webhook already has 1000 completion deliveries in flight a new one is
+dropped with a warning. A receiver that must not miss a call should also read
+the events back (below).
 
 #### Reading events back
 
 `GET /admin/api/usage/events` returns the `usage` events for stored ledger
-rows, so a receiver that was down, or lost deliveries to a restart, can fill
-the gaps. It takes the admin session, like the other `/admin/api` routes: a
+rows, so a receiver that was down, or missed a delivery, can fill the gaps.
+It takes the admin session, like the other `/admin/api` routes: a
 `Bearer` token from `POST /admin/api/login` or the dashboard cookie.
 
 ```bash

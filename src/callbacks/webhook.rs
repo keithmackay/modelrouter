@@ -107,8 +107,7 @@ impl WebhookBackend {
     /// True when this webhook subscribes to `event`; an empty list or `*`
     /// subscribes to every event.
     fn should_send_event(&self, event: &str) -> bool {
-        self.config.events.is_empty()
-            || self.config.events.iter().any(|e| e == "*" || e == event)
+        subscribes(&self.config.events, event)
     }
 
     /// Claim a pending slot, or `None` when the webhook already has
@@ -190,13 +189,25 @@ impl WebhookBackend {
     }
 }
 
+/// True when `events` subscribes to `event`. An empty list or `*` subscribes
+/// to every event. Unparseable JSON is an empty list, so it subscribes too.
+pub(crate) fn subscribes(events: &[String], event: &str) -> bool {
+    events.is_empty() || events.iter().any(|e| e == "*" || e == event)
+}
+
+/// [`subscribes`] for the JSON array stored on a webhook row.
+pub(crate) fn subscribes_json(events_json: &str, event: &str) -> bool {
+    let events = serde_json::from_str::<Vec<String>>(events_json).unwrap_or_default();
+    subscribes(&events, event)
+}
+
 /// An answer worth retrying: the receiver is overloaded or failed.
-fn is_retryable(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_retryable(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// One POST of `body`, signed afresh when the webhook has a signing secret.
-async fn post(
+pub(crate) async fn post(
     client: &reqwest::Client,
     config: &WebhookBackendConfig,
     event: &str,
@@ -238,13 +249,11 @@ impl CallbackBackend for WebhookBackend {
         self.deliver("completion", uuid::Uuid::new_v4().to_string(), body, false);
     }
 
-    fn send_usage(&self, payload: &Value) {
-        if !self.should_send_event(super::usage::EVENT) { return; }
-
-        let delivery_id = uuid::Uuid::new_v4().to_string();
-        let mut body = payload.clone();
-        body["delivery_id"] = Value::String(delivery_id.clone());
-        self.deliver(super::usage::EVENT, delivery_id, body, true);
+    fn send_usage(&self, _payload: &Value) {
+        // Usage deliveries are inserted into webhook_deliveries beside the
+        // ledger row and posted by the outbox loop. Sending here as well
+        // would deliver each event twice, and an in-memory retry would not
+        // survive a restart.
     }
 }
 

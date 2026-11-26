@@ -16,7 +16,9 @@ use crate::{
         maintenance::MaintenanceRepository,
         groups::GroupRepository,
         health::HealthRepository,
-        webhook_callbacks::WebhookCallbackRepository, mcp_servers::McpServerRepository, models::ModelRepository,
+        webhook_callbacks::WebhookCallbackRepository,
+        webhook_deliveries::WebhookDeliveryRepository,
+        mcp_servers::McpServerRepository, models::ModelRepository,
         prompts::PromptRepository, rate_limits::RateLimitRepository, sessions::SessionRepository,
         users::UserRepository,
     },
@@ -48,6 +50,7 @@ pub trait DatabaseProvider:
     + GroupRepository
     + HealthRepository
     + WebhookCallbackRepository
+    + WebhookDeliveryRepository
     + Send
     + Sync
 {
@@ -77,6 +80,7 @@ impl<T> DatabaseProvider for T where
         + GroupRepository
         + HealthRepository
         + WebhookCallbackRepository
+        + WebhookDeliveryRepository
         + Send
         + Sync
 {

@@ -1,5 +1,6 @@
 pub mod langfuse;
 pub mod langsmith;
+pub mod outbox;
 pub mod usage;
 pub mod webhook;
 

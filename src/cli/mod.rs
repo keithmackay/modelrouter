@@ -721,6 +721,35 @@ pub async fn run_with_extensions(cli: Cli, extensions: crate::extensions::Extens
                 });
             }
 
+            // Usage-webhook outbox. Every replica leases due rows and POSTs
+            // them. A crash leaves the row; the lease expires and another
+            // replica (or this one, after it starts again) retries. Delivered
+            // rows are deleted after the retention window.
+            {
+                let tick_db = state.db.clone();
+                tokio::spawn(async move {
+                    let worker = format!("mr-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .expect("a client with a timeout and no redirects always builds");
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut next_purge = tokio::time::Instant::now();
+                    loop {
+                        interval.tick().await;
+                        crate::callbacks::outbox::drain_once(&*tick_db, &worker, &client).await;
+                        if next_purge.elapsed() >= std::time::Duration::from_secs(60 * 60) {
+                            if let Err(e) = crate::callbacks::outbox::purge_delivered(&*tick_db).await {
+                                tracing::warn!(error = %e, "webhook outbox purge failed");
+                            }
+                            next_purge = tokio::time::Instant::now();
+                        }
+                    }
+                });
+            }
+
             // Background sweeper for session affinity TTL eviction
             {
                 let affinity = state.session_affinity.clone();
