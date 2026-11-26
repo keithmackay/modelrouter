@@ -7,6 +7,15 @@ use crate::callbacks::CallbackDispatcher;
 use crate::db::models::{CostLedgerEntry, NewCostLedgerEntry};
 use crate::db::repositories::costs::CostRepository;
 
+/// Write usage-webhook rows for `row`. A failure is logged and does not fail
+/// the ledger write: the row is already stored, and the events API can
+/// backfill a delivery this insert missed.
+async fn enqueue_usage_delivery(db: &dyn DatabaseProvider, row: &CostLedgerEntry) {
+    if let Err(e) = crate::callbacks::outbox::enqueue_usage(db, row).await {
+        tracing::warn!(ledger_id = row.id, error = %e, "usage webhook outbox enqueue failed");
+    }
+}
+
 /// Record a billed call and emit its `usage` event.
 pub async fn record_usage(
     db: &dyn DatabaseProvider,
@@ -14,6 +23,7 @@ pub async fn record_usage(
     entry: NewCostLedgerEntry,
 ) -> anyhow::Result<CostLedgerEntry> {
     let row = CostRepository::create(db, entry).await?;
+    enqueue_usage_delivery(db, &row).await;
     callbacks.dispatch_usage(&row);
     Ok(row)
 }
@@ -27,6 +37,7 @@ pub async fn record_cache_hit_usage(
     entry: NewCostLedgerEntry,
 ) -> anyhow::Result<CostLedgerEntry> {
     let row = CostRepository::create_cache_hit(db, entry).await?;
+    enqueue_usage_delivery(db, &row).await;
     callbacks.dispatch_usage(&row);
     Ok(row)
 }

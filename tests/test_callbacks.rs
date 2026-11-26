@@ -173,8 +173,8 @@ fn expected_signature(timestamp: &str, body: &[u8]) -> String {
 #[tokio::test]
 async fn a_signed_usage_delivery_verifies_against_the_bytes_received() {
     let (receiver, url) = Receiver::start().await;
-    let dispatcher = CallbackDispatcher::new(vec![Box::new(backend(&url, &["usage"], Some(SECRET)))]);
-    dispatcher.dispatch_usage(&ledger_row());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &DeliveryPolicy::default(), 1).await;
 
     let got = receiver.wait_for(1).await;
     let d = &got[0];
@@ -200,9 +200,9 @@ async fn a_signed_usage_delivery_verifies_against_the_bytes_received() {
 #[tokio::test]
 async fn an_unsigned_webhook_sends_no_signature_headers() {
     let (receiver, url) = Receiver::start().await;
-    let b = backend(&url, &["usage", "completion"], None);
-    b.send_usage(&modelrouter::callbacks::usage::from_ledger(&ledger_row()));
-    b.send(completion());
+    let db = usage_store(&url, &["usage", "completion"], None).await;
+    pump_usage(&db, &DeliveryPolicy::default(), 1).await;
+    backend(&url, &["usage", "completion"], None).send(completion());
 
     for d in receiver.wait_for(2).await {
         for h in ["x-modelrouter-signature", "x-modelrouter-timestamp", "x-modelrouter-delivery"] {
@@ -244,9 +244,10 @@ async fn a_signed_completion_keeps_its_payload_and_is_signed() {
 #[tokio::test]
 async fn a_completion_subscription_receives_no_usage_event() {
     let (receiver, url) = Receiver::start().await;
-    let b = backend(&url, &["completion"], None);
-    b.send_usage(&modelrouter::callbacks::usage::from_ledger(&ledger_row()));
-    b.send(completion());
+    let db = usage_store(&url, &["completion"], None).await;
+    let n = modelrouter::callbacks::outbox::enqueue_usage(&db, &ledger_row()).await.unwrap();
+    assert_eq!(n, 0, "a completion subscription is not a usage delivery");
+    backend(&url, &["completion"], None).send(completion());
 
     let got = receiver.settle(1).await;
     assert_eq!(got.len(), 1);
@@ -256,9 +257,9 @@ async fn a_completion_subscription_receives_no_usage_event() {
 #[tokio::test]
 async fn a_usage_subscription_receives_no_completion_event() {
     let (receiver, url) = Receiver::start().await;
-    let b = backend(&url, &["usage"], None);
-    b.send(completion());
-    b.send_usage(&modelrouter::callbacks::usage::from_ledger(&ledger_row()));
+    backend(&url, &["usage"], None).send(completion());
+    let db = usage_store(&url, &["usage"], None).await;
+    pump_usage(&db, &DeliveryPolicy::default(), 1).await;
 
     let got = receiver.settle(1).await;
     assert_eq!(got.len(), 1);
@@ -278,22 +279,46 @@ fn quick_policy() -> DeliveryPolicy {
     }
 }
 
-fn signed_usage_backend(url: &str, policy: DeliveryPolicy) -> WebhookBackend {
-    WebhookBackend::with_policy(
-        WebhookBackendConfig {
+async fn usage_store(url: &str, events: &[&str], signing_secret: Option<&str>) -> modelrouter::db::sqlite::SqliteDb {
+    use modelrouter::db::repositories::webhook_callbacks::{NewWebhookCallback, WebhookCallbackRepository};
+    let db = modelrouter::db::sqlite::SqliteDb::connect(":memory:").await.unwrap();
+    modelrouter::db::migrations::run_migrations(&db.pool).await.unwrap();
+    let events = serde_json::to_string(&events.iter().map(|e| (*e).to_string()).collect::<Vec<_>>()).unwrap();
+    WebhookCallbackRepository::create_webhook(
+        &db,
+        NewWebhookCallback {
             name: "test".into(),
             url: url.into(),
-            events: vec!["usage".into()],
-            secret_header_name: None,
-            secret_header_value: None,
-            signing_secret: Some(SECRET.into()),
+            events,
+            secret_header_name: Some("X-Static-Token".into()),
+            secret_header_value: Some("static".into()),
+            signing_secret: signing_secret.map(str::to_string),
         },
-        policy,
     )
+    .await
+    .unwrap();
+    db
 }
 
-fn usage_payload() -> Value {
-    modelrouter::callbacks::usage::from_ledger(&ledger_row())
+fn http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+/// Enqueue one usage delivery and drain until it has been attempted `rounds`
+/// times, waiting out the policy's first retry delay between passes.
+async fn pump_usage(db: &modelrouter::db::sqlite::SqliteDb, policy: &DeliveryPolicy, rounds: usize) {
+    modelrouter::callbacks::outbox::enqueue_usage(db, &ledger_row()).await.unwrap();
+    let client = http_client(policy.timeout);
+    for _ in 0..rounds {
+        modelrouter::callbacks::outbox::drain_with(db, "test-worker", &client, policy).await;
+        let pause = policy.retry_delays.first().copied().unwrap_or(Duration::from_millis(10))
+            + Duration::from_millis(40);
+        tokio::time::sleep(pause).await;
+    }
 }
 
 #[test]
@@ -310,7 +335,8 @@ fn the_default_policy_is_a_ten_second_timeout_and_five_backed_off_retries() {
 #[tokio::test]
 async fn server_errors_are_retried_under_one_delivery_id_each_attempt_signed() {
     let (receiver, url) = Receiver::scripted(&[Reply::Status(503), Reply::Status(503)]).await;
-    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &quick_policy(), 3).await;
 
     let got = receiver.settle(3).await;
     assert_eq!(got.len(), 3, "503, 503, then 204");
@@ -331,7 +357,8 @@ async fn each_attempt_carries_a_fresh_timestamp() {
         ..quick_policy()
     };
     let (receiver, url) = Receiver::scripted(&[Reply::Status(500)]).await;
-    signed_usage_backend(&url, policy).send_usage(&usage_payload());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &policy, 2).await;
 
     let got = receiver.wait_for(2).await;
     let (first, second) = (
@@ -345,14 +372,16 @@ async fn each_attempt_carries_a_fresh_timestamp() {
 #[tokio::test]
 async fn too_many_requests_is_retried() {
     let (receiver, url) = Receiver::scripted(&[Reply::Status(429)]).await;
-    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &quick_policy(), 2).await;
     assert_eq!(receiver.settle(2).await.len(), 2);
 }
 
 #[tokio::test]
 async fn a_client_error_is_not_retried() {
     let (receiver, url) = Receiver::scripted(&[Reply::Status(400)]).await;
-    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &quick_policy(), 3).await;
     assert_eq!(receiver.settle(1).await.len(), 1);
 }
 
@@ -360,14 +389,16 @@ async fn a_client_error_is_not_retried() {
 async fn retries_stop_when_the_schedule_runs_out() {
     let policy = DeliveryPolicy { retry_delays: vec![Duration::from_millis(10); 2], ..quick_policy() };
     let (receiver, url) = Receiver::scripted(&[Reply::Status(503); 5]).await;
-    signed_usage_backend(&url, policy).send_usage(&usage_payload());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &policy, 5).await;
     assert_eq!(receiver.settle(3).await.len(), 3, "one attempt plus two retries");
 }
 
 #[tokio::test]
 async fn a_receiver_that_never_answers_times_out_and_is_retried() {
     let (receiver, url) = Receiver::scripted(&[Reply::Hang]).await;
-    signed_usage_backend(&url, quick_policy()).send_usage(&usage_payload());
+    let db = usage_store(&url, &["usage"], Some(SECRET)).await;
+    pump_usage(&db, &quick_policy(), 2).await;
     let got = receiver.wait_for(2).await;
     assert_eq!(got[0].header("x-modelrouter-delivery"), got[1].header("x-modelrouter-delivery"));
 }
@@ -422,9 +453,19 @@ async fn deliveries_beyond_the_pending_bound_are_dropped_with_a_warning() {
         max_pending: 1,
         ..quick_policy()
     };
-    let b = signed_usage_backend(&url, policy);
-    b.send_usage(&usage_payload());
-    b.send_usage(&usage_payload());
+    let b = WebhookBackend::with_policy(
+        WebhookBackendConfig {
+            name: "test".into(),
+            url,
+            events: vec!["completion".into()],
+            secret_header_name: None,
+            secret_header_value: None,
+            signing_secret: Some(SECRET.into()),
+        },
+        policy,
+    );
+    b.send(completion());
+    b.send(completion());
 
     assert_eq!(receiver.settle(1).await.len(), 1, "the second delivery was dropped");
     let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();

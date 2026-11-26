@@ -5,6 +5,7 @@
 ### Week of 2026-11-09
 
 **Features**
+- Usage webhook deliveries are written to `webhook_deliveries` immediately after the cost-ledger row and sent by every replica. A replica claims due rows under a short lease (PostgreSQL `FOR UPDATE SKIP LOCKED`, SQLite a single-writer `UPDATE ... RETURNING`), so a crash or a rollout no longer drops a retry that lived only in memory. A connection error, timeout, 429 or 5xx is retried after 1 s, 5 s, 30 s, 2 min and 10 min; any other 4xx is not retried. The payload's `ledger_id` stays the idempotency key. Delivered rows are deleted after 7 days; a delivery that was given up stays, with `last_error`. Migrations 042 (SQLite) and 048 (PostgreSQL). (#174)
 - `GET /admin/api/usage/events?since=&after_id=&limit=` reads `usage` events back by ledger id, so a receiver can backfill deliveries it missed. Each item is the webhook payload for that row without `delivery_id`; health-probe rows are left out. Pages are in id order, at most 1000 events; `next_after_id` is the cursor for the next page and `null` once caught up. Admin session required.
 
 **Fixes**

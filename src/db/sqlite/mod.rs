@@ -23,6 +23,7 @@ mod mcp_servers;
 mod models;
 mod outcomes;
 mod webhook_callbacks;
+mod webhook_deliveries;
 
 #[derive(Clone)]
 pub struct SqliteDb {
