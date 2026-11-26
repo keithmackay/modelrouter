@@ -97,6 +97,15 @@ impl Readiness {
         Some(InFlightGuard(self.0.clone()))
     }
 
+    /// Count work that already belongs to an admitted request. Unlike
+    /// [`track`](Self::track), this still counts while draining, so a ledger
+    /// write that outlives the response body keeps the drain waiting until
+    /// the insert returns.
+    pub fn hold_work(&self) -> InFlightGuard {
+        self.0.in_flight.fetch_add(1, Ordering::AcqRel);
+        InFlightGuard(self.0.clone())
+    }
+
     pub fn in_flight(&self) -> usize {
         self.0.in_flight.load(Ordering::Acquire)
     }
@@ -314,6 +323,32 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), r.wait_idle())
             .await
             .expect("idle already");
+    }
+
+    #[tokio::test]
+    async fn hold_work_counts_during_drain_until_the_write_finishes() {
+        let r = Readiness::started();
+        r.begin_drain();
+        assert!(r.track().is_none());
+        let held = r.hold_work();
+        assert_eq!(r.in_flight(), 1);
+        assert_eq!(r.refused(), 1, "holding admitted work is not a new request");
+
+        let waiter = {
+            let r = r.clone();
+            tokio::spawn(async move { r.wait_idle().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "drain must wait for the ledger write"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_idle resolved")
+            .unwrap();
+        assert_eq!(r.in_flight(), 0);
     }
 
     #[test]
