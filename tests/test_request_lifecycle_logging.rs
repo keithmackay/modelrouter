@@ -177,7 +177,10 @@ async fn an_upstream_that_never_answers_shows_a_start_without_headers_then_dropp
     let (out, _guard) = capture();
     let server = app(true).await;
     let call = server.post("/v1/chat/completions").add_header(axum::http::header::AUTHORIZATION, axum::http::HeaderValue::from_static("Bearer test-token")).json(&request(true));
-    let gave_up = tokio::time::timeout(Duration::from_millis(300), async move { call.await }).await;
+    // The drop must be observable as a real wait, not an instant cancel.
+    // A 300 ms cap left too little room for the request to start on a busy
+    // runner, so the recorded latency could fall under the 200 ms check.
+    let gave_up = tokio::time::timeout(Duration::from_millis(1000), async move { call.await }).await;
     assert!(gave_up.is_err(), "the silent upstream answered");
     let events = out.lifecycle();
     assert_eq!(messages(&events), ["upstream request started", "upstream request finished"], "{events:#?}");

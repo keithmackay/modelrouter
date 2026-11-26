@@ -64,8 +64,14 @@ async fn test_app() -> TestServer {
 }
 
 #[tokio::test]
-async fn test_metrics_returns_404_without_feature() {
+async fn test_metrics_exports_replica_gauges_without_feature() {
+    // The autoscaling signal is served whether or not the prometheus
+    // feature (and its counters) is compiled in.
     let server = test_app().await;
     let resp = server.get("/metrics").await;
-    assert_eq!(resp.status_code(), 404);
+    assert_eq!(resp.status_code(), 200);
+    let text = resp.text();
+    // The scrape itself is exempt from the drain accounting, so nothing is in flight.
+    assert!(text.lines().any(|l| l == "modelrouter_requests_in_flight 0"), "{text}");
+    assert!(text.lines().any(|l| l == "modelrouter_draining 0"), "{text}");
 }

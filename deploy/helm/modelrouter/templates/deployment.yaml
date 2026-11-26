@@ -1,3 +1,4 @@
+{{- include "modelrouter.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -5,7 +6,11 @@ metadata:
   labels:
     {{- include "modelrouter.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # Under the HPA the count is the HPA's; rendering it here would reset the
+  # scale on every helm upgrade.
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   # A new pod must be Ready before an old one stops, so a build that cannot
   # start never takes traffic away from one that can.
   strategy:
@@ -24,6 +29,11 @@ spec:
         # Force pod restart when config changes
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- if .Values.metrics.podAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+        {{- end }}
     spec:
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -56,11 +66,7 @@ spec:
           env:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
-            # Each replica enforces its share of the in-memory limits.
-            - name: MODELROUTER_CLUSTER__REPLICAS
-              value: {{ .Values.replicaCount | quote }}
-            - name: MODELROUTER_DATABASE__PATH
-              value: /data/router.db
+            {{- include "modelrouter.storeEnv" . | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /config
@@ -83,17 +89,13 @@ spec:
           env:
             - name: MODELROUTER_CONFIG
               value: /config/config.toml
-            # Each replica enforces its share of the in-memory limits.
-            - name: MODELROUTER_CLUSTER__REPLICAS
-              value: {{ .Values.replicaCount | quote }}
+            {{- include "modelrouter.storeEnv" . | nindent 12 }}
             - name: MODELROUTER_CLUSTER__BACKEND
               value: {{ .Values.cluster.backend | quote }}
             {{- if .Values.cluster.redisUrl }}
             - name: MODELROUTER_CLUSTER__REDIS_URL
               value: {{ .Values.cluster.redisUrl | quote }}
             {{- end }}
-            - name: MODELROUTER_DATABASE__PATH
-              value: /data/router.db
             - name: MODELROUTER_AUTH__JWT_SECRET
               valueFrom:
                 secretKeyRef:

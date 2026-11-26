@@ -55,7 +55,7 @@ backend = "redis"      # limits, session pins and pending admin logins
 # redis_url and namespace default to the [cache] values
 ```
 
-`[cluster] replicas` alone divides the in-memory limits by the replica count. `backend = "redis"` makes them exact and shared, keeps session affinity pins visible to every replica, and lets an admin login started on one replica finish on another. The Helm chart passes `replicaCount` through for you.
+`[cluster] replicas` alone divides the in-memory limits by the replica count. `backend = "redis"` makes them exact and shared, keeps session affinity pins visible to every replica, and lets an admin login started on one replica finish on another. The Helm chart passes `replicaCount` through for you (`autoscaling.maxReplicas` under the HPA).
 
 ## 5. Wire the three probes
 
@@ -87,7 +87,42 @@ topologySpread:
 
 `maxSurge: 1` with `maxUnavailable: 0` starts one new pod, waits for its startup and readiness probes, and only then stops one old pod. A new build that cannot start therefore never reduces capacity. The PodDisruptionBudget keeps one pod serving through node drains; enable it only with two or more replicas or a drain can never proceed. Topology spread places replicas across zones and nodes with `ScheduleAnyway`, so a small cluster still schedules.
 
-## 8. Prove a build before it takes traffic
+## 8. Autoscaling
+
+```yaml
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetInFlightPerPod: "20"          # needs a custom-metrics adapter
+  targetCPUUtilizationPercentage: 70  # fallback signal
+persistence:
+  enabled: false
+database:
+  existingSecret: modelrouter-postgres   # key: postgres-url
+cluster:
+  backend: redis
+  redisUrl: redis://redis.internal:6379
+podDisruptionBudget:
+  enabled: true
+topologySpread:
+  enabled: true
+```
+
+The chart refuses to render autoscaling without PostgreSQL, with the SQLite volume still enabled, with `cluster.backend: memory`, or with `minReplicas` below 2. With autoscaling on, the Deployment omits `replicas` so a `helm upgrade` never resets the count the HPA chose, and each pod gets `maxReplicas` as `[cluster] replicas`: with Redis up the limits are exact and shared, and if Redis goes down each pod's fallback share is `ceil(limit / maxReplicas)`, which never adds up to more than the limit.
+
+Scale on concurrency, not CPU. Every pod serves `modelrouter_requests_in_flight` on `/metrics` (a stream counts until its last byte; probes and scrapes are not counted), with or without the `prometheus` build feature, plus `modelrouter_draining`. The router mostly waits on upstreams, so a pod full of long streams can sit at a few percent CPU. `targetInFlightPerPod` adds a `Pods` metric on the gauge; it needs an adapter that serves it to the HPA, such as prometheus-adapter with a rule like:
+
+```yaml
+rules:
+  - seriesQuery: 'modelrouter_requests_in_flight{namespace!="",pod!=""}'
+    resources: {overrides: {namespace: {resource: namespace}, pod: {resource: pod}}}
+    metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[1m])'
+```
+
+The pods carry `prometheus.io/scrape` annotations (`metrics.podAnnotations`). The default `behavior` scales up by two pods every 30 s and down by one every two minutes after ten stable minutes: a pod picked for removal stops getting new requests at once but finishes its streams first, so flapping costs capacity.
+
+## 9. Prove a build before it takes traffic
 
 ```bash
 modelrouter serve --check-config
@@ -100,6 +135,6 @@ Loads the config, checks the signing secret and OIDC role, opens the PostgreSQL 
 1. PostgreSQL provisioned; `postgres_url` injected as a secret; image built with `--features postgres`.
 2. Existing SQLite store moved with `db export` / `db import` in one quiesced window.
 3. Redis reachable; `[cache]` and `[cluster]` pointed at it.
-4. Chart values: `replicaCount >= 2`, probes as above, `rollout`, `podDisruptionBudget`, `topologySpread`, `terminationGracePeriodSeconds`.
+4. Chart values: `replicaCount >= 2` (or `autoscaling` as in section 8), `database.existingSecret` or `database.postgresUrl` with `persistence.enabled: false`, probes as above, `rollout`, `podDisruptionBudget`, `topologySpread`, `terminationGracePeriodSeconds`.
 5. `serve --check-config` green from the new image.
 6. Roll out; watch `/health/ready` on the new pod before the old one stops.
