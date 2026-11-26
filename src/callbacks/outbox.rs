@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use serde_json::Value;
 
 use crate::db::models::CostLedgerEntry;
@@ -49,16 +49,16 @@ pub(crate) enum RetryChoice {
     GiveUp { attempt: i64 },
 }
 
-pub(crate) fn retry_choice(attempts_already_made: i64, retryable: bool) -> RetryChoice {
+pub(crate) fn retry_choice(
+    attempts_already_made: i64,
+    retryable: bool,
+    delays: &[Duration],
+) -> RetryChoice {
     let next = attempts_already_made.saturating_add(1);
     if !retryable {
         return RetryChoice::GiveUp { attempt: next };
     }
-    match DeliveryPolicy::default()
-        .retry_delays
-        .get(attempts_already_made as usize)
-        .copied()
-    {
+    match delays.get(attempts_already_made as usize).copied() {
         Some(delay) => RetryChoice::Retry {
             attempt: next,
             delay,
@@ -68,8 +68,9 @@ pub(crate) fn retry_choice(attempts_already_made: i64, retryable: bool) -> Retry
 }
 
 fn stamp(t: chrono::DateTime<Utc>) -> String {
-    // Fixed width (`...Z`, no fractional seconds) so the text sort matches time.
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+    // Fixed millisecond width so a text sort matches time, including a
+    // sub-second retry delay.
+    t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 fn clip_error(error: &str) -> String {
@@ -103,8 +104,22 @@ where
     Ok(n)
 }
 
-/// Claim and send one batch of due deliveries.
+/// Claim and send one batch of due deliveries, using the default retry schedule.
 pub async fn drain_once<D>(db: &D, worker: &str, client: &reqwest::Client) -> DrainReport
+where
+    D: WebhookCallbackRepository + WebhookDeliveryRepository + ?Sized,
+{
+    drain_with(db, worker, client, &DeliveryPolicy::default()).await
+}
+
+/// [`drain_once`] with an explicit retry schedule. The HTTP timeout is the
+/// client's, not the policy's.
+pub async fn drain_with<D>(
+    db: &D,
+    worker: &str,
+    client: &reqwest::Client,
+    policy: &DeliveryPolicy,
+) -> DrainReport
 where
     D: WebhookCallbackRepository + WebhookDeliveryRepository + ?Sized,
 {
@@ -133,7 +148,7 @@ where
 
     let mut report = DrainReport::default();
     for delivery in claimed {
-        match send_one(db, client, worker, &hooks, delivery).await {
+        match send_one(db, client, worker, &hooks, delivery, policy).await {
             OneOutcome::Delivered => report.delivered += 1,
             OneOutcome::Retried => report.retried += 1,
             OneOutcome::Abandoned => report.abandoned += 1,
@@ -169,6 +184,7 @@ async fn send_one<D>(
     worker: &str,
     hooks: &[crate::db::repositories::webhook_callbacks::WebhookCallback],
     delivery: ClaimedDelivery,
+    policy: &DeliveryPolicy,
 ) -> OneOutcome
 where
     D: WebhookDeliveryRepository + ?Sized,
@@ -223,7 +239,7 @@ where
         }
         Err(e) => e.to_string(),
     };
-    match retry_choice(delivery.attempt, true) {
+    match retry_choice(delivery.attempt, true, &policy.retry_delays) {
         RetryChoice::Retry { attempt, delay } => {
             let at = stamp(Utc::now() + delay);
             let error = clip_error(&failure);
@@ -307,7 +323,8 @@ mod tests {
     use crate::db::sqlite::SqliteDb;
 
     fn choice_delay(attempts: i64) -> Duration {
-        match retry_choice(attempts, true) {
+        let delays = DeliveryPolicy::default().retry_delays;
+        match retry_choice(attempts, true, &delays) {
             RetryChoice::Retry { delay, .. } => delay,
             RetryChoice::GiveUp { .. } => panic!("attempt {attempts} should retry"),
         }
@@ -319,8 +336,9 @@ mod tests {
         for (attempt, delay) in delays.into_iter().enumerate() {
             assert_eq!(choice_delay(attempt as i64), delay);
         }
-        assert_eq!(retry_choice(5, true), RetryChoice::GiveUp { attempt: 6 });
-        assert_eq!(retry_choice(0, false), RetryChoice::GiveUp { attempt: 1 });
+        let delays = DeliveryPolicy::default().retry_delays;
+        assert_eq!(retry_choice(5, true, &delays), RetryChoice::GiveUp { attempt: 6 });
+        assert_eq!(retry_choice(0, false, &delays), RetryChoice::GiveUp { attempt: 1 });
     }
 
     async fn migrated() -> SqliteDb {
