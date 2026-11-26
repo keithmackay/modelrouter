@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: Job
+metadata: {name: __NAME__, namespace: mr-autoscale}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: __DEADLINE__
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            ["python3", "/app/load.py", "--url", "__TARGET__", "--key", "__KEY__",
+             "--secs", "__SECS__", "--workers", "__WORKERS__",
+             "--stream-share", "__STREAM__", "--run", "__NAME__"]
+          volumeMounts: [{name: app, mountPath: /app}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "1", memory: 256Mi}
+      volumes: [{name: app, configMap: {name: crash-scripts}}]

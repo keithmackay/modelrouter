@@ -1,0 +1,87 @@
+# Postgres, Redis and the stub upstream for the autoscaling proof.
+# No persistent volume: the router stores nothing on SQLite.
+apiVersion: v1
+kind: Namespace
+metadata: {name: mr-autoscale}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: postgres, namespace: mr-autoscale}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: POSTGRES_USER, value: modelrouter}
+            - {name: POSTGRES_PASSWORD, value: modelrouter}
+            - {name: POSTGRES_DB, value: modelrouter}
+          args: ["-c", "max_connections=300"]
+          ports: [{containerPort: 5432}]
+          readinessProbe: {exec: {command: ["pg_isready", "-U", "modelrouter"]}, periodSeconds: 2}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "1", memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: mr-autoscale}
+spec: {selector: {app: postgres}, ports: [{port: 5432}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: mr-autoscale}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 6379}]
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: mr-autoscale}
+spec: {selector: {app: redis}, ports: [{port: 6379}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: stub, namespace: mr-autoscale}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: stub}}
+  template:
+    metadata: {labels: {app: stub}}
+    spec:
+      containers:
+        - name: stub
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/app/stub_upstream.py", "8000"]
+          env:
+            - {name: STUB_HOST, value: "0.0.0.0"}
+            - {name: STUB_DELAY_SECS, value: "0.3"}
+            - {name: STUB_STREAM_SECS, value: "3"}
+          ports: [{containerPort: 8000}]
+          volumeMounts: [{name: app, mountPath: /app}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "1", memory: 512Mi}
+      volumes: [{name: app, configMap: {name: crash-scripts}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: stub, namespace: mr-autoscale}
+spec: {selector: {app: stub}, ports: [{port: 8000}]}

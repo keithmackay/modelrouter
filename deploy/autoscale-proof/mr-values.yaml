@@ -1,0 +1,66 @@
+# Postgres + Redis + HPA for the k3s proof. The image is a public Debian
+# userspace; run.sh bind-mounts a postgres-enabled binary and the host
+# dynamic linker. There is no SQLite volume.
+#
+# minReplicas stays 2. The chart rejects 1, because a single pod's crash
+# takes the service down. The scale-to-1 phase patches the live HPA.
+image:
+  repository: debian
+  tag: trixie-slim
+  pullPolicy: IfNotPresent
+persistence:
+  enabled: false
+database:
+  postgresUrl: postgres://modelrouter:modelrouter@postgres:5432/modelrouter
+cluster:
+  backend: redis
+  redisUrl: redis://redis:6379
+secrets:
+  jwtSecret: "autoscale-proof-jwt-secret-autoscale-proof-jwt-0123456789"
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetInFlightPerPod: "6"
+  targetCPUUtilizationPercentage: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{type: Pods, value: 2, periodSeconds: 15}]
+    scaleDown:
+      stabilizationWindowSeconds: 15
+      policies: [{type: Pods, value: 1, periodSeconds: 15}]
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+topologySpread:
+  enabled: true
+drainDelaySeconds: 10
+terminationGracePeriodSeconds: 120
+resources:
+  requests: {cpu: 100m, memory: 64Mi}
+  limits: {cpu: "1", memory: 512Mi}
+config: |
+  [server]
+  host = "0.0.0.0"
+  port = 8080
+  shutdown_grace_secs = 90
+
+  [routing]
+  default_provider = "mock"
+  default_model = "mock-model"
+
+  [providers.mock]
+  api_base = "http://stub:8000/v1"
+  api_key = "stub-key-not-a-secret"
+
+  [auth]
+  jwt_secret = ""
+
+  [cache]
+  enabled = false
+
+  [[pricing]]
+  model = "mock-model"
+  input_per_million = 1.0
+  output_per_million = 2.0

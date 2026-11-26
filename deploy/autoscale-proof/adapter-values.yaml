@@ -1,0 +1,20 @@
+# Serves modelrouter_requests_in_flight to the HPA as a pod metric.
+# 30s average so a bounded proof can see scale-up and scale-down.
+prometheus:
+  url: http://prom-prometheus-server.mr-autoscale-mon.svc
+  port: 80
+metricsRelistInterval: 30s
+resources:
+  requests: {cpu: 20m, memory: 64Mi}
+  limits: {cpu: 500m, memory: 512Mi}
+rules:
+  default: false
+  custom:
+    - seriesQuery: 'modelrouter_requests_in_flight{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+          pod: {resource: pod}
+      name:
+        as: modelrouter_requests_in_flight
+      metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[30s])'

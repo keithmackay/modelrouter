@@ -1,0 +1,15 @@
+# Minimal Prometheus. Scrapes pods with prometheus.io annotations (chart default).
+alertmanager: {enabled: false}
+prometheus-pushgateway: {enabled: false}
+kube-state-metrics: {enabled: false}
+prometheus-node-exporter: {enabled: false}
+server:
+  retention: 6h
+  persistentVolume: {enabled: false}
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  global:
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    evaluation_interval: 10s
