@@ -144,7 +144,25 @@ cluster:
   backend: memory
   redisUrl: ""
 
-# Node selector, tolerations, affinity
+# Optional Ingress. With ingress-nginx (className nginx) and nginxRetry, a
+# request whose connection to a pod failed before it was sent (the pod just
+# died, or its endpoint is stale) is sent to another pod instead of failing.
+# nginx never re-sends a POST that already reached a pod, so no request runs
+# twice; a stream cut mid-way still fails and is the caller's to retry.
+# Timeouts are raised for long streams and buffering is off for SSE.
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  path: /
+  tls: []
+  #  - secretName: modelrouter-tls
+  #    hosts: [modelrouter.example.com]
+  annotations: {}
+  nginxRetry: true
+  nginxRetryTries: 3
+  streamTimeoutSeconds: 21600
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
